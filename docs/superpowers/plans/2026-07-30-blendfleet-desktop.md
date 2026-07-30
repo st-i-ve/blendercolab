@@ -28,6 +28,8 @@ Every value below was measured against a live Kaggle account on 2026-07-30. Evid
 - In Blender, `prefs.devices` lists each physical GPU **once per backend**. Enable only devices whose `type == chosen_backend`, or the same card is switched on twice.
 - **No Google Drive, no rclone.** Renders go to `/kaggle/working`; retrieval is `kernels output`. v1 has zero Google dependencies.
 - `/kaggle/working` caps at 20 GB. `/kaggle/tmp` is ~60 GB scratch, not persisted.
+- **Live progress MUST use `GetKernelSessionLogsStream` (SSE), never `kernels logs` or `kernels output`.** Both of those return nothing at all until the kernel reaches COMPLETE — measured, not assumed.
+- Any notebook line the app parses MUST be printed with `flush=True`, or Python buffers it and it never reaches the stream.
 - No network in unit tests. Every external call is injected and stubbed.
 
 ## Verified Facts (evidence, 2026-07-30)
@@ -44,6 +46,8 @@ Every value below was measured against a live Kaggle account on 2026-07-30. Evid
 | OptiX **is** accepted on Pascal | Log: `USING OPTIX -> [Tesla P100…]` — a prediction that it would fall back to CUDA was wrong |
 | Duplicate device bug | Log listed the single P100 twice |
 | Quota RPC exists | `ApiGetAcceleratorQuotaStatisticsRequest`, returns `timeUsed`/`totalTimeAllowed`/`quotaRefreshTime` |
+| **Live log streaming works** — SSE, progress lines arrive in real time | Pushed a probe printing `PROGRESS …` every 15 s; stream delivered all 10 lines live |
+| `kernels logs` / `kernels output` are **not** live | Both returned nothing for 6 min, then everything at once on COMPLETE |
 | Cancel RPC exists | `kagglesdk/kernels/services/kernels_api_service.py:124 cancel_kernel_session` — the CLI has no `cancel` subcommand, which is why forums claim it is impossible |
 
 **Unresolved — do not assert either way.** The settings page showed **30 hrs** GPU quota while `gpuQuota.totalTimeAllowed` returned **21600 s (6 h)** for the same account at the same moment. TPU agreed across both (72000 s = 20 hrs). The dashboard MUST show the API figure *labelled as the API figure*, alongside a link to the settings page — never silently pick one.
@@ -1966,6 +1970,197 @@ git commit -m "feat: Linux build"
 
 **Concurrency ceiling.** 2 GPU sessions per account. Three accounts is a hard ceiling of 6 simultaneous renders, and each still draws on its own weekly quota.
 
+---
+
+### Task 12: Live progress via SSE log stream
+
+**Files:**
+- Create: `blendfleet/log_stream.py`
+- Modify: `blendfleet/fleet.py` (populate `WorkerState.frames_done`)
+- Test: `tests/test_log_stream.py`
+
+**Interfaces:**
+- Produces: `parse_progress(line: str) -> tuple[int, int] | None` returning `(done, total)`; `is_end_of_log(line) -> bool`; `stream_progress(token, user_name, kernel_slug, on_progress, stop_event)`
+
+Verified 2026-07-31: `GetKernelSessionLogsStream` returns Server-Sent Events while a
+session runs. `kernels logs` and `kernels output` return **nothing** until COMPLETE, so
+neither can drive a progress bar. If the session already ended, the same RPC returns the
+persisted log as `application/json` instead — branch on Content-Type.
+
+- [ ] **Step 1: Write the failing test**
+
+```python
+# tests/test_log_stream.py
+from blendfleet.log_stream import parse_progress, is_end_of_log
+
+
+def test_parses_a_real_sse_line():
+    line = ('data: {"stream_name":"stdout","time":14.8,'
+            '"data":"PROGRESS frame=1 done=1/10\n"}')
+    assert parse_progress(line) == (1, 10)
+
+
+def test_parses_later_frame():
+    line = ('data: {"stream_name":"stdout","time":149.8,'
+            '"data":"PROGRESS frame=10 done=10/10\n"}')
+    assert parse_progress(line) == (10, 10)
+
+
+def test_ignores_stderr_and_noise():
+    assert parse_progress('data: {"stream_name":"stderr","data":"warning\n"}') is None
+    assert parse_progress("") is None
+    assert parse_progress("event: ping") is None
+    assert parse_progress("not json at all") is None
+
+
+def test_ignores_malformed_json():
+    assert parse_progress('data: {"stream_name":') is None
+
+
+def test_detects_end_sentinel():
+    assert is_end_of_log("data: END_OF_LOG")
+    assert not is_end_of_log("data: PROGRESS frame=1 done=1/2")
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `pytest tests/test_log_stream.py -v`
+Expected: FAIL — no module `blendfleet.log_stream`
+
+- [ ] **Step 3: Write the implementation**
+
+```python
+# blendfleet/log_stream.py
+"""Live progress from Kaggle's SSE log stream.
+
+Verified 2026-07-31: GetKernelSessionLogsStream emits Server-Sent Events while
+the session runs. `kernels logs` and `kernels output` return nothing until the
+kernel completes, so neither can drive a live progress bar.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import threading
+from typing import Callable
+
+PROGRESS_RE = re.compile(r"PROGRESS frame=(\d+) .*?done=(\d+)/(\d+)")
+
+
+def is_end_of_log(line: str) -> bool:
+    return "END_OF_LOG" in line
+
+
+def parse_progress(line: str) -> tuple[int, int] | None:
+    """Return (frames_done, total) from one SSE line, or None."""
+    if not line.startswith("data:"):
+        return None
+    payload = line[len("data:"):].strip()
+    try:
+        obj = json.loads(payload)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if obj.get("stream_name") != "stdout":
+        return None
+    m = PROGRESS_RE.search(obj.get("data", ""))
+    if not m:
+        return None
+    return int(m.group(2)), int(m.group(3))
+
+
+def stream_progress(token: str, user_name: str, kernel_slug: str,
+                    on_progress: Callable[[int, int], None],
+                    stop_event: threading.Event | None = None) -> None:
+    """Block, calling on_progress(done, total) as lines arrive."""
+    os.environ["KAGGLE_API_TOKEN"] = token
+    from kagglesdk import KaggleClient
+    from kagglesdk.kernels.types.kernels_api_service import (
+        ApiGetKernelSessionLogsStreamRequest)
+
+    req = ApiGetKernelSessionLogsStreamRequest()
+    req.user_name = user_name
+    req.kernel_slug = kernel_slug
+    req.wait_for_logs_url_seconds = 30
+
+    resp = KaggleClient().kernels.kernels_api_client.get_kernel_session_logs_stream(req)
+    for raw in resp.iter_lines(decode_unicode=True):
+        if stop_event is not None and stop_event.is_set():
+            return
+        if not raw:
+            continue
+        if is_end_of_log(raw):
+            return
+        got = parse_progress(raw)
+        if got:
+            on_progress(*got)
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `pytest tests/test_log_stream.py -v`
+Expected: PASS, 5 tests
+
+- [ ] **Step 5: Wire into the dashboard**
+
+In `blendfleet/ui/dashboard.py` `_launch()`, after `fleet.launch(...)` returns, start one
+daemon thread per worker:
+
+```python
+import threading
+from blendfleet.log_stream import stream_progress
+
+self._stop = threading.Event()
+for acct, w in zip(self.store.list(), st.workers):
+    def run(acct=acct, w=w):
+        def bump(done, total):
+            w.frames_done = done
+        try:
+            stream_progress(acct.token, w.username,
+                            w.kernel_slug.split("/", 1)[1], bump, self._stop)
+        except Exception:
+            pass      # a dead stream must never kill the render or the UI
+    threading.Thread(target=run, daemon=True).start()
+```
+
+Set `self._stop.set()` in `closeEvent` so threads exit with the window.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add blendfleet/log_stream.py tests/test_log_stream.py blendfleet/ui/dashboard.py
+git commit -m "feat: live per-frame progress via SSE log stream"
+```
+
+---
+
+## Phase 2 — Expo mobile companion
+
+Feasible, and its shape is already settled by what was measured.
+
+**Kaggle's API is plain HTTPS plus a bearer token**, proven with raw `curl`. A React
+Native app can call it directly — native apps have no CORS restriction.
+
+| Approach | Backend | Works with laptop closed | Token lives |
+|---|---|---|---|
+| **A.** Phone polls Kaggle directly | none | only while app is open | phone (Expo SecureStore) |
+| **B.** Desktop pushes to Expo | none | no | desktop only |
+| **C.** Hosted poller | yes | **yes** | server |
+
+**Recommended: B + A.** The desktop is already polling and streaming, so when a worker
+finishes or fails it POSTs to `https://exp.host/--/api/v2/push/send` with the phone's
+Expo push token — real push notifications with **no server at all**. Opening the app then
+polls Kaggle directly for a live view.
+
+**The honest limitation:** a render runs 1.3–4 hours. B only delivers while the desktop
+is awake. "Close the laptop and get told when it is done" requires C — a cron job on any
+always-on box polling `kernels status` and firing the same Expo push. That is the only
+thing that justifies a backend, and it is a small one.
+
+**Note for whoever builds it:** SSE on React Native needs an explicit library
+(`react-native-sse`); `fetch` streaming is unreliable there. For the phone, polling
+`kernels status` every 30 s is simpler and sufficient — leave SSE to the desktop.
+
 ## Self-Review
 
 **Spec coverage:** accounts → Task 2; frame splitting → Task 3; Kaggle API incl. cancel and quota → Task 4; dataset upload → Task 5; notebook generation → Task 6; multi-account orchestration → Task 7; output retrieval and merge → Task 8; dashboard → Task 9; Windows `.exe` → Task 10; Linux → Task 11.
@@ -1974,6 +2169,6 @@ git commit -m "feat: Linux build"
 
 **Type consistency:** `KernelStatus.state` is a lowercase `str` everywhere, produced in Task 4 and consumed in Tasks 7 and 9. `WorkerState.frames` is `list[int]` from Task 3 through Tasks 7, 8 and 9. `Quota.source` is always set and always displayed.
 
-**Known gap, deliberately deferred:** `WorkerState.frames_done` is only ever 0 until log-stream parsing lands. The notebook already emits `PROGRESS frame=… done=n/m` lines for exactly this purpose, and `ApiGetKernelSessionLogsStreamRequest` exists in the SDK. v1 shows job-level state and a progress bar that fills on completion; live per-frame progress is the first v2 task.
+**Live progress is in scope (Task 12), not deferred.** Verified working on 2026-07-31.
 
 **Placeholder scan:** no TBDs. Every code step is runnable; every test step contains real assertions.
