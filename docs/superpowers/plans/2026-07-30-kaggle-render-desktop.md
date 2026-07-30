@@ -1,5 +1,10 @@
 # Kaggle Render Desktop App Implementation Plan
 
+> **SUPERSEDED 2026-07-30 by `2026-07-30-blendfleet-desktop.md`.**
+> Three of this plan's Global Constraints were disproved by testing against a
+> live Kaggle account: auth does not use `kaggle.json`, cancellation IS possible
+> via the SDK, and GPU quota IS exposed by the API. Do not execute this plan.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** A Windows desktop app that submits Blender renders to Kaggle and monitors them, with no browser involved.
