@@ -122,16 +122,38 @@ Poll intervals: kernel status every 30 s, frame count every 20 s, both backing o
 PyInstaller one-file `.exe`. PySide6 pushes this to roughly 80–150 MB — acceptable for a
 desktop tool, and worth noting up front so it isn't a surprise.
 
-## Open questions
+## Resolved unknowns (verified 2026-07-30)
 
-1. **Weekly GPU quota is probably not exposed by the API.** The mockup showed
-   "6.2 / 30 h this week"; I have not confirmed any endpoint provides it. If none does,
-   v1 shows elapsed time for jobs it launched itself and links to the Kaggle settings
-   page for the real number. **Verify before building the UI around it.**
-2. **Does `kernels push` reliably start a run every time**, or only when content changed?
-   If unchanged pushes are no-ops, the app must vary something to force a re-run.
-3. **Concurrent-session limit.** Kaggle restricts simultaneous interactive GPU sessions;
-   unclear how that interacts with repeated batch pushes. Affects rapid resubmits.
+Documentary evidence only — none of this was executed against a live account, so treat
+each as "best available evidence", not a test result.
+
+**1. Weekly GPU quota is NOT exposed by the API.** No endpoint exists. The public API
+covers competitions, datasets, kernels and models; there is no user-quota or usage
+endpoint, and Kaggle has said there is no user-fetch API at all.
+
+→ **Design change:** drop the "6.2 / 30 h this week" readout from the UI. v1 shows
+elapsed time for jobs it launched itself and links to Kaggle's settings page for the real
+figure. Do not fake a number the API cannot supply.
+
+**2. `kernels push` always triggers a run.** It is never a no-op — every push creates a
+new version and executes it, even when the code and data are byte-identical.
+
+→ **Design change:** re-rendering needs no cache-busting trick. But an accidental double
+submit costs real quota, so the submit button must guard against it.
+
+**3. Concurrent limits are 2 GPU / 5 CPU sessions — and pushing does NOT stop the
+previous run.** Prior versions of the same kernel keep running concurrently after a new
+push. There is **no API method to stop a kernel**; issue #388 is an open feature request.
+Stopping requires the website.
+
+→ **Design change, the significant one:** the app can *start* work it cannot *stop*. So:
+- Track every submission the app makes, persisted across restarts.
+- Refuse a second submit while one is believed active; require explicit override.
+- Warn at the 2-concurrent-GPU ceiling before pushing, not after it fails.
+- Surface a prominent "Stop on Kaggle" link to *Active Events*, since that is the only
+  way to kill a run.
+- The UI must never imply it can cancel. A greyed-out Cancel that does nothing is worse
+  than no Cancel.
 
 ## Out of scope
 
