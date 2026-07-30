@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Poetic Rosebilder</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            background: linear-gradient(135deg, #e6e9f0 0%, #e2e6f5 100%);
+            font-family: 'Georgia', serif;
+        }
+        .description-container {
+            background-color: rgba(255, 255, 255, 0.9);
+            padding: 2rem;
+            border-radius: 15px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+            max-width: 600px;
+            animation: fadeIn ease 2s;
+            transition: all 0.5s ease;
+        }
+        .description-container h1 {
+            margin: 0;
+            color: #d1b4d4;
+            font-size: 1.8rem;
+            text-align: center;
+            letter-spacing: 1px;
+        }
+        .description-container p {
+            color: #8b7abf;
+            font-size: 1.2rem;
+            line-height: 1.7;
+            margin-top: 0.5rem;
+            text-align: center;
+            letter-spacing: 0.5px;
+        }
+        .description-container:hover {
+            transform: scale(1.02);
+            box-shadow: 0 12px 40px rgba(0, 0, 0, 0.15);
+        }
+        @keyframes fadeIn {
+            0% {
+                opacity: 0;
+                transform: translateY(20px);
+            }
+            100% {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+        @keyframes glow {
+            0%, 100% {
+                text-shadow: 0 0 5px rgba(220, 180, 255, 0.3);
+            }
+            50% {
+                text-shadow: 0 0 15px rgba(220, 180, 255, 0.6);
+            }
+        }
+        .description-container h1 {
+            animation: glow 3s infinite;
+        }
+    </style>
+</head>
+<body>
+    <div class="description-container" style="animation: fadeIn ease 2s, glow 3s infinite;">
+        <h1>Poetic Rose Vision</h1>
+        <p>A pink rose, petals spiraling like a tender embrace, unfurls in delicate layers, captivating the heart with its gentle beauty.</p>
+    </div>
+</body>
+</html>

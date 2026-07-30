@@ -1,0 +1,906 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Private AI Assistant for Frappe — Design & Runbook</title>
+<style>
+  :root{
+    --ink:#1a1d29; --muted:#5b6172; --faint:#8a90a2;
+    --line:#dfe3ee; --line2:#eef1f8;
+    --brand:#2f3a8f; --brand2:#4453c6; --brandbg:#eef0fb;
+    --free:#0e7c5a; --freebg:#e6f6ee;
+    --paid:#b7791f; --paidbg:#fbf3e2;
+    --danger:#b23a48; --dangerbg:#fbeced;
+    --code:#0d1117; --codeink:#e6edf3;
+    --mono:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace;
+  }
+  *{box-sizing:border-box;}
+  html{font-size:11pt;}
+  body{
+    font-family:"Segoe UI",-apple-system,Roboto,Helvetica,Arial,sans-serif;
+    color:var(--ink); line-height:1.5; margin:0; -webkit-print-color-adjust:exact; print-color-adjust:exact;
+  }
+  @page{ size:A4; margin:16mm 15mm 18mm 15mm; }
+  /* Screen-only: constrain to a page-like reading column so it doesn't stretch across wide monitors. Print layout is untouched. */
+  @media screen{
+    html{ background:#e9ebf3; }
+    body{ max-width:900px; margin:24px auto 48px; padding:32px 40px; background:#fff;
+          border:1px solid var(--line); border-radius:10px; box-shadow:0 4px 24px rgba(26,29,41,.08); }
+    .cover{ height:auto; min-height:auto; padding:24px 0 40px; }
+    .section{ page-break-before:auto; }
+    pre{ font-size:10.5px; }
+    table{ font-size:10.5px; }
+  }
+  h1,h2,h3,h4{ line-height:1.2; color:var(--ink); }
+  h2{ font-size:19pt; margin:0 0 .2em; padding-bottom:.25em; border-bottom:3px solid var(--brand); color:var(--brand); }
+  h3{ font-size:13.5pt; margin:1.4em 0 .4em; color:var(--brand2); }
+  h4{ font-size:11.5pt; margin:1.1em 0 .3em; color:var(--ink); }
+  p{ margin:.5em 0; }
+  a{ color:var(--brand2); text-decoration:none; }
+  code{ font-family:var(--mono); font-size:.86em; background:var(--brandbg); color:#2a2f6b; padding:.08em .35em; border-radius:4px; }
+  pre{ background:var(--code); color:var(--codeink); border-radius:8px; padding:12px 14px; overflow:auto; font-family:var(--mono); font-size:8.7pt; line-height:1.45; margin:.6em 0; }
+  pre code{ background:none; color:inherit; padding:0; }
+  pre .c{ color:#7d8590; } /* comment */
+  pre .k{ color:#79c0ff; } /* key */
+  pre .s{ color:#a5d6ff; } /* string */
+  small{ color:var(--muted); }
+  .section{ page-break-before:always; padding-top:.2em; }
+  .nobreak{ page-break-inside:avoid; }
+  table{ border-collapse:collapse; width:100%; margin:.7em 0; font-size:9.4pt; }
+  th,td{ border:1px solid var(--line); padding:6px 9px; text-align:left; vertical-align:top; }
+  th{ background:var(--brandbg); color:var(--brand); font-weight:600; }
+  tr:nth-child(even) td{ background:#fafbfe; }
+  ul,ol{ margin:.4em 0 .6em; padding-left:1.3em; }
+  li{ margin:.22em 0; }
+  .tag{ display:inline-block; font-size:8pt; font-weight:700; letter-spacing:.03em; padding:2px 8px; border-radius:20px; text-transform:uppercase; vertical-align:middle; }
+  .tag.free{ background:var(--freebg); color:var(--free); }
+  .tag.paid{ background:var(--paidbg); color:var(--paid); }
+  .tag.brand{ background:var(--brandbg); color:var(--brand); }
+  .callout{ border-left:4px solid var(--brand2); background:var(--brandbg); padding:10px 14px; border-radius:0 8px 8px 0; margin:.8em 0; font-size:9.8pt; }
+  .callout.warn{ border-color:var(--paid); background:var(--paidbg); }
+  .callout.free{ border-color:var(--free); background:var(--freebg); }
+  .callout.danger{ border-color:var(--danger); background:var(--dangerbg); }
+  .callout b{ color:var(--ink); }
+  .fig{ margin:1em 0; text-align:center; page-break-inside:avoid; }
+  .fig svg{ max-width:100%; height:auto; border:1px solid var(--line); border-radius:10px; background:#fff; }
+  .figcap{ font-size:8.6pt; color:var(--muted); margin-top:.4em; font-style:italic; }
+  .lead{ font-size:11pt; color:var(--muted); }
+  .grid2{ display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  .card{ border:1px solid var(--line); border-radius:10px; padding:12px 14px; }
+  .card h4{ margin-top:0; }
+  .kbd{ font-family:var(--mono); font-size:.85em; background:#fff; border:1px solid var(--line); border-bottom-width:2px; border-radius:5px; padding:1px 6px; }
+
+  /* Cover */
+  .cover{ height:250mm; display:flex; flex-direction:column; justify-content:center; page-break-after:always; }
+  .cover .eyebrow{ color:var(--brand2); font-weight:700; letter-spacing:.18em; text-transform:uppercase; font-size:10pt; }
+  .cover h1{ font-size:34pt; margin:.15em 0 .1em; color:var(--ink); letter-spacing:-.01em; }
+  .cover .sub{ font-size:15pt; color:var(--muted); font-weight:400; margin-bottom:2em; }
+  .cover .meta{ border-top:2px solid var(--line); padding-top:1em; font-size:9.5pt; color:var(--muted); }
+  .cover .meta b{ color:var(--ink); }
+  .cover .rule{ width:70px; height:6px; background:var(--brand); border-radius:6px; margin:1.4em 0; }
+  .toc{ page-break-after:always; }
+  .toc ol{ list-style:none; padding:0; counter-reset:toc; }
+  .toc > ol > li{ counter-increment:toc; padding:7px 0; border-bottom:1px solid var(--line2); font-weight:600; }
+  .toc > ol > li::before{ content:counter(toc) ".  "; color:var(--brand2); }
+  .toc ul{ list-style:none; padding-left:1.6em; font-weight:400; font-size:9.6pt; color:var(--muted); }
+  .toc ul li{ padding:2px 0; }
+</style>
+</head>
+<body>
+
+<!-- ============ COVER ============ -->
+<section class="cover">
+  <div class="eyebrow">Technical Design &amp; Implementation Runbook</div>
+  <h1>Private AI Assistant<br>for Frappe / ERPNext</h1>
+  <div class="sub">A self-hosted, isolated assistant over selected ERP data —<br>hybrid text-to-SQL + RAG, document OCR, image Q&amp;A, and pest identification.</div>
+  <div class="rule"></div>
+  <div class="meta">
+    <p><b>Prepared for:</b> Upande&nbsp;·&nbsp;james@upande.com</p>
+    <p><b>Phase focus:</b> Free evaluation on <b>Lightning AI</b> — no payment until a model is proven</p>
+    <p><b>Version:</b> 1.0 &nbsp;|&nbsp; <b>Date:</b> 13 July 2026 &nbsp;|&nbsp; <b>Status:</b> Approved design → runbook</p>
+  </div>
+</section>
+
+<!-- ============ TOC ============ -->
+<section class="toc">
+  <h2>Contents</h2>
+  <ol>
+    <li>Executive Summary
+      <ul><li>Goals, the free-first principle, and what we deliver</li></ul>
+    </li>
+    <li>System Architecture
+      <ul><li>Full system diagram · Query data flow · Component responsibilities</li></ul>
+    </li>
+    <li>Project Decomposition &amp; Sequencing
+      <ul><li>Specs A–D · Dependency graph · Build order</li></ul>
+    </li>
+    <li>Spec A — VLM Brain Comparison Harness
+      <ul><li>Candidates · Sample data · Eval set · Scoring</li></ul>
+    </li>
+    <li>Spec B — Pest Identification CV Model
+      <ul><li>Transfer learning · IP102 · Training &amp; inference</li></ul>
+    </li>
+    <li>The Free Test Plan &amp; Lightning AI
+      <ul><li>Three stages · CPU/GPU split · Studio workflow</li></ul>
+    </li>
+    <li>Runbook — Commands &amp; Resources
+      <ul><li>Lightning setup · Serving · Retrieval · OCR · Eval · Pest training</li></ul>
+    </li>
+    <li>Cost Model &amp; Migration to Paid</li>
+    <li>Risks, Constraints &amp; Decisions</li>
+    <li>Agentic Workflow — Tool-Using Brain
+      <ul><li>Tools · ReAct loop · Guardrails · Tiered model roles</li></ul>
+    </li>
+    <li>Scaling &amp; the Deployment Race
+      <ul><li>Model-tier ladder · Users × GPU sizing · The race by stage</li></ul>
+    </li>
+    <li>Appendix — Resource Index</li>
+  </ol>
+</section>
+
+<!-- ============ 1. EXEC SUMMARY ============ -->
+<section class="section">
+  <h2>1 · Executive Summary</h2>
+  <p class="lead">Build a privately-hosted AI assistant that answers questions over a <b>curated, isolated mirror</b> of selected Frappe/ERPNext tables — using structured data, free text, documents, and images — without exposing the production ERP and without per-token API bills.</p>
+
+  <h3>1.1 Goals</h3>
+  <table>
+    <tr><th>#</th><th>Goal</th><th>How this design meets it</th></tr>
+    <tr><td>G1</td><td>Answer questions from ERP <b>structured data</b></td><td>Text-to-SQL over a mirror DB (execution-verified)</td></tr>
+    <tr><td>G2</td><td>Answer from <b>free text / notes</b></td><td>Vector RAG over embedded text fields</td></tr>
+    <tr><td>G3</td><td>Read <b>documents</b> (invoices, delivery notes)</td><td>OCR via VLM or dedicated engine → structured fields</td></tr>
+    <tr><td>G4</td><td><b>Image Q&amp;A</b> (describe / understand photos)</td><td>Vision-language model (same brain)</td></tr>
+    <tr><td>G5</td><td><b>Identify pests</b> from photos</td><td>Dedicated fine-tuned CV classifier (Track B)</td></tr>
+    <tr><td>G6</td><td><b>Data isolation</b> — model never touches production</td><td>Only selected tables sync to a separate box the model sees</td></tr>
+    <tr><td>G7</td><td><b>No cost until proven</b></td><td>All evaluation on free tiers; pay only to deploy the winner</td></tr>
+  </table>
+
+  <h3>1.2 The free-first principle</h3>
+  <div class="callout free">
+    <b>Decouple evaluation from production.</b> Choosing a model is a one-off experiment; it does <i>not</i> need a paid, isolated box. We screen and validate every candidate on <b>free infrastructure</b> using <b>synthetic data</b>, and spend the first real money only when we already know which model to deploy. This document scopes the free phase on <b>Lightning AI</b>.
+  </div>
+
+  <h3>1.3 What "self-hosted only" commits us to</h3>
+  <p>The isolation requirement (G6) rules out hosted APIs as the <i>production</i> brain, because sending even the synced subset to a third party breaks isolation. Production therefore needs a GPU box we control (rented ~16&nbsp;GB to start). But — see §6 — the <b>comparison</b> is still free because it runs on synthetic data on free compute.</p>
+
+  <h3>1.4 Deliverables of the free phase</h3>
+  <ul>
+    <li>A <b>scorecard</b> ranking VLM candidates on SQL accuracy, RAG quality, OCR, image-Q&amp;A, latency and VRAM fit → one recommended brain + runner-up.</li>
+    <li>A <b>pest classifier</b> with a per-pest accuracy report, trained on public data.</li>
+    <li>A reusable <b>harness</b> and <b>Lightning Studio</b> environment, ready to re-run when new models appear.</li>
+  </ul>
+</section>
+
+<!-- ============ 2. ARCHITECTURE ============ -->
+<section class="section">
+  <h2>2 · System Architecture</h2>
+  <p>The system is one <b>isolated environment</b> that the model controls, fed by a one-way sync from Frappe. The model can only ever see what was synced — its blast radius is the curated subset, never the live ERP.</p>
+
+  <div class="fig nobreak">
+  <svg viewBox="0 0 860 470" xmlns="http://www.w3.org/2000/svg" font-family="Segoe UI, sans-serif">
+    <defs>
+      <marker id="ah" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#4453c6"/></marker>
+      <marker id="ahg" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#0e7c5a"/></marker>
+    </defs>
+    <!-- Frappe -->
+    <rect x="20" y="150" width="170" height="150" rx="12" fill="#fbf3e2" stroke="#b7791f" stroke-width="1.5"/>
+    <text x="105" y="180" text-anchor="middle" font-size="14" font-weight="700" fill="#7a5510">Frappe / ERPNext</text>
+    <text x="105" y="200" text-anchor="middle" font-size="10" fill="#7a5510">(online, production)</text>
+    <rect x="40" y="215" width="130" height="26" rx="5" fill="#fff" stroke="#d9c08a"/><text x="105" y="232" text-anchor="middle" font-size="9.5" fill="#7a5510">Full ERP data</text>
+    <rect x="40" y="248" width="130" height="26" rx="5" fill="#fff" stroke="#d9c08a"/><text x="105" y="265" text-anchor="middle" font-size="9" fill="#7a5510">Scheduler / webhook</text>
+    <text x="105" y="292" text-anchor="middle" font-size="8" fill="#a07d2c">stays separate from model</text>
+
+    <!-- sync arrow -->
+    <path d="M195,225 L250,225" stroke="#0e7c5a" stroke-width="2.5" fill="none" marker-end="url(#ahg)"/>
+    <text x="222" y="215" text-anchor="middle" font-size="8.5" font-weight="700" fill="#0e7c5a">sync</text>
+    <text x="222" y="243" text-anchor="middle" font-size="7.5" fill="#0e7c5a">selected</text>
+    <text x="222" y="253" text-anchor="middle" font-size="7.5" fill="#0e7c5a">tables only</text>
+
+    <!-- isolated box -->
+    <rect x="258" y="30" width="582" height="410" rx="14" fill="none" stroke="#2f3a8f" stroke-width="2" stroke-dasharray="7 5"/>
+    <text x="549" y="52" text-anchor="middle" font-size="12" font-weight="700" fill="#2f3a8f">ISOLATED ENVIRONMENT — you control (rented ~16GB GPU at prod)</text>
+
+    <!-- data stores -->
+    <rect x="278" y="75" width="150" height="60" rx="9" fill="#eef0fb" stroke="#4453c6"/><text x="353" y="100" text-anchor="middle" font-size="11" font-weight="600" fill="#2f3a8f">Mirror DB</text><text x="353" y="118" text-anchor="middle" font-size="8.5" fill="#5b6172">subset tables (SQL)</text>
+    <rect x="278" y="145" width="150" height="60" rx="9" fill="#eef0fb" stroke="#4453c6"/><text x="353" y="170" text-anchor="middle" font-size="11" font-weight="600" fill="#2f3a8f">Vector store</text><text x="353" y="188" text-anchor="middle" font-size="8.5" fill="#5b6172">embedded text fields</text>
+    <rect x="278" y="215" width="150" height="60" rx="9" fill="#eef0fb" stroke="#4453c6"/><text x="353" y="240" text-anchor="middle" font-size="11" font-weight="600" fill="#2f3a8f">Image / doc store</text><text x="353" y="258" text-anchor="middle" font-size="8.5" fill="#5b6172">photos, PDFs</text>
+
+    <!-- retrieval -->
+    <rect x="470" y="120" width="150" height="110" rx="10" fill="#fff" stroke="#4453c6" stroke-width="1.5"/>
+    <text x="545" y="145" text-anchor="middle" font-size="11" font-weight="700" fill="#2f3a8f">Hybrid retrieval</text>
+    <text x="545" y="168" text-anchor="middle" font-size="9" fill="#5b6172">• text-to-SQL</text>
+    <text x="545" y="186" text-anchor="middle" font-size="9" fill="#5b6172">• vector search</text>
+    <text x="545" y="204" text-anchor="middle" font-size="9" fill="#5b6172">• OCR pre-step</text>
+    <text x="545" y="222" text-anchor="middle" font-size="9" fill="#5b6172">• router</text>
+
+    <!-- models -->
+    <rect x="660" y="75" width="160" height="115" rx="10" fill="#eef0fb" stroke="#2f3a8f" stroke-width="1.8"/>
+    <text x="740" y="100" text-anchor="middle" font-size="11.5" font-weight="700" fill="#2f3a8f">VLM Brain</text>
+    <text x="740" y="120" text-anchor="middle" font-size="8.5" fill="#5b6172">text · SQL · OCR</text>
+    <text x="740" y="135" text-anchor="middle" font-size="8.5" fill="#5b6172">· image Q&amp;A</text>
+    <text x="740" y="158" text-anchor="middle" font-size="8" fill="#8a90a2">Qwen2.5-VL / Llama-Vision</text>
+    <text x="740" y="174" text-anchor="middle" font-size="8" fill="#8a90a2">(Spec A)</text>
+
+    <rect x="660" y="205" width="160" height="90" rx="10" fill="#e6f6ee" stroke="#0e7c5a" stroke-width="1.8"/>
+    <text x="740" y="230" text-anchor="middle" font-size="11.5" font-weight="700" fill="#0e7c5a">Pest CV model</text>
+    <text x="740" y="250" text-anchor="middle" font-size="8.5" fill="#3e6a55">photo → pest + confidence</text>
+    <text x="740" y="268" text-anchor="middle" font-size="8" fill="#5c8a76">EfficientNet/ViT · CPU</text>
+    <text x="740" y="283" text-anchor="middle" font-size="8" fill="#5c8a76">(Spec B)</text>
+
+    <!-- connectors -->
+    <path d="M428,105 L470,140" stroke="#4453c6" stroke-width="1.6" fill="none" marker-end="url(#ah)"/>
+    <path d="M428,175 L470,175" stroke="#4453c6" stroke-width="1.6" fill="none" marker-end="url(#ah)"/>
+    <path d="M428,245 L470,210" stroke="#4453c6" stroke-width="1.6" fill="none" marker-end="url(#ah)"/>
+    <path d="M620,150 L660,135" stroke="#4453c6" stroke-width="1.6" fill="none" marker-end="url(#ah)"/>
+    <path d="M428,255 C520,300 600,290 660,255" stroke="#0e7c5a" stroke-width="1.6" fill="none" marker-end="url(#ahg)"/>
+
+    <!-- user -->
+    <rect x="360" y="360" width="380" height="56" rx="10" fill="#1a1d29"/>
+    <text x="550" y="385" text-anchor="middle" font-size="11" font-weight="700" fill="#fff">User / Frappe app UI</text>
+    <text x="550" y="403" text-anchor="middle" font-size="8.5" fill="#b9bed0">asks question or uploads photo → gets grounded answer</text>
+    <path d="M740,300 C740,340 640,350 620,358" stroke="#4453c6" stroke-width="1.6" fill="none" marker-end="url(#ah)"/>
+    <path d="M470,358 C450,340 420,320 400,300" stroke="#4453c6" stroke-width="1.6" fill="none"/>
+  </svg>
+  <div class="figcap">Figure 1 — Full system. One-way sync (green) copies only selected tables into an isolated box; the model never reaches production Frappe.</div>
+  </div>
+
+  <h3>2.1 Query data flow (hybrid)</h3>
+  <div class="fig nobreak">
+  <svg viewBox="0 0 860 250" xmlns="http://www.w3.org/2000/svg" font-family="Segoe UI, sans-serif">
+    <defs><marker id="a2" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#4453c6"/></marker></defs>
+    <rect x="15" y="100" width="120" height="50" rx="9" fill="#1a1d29"/><text x="75" y="122" text-anchor="middle" font-size="10" font-weight="700" fill="#fff">Question</text><text x="75" y="138" text-anchor="middle" font-size="8" fill="#b9bed0">(+ optional image)</text>
+    <rect x="175" y="100" width="110" height="50" rx="9" fill="#eef0fb" stroke="#2f3a8f"/><text x="230" y="122" text-anchor="middle" font-size="10" font-weight="700" fill="#2f3a8f">Router</text><text x="230" y="138" text-anchor="middle" font-size="8" fill="#5b6172">picks path(s)</text>
+    <!-- SQL path -->
+    <rect x="330" y="20" width="150" height="46" rx="9" fill="#fff" stroke="#4453c6"/><text x="405" y="40" text-anchor="middle" font-size="9.5" font-weight="600" fill="#2f3a8f">Schema + LLM → SQL</text><text x="405" y="56" text-anchor="middle" font-size="8" fill="#5b6172">generated query</text>
+    <rect x="520" y="20" width="140" height="46" rx="9" fill="#eef0fb" stroke="#4453c6"/><text x="590" y="40" text-anchor="middle" font-size="9.5" font-weight="600" fill="#2f3a8f">Run on Mirror DB</text><text x="590" y="56" text-anchor="middle" font-size="8" fill="#5b6172">read-only result set</text>
+    <!-- RAG path -->
+    <rect x="330" y="105" width="150" height="40" rx="9" fill="#fff" stroke="#4453c6"/><text x="405" y="130" text-anchor="middle" font-size="9.5" font-weight="600" fill="#2f3a8f">Embed → vector search</text>
+    <rect x="520" y="105" width="140" height="40" rx="9" fill="#eef0fb" stroke="#4453c6"/><text x="590" y="130" text-anchor="middle" font-size="9.5" font-weight="600" fill="#2f3a8f">Top-k text chunks</text>
+    <!-- OCR path -->
+    <rect x="330" y="185" width="150" height="40" rx="9" fill="#fff" stroke="#0e7c5a"/><text x="405" y="210" text-anchor="middle" font-size="9.5" font-weight="600" fill="#0e7c5a">OCR / vision</text>
+    <rect x="520" y="185" width="140" height="40" rx="9" fill="#e6f6ee" stroke="#0e7c5a"/><text x="590" y="210" text-anchor="middle" font-size="9.5" font-weight="600" fill="#0e7c5a">Extracted fields</text>
+    <!-- synth -->
+    <rect x="705" y="95" width="140" height="60" rx="10" fill="#2f3a8f"/><text x="775" y="120" text-anchor="middle" font-size="10.5" font-weight="700" fill="#fff">LLM synthesis</text><text x="775" y="138" text-anchor="middle" font-size="8" fill="#c9cef0">grounded answer</text>
+
+    <path d="M135,125 L175,125" stroke="#4453c6" stroke-width="1.8" marker-end="url(#a2)"/>
+    <path d="M285,120 C305,95 310,55 330,45" stroke="#4453c6" stroke-width="1.6" fill="none" marker-end="url(#a2)"/>
+    <path d="M285,125 L330,125" stroke="#4453c6" stroke-width="1.6" marker-end="url(#a2)"/>
+    <path d="M285,130 C305,155 310,195 330,205" stroke="#0e7c5a" stroke-width="1.6" fill="none" marker-end="url(#a2)"/>
+    <path d="M480,43 L520,43" stroke="#4453c6" stroke-width="1.6" marker-end="url(#a2)"/>
+    <path d="M480,125 L520,125" stroke="#4453c6" stroke-width="1.6" marker-end="url(#a2)"/>
+    <path d="M480,205 L520,205" stroke="#0e7c5a" stroke-width="1.6" marker-end="url(#a2)"/>
+    <path d="M660,43 C685,55 690,95 705,110" stroke="#4453c6" stroke-width="1.6" fill="none" marker-end="url(#a2)"/>
+    <path d="M660,125 L705,125" stroke="#4453c6" stroke-width="1.6" marker-end="url(#a2)"/>
+    <path d="M660,205 C685,190 690,155 705,142" stroke="#0e7c5a" stroke-width="1.6" fill="none" marker-end="url(#a2)"/>
+  </svg>
+  <div class="figcap">Figure 2 — A question is routed to one or more paths; results are fused and the LLM writes a grounded answer.</div>
+  </div>
+
+  <h3>2.2 Component responsibilities</h3>
+  <table>
+    <tr><th>Component</th><th>Responsibility</th><th>Depends on</th></tr>
+    <tr><td>Sync job</td><td>Push selected Frappe tables/records into the mirror on a schedule/webhook</td><td>Frappe API</td></tr>
+    <tr><td>Mirror DB</td><td>Read-only structured store the SQL runs against</td><td>Postgres/SQLite</td></tr>
+    <tr><td>Vector store</td><td>Embeddings of text fields for semantic search</td><td>Embedding model</td></tr>
+    <tr><td>Hybrid retriever</td><td>Route question, run SQL + vector search + OCR, assemble context</td><td>Mirror DB, vector store, VLM</td></tr>
+    <tr><td>VLM brain</td><td>Generate SQL, read images/docs, synthesize answers</td><td>GPU (prod) / free tier (eval)</td></tr>
+    <tr><td>Pest CV model</td><td>Classify pest from a photo</td><td>CPU only</td></tr>
+  </table>
+</section>
+
+<!-- ============ 3. DECOMPOSITION ============ -->
+<section class="section">
+  <h2>3 · Project Decomposition &amp; Sequencing</h2>
+  <p>The system is split into four sub-projects, each its own spec → plan → build cycle. Only <b>A</b> and <b>B</b> are in the free phase; <b>C</b> and <b>D</b> follow once a brain is chosen.</p>
+
+  <div class="fig nobreak">
+  <svg viewBox="0 0 860 240" xmlns="http://www.w3.org/2000/svg" font-family="Segoe UI, sans-serif">
+    <defs><marker id="a3" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#8a90a2"/></marker></defs>
+    <rect x="30" y="70" width="180" height="100" rx="12" fill="#eef0fb" stroke="#2f3a8f" stroke-width="2"/>
+    <text x="120" y="98" text-anchor="middle" font-size="13" font-weight="700" fill="#2f3a8f">A — VLM Brain</text>
+    <text x="120" y="118" text-anchor="middle" font-size="9" fill="#5b6172">Comparison harness</text>
+    <text x="120" y="134" text-anchor="middle" font-size="9" fill="#5b6172">text·SQL·OCR·image</text>
+    <text x="120" y="156" text-anchor="middle" font-size="8.5" font-weight="700" fill="#0e7c5a">FREE PHASE — now</text>
+
+    <rect x="30" y="185" width="180" height="45" rx="12" fill="#e6f6ee" stroke="#0e7c5a" stroke-width="2"/>
+    <text x="120" y="205" text-anchor="middle" font-size="13" font-weight="700" fill="#0e7c5a">B — Pest CV</text>
+    <text x="120" y="221" text-anchor="middle" font-size="8.5" fill="#3e6a55">FREE PHASE — now (independent)</text>
+
+    <rect x="330" y="70" width="180" height="100" rx="12" fill="#fbf3e2" stroke="#b7791f" stroke-width="1.6"/>
+    <text x="420" y="98" text-anchor="middle" font-size="13" font-weight="700" fill="#7a5510">C — Sync pipeline</text>
+    <text x="420" y="118" text-anchor="middle" font-size="9" fill="#7a5510">Frappe → mirror</text>
+    <text x="420" y="156" text-anchor="middle" font-size="8.5" fill="#a07d2c">after brain chosen</text>
+
+    <rect x="630" y="70" width="180" height="100" rx="12" fill="#fbf3e2" stroke="#b7791f" stroke-width="1.6"/>
+    <text x="720" y="98" text-anchor="middle" font-size="13" font-weight="700" fill="#7a5510">D — Prod deploy</text>
+    <text x="720" y="118" text-anchor="middle" font-size="9" fill="#7a5510">isolated GPU box</text>
+    <text x="720" y="156" text-anchor="middle" font-size="8.5" fill="#a07d2c">first paid step</text>
+
+    <path d="M210,110 L330,110" stroke="#8a90a2" stroke-width="1.8" fill="none" marker-end="url(#a3)"/><text x="270" y="103" text-anchor="middle" font-size="8" fill="#8a90a2">winner</text>
+    <path d="M510,120 L630,120" stroke="#8a90a2" stroke-width="1.8" fill="none" marker-end="url(#a3)"/>
+    <path d="M210,207 C400,207 720,207 720,172" stroke="#8a90a2" stroke-width="1.4" fill="none" stroke-dasharray="4 3" marker-end="url(#a3)"/>
+  </svg>
+  <div class="figcap">Figure 3 — Dependency graph. A and B run free and in parallel; C and D begin only after the winning brain is known (D = first paid step).</div>
+  </div>
+
+  <table>
+    <tr><th>Spec</th><th>Scope</th><th>Compute</th><th>Cost</th><th>Order</th></tr>
+    <tr><td><b>A</b></td><td>Pick best VLM brain</td><td>Free APIs → Lightning T4</td><td><span class="tag free">$0</span></td><td>1 (with B)</td></tr>
+    <tr><td><b>B</b></td><td>Pest classifier</td><td>Free Kaggle/Lightning T4; CPU inference</td><td><span class="tag free">$0</span></td><td>1 (with A)</td></tr>
+    <tr><td><b>C</b></td><td>Frappe → mirror sync</td><td>CPU</td><td><span class="tag free">$0</span></td><td>2</td></tr>
+    <tr><td><b>D</b></td><td>Isolated prod + serve</td><td>Rented ~16GB GPU</td><td><span class="tag paid">paid</span></td><td>3</td></tr>
+  </table>
+</section>
+
+<!-- ============ 4. SPEC A ============ -->
+<section class="section">
+  <h2>4 · Spec A — VLM Brain Comparison Harness</h2>
+  <p><b>Goal:</b> objectively pick the best ~16&nbsp;GB self-hosted <b>vision-language model</b> that handles text RAG + text-to-SQL + OCR + image Q&amp;A in one model — evaluated at <b>$0</b> on synthetic data.</p>
+
+  <h3>4.1 Candidate models</h3>
+  <table>
+    <tr><th>Model</th><th>Params</th><th>Strengths</th><th>~16GB fit (quantized)</th></tr>
+    <tr><td><b>Qwen3-VL-8B-Instruct</b> <span class="tag free">top pick</span></td><td>8B</td><td>Current OCR/doc leader — OCRBench 89.6, DocVQA 96.1 (+6–14 pts OCR over Qwen2.5-VL), 32-language OCR. Tokenizer-compatible with 2.5, so near drop-in</td><td>Yes (AWQ/FP8/Q4 ~6–9GB)</td></tr>
+    <tr><td>Qwen3-VL-8B-Thinking</td><td>8B</td><td>Reasoning variant of the above — higher accuracy on hard multi-step/chart questions, more latency &amp; tokens</td><td>Yes (AWQ/FP8)</td></tr>
+    <tr><td>Qwen2.5-VL-7B-Instruct <span class="tag brand">first tested</span></td><td>7B</td><td>Proven unified pick, already serving in our Studio; strong text, SQL, OCR, image. Now the previous generation</td><td>Yes (AWQ/GPTQ)</td></tr>
+    <tr><td>MiMo-VL-7B-RL <small>(Xiaomi)</small></td><td>7B</td><td>Beats Qwen2.5-VL on doc/chart (CharXiv 56.5 vs 42.5) &amp; math/reasoning</td><td>Tight — fp16 OOMs 16GB; needs a quant or 24GB tier</td></tr>
+    <tr><td>GLM-4.1V-9B-Thinking</td><td>9B</td><td>Reasoning VLM; strong all-round multimodal — easiest rival to test (AWQ fits comfortably)</td><td>Yes (AWQ)</td></tr>
+    <tr><td>InternVL3.5-8B <small>(was InternVL3)</small></td><td>8B</td><td>OCR / document-understanding specialist line</td><td>Yes (quantized)</td></tr>
+    <tr><td>DeepSeek-VL2-Small <small>(MoE)</small></td><td>16B total / 2.8B active</td><td>Efficient MoE VLM — strong OCR, doc/chart &amp; grounding at low active-compute</td><td>Yes (AWQ ~8–10GB)</td></tr>
+    <tr><td>Pixtral-12B <small>(Mistral)</small></td><td>12B</td><td>Excellent instruction-following, native multi-image</td><td>Needs 4-bit; else 24GB tier</td></tr>
+    <tr><td>Qwen2.5-Coder-7B <small>(text-only reference)</small></td><td>7B</td><td>Text/SQL only — measures what vision "costs" in SQL skill</td><td>Yes</td></tr>
+  </table>
+  <div class="callout free"><b>Recommended primary candidate (updated July 2026):</b> <b>Qwen3-VL-8B-Instruct</b> supersedes Qwen2.5-VL as the model to beat. It's the current open-source OCR/document leader at this size, still fits ~16&nbsp;GB quantized, and shares Qwen2.5-VL's tokenizer — so swapping it into our harness is a one-line model-id change. Keep Qwen2.5-VL in the run as the "previous generation" reference to quantify the upgrade.</div>
+  <div class="callout warn"><b>VRAM note:</b> VLMs spend memory on image tokens, so ~16&nbsp;GB is tight. The harness records real VRAM per model; if the best model needs &gt;16&nbsp;GB we surface what a ~24&nbsp;GB tier would buy before you commit.</div>
+  <div class="callout"><b>Fit reality (measured on a 16GB T4, 2026):</b> a 7–8B model in fp16 is ~15&nbsp;GB of weights alone, leaving no room for the KV cache — so <b>quantized (AWQ/FP8/GPTQ) builds are mandatory</b> on the cheap box. Qwen3-VL-8B, GLM-4.1V-9B-AWQ, InternVL3.5-8B and Qwen2.5-VL-AWQ all fit; MiMo-VL-7B-RL and Pixtral-12B in full precision do not. The <b>Thinking</b> variants (Qwen3-VL, GLM-4.1V, MiMo-VL-RL) emit a reasoning trace — higher accuracy, higher latency/token cost, all captured by the scorecard.</div>
+
+  <h3>4.2 Sample data (synthetic — no real ERP data)</h3>
+  <ul>
+    <li>ERPNext-shaped tables: <code>Customer</code>, <code>Sales Invoice</code>, <code>Item</code>, <code>Delivery Note</code> — structured fields + free-text (notes/remarks).</li>
+    <li>A handful of sample <b>documents</b> (invoice/delivery-note PDFs or images) for OCR.</li>
+    <li>A few sample <b>images</b> for image-Q&amp;A.</li>
+  </ul>
+
+  <h3>4.3 Eval set (~40 questions, with gold answers)</h3>
+  <table>
+    <tr><th>Bucket</th><th>Example</th><th>Gold form</th></tr>
+    <tr><td>SQL</td><td>"Total sales by customer last quarter"</td><td>Correct result set</td></tr>
+    <tr><td>RAG</td><td>"What did the notes say about customer X's complaint?"</td><td>Reference answer</td></tr>
+    <tr><td>Hybrid</td><td>"Which overdue customers also had quality complaints?"</td><td>Set + reference</td></tr>
+    <tr><td>OCR</td><td>"Extract invoice no., date, total from this PDF"</td><td>Field values</td></tr>
+    <tr><td>Image Q&amp;A</td><td>"Describe what's in this photo"</td><td>Reference answer</td></tr>
+  </table>
+
+  <h3>4.4 Scoring</h3>
+  <table>
+    <tr><th>Dimension</th><th>Metric</th><th>Method</th></tr>
+    <tr><td>SQL correctness</td><td>Execution accuracy</td><td>Run generated SQL on mirror; compare result set to gold</td></tr>
+    <tr><td>SQL safety</td><td>Read-only rate</td><td>Reject/flag any DDL/DML; must be SELECT-only</td></tr>
+    <tr><td>RAG / image</td><td>Judge score + hit-rate</td><td>LLM-as-judge (free API) on correctness &amp; groundedness; retrieval hit-rate</td></tr>
+    <tr><td>OCR</td><td>Field accuracy</td><td>Extracted field vs gold (exact/fuzzy)</td></tr>
+    <tr><td>Operational</td><td>tok/s, VRAM, fits-16GB</td><td>Measured during Stage 2 runs</td></tr>
+  </table>
+
+  <h3>4.5 The model-tier ladder — best fit at every VRAM size</h3>
+  <p>We <b>test at 16&nbsp;GB</b> (free Lightning), but production can rent bigger cards. The Qwen3-VL family scales
+  cleanly across the whole range, so the winner we prove at 16&nbsp;GB has a documented upgrade path — the same
+  serve command, a bigger model id, and <code>--tensor-parallel-size N</code> for multi-GPU.</p>
+  <table>
+    <tr><th>VRAM tier</th><th>Example GPUs</th><th>Best-fit model (2026)</th><th>Precision</th><th>Role</th></tr>
+    <tr><td>≤ 8 GB</td><td>laptop, ½ T4</td><td>Qwen3-VL-4B-Instruct</td><td>Q4 (~4 GB)</td><td>Edge / dev demo</td></tr>
+    <tr><td><b>16 GB</b> <span class="tag free">test tier</span></td><td>T4, ½ A10</td><td><b>Qwen3-VL-8B-Instruct</b></td><td>AWQ/FP8 (~6–9 GB)</td><td>★ Our proving ground (free)</td></tr>
+    <tr><td>24 GB</td><td>L4, A10G, RTX 4090</td><td>Qwen3-VL-8B (fp16) · or Qwen3-VL-30B-A3B (AWQ)</td><td>fp16 / AWQ</td><td>Small-team production</td></tr>
+    <tr><td>48 GB</td><td>L40S, A6000</td><td>Qwen3-VL-30B-A3B</td><td>FP8 (~30 GB)</td><td>High-quality production</td></tr>
+    <tr><td>80 GB</td><td>A100, H100</td><td>Qwen3-VL-30B-A3B + large batch</td><td>fp16</td><td>Quality + high throughput</td></tr>
+    <tr><td>4–8 × 80 GB</td><td>H100/H200 node (TP)</td><td>Qwen3-VL-235B-A22B</td><td>FP8</td><td>Frontier-rivalling flagship</td></tr>
+  </table>
+  <div class="callout"><b>MoE note:</b> the <code>A3B</code>/<code>A22B</code> models are mixture-of-experts — all experts sit in VRAM (so 30B/235B of weights must fit) but only ~3B/22B activate per token, giving big-model quality at small-model speed. That's why a 30B-A3B is a realistic 24&nbsp;GB (AWQ) option where a 30B <i>dense</i> model would not be.</div>
+</section>
+
+<!-- ============ 5. SPEC B ============ -->
+<section class="section">
+  <h2>5 · Spec B — Pest Identification CV Model</h2>
+  <p><b>Goal:</b> a photo → pest name + confidence, for common flower/rose pests (thrips, aphids, whitefly, spider mites, caterpillars…). Built by <b>transfer learning</b> — no training from scratch.</p>
+
+  <div class="fig nobreak">
+  <svg viewBox="0 0 860 170" xmlns="http://www.w3.org/2000/svg" font-family="Segoe UI, sans-serif">
+    <defs><marker id="a4" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#0e7c5a"/></marker></defs>
+    <rect x="20" y="55" width="150" height="60" rx="10" fill="#e6f6ee" stroke="#0e7c5a"/><text x="95" y="80" text-anchor="middle" font-size="10.5" font-weight="700" fill="#0e7c5a">IP102 dataset</text><text x="95" y="98" text-anchor="middle" font-size="8" fill="#3e6a55">~75k imgs / 102 pests</text>
+    <rect x="215" y="55" width="160" height="60" rx="10" fill="#fff" stroke="#0e7c5a"/><text x="295" y="80" text-anchor="middle" font-size="10.5" font-weight="700" fill="#0e7c5a">Pretrained backbone</text><text x="295" y="98" text-anchor="middle" font-size="8" fill="#3e6a55">EfficientNet / ConvNeXt / ViT</text>
+    <rect x="420" y="55" width="150" height="60" rx="10" fill="#e6f6ee" stroke="#0e7c5a"/><text x="495" y="80" text-anchor="middle" font-size="10.5" font-weight="700" fill="#0e7c5a">Fine-tune</text><text x="495" y="98" text-anchor="middle" font-size="8" fill="#3e6a55">free T4, ~1–2 hrs</text>
+    <rect x="615" y="55" width="150" height="60" rx="10" fill="#fff" stroke="#0e7c5a"/><text x="690" y="80" text-anchor="middle" font-size="10.5" font-weight="700" fill="#0e7c5a">Classifier</text><text x="690" y="98" text-anchor="middle" font-size="8" fill="#3e6a55">pest + confidence</text>
+    <rect x="615" y="130" width="150" height="34" rx="8" fill="#1a1d29"/><text x="690" y="152" text-anchor="middle" font-size="9" font-weight="700" fill="#fff">CPU inference</text>
+    <path d="M170,85 L215,85" stroke="#0e7c5a" stroke-width="1.8" marker-end="url(#a4)"/>
+    <path d="M375,85 L420,85" stroke="#0e7c5a" stroke-width="1.8" marker-end="url(#a4)"/>
+    <path d="M570,85 L615,85" stroke="#0e7c5a" stroke-width="1.8" marker-end="url(#a4)"/>
+    <path d="M690,115 L690,130" stroke="#0e7c5a" stroke-width="1.8" marker-end="url(#a4)"/>
+  </svg>
+  <div class="figcap">Figure 4 — Pest track. Fine-tune a pretrained backbone on public IP102 data; the resulting classifier is small enough to run on CPU.</div>
+  </div>
+
+  <table>
+    <tr><th>Aspect</th><th>Choice</th></tr>
+    <tr><td>Task</td><td>Image classification (extendable to detection later)</td></tr>
+    <tr><td>Data</td><td>IP102 (public); PlantVillage / PlantDoc for disease later</td></tr>
+    <tr><td>Model</td><td>Transfer-learn EfficientNet-B0/ConvNeXt/ViT, or Ultralytics YOLO-cls</td></tr>
+    <tr><td>Train compute</td><td><span class="tag free">Free</span> Kaggle/Colab/Lightning T4, ~1–2 hrs</td></tr>
+    <tr><td>Inference</td><td>CPU — runs on the isolated box or even an 8GB laptop</td></tr>
+    <tr><td>Metrics</td><td>Top-1 / Top-3 accuracy, per-class F1, confusion matrix</td></tr>
+  </table>
+
+  <h3>5.1 The small-pest problem — classify vs. detect</h3>
+  <p>A whole-image classifier assumes the pest fills the frame. Real field photos are the opposite: a thrip or
+  aphid is a <b>handful of pixels</b> on a big leaf, so the pest's signal gets averaged away and accuracy drops.
+  This is the classic small-object problem. Three ways to handle it, in increasing effort:</p>
+  <table>
+    <tr><th>Approach</th><th>How</th><th>When to use</th></tr>
+    <tr><td>Classify (baseline)</td><td>Whole image → one label. Push input resolution up (imgsz 320–448) so small pests survive downsampling</td><td>Close-up photos where the pest already dominates the frame</td></tr>
+    <tr><td>Crop-then-classify</td><td>Tile the image into patches (or crop to the leaf), classify each, keep the most confident</td><td>Cheap upgrade when pests are small but photos are framed loosely</td></tr>
+    <tr><td>Detect (localise + label)</td><td>Train a detector (YOLO-cls → YOLO detection) on IP102's <b>~19k bounding-boxed</b> images; it finds and labels each pest</td><td>Wide shots, multiple pests, or when you need <i>where</i> not just <i>what</i></td></tr>
+  </table>
+  <div class="callout"><b>Recommended path:</b> ship the classifier first (it's the fast, free win), and measure per-class accuracy on <i>realistic loosely-framed</i> photos, not just tight crops. If the small pests (thrips, spider mites) score badly, upgrade just those to crop-then-classify or a YOLO detector — IP102 already ships the boxes for it.</div>
+
+  <h3>5.2 Pest model-size ladder (all CPU-friendly)</h3>
+  <p>Mirroring the VLM ladder in §4.5: pest recognition also has a size/accuracy trade-off, but every rung runs on
+  CPU — even the largest is tiny next to a VLM.</p>
+  <table>
+    <tr><th>Size</th><th>Model</th><th>Trade-off</th><th>Fits</th></tr>
+    <tr><td>Nano</td><td>MobileNetV3-S · YOLO11n-cls</td><td>Fastest, lowest accuracy — real-time on a phone</td><td>Edge / phone / 8 GB laptop</td></tr>
+    <tr><td>Small <span class="tag free">start here</span></td><td>EfficientNet-B0 · YOLO11s-cls</td><td>Best accuracy-per-CPU-cost; the default recommendation</td><td>Any CPU box</td></tr>
+    <tr><td>Base</td><td>ConvNeXt-Tiny · ViT-S · EfficientNet-B3</td><td>Higher accuracy, still CPU-servable (slower)</td><td>Isolated prod box (CPU)</td></tr>
+  </table>
+</section>
+
+<!-- ============ 6. FREE TEST PLAN + LIGHTNING ============ -->
+<section class="section">
+  <h2>6 · The Free Test Plan &amp; Lightning AI</h2>
+  <p>Three stages. The first spend of money is Stage 3, by which point the winning model is already proven.</p>
+
+  <div class="fig nobreak">
+  <svg viewBox="0 0 860 210" xmlns="http://www.w3.org/2000/svg" font-family="Segoe UI, sans-serif">
+    <defs><marker id="a5" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#8a90a2"/></marker></defs>
+    <rect x="20" y="40" width="250" height="130" rx="12" fill="#e6f6ee" stroke="#0e7c5a" stroke-width="2"/>
+    <text x="145" y="66" text-anchor="middle" font-size="12" font-weight="700" fill="#0e7c5a">Stage 1 — Free screen</text>
+    <text x="145" y="88" text-anchor="middle" font-size="9" fill="#3e6a55">Groq / Cerebras free APIs</text>
+    <text x="145" y="106" text-anchor="middle" font-size="9" fill="#3e6a55">synthetic data</text>
+    <text x="145" y="124" text-anchor="middle" font-size="9" fill="#3e6a55">→ shortlist top 2–3</text>
+    <text x="145" y="150" text-anchor="middle" font-size="10" font-weight="700" fill="#0e7c5a">$0</text>
+
+    <rect x="305" y="40" width="250" height="130" rx="12" fill="#e6f6ee" stroke="#0e7c5a" stroke-width="2"/>
+    <text x="430" y="66" text-anchor="middle" font-size="12" font-weight="700" fill="#0e7c5a">Stage 2 — Free confirm</text>
+    <text x="430" y="88" text-anchor="middle" font-size="9" fill="#3e6a55">Lightning Studio: CPU plumbing</text>
+    <text x="430" y="106" text-anchor="middle" font-size="9" fill="#3e6a55">GPU only to load real weights</text>
+    <text x="430" y="124" text-anchor="middle" font-size="9" fill="#3e6a55">+ pest fine-tune</text>
+    <text x="430" y="150" text-anchor="middle" font-size="10" font-weight="700" fill="#0e7c5a">$0 (~80 free T4-hrs/mo)</text>
+
+    <rect x="590" y="40" width="250" height="130" rx="12" fill="#fbf3e2" stroke="#b7791f" stroke-width="2"/>
+    <text x="715" y="66" text-anchor="middle" font-size="12" font-weight="700" fill="#7a5510">Stage 3 — Deploy</text>
+    <text x="715" y="88" text-anchor="middle" font-size="9" fill="#7a5510">rent ~16GB private box</text>
+    <text x="715" y="106" text-anchor="middle" font-size="9" fill="#7a5510">winner only + real data</text>
+    <text x="715" y="124" text-anchor="middle" font-size="9" fill="#7a5510">pest model on CPU</text>
+    <text x="715" y="150" text-anchor="middle" font-size="10" font-weight="700" fill="#7a5510">first $ spent</text>
+
+    <path d="M270,105 L305,105" stroke="#8a90a2" stroke-width="2" marker-end="url(#a5)"/>
+    <path d="M555,105 L590,105" stroke="#8a90a2" stroke-width="2" marker-end="url(#a5)"/>
+  </svg>
+  <div class="figcap">Figure 5 — Free-first staging. Only the proven winner reaches the paid box.</div>
+  </div>
+
+  <h3>6.1 Why Lightning AI for the free phase</h3>
+  <p>A Lightning "<b>Studio</b>" is a persistent Linux dev box in the browser (VSCode/Jupyter/terminal). Unlike Colab/Kaggle notebooks it <b>keeps your files and installs between sessions</b>, and you toggle the GPU on only when needed.</p>
+  <table>
+    <tr><th>Free-tier fact</th><th>Value</th></tr>
+    <tr><td>Monthly credits</td><td>15, <b>recurring</b> (~80 T4-hours on cheap GPU)</td></tr>
+    <tr><td>Persistence</td><td>Files/installs survive between sessions</td></tr>
+    <tr><td>CPU time</td><td>Effectively free — do all setup here, burn no GPU credits</td></tr>
+    <tr><td>Limits</td><td>1 active Studio, interruptible, ~4-hr restart on free</td></tr>
+  </table>
+
+  <h3>6.2 The credit-saving split</h3>
+  <div class="callout free"><b>Rule:</b> build every non-model piece (mirror DB, vector store, retrieval, harness, sync stubs) on <b>free CPU</b>, using a <b>free hosted-API brain</b> (Groq/Cerebras) as a stand-in. Switch the Studio to a <b>T4 GPU only</b> to (a) load the shortlisted quantized VLMs for the final scorecard and (b) fine-tune the pest model. Your ~80 free T4-hrs go entirely to the two things that truly need a GPU.</div>
+
+  <div class="fig nobreak">
+  <svg viewBox="0 0 860 150" xmlns="http://www.w3.org/2000/svg" font-family="Segoe UI, sans-serif">
+    <rect x="30" y="30" width="360" height="90" rx="12" fill="#eef0fb" stroke="#2f3a8f"/>
+    <text x="210" y="55" text-anchor="middle" font-size="11.5" font-weight="700" fill="#2f3a8f">CPU Studio (free)</text>
+    <text x="210" y="76" text-anchor="middle" font-size="9" fill="#5b6172">mirror DB · vector store · retrieval · harness</text>
+    <text x="210" y="93" text-anchor="middle" font-size="9" fill="#5b6172">brain = free hosted API (stand-in)</text>
+    <text x="210" y="110" text-anchor="middle" font-size="8.5" font-weight="700" fill="#0e7c5a">burns no GPU credits</text>
+
+    <rect x="470" y="30" width="360" height="90" rx="12" fill="#fff" stroke="#b7791f"/>
+    <text x="650" y="55" text-anchor="middle" font-size="11.5" font-weight="700" fill="#7a5510">GPU toggle → T4 (spends credits)</text>
+    <text x="650" y="76" text-anchor="middle" font-size="9" fill="#7a5510">load quantized VLMs · run scorecard</text>
+    <text x="650" y="93" text-anchor="middle" font-size="9" fill="#7a5510">fine-tune pest model</text>
+    <text x="650" y="110" text-anchor="middle" font-size="8.5" font-weight="700" fill="#b7791f">only when needed</text>
+
+    <path d="M390,75 L470,75" stroke="#8a90a2" stroke-width="2" fill="none" marker-end="url(#a5)"/>
+    <path d="M470,95 C430,110 430,110 390,95" stroke="#8a90a2" stroke-width="1.4" fill="none" stroke-dasharray="4 3"/>
+    <text x="430" y="128" text-anchor="middle" font-size="8" fill="#8a90a2">toggle back to CPU when done</text>
+  </svg>
+  <div class="figcap">Figure 6 — Same Studio, two machine types. Live on CPU; visit the GPU only for model work.</div>
+  </div>
+</section>
+
+<!-- ============ 7. RUNBOOK ============ -->
+<section class="section">
+  <h2>7 · Runbook — Commands &amp; Resources</h2>
+  <p class="lead">Everything below runs <b>inside the Lightning Studio terminal</b> unless noted. Commands are grouped by stage.</p>
+
+  <h3>7.1 Lightning AI — create the environment</h3>
+  <ol>
+    <li>Sign up at <a href="https://lightning.ai">lightning.ai</a> → <b>New Studio</b> (starts on CPU by default).</li>
+    <li>Open the Studio → you get VSCode + a terminal in the browser.</li>
+    <li>Switch machine type anytime via the compute selector (top-right): <b>CPU</b> (free) ↔ <b>T4 GPU</b> (credits).</li>
+  </ol>
+  <div class="callout danger"><b>Do not create a venv on Lightning.</b> A Studio allows exactly one environment — the pre-built conda env <code>cloudspace</code> at <code>/home/zeus/miniconda3/envs/cloudspace</code>, already active in every terminal. <code>python -m venv .venv</code> fails with <code>Error: Venv creation is not allowed. A Studio has a default conda environment (max 1 environment).</code> Just <code>pip install</code> straight into <code>cloudspace</code>; the Studio snapshots it, so packages survive restarts and machine-type switches.</div>
+  <pre><code><span class="c"># One-time project scaffold (run on the free CPU machine)</span>
+mkdir -p ~/frappe-ai/{data,models,harness,vectorstore,pest}
+cd ~/frappe-ai
+python -c <span class="s">"import sys; print(sys.prefix)"</span>   <span class="c"># expect .../envs/cloudspace — no venv needed</span>
+pip install --upgrade pip wheel
+
+<span class="c"># Optional: Lightning CLI for scripted control from your laptop</span>
+pip install lightning-sdk</code></pre>
+
+  <h3>7.2 Stage 1 — Free API screening (CPU)</h3>
+  <pre><code>pip install openai groq cerebras-cloud-sdk
+
+<span class="c"># Groq (hosts Llama / Qwen) — get key at console.groq.com</span>
+export GROQ_API_KEY=<span class="s">"gsk_..."</span>
+<span class="c"># Cerebras (Llama, Qwen3; ~1M tokens/day free) — cloud.cerebras.ai</span>
+export CEREBRAS_API_KEY=<span class="s">"csk-..."</span></code></pre>
+  <pre><code><span class="c"># harness/screen.py — same prompt across candidates (OpenAI-compatible)</span>
+<span class="k">from</span> openai <span class="k">import</span> OpenAI
+groq = OpenAI(base_url=<span class="s">"https://api.groq.com/openai/v1"</span>, api_key=os.environ[<span class="s">"GROQ_API_KEY"</span>])
+r = groq.chat.completions.create(
+    model=<span class="s">"llama-3.3-70b-versatile"</span>,
+    messages=[{<span class="s">"role"</span>:<span class="s">"user"</span>,<span class="s">"content"</span>: sql_prompt(schema, question)}])
+print(r.choices[0].message.content)</code></pre>
+  <div class="callout warn"><b>Privacy:</b> Stage 1 sends the <b>synthetic</b> sample to Groq/Cerebras — never real ERP rows. It is a screen only; the verdict comes from Stage 2 self-hosted runs.</div>
+
+  <h3>7.3 Stage 2 — Serve real weights (GPU toggle)</h3>
+  <h4>Option A — vLLM (best for Qwen2.5-VL; OpenAI-compatible)</h4>
+  <p>vLLM turns a Hugging Face model into a local OpenAI-compatible server. The full first run is: <b>toggle GPU &rarr; confirm the GPU &rarr; install (usually already there) &rarr; serve (downloads weights) &rarr; test text &rarr; test an image</b>. Follow the steps in order.</p>
+
+  <p><b>Step 1 — Switch to the T4 GPU and confirm it's attached. This is a hard gate: do not run any later step until it passes.</b> Use the compute selector (top-right of the Studio), wait for the machine to restart, then verify. vLLM will not run on CPU.</p>
+  <pre><code>nvidia-smi                                  <span class="c"># must list a Tesla T4; if "command not found", you're still on CPU</span></code></pre>
+  <div class="callout danger"><b>If you skip this gate, every later step fails with the same misleading error.</b> On a CPU machine vLLM logs <code>Triton is installed but 0 active driver(s) found</code> and then dies with <code>RuntimeError: Failed to infer device type</code> — <i>including on <code>vllm --help</code></i>, because building the argument parser instantiates the device config. That traceback is not a broken install, a numpy problem, or a bad model name. It means <b>no GPU is attached</b>. Go back to the compute selector. Note that a Studio reverts to CPU after inactivity, so a setup that worked yesterday can produce this today.</div>
+
+  <p><b>Step 2 — Install vLLM</b> (skip if already present). Recent Lightning base images ship vLLM, torch and numpy 2.x pre-installed — check first rather than reinstalling.</p>
+  <pre><code>pip show vllm | head -2                     <span class="c"># if it prints a version, skip the install</span>
+pip install vllm                            <span class="c"># only if not already present</span></code></pre>
+
+  <p><b>Step 3 — Fix the numpy 2.x conflicts</b> (older base images only; skip if Step 2 reported vLLM already installed).</p>
+  <div class="callout danger"><b>Why this happens:</b> on older images <code>pip install vllm</code> upgrades numpy to 2.x, but several scientific libraries baked into Lightning's base were compiled against numpy 1.x and crash the moment <code>transformers</code> imports them — you'll see <code>cannot import name 'Inf' from 'numpy'</code> (scipy) or <code>numpy.dtype size changed &hellip; binary incompatibility</code> (scikit-learn, then pandas). <b>Do not downgrade numpy</b> — that breaks vLLM and torch, which need 2.x. Upgrade the three stragglers instead, in one command:</div>
+  <pre><code><span class="c"># scipy -&gt; scikit-learn -&gt; pandas: the numpy-1.x holdovers transformers imports on startup</span>
+pip install -U <span class="s">"scipy&gt;=1.13"</span> <span class="s">"scikit-learn&gt;=1.6"</span> <span class="s">"pandas&gt;=2.2.2"</span>
+vllm --help                                 <span class="c"># SUCCESS = prints help text with NO traceback</span>
+<span class="c"># "Failed to infer device type" here is NOT a numpy issue — it means Step 1 was skipped.</span>
+<span class="c"># If a different package throws "numpy.dtype size changed", read the bottom of the</span>
+<span class="c"># traceback for the package name and upgrade it the same way: pip install -U &lt;name&gt;</span></code></pre>
+
+  <p><b>Step 4 — Load the model (start the server).</b> Leave this terminal running. The first run downloads several GB into <code>~/.cache/huggingface</code>; later runs reuse that cache and start in seconds. Wait for the line <code>Application startup complete</code>.</p>
+  <pre><code>vllm serve Qwen/Qwen2.5-VL-7B-Instruct-AWQ \
+  --max-model-len 8192 --gpu-memory-utilization 0.92 --port 8000
+<span class="c"># --max-model-len 8192        cap context length to keep VRAM within ~16GB</span>
+<span class="c"># --gpu-memory-utilization    fraction of GPU RAM vLLM may claim (0.92 = 92%)</span>
+<span class="c"># endpoint served at:  http://localhost:8000/v1</span></code></pre>
+  <div class="callout free"><b>Already downloaded?</b> Check with <code>du -sh ~/.cache/huggingface/hub/models--Qwen--Qwen2.5-VL-7B-Instruct-AWQ</code>. If it's several GB, re-running <code>vllm serve</code> reuses it — no re-download. A crash <i>before</i> the fix in Step 3 usually means nothing downloaded yet.</div>
+
+  <p><b>Step 5 — Test it with text</b> (open a <b>second terminal</b>; leave the server running in the first). A JSON reply proves the brain is serving.</p>
+  <pre><code>curl http://localhost:8000/v1/models        <span class="c"># confirms the model is loaded</span>
+curl http://localhost:8000/v1/chat/completions \
+  -H <span class="s">"Content-Type: application/json"</span> \
+  -d <span class="s">'{"model":"Qwen/Qwen2.5-VL-7B-Instruct-AWQ","messages":[{"role":"user","content":"Reply with one sentence confirming you are working."}],"max_tokens":50}'</span></code></pre>
+
+  <p><b>Step 6 — Make it look at a picture.</b> This is a vision model, so a message's <code>content</code> can be a <i>list</i> mixing text and an <code>image_url</code>. Prefer sending the image <b>inline as base64</b> — the server then does no external fetch, which is more reliable and is the same path your OCR tests use for local files.</p>
+  <div class="callout warn"><b>Don't point at a public URL directly.</b> When <code>image_url.url</code> is a web link, the <i>vLLM server</i> fetches it, and many hosts (e.g. Wikimedia) block automated requests with <code>429 Too Many Requests</code> &rarr; you'll see a <code>code:500</code> error. Download the image yourself, then embed it as a <code>data:</code> URI instead.</div>
+  <pre><code><span class="c"># 6a — download any image locally (browser-like UA avoids 429), then send it INLINE</span>
+curl -L -A <span class="s">"Mozilla/5.0"</span> -o test.jpg <span class="s">"https://picsum.photos/512"</span>
+IMG=$(base64 -w0 test.jpg)
+curl http://localhost:8000/v1/chat/completions \
+  -H <span class="s">"Content-Type: application/json"</span> \
+  -d <span class="s">'{"model":"Qwen/Qwen2.5-VL-7B-Instruct-AWQ","messages":[{"role":"user","content":[
+        {"type":"text","text":"Describe this picture in one sentence."},
+        {"type":"image_url","image_url":{"url":"data:image/jpeg;base64,'"$IMG"'"}}
+      ]}],"max_tokens":100}'</span>
+<span class="c"># the '"$IMG"' juggling splices the base64 shell variable into the JSON payload</span></code></pre>
+  <pre><code><span class="c"># 6b — a LOCAL image (e.g. a scanned invoice) via the Python client — better for files &amp; OCR</span>
+<span class="k">import</span> base64
+<span class="k">from</span> openai <span class="k">import</span> OpenAI
+client = OpenAI(base_url=<span class="s">"http://localhost:8000/v1"</span>, api_key=<span class="s">"EMPTY"</span>)   <span class="c"># local server ignores the key</span>
+img = base64.b64encode(open(<span class="s">"data/invoice_01.png"</span>, <span class="s">"rb"</span>).read()).decode()
+r = client.chat.completions.create(
+    model=<span class="s">"Qwen/Qwen2.5-VL-7B-Instruct-AWQ"</span>,
+    messages=[{<span class="s">"role"</span>:<span class="s">"user"</span>,<span class="s">"content"</span>:[
+        {<span class="s">"type"</span>:<span class="s">"text"</span>,<span class="s">"text"</span>:<span class="s">"Extract the invoice number, date and total."</span>},
+        {<span class="s">"type"</span>:<span class="s">"image_url"</span>,<span class="s">"image_url"</span>:{<span class="s">"url"</span>: <span class="s">f"data:image/png;base64,{img}"</span>}},
+    ]}],
+    max_tokens=300)
+print(r.choices[0].message.content)</code></pre>
+  <div class="callout"><b>This is goals G3 &amp; G4 in one call.</b> Text + image in the same request is exactly how the harness scores <b>OCR</b> (&sect;4.3, "extract fields from this PDF") and <b>image Q&amp;A</b> ("describe this photo"). Same endpoint, same client — you just add the image part.</div>
+
+  <p><b>Step 7 — Stop &amp; save credits.</b> Press <span class="kbd">Ctrl</span>+<span class="kbd">C</span> in the server terminal, then toggle the Studio back to <b>CPU</b>. The T4 burns your ~80 free credit-hours; the retrieval work in &sect;7.4 runs on free CPU.</p>
+
+  <h4>Swapping in the other candidates (&sect;4.1)</h4>
+  <p>Only one model fits 16&nbsp;GB at a time, so the comparison is a loop: <b>serve &rarr; run the eval &rarr; <span class="kbd">Ctrl</span>+<span class="kbd">C</span> &rarr; serve the next</b>. Every model below speaks the same OpenAI-compatible API — reuse the identical curl/base64 and Python from Steps 5–6, only changing the <code>"model"</code> field to match. Start with <b>Qwen3-VL-8B</b> (the recommended primary candidate), then GLM-4.1V.</p>
+  <pre><code><span class="c"># Qwen3-VL-8B-Instruct — current OCR/doc leader; tokenizer-compatible with Qwen2.5-VL</span>
+vllm serve Qwen/Qwen3-VL-8B-Instruct \
+  --max-model-len 8192 --gpu-memory-utilization 0.92 --port 8000
+<span class="c"># Thinking variant (reasoning): swap in Qwen/Qwen3-VL-8B-Thinking</span>
+
+<span class="c"># GLM-4.1V-9B-Thinking (AWQ) — fits comfortably; reasoning VLM</span>
+vllm serve dengcao/GLM-4.1V-9B-Thinking-AWQ \
+  --max-model-len 8192 --gpu-memory-utilization 0.92 --port 8000 \
+  --limit-mm-per-prompt <span class="s">'{"image":4}'</span>
+
+<span class="c"># InternVL3-9B — OCR / document specialist (use an AWQ community build if fp16 OOMs)</span>
+vllm serve OpenGVLab/InternVL3-9B --trust-remote-code \
+  --max-model-len 8192 --gpu-memory-utilization 0.92 --port 8000
+
+<span class="c"># MiMo-VL-7B-RL (Xiaomi) — top doc/chart scores, but fp16 is TIGHT on 16GB:</span>
+<span class="c"># try a shorter context + higher util, or find an AWQ/GPTQ quant; else use the 24GB tier.</span>
+vllm serve XiaomiMiMo/MiMo-VL-7B-RL --trust-remote-code \
+  --max-model-len 4096 --gpu-memory-utilization 0.95 --port 8000
+
+<span class="c"># Pixtral-12B (Mistral) — needs the mistral tokenizer; 12B wants ~24GB in fp16</span>
+vllm serve mistralai/Pixtral-12B-2409 --tokenizer-mode mistral \
+  --max-model-len 16384 --limit-mm-per-prompt <span class="s">'image=4'</span> --port 8000</code></pre>
+  <div class="callout warn"><b>If a server dies with CUDA out of memory:</b> the model doesn't fit at that setting. Lower <code>--max-model-len</code> (e.g. 4096), raise <code>--gpu-memory-utilization</code> toward 0.97, or switch to a quantized (AWQ/GPTQ) build of the model. If it still won't fit, that's a scorecard result: this candidate needs the ~24&nbsp;GB tier.</div>
+
+  <h4>Option B — Ollama (simplest; good for quick multi-model swaps)</h4>
+  <pre><code>curl -fsSL https://ollama.com/install.sh | sh
+ollama serve &amp;
+ollama pull llama3.2-vision:11b
+ollama pull minicpm-v
+ollama pull qwen2.5vl:7b            <span class="c"># if available in your Ollama version</span>
+<span class="c"># chat/vision endpoint at http://localhost:11434</span></code></pre>
+
+  <h3>7.4 Retrieval layer (CPU — build once)</h3>
+  <pre><code>pip install sentence-transformers chromadb sqlalchemy pandas
+
+<span class="c"># Embeddings + local vector store</span>
+<span class="k">from</span> sentence_transformers <span class="k">import</span> SentenceTransformer
+<span class="k">import</span> chromadb
+emb = SentenceTransformer(<span class="s">"BAAI/bge-small-en-v1.5"</span>)      <span class="c"># small, CPU-fine</span>
+client = chromadb.PersistentClient(path=<span class="s">"~/frappe-ai/vectorstore"</span>)
+col = client.get_or_create_collection(<span class="s">"notes"</span>)
+col.add(ids=ids, embeddings=emb.encode(texts).tolist(), documents=texts)
+
+<span class="c"># Mirror DB for testing (SQLite; swap for Postgres at prod)</span>
+<span class="k">from</span> sqlalchemy <span class="k">import</span> create_engine, text
+engine = create_engine(<span class="s">"sqlite:///~/frappe-ai/data/mirror.db"</span>)
+<span class="k">with</span> engine.connect() <span class="k">as</span> c:
+    rows = c.execute(text(model_generated_sql)).fetchall()   <span class="c"># execution-accuracy check</span></code></pre>
+
+  <h3>7.5 OCR (dedicated engine — baseline &amp; modern option)</h3>
+  <p><b>Baseline (CPU):</b> PaddleOCR is the cheap, no-GPU reference to compare the VLM's built-in OCR against.</p>
+  <pre><code>pip install paddleocr paddlepaddle          <span class="c"># or: pip install pytesseract (+ system tesseract)</span>
+<span class="k">from</span> paddleocr <span class="k">import</span> PaddleOCR
+ocr = PaddleOCR(use_angle_cls=<span class="k">True</span>, lang=<span class="s">"en"</span>)
+result = ocr.ocr(<span class="s">"data/invoice_01.png"</span>)      <span class="c"># compare vs VLM-OCR in the harness</span></code></pre>
+  <div class="callout"><b>Modern option — DeepSeek-OCR-2 (3B, dedicated doc engine):</b> for invoices and delivery notes,
+  a purpose-built OCR model beats a general VLM on structured extraction. DeepSeek-OCR-2 is SOTA on OmniDocBench
+  (~91), small (3B), VRAM-light, and <b>officially supported in vLLM</b> — so it drops straight into the
+  <code>ocr_extract</code> tool of the agentic workflow (§10). Use it when the harness shows the VLM's own OCR
+  isn't accurate enough on real document layouts.</div>
+  <pre><code><span class="c"># DeepSeek-OCR-2 as a dedicated OCR engine, same OpenAI-compatible endpoint</span>
+vllm serve deepseek-ai/DeepSeek-OCR-2 --trust-remote-code \
+  --max-model-len 8192 --gpu-memory-utilization 0.85 --port 8001
+<span class="c"># then POST the invoice image (base64 data URI) exactly like Step 6b</span></code></pre>
+
+  <h3>7.6 Scoring (LLM-as-judge, free API)</h3>
+  <pre><code><span class="c"># Grade RAG/image answers against reference with a free judge model</span>
+judge = groq.chat.completions.create(
+    model=<span class="s">"llama-3.3-70b-versatile"</span>,
+    messages=[{<span class="s">"role"</span>:<span class="s">"user"</span>,<span class="s">"content"</span>: judge_prompt(question, reference, candidate_answer)}])
+<span class="c"># parse {correctness:0-5, grounded:bool} → aggregate into scorecard.csv</span></code></pre>
+
+  <h3>7.7 Spec B — Pest model training (GPU toggle, ~1–2 hrs)</h3>
+  <pre><code><span class="c"># IP102: available on Kaggle ('ip102') and Hugging Face. Download into pest/data.</span>
+pip install ultralytics timm torch torchvision scikit-learn
+
+<span class="c"># Fast path — Ultralytics YOLO classification</span>
+yolo classify train model=yolo11n-cls.pt data=~/frappe-ai/pest/data epochs=30 imgsz=224
+yolo classify val   model=runs/classify/train/weights/best.pt data=~/frappe-ai/pest/data
+
+<span class="c"># Inference (CPU — runs anywhere, incl. an 8GB laptop)</span>
+yolo classify predict model=best.pt source=leaf_photo.jpg</code></pre>
+  <pre><code><span class="c"># Alt path — timm transfer learning (EfficientNet/ConvNeXt), more control</span>
+<span class="k">import</span> timm, torch
+model = timm.create_model(<span class="s">"efficientnet_b0"</span>, pretrained=<span class="k">True</span>, num_classes=N_PESTS)
+<span class="c"># standard train loop; export best; evaluate top-1/top-3 + confusion matrix</span></code></pre>
+</section>
+
+<!-- ============ 8. COST ============ -->
+<section class="section">
+  <h2>8 · Cost Model &amp; Migration to Paid</h2>
+  <table>
+    <tr><th>Phase</th><th>Where</th><th>What runs</th><th>Cost</th></tr>
+    <tr><td>Stage 1 screen</td><td>Groq / Cerebras free</td><td>Candidate shortlisting</td><td><span class="tag free">$0</span></td></tr>
+    <tr><td>Stage 2 confirm</td><td>Lightning free (CPU + ~80 T4-hrs)</td><td>Full harness, real weights, pest fine-tune</td><td><span class="tag free">$0</span></td></tr>
+    <tr><td>Stage 3 deploy</td><td>RunPod / Vast ~16GB (T4/A10)</td><td>Winner brain, real synced data</td><td><span class="tag paid">~$0.20–0.40/hr</span></td></tr>
+    <tr><td>Pest inference</td><td>CPU on same box</td><td>Classifier serving</td><td><span class="tag free">negligible</span></td></tr>
+  </table>
+  <h3>8.1 When to leave Lightning for a paid box</h3>
+  <ul>
+    <li>The scorecard names a winner and it <b>fits your VRAM target</b>.</li>
+    <li>You need <b>always-on</b> serving (Lightning free has a 4-hr restart and is interruptible).</li>
+    <li>You're ready to connect <b>real</b> Frappe data (Spec C) — which must never touch a free/shared tier.</li>
+  </ul>
+  <div class="callout"><b>Migration is a lift-and-shift:</b> the Studio already has your serving command (vLLM/Ollama), retrieval code, and harness. On the paid box you re-run the same install script, point the mirror DB at real synced data, and serve the single winning model.</div>
+</section>
+
+<!-- ============ 9. RISKS ============ -->
+<section class="section">
+  <h2>9 · Risks, Constraints &amp; Decisions</h2>
+  <table>
+    <tr><th>Risk / constraint</th><th>Impact</th><th>Mitigation</th></tr>
+    <tr><td>VLM &gt; 16GB VRAM</td><td>Winner won't fit cheap box</td><td>Harness reports VRAM; keep ~24GB tier as reference; quantize (AWQ/GPTQ)</td></tr>
+    <tr><td>Lightning free interruptible + 4-hr restart</td><td>Long runs interrupted</td><td>Checkpoint harness progress; batch eval in &lt;4-hr chunks</td></tr>
+    <tr><td>Free API rate limits (Stage 1)</td><td>Slow screening</td><td>Screen is coarse; throttle + cache responses</td></tr>
+    <tr><td>Text-to-SQL hallucinated/unsafe SQL</td><td>Wrong answers / writes</td><td>SELECT-only allow-list; execution-verify; read-only DB user</td></tr>
+    <tr><td>Pest classes absent from IP102</td><td>Can't identify some pests</td><td>Confirmed scope = common pests (in IP102); collect own images later if gaps</td></tr>
+    <tr><td>Isolation vs hosted quality</td><td>Self-host weaker than frontier APIs</td><td>Accepted: isolation is the hard requirement (G6)</td></tr>
+  </table>
+
+  <h3>9.1 Key decisions locked</h3>
+  <ul>
+    <li><b>Self-hosted open weights only</b> for production (isolation over convenience).</li>
+    <li><b>Hybrid</b> retrieval (SQL + vector), not one or the other.</li>
+    <li><b>One VLM brain</b> unifies text + SQL + OCR + image Q&amp;A; pest ID is a <b>separate</b> CV model.</li>
+    <li><b>~16GB</b> production target; free eval on the equivalent T4.</li>
+    <li><b>Free-first</b>: no payment until a model is proven on Lightning.</li>
+  </ul>
+
+  <h3>9.2 Open items to confirm</h3>
+  <ul>
+    <li>Synthetic sample data vs a sanitized dump of your real table shapes.</li>
+    <li>Whether we draft the ~40 eval questions or you supply real user questions.</li>
+    <li>Keep a ~24GB/32B tier in the comparison as a "what more money buys" reference?</li>
+  </ul>
+</section>
+
+<!-- ============ 10. AGENTIC WORKFLOW ============ -->
+<section class="section">
+  <h2>10 · Agentic Workflow — a tool-using brain</h2>
+  <p>The static router in §2 is the v1. The stronger pattern is to let the VLM act as an <b>agent</b>: it plans,
+  calls read-only tools, observes the results, and only then writes a grounded answer — a ReAct-style loop. The
+  same OpenAI-compatible endpoint we already serve supports tool/function calling, so no new infrastructure is
+  needed — just tool definitions and a control loop.</p>
+
+  <div class="fig nobreak">
+    <svg viewBox="0 0 840 236" width="100%" role="img" aria-label="Agentic loop: question to planner to tools and back, then synthesize and answer">
+      <defs><marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#4453c6"/></marker>
+      <marker id="ahg" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#0e7c5a"/></marker>
+      <marker id="ahm" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#8a90a2"/></marker></defs>
+      <g font-family="Segoe UI, sans-serif" font-size="12">
+        <rect x="14" y="94" width="118" height="54" rx="10" fill="#eef0fb" stroke="#c9cff0"/>
+        <text x="73" y="117" text-anchor="middle" fill="#2f3a8f" font-weight="600">Question</text>
+        <text x="73" y="133" text-anchor="middle" fill="#5b6172">(+ image)</text>
+
+        <rect x="172" y="86" width="152" height="70" rx="12" fill="#4453c6"/>
+        <text x="248" y="114" text-anchor="middle" fill="#fff" font-weight="600">Planner (VLM)</text>
+        <text x="248" y="132" text-anchor="middle" fill="#dfe4fb">picks next action</text>
+
+        <text x="456" y="34" text-anchor="middle" fill="#5b6172" font-weight="600">Read-only tools</text>
+        <rect x="364" y="40" width="184" height="166" rx="12" fill="#f7f8fc" stroke="#dfe3ee"/>
+        <rect x="376" y="50" width="160" height="30" rx="7" fill="#fff" stroke="#dfe3ee"/><text x="456" y="69" text-anchor="middle" fill="#1a1d29">run_sql · SELECT-only</text>
+        <rect x="376" y="88" width="160" height="30" rx="7" fill="#fff" stroke="#dfe3ee"/><text x="456" y="107" text-anchor="middle" fill="#1a1d29">vector_search · notes</text>
+        <rect x="376" y="126" width="160" height="30" rx="7" fill="#fff" stroke="#dfe3ee"/><text x="456" y="145" text-anchor="middle" fill="#1a1d29">ocr_extract · docs</text>
+        <rect x="376" y="164" width="160" height="30" rx="7" fill="#fff" stroke="#dfe3ee"/><text x="456" y="183" text-anchor="middle" fill="#1a1d29">classify_pest · CV</text>
+
+        <rect x="588" y="58" width="172" height="48" rx="11" fill="#e6f6ee" stroke="#bfe6d2"/>
+        <text x="674" y="80" text-anchor="middle" fill="#0e7c5a" font-weight="600">Synthesize + cite</text>
+        <text x="674" y="96" text-anchor="middle" fill="#0b7c56">grounded answer</text>
+        <rect x="588" y="140" width="172" height="48" rx="11" fill="#2f3a8f"/>
+        <text x="674" y="169" text-anchor="middle" fill="#fff" font-weight="600">Answer to user</text>
+
+        <line x1="132" y1="121" x2="168" y2="121" stroke="#4453c6" stroke-width="2" marker-end="url(#ah)"/>
+        <line x1="324" y1="112" x2="360" y2="112" stroke="#4453c6" stroke-width="2" marker-end="url(#ah)"/>
+        <path d="M364,192 C300,224 250,206 248,160" fill="none" stroke="#8a90a2" stroke-width="1.6" stroke-dasharray="4 3" marker-end="url(#ahm)"/>
+        <text x="300" y="220" fill="#8a90a2" font-size="11">observe · loop up to N×</text>
+        <path d="M324,96 C430,84 500,82 584,82" fill="none" stroke="#0e7c5a" stroke-width="2" marker-end="url(#ahg)"/>
+        <text x="452" y="74" text-anchor="middle" fill="#0e7c5a" font-size="11">enough context</text>
+        <line x1="674" y1="106" x2="674" y2="138" stroke="#4453c6" stroke-width="2" marker-end="url(#ah)"/>
+      </g>
+    </svg>
+    <div class="figcap">Figure 7 — ReAct loop. The VLM plans, calls read-only tools, observes, and repeats up to N times before synthesizing a cited answer.</div>
+  </div>
+
+  <h3>10.1 Tools the agent can call</h3>
+  <table>
+    <tr><th>Tool</th><th>What it does</th><th>Guardrail</th></tr>
+    <tr><td><code>get_schema()</code></td><td>Return mirror-DB tables/columns so the model writes valid SQL</td><td>Read-only metadata</td></tr>
+    <tr><td><code>run_sql(query)</code></td><td>Execute the generated query on the mirror DB</td><td>SELECT-only allow-list · read-only DB user · row cap · execution-verified</td></tr>
+    <tr><td><code>vector_search(q, k)</code></td><td>Semantic search over embedded notes/free-text</td><td>Returns chunks <b>with source ids</b> for citation</td></tr>
+    <tr><td><code>ocr_extract(doc)</code></td><td>OCR a PDF/image into structured fields</td><td>Dedicated engine or VLM; fields validated vs schema</td></tr>
+    <tr><td><code>classify_pest(image)</code></td><td>Run the Spec B CV model → pest + confidence</td><td>Confidence threshold; abstains below it</td></tr>
+    <tr><td><code>final_answer(text, cites)</code></td><td>Emit the answer</td><td>Must include citations (row ids / chunk ids)</td></tr>
+  </table>
+
+  <h3>10.2 Control loop &amp; guardrails</h3>
+  <ol>
+    <li><b>Plan</b> — the VLM reads the question (+ image) and chooses a tool, or decides it can answer directly.</li>
+    <li><b>Act &amp; observe</b> — the tool runs; its result is fed back as an observation.</li>
+    <li><b>Loop</b> — repeat up to a hard cap (e.g. <b>N = 4</b>) so a confused model can't run forever.</li>
+    <li><b>Synthesize</b> — write the answer grounded <i>only</i> in tool outputs, with citations.</li>
+    <li><b>Verify (optional)</b> — a cheap second pass checks the SQL result actually answers the question and every claim is grounded; otherwise re-plan once.</li>
+  </ol>
+  <div class="callout warn"><b>Isolation holds (G6):</b> every tool reads only the curated mirror / vector store / doc store — never production Frappe. SELECT-only + read-only DB user means even a hallucinated query cannot write or reach unsynced data.</div>
+
+  <h3>10.3 Tiered model roles (this is what makes scale affordable)</h3>
+  <p>One big model answering everything is wasteful. Split the work by difficulty:</p>
+  <table>
+    <tr><th>Role</th><th>Model</th><th>Handles</th></tr>
+    <tr><td>Router / planner</td><td>small &amp; fast (Qwen3-VL-4B)</td><td>Classify intent, route, answer easy lookups directly</td></tr>
+    <tr><td>Executor / synthesizer</td><td>Qwen3-VL-8B (or 30B)</td><td>Hard SQL, OCR, multi-step reasoning, final synthesis</td></tr>
+    <tr><td>Escalation (optional)</td><td>flagship (235B, multi-GPU)</td><td>The few genuinely hard queries the 8B/30B gets wrong</td></tr>
+  </table>
+  <div class="callout free"><b>Why tiering wins the race:</b> most ERP questions are easy lookups. If the small model handles the bulk and only escalates hard ones, you serve far more users per GPU than routing everything to the big model — the core lever behind the scaling table in §11.</div>
+</section>
+
+<!-- ============ 11. SCALING RACE ============ -->
+<section class="section">
+  <h2>11 · Scaling &amp; the Deployment Race</h2>
+  <p>Testing stays free at 16&nbsp;GB. Production, though, is a three-way <b>race between model intelligence, GPU
+  budget, and concurrent load</b>. The winner at each stage is <b>the highest-quality model that still meets our
+  latency target at the required concurrency on a fleet we can afford</b>. Low GPU + many users → a smaller, faster
+  model wins on throughput; abundant GPU → a bigger model wins on quality. Spec A's scorecard ranks quality; this
+  section overlays cost and throughput to pick the deployment winner.</p>
+
+  <h3>11.1 How to size the fleet</h3>
+  <p>Registered users are not concurrent requests. Size on <b>peak in-flight requests</b>:</p>
+  <pre><code>peak_concurrent ≈ registered_users × peak_active_fraction     # internal ERP tool: ~0.3–1% in busy hours
+GPUs           = ceil( peak_concurrent / requests_per_gpu )   # requests_per_gpu comes from a load test</code></pre>
+  <div class="callout warn"><b>These are planning bands, not promises.</b> Real throughput depends on prompt length, image tokens, output length and quantization — multimodal image tokens cut it sharply. Treat the table as a starting fleet, then confirm <code>requests_per_gpu</code> with a load test (e.g. <code>vllm bench serve</code>) before committing spend. Assumed here: ~800 in / ~400 out tokens, p95 &lt; ~5&nbsp;s, peak concurrency ≈ 0.5% of users.</div>
+
+  <h3>11.2 Users × GPU — the growth ladder</h3>
+  <table>
+    <tr><th>Registered users</th><th>Peak concurrent (assumed)</th><th>Model strategy</th><th>GPU fleet</th><th>Serving pattern</th><th>Cost band (planning)</th></tr>
+    <tr><td>100</td><td>1–3</td><td>Qwen3-VL-8B</td><td>1 × L4/A10 (24 GB)</td><td>Single replica</td><td>~$150–400/mo (spot cheaper)</td></tr>
+    <tr><td>1,000</td><td>5–15</td><td>Qwen3-VL-8B</td><td>1–2 × A10/L4</td><td>1–2 replicas + failover</td><td>~$400–900/mo</td></tr>
+    <tr><td>10,000</td><td>30–120</td><td>8B + 4B router</td><td>2–4 × A100 (80 GB)</td><td>Replicas behind a load balancer</td><td>~$3–8k/mo</td></tr>
+    <tr><td>100,000</td><td>200–900</td><td>Tiered 4B → 8B/30B</td><td>8–24 × H100</td><td>Autoscale · KV-aware routing · prefix cache</td><td>~$25–75k/mo</td></tr>
+    <tr><td>1,000,000</td><td>2,000–8,000</td><td>Tiered + heavy caching</td><td>40–120 × H100, multi-region</td><td>Disaggregated prefill/decode · autoscale</td><td>~$150–450k/mo</td></tr>
+    <tr><td>5,000,000</td><td>10,000–40,000</td><td>Tiered + distilled router</td><td>200–600 × H100/H200, multi-region</td><td>Full platform: routing · cache · spot · tiering</td><td>7-figure/yr</td></tr>
+  </table>
+
+  <h3>11.3 The race, by stage</h3>
+  <p>Same idea, framed as the "race" — who wins when GPU is scarce and users are many:</p>
+  <table>
+    <tr><th>Stage</th><th>Constraint</th><th>Winner</th><th>Why it wins</th></tr>
+    <tr><td><b>Sprint</b></td><td>Low GPU, high users<br><small>1–2 cards, 10k+ users</small></td><td>Qwen3-VL-4B / 8B-Q4</td><td>Throughput beats peak IQ — a fast small model serves everyone within latency; a big model would queue</td></tr>
+    <tr><td><b>Middle distance</b></td><td>Balanced budget<br><small>few A100/H100, 100k users</small></td><td>Tiered 4B → 8B/30B</td><td>Spend intelligence only where it's needed; router soaks up the easy majority</td></tr>
+    <tr><td><b>Marathon</b></td><td>Ample GPU, huge users<br><small>H100 fleet, 1M–5M</small></td><td>Tiered + 235B escalation</td><td>Cache &amp; route the bulk cheaply; reserve the flagship for the genuinely hard queries</td></tr>
+  </table>
+  <div class="callout"><b>How the winner is actually decided:</b> Spec A gives each model a quality score and a measured tok/s + VRAM. Combine them — pick the top-quality model whose <code>requests_per_gpu</code> meets the stage's concurrency inside the GPU budget. As the budget grows across stages, the affordable frontier moves up the model-tier ladder (§4.5), and a bigger model becomes the new winner. The race is re-run, not guessed.</div>
+</section>
+
+<!-- ============ 12. APPENDIX ============ -->
+<section class="section">
+  <h2>12 · Appendix — Resource Index</h2>
+  <table>
+    <tr><th>Resource</th><th>Use</th><th>Link</th></tr>
+    <tr><td>Lightning AI</td><td>Free persistent Studio (CPU + ~80 T4-hrs/mo)</td><td>lightning.ai</td></tr>
+    <tr><td>Groq</td><td>Free API screening (Llama/Qwen)</td><td>console.groq.com</td></tr>
+    <tr><td>Cerebras</td><td>Free API (~1M tokens/day)</td><td>cloud.cerebras.ai</td></tr>
+    <tr><td>Kaggle</td><td>Backup free GPU (~30 hrs/wk) + IP102 dataset</td><td>kaggle.com</td></tr>
+    <tr><td>vLLM</td><td>Serve VLMs, OpenAI-compatible</td><td>docs.vllm.ai</td></tr>
+    <tr><td>Ollama</td><td>Simple local model serving</td><td>ollama.com</td></tr>
+    <tr><td>Qwen2.5-VL</td><td>Top unified brain candidate</td><td>huggingface.co/Qwen</td></tr>
+    <tr><td>sentence-transformers / bge-small</td><td>Embeddings for RAG</td><td>huggingface.co/BAAI</td></tr>
+    <tr><td>ChromaDB</td><td>Local vector store</td><td>trychroma.com</td></tr>
+    <tr><td>PaddleOCR</td><td>Dedicated OCR baseline</td><td>github.com/PaddlePaddle/PaddleOCR</td></tr>
+    <tr><td>IP102</td><td>Pest classification dataset</td><td>Kaggle / HF search "IP102"</td></tr>
+    <tr><td>Ultralytics</td><td>YOLO classification training</td><td>docs.ultralytics.com</td></tr>
+    <tr><td>RunPod / Vast.ai</td><td>Paid isolated GPU (Stage 3)</td><td>runpod.io · vast.ai</td></tr>
+  </table>
+
+  <div class="callout"><b>Next step:</b> on approval, this design becomes an implementation plan for <b>Spec A</b> (the brain comparison harness) — the first buildable, entirely-free piece — followed by <b>Spec B</b> (pest model).</div>
+
+  <p style="margin-top:2em; text-align:center; color:#8a90a2; font-size:8.5pt;">Private AI Assistant for Frappe · Design &amp; Runbook v1.0 · 13 July 2026 · Prepared for Upande</p>
+</section>
+
+</body>
+</html>

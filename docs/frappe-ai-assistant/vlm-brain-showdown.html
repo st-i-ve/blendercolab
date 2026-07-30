@@ -1,0 +1,427 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The VLM Brain Showdown — Choosing Qwen's Rivals</title>
+<style>
+  :root{
+    --ink:#171a24; --body:#3b4152; --muted:#6b7183; --faint:#9aa0b2;
+    --line:#e7e9f1; --line2:#f1f2f8;
+    --bg:#f6f7fb; --card:#ffffff;
+    --indigo:#4453c6; --indigo-d:#2f3a8f; --indigo-bg:#eef0fb;
+    --green:#0e9e6e; --green-d:#0b7c56; --green-bg:#e7f6ef;
+    --amber:#c98a1a; --amber-d:#a06d12; --amber-bg:#fbf1dd;
+    --rose:#c14b63;
+    --code:#141826; --codeink:#e7ecf6;
+    --mono:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace;
+    --sans:"Segoe UI",-apple-system,BlinkMacSystemFont,Roboto,Helvetica,Arial,sans-serif;
+    --serif:"Iowan Old Style","Palatino Linotype",Palatino,Georgia,"Times New Roman",serif;
+  }
+  *{box-sizing:border-box;}
+  html{ font-size:17px; scroll-behavior:smooth; }
+  body{
+    margin:0; background:var(--bg); color:var(--body);
+    font-family:var(--sans); line-height:1.68;
+    -webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility;
+  }
+
+  /* ---------- layout ---------- */
+  .wrap{ max-width:760px; margin:0 auto; padding:0 24px; }
+  .wide{ max-width:920px; }
+  section{ padding:8px 0; }
+  p{ margin:1.05em 0; }
+  a{ color:var(--indigo); text-decoration:none; border-bottom:1px solid transparent; transition:border-color .2s ease; }
+  a:hover{ border-color:var(--indigo); }
+
+  h1,h2,h3{ color:var(--ink); line-height:1.18; letter-spacing:-.015em; }
+  h2{ font-family:var(--serif); font-size:2.05rem; font-weight:600; margin:2.4em 0 .1em; }
+  h3{ font-size:1.28rem; font-weight:650; margin:2em 0 .1em; }
+  .kicker{ text-transform:uppercase; letter-spacing:.16em; font-size:.72rem; font-weight:700;
+           color:var(--indigo); margin-bottom:.5em; }
+  .dek{ font-size:1.16rem; color:var(--muted); margin-top:.35em; }
+
+  /* ---------- hero ---------- */
+  .hero{ position:relative; overflow:hidden; padding:104px 0 72px; color:#fff;
+         background:
+           radial-gradient(1100px 520px at 12% -10%, #5b6bff 0%, rgba(91,107,255,0) 60%),
+           radial-gradient(900px 520px at 96% 8%, #17b98a 0%, rgba(23,185,138,0) 55%),
+           radial-gradient(1000px 700px at 78% 116%, #7b3ff2 0%, rgba(123,63,242,0) 60%),
+           linear-gradient(150deg, #232a63 0%, #2f3a8f 46%, #3a2f7a 100%); }
+  .hero .blob{ position:absolute; border-radius:50%; filter:blur(46px); opacity:.5; pointer-events:none; }
+  .hero .b1{ width:340px; height:340px; left:-70px; top:-40px; background:#6a7bff; }
+  .hero .b2{ width:300px; height:300px; right:-60px; bottom:-90px; background:#19c58f; }
+  .hero h1{ color:#fff; font-family:var(--serif); font-weight:600; font-size:3.1rem; margin:.1em 0 .18em; }
+  .hero .kicker{ color:#c8cff8; }
+  .hero .dek{ color:#dfe4fb; font-size:1.28rem; max-width:36ch; }
+  .hero .meta{ margin-top:26px; font-size:.86rem; color:#c3c9ee; display:flex; gap:18px; flex-wrap:wrap; }
+  .hero .meta b{ color:#fff; font-weight:600; }
+  @media (prefers-reduced-motion: no-preference){
+    .hero .b1{ animation:drift1 24s ease-in-out infinite alternate; }
+    .hero .b2{ animation:drift2 30s ease-in-out infinite alternate; }
+    @keyframes drift1{ to{ transform:translate(40px,30px) scale(1.08); } }
+    @keyframes drift2{ to{ transform:translate(-36px,-26px) scale(1.1); } }
+  }
+
+  /* ---------- reveal-on-scroll (subtle) ---------- */
+  @media (prefers-reduced-motion: no-preference){
+    .reveal{ opacity:0; transform:translateY(16px); transition:opacity .7s ease, transform .7s cubic-bezier(.22,.61,.36,1); }
+    .reveal.in{ opacity:1; transform:none; }
+  }
+
+  /* ---------- soft note cards (NO side strips) ---------- */
+  .note{ background:var(--indigo-bg); border:1px solid #e0e4fb; border-radius:16px;
+         padding:18px 22px; margin:1.6em 0; font-size:.97rem; color:#37406e; }
+  .note.win{ background:var(--green-bg); border-color:#cdeede; color:#0d5e43; }
+  .note.warn{ background:var(--amber-bg); border-color:#f0dfb9; color:#7d5806; }
+  .note b{ color:inherit; }
+  .note .ico{ font-size:1.05rem; margin-right:.35em; }
+
+  /* ---------- contender cards ---------- */
+  .cards{ display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:16px; margin:1.8em 0; }
+  .mcard{ background:var(--card); border:1px solid var(--line); border-radius:18px; padding:20px 20px 18px;
+          box-shadow:0 1px 2px rgba(23,26,36,.04); transition:transform .25s ease, box-shadow .25s ease; }
+  .mcard:hover{ transform:translateY(-3px); box-shadow:0 12px 30px rgba(23,26,36,.09); }
+  .mcard .top{ height:5px; border-radius:99px; margin:-4px 0 14px; }
+  .mcard h4{ margin:0 0 2px; font-size:1.06rem; color:var(--ink); }
+  .mcard .sz{ font-size:.78rem; color:var(--faint); font-weight:600; letter-spacing:.02em; }
+  .mcard p{ margin:.7em 0 .9em; font-size:.9rem; color:var(--body); line-height:1.5; }
+  .pill{ display:inline-block; font-size:.72rem; font-weight:700; padding:3px 11px; border-radius:99px; letter-spacing:.02em; }
+  .pill.ok{ background:var(--green-bg); color:var(--green-d); }
+  .pill.tight{ background:var(--amber-bg); color:var(--amber-d); }
+
+  /* ---------- chart figure ---------- */
+  .fig{ background:var(--card); border:1px solid var(--line); border-radius:20px;
+        padding:26px 28px 20px; margin:2em 0; box-shadow:0 1px 3px rgba(23,26,36,.05); }
+  .fig .ftitle{ font-size:1.08rem; font-weight:650; color:var(--ink); margin:0; }
+  .fig .fsub{ font-size:.88rem; color:var(--muted); margin:.25em 0 1.2em; }
+  .legend{ display:flex; gap:18px; flex-wrap:wrap; margin:2px 0 16px; font-size:.84rem; color:var(--body); }
+  .legend span{ display:inline-flex; align-items:center; gap:7px; }
+  .legend i{ width:11px; height:11px; border-radius:3px; display:inline-block; }
+  .fnote{ font-size:.79rem; color:var(--faint); margin-top:14px; line-height:1.5; }
+  .fnote a{ color:var(--muted); border-bottom:1px solid var(--line); }
+  .tbtn{ font:inherit; font-size:.78rem; color:var(--muted); background:none; border:1px solid var(--line);
+         border-radius:99px; padding:4px 13px; cursor:pointer; transition:background .2s ease, color .2s ease; }
+  .tbtn:hover{ background:var(--line2); color:var(--ink); }
+  .dtable{ width:100%; border-collapse:collapse; margin-top:14px; font-size:.85rem; display:none; }
+  .dtable th,.dtable td{ text-align:left; padding:7px 10px; border-bottom:1px solid var(--line); }
+  .dtable th{ color:var(--muted); font-weight:600; }
+  .dtable td.num{ text-align:right; font-variant-numeric:tabular-nums; font-weight:600; color:var(--ink); }
+
+  svg .grid{ stroke:var(--line); stroke-width:1; }
+  svg .axis{ stroke:#d3d7e4; stroke-width:1.5; }
+  svg .tick{ fill:var(--faint); font-size:12px; }
+  svg .glab{ fill:var(--ink); font-size:13px; font-weight:600; }
+  svg .val{ fill:var(--ink); font-size:14px; font-weight:700; font-variant-numeric:tabular-nums; }
+  .bar{ cursor:default; transform-box:fill-box; transition:transform .9s cubic-bezier(.22,.61,.36,1); }
+  .bar.v{ transform-origin:bottom; transform:scaleY(0); }
+  .bar.v.in{ transform:scaleY(1); }
+  .bar.h{ transform-origin:left; transform:scaleX(0); }
+  .bar.h.in{ transform:scaleX(1); }
+  .val, .glab{ opacity:0; transition:opacity .5s ease .55s; }
+  .fig.in .val, .fig.in .glab{ opacity:1; }
+  .bargrp:hover .bar{ filter:brightness(1.06); }
+
+  /* ---------- tooltip ---------- */
+  #tip{ position:fixed; pointer-events:none; z-index:20; background:#171a24; color:#fff;
+        font-size:.8rem; padding:7px 11px; border-radius:9px; opacity:0; transform:translateY(4px);
+        transition:opacity .15s ease, transform .15s ease; white-space:nowrap; box-shadow:0 6px 22px rgba(0,0,0,.25); }
+  #tip.on{ opacity:1; transform:none; }
+  #tip b{ color:#fff; }
+
+  /* ---------- code ---------- */
+  code{ font-family:var(--mono); font-size:.86em; background:var(--indigo-bg); color:#333c86; padding:.1em .38em; border-radius:6px; }
+  pre{ background:var(--code); color:var(--codeink); border-radius:14px; padding:16px 18px; overflow:auto;
+       font-family:var(--mono); font-size:.83rem; line-height:1.55; margin:1.3em 0; }
+  pre code{ background:none; color:inherit; padding:0; }
+
+  hr.soft{ border:0; height:1px; background:linear-gradient(90deg,transparent,var(--line),transparent); margin:3em 0; }
+  footer{ color:var(--faint); font-size:.82rem; text-align:center; padding:48px 0 60px; }
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="blob b1"></div><div class="blob b2"></div>
+  <div class="wrap">
+    <div class="kicker">Spec A · VLM Brain Comparison</div>
+    <h1>The VLM Brain Showdown</h1>
+    <p class="dek">Qwen2.5-VL is the baseline. Who actually beats it on the box we can afford?</p>
+    <div class="meta">
+      <span><b>Target</b> ~16 GB self-hosted</span>
+      <span><b>Contenders</b> 5 open-weight VLMs</span>
+      <span><b>Rule</b> free until proven</span>
+    </div>
+  </div>
+</header>
+
+<main>
+  <section class="wrap">
+    <p class="reveal">Our assistant needs one model that can read structured data, write SQL, extract fields
+    from scanned invoices, and describe a photo of a rose. Qwen2.5-VL-7B is our proven baseline — it serves cleanly
+    on a quantized ~16&nbsp;GB box and already answers text and image prompts. The question Spec&nbsp;A exists to
+    settle is simple: <b>is there a better brain that still fits?</b> Below are the real contenders as of mid-2026,
+    what the public benchmarks actually say, and the constraint that quietly decides everything — VRAM.</p>
+  </section>
+
+  <section class="wrap">
+    <h2 class="reveal">The contenders</h2>
+    <p class="reveal">Five open-weight models, all servable through vLLM on the same OpenAI-compatible endpoint.
+    Two of them are <em>reasoning</em> models — they think before answering, trading latency for accuracy.</p>
+
+    <div class="cards">
+      <div class="mcard reveal">
+        <div class="top" style="background:linear-gradient(90deg,#4453c6,#7b8bff)"></div>
+        <h4>Qwen2.5-VL-7B</h4><div class="sz">7B · baseline</div>
+        <p>The proven all-rounder: strong text, SQL, OCR and image. AWQ build fits easily.</p>
+        <span class="pill ok">Fits 16 GB</span>
+      </div>
+      <div class="mcard reveal">
+        <div class="top" style="background:linear-gradient(90deg,#0e9e6e,#3fd6a3)"></div>
+        <h4>MiMo-VL-7B-RL</h4><div class="sz">7B · Xiaomi · reasoning</div>
+        <p>Punches far above its size on document &amp; chart reasoning and math. The benchmark darling.</p>
+        <span class="pill tight">Tight — needs a quant</span>
+      </div>
+      <div class="mcard reveal">
+        <div class="top" style="background:linear-gradient(90deg,#6a4bd8,#a48bff)"></div>
+        <h4>GLM-4.1V-9B-Thinking</h4><div class="sz">9B · Zhipu · reasoning</div>
+        <p>Strong all-round multimodal reasoning. An AWQ build fits comfortably — the easiest rival to test.</p>
+        <span class="pill ok">Fits 16 GB (AWQ)</span>
+      </div>
+      <div class="mcard reveal">
+        <div class="top" style="background:linear-gradient(90deg,#c98a1a,#f0b64e)"></div>
+        <h4>Pixtral-12B</h4><div class="sz">12B · Mistral</div>
+        <p>Excellent instruction-following and native multi-image, but the largest here.</p>
+        <span class="pill tight">Needs 4-bit / 24 GB</span>
+      </div>
+      <div class="mcard reveal">
+        <div class="top" style="background:linear-gradient(90deg,#2f3a8f,#5566d6)"></div>
+        <h4>InternVL3-9B</h4><div class="sz">9B · OpenGVLab</div>
+        <p>Document-understanding specialist — a natural fit for invoice and delivery-note OCR.</p>
+        <span class="pill ok">Fits 16 GB (quant)</span>
+      </div>
+    </div>
+  </section>
+
+  <hr class="soft">
+
+  <!-- ===================== CHART A ===================== -->
+  <section class="wrap wide">
+    <h2 class="reveal">Where MiMo pulls ahead: reading charts &amp; documents</h2>
+    <p class="reveal">For an ERP assistant, the benchmark that matters most is the hard one about
+    <b>reading charts and dense documents</b> — exactly the skill needed to pull totals off a scanned invoice.
+    On <b>CharXiv-RQ</b> (reasoning questions over scientific charts, higher is better), Xiaomi's 7B model opens a
+    real gap over both Qwen and InternVL — despite being the same size as Qwen.</p>
+
+    <figure class="fig reveal" id="figA">
+      <p class="ftitle">Document &amp; chart reasoning — CharXiv-RQ</p>
+      <p class="fsub">Score out of 100 · higher is better · all three measured in one report</p>
+      <div class="legend">
+        <span><i style="background:#0e9e6e"></i>MiMo-VL-7B-RL</span>
+        <span><i style="background:#4453c6"></i>Qwen2.5-VL-7B</span>
+        <span><i style="background:#c98a1a"></i>InternVL3</span>
+        <button class="tbtn" data-table="tblA">Show data table</button>
+      </div>
+      <!-- horizontal soft-gradient bars -->
+      <svg id="svgA" viewBox="0 0 720 240" width="100%" role="img" aria-label="CharXiv-RQ scores: MiMo-VL 56.5, Qwen2.5-VL 42.5, InternVL3 37.6">
+        <defs>
+          <linearGradient id="gGreen" x1="0" y1="0" x2="1" y2="0">
+            <stop offset="0" stop-color="#0b7c56"/><stop offset="1" stop-color="#22c78e"/></linearGradient>
+          <linearGradient id="gIndigo" x1="0" y1="0" x2="1" y2="0">
+            <stop offset="0" stop-color="#3a47b4"/><stop offset="1" stop-color="#6d7cf0"/></linearGradient>
+          <linearGradient id="gAmber" x1="0" y1="0" x2="1" y2="0">
+            <stop offset="0" stop-color="#b0770f"/><stop offset="1" stop-color="#e9a83a"/></linearGradient>
+        </defs>
+        <!-- gridlines at 20/40/60 (scale 0..70 across x 190..690) -->
+        <g class="grid">
+          <line x1="333" y1="26" x2="333" y2="196"/>
+          <line x1="476" y1="26" x2="476" y2="196"/>
+          <line x1="619" y1="26" x2="619" y2="196"/>
+        </g>
+        <g class="tick" text-anchor="middle">
+          <text x="333" y="216">20</text><text x="476" y="216">40</text><text x="619" y="216">60</text>
+        </g>
+        <line class="axis" x1="190" y1="24" x2="190" y2="196"/>
+        <!-- rows: y baseline; scale px per unit = 500/70 = 7.142 -->
+        <g class="bargrp" data-name="MiMo-VL-7B-RL" data-val="56.5">
+          <text class="glab" x="182" y="52" text-anchor="end">MiMo-VL</text>
+          <rect class="bar h" x="190" y="34" width="403.6" height="30" rx="7" fill="url(#gGreen)"/>
+          <text class="val" x="603" y="53">56.5</text>
+        </g>
+        <g class="bargrp" data-name="Qwen2.5-VL-7B" data-val="42.5">
+          <text class="glab" x="182" y="102" text-anchor="end">Qwen2.5-VL</text>
+          <rect class="bar h" x="190" y="84" width="303.6" height="30" rx="7" fill="url(#gIndigo)"/>
+          <text class="val" x="503" y="103">42.5</text>
+        </g>
+        <g class="bargrp" data-name="InternVL3" data-val="37.6">
+          <text class="glab" x="182" y="152" text-anchor="end">InternVL3</text>
+          <rect class="bar h" x="190" y="134" width="268.6" height="30" rx="7" fill="url(#gAmber)"/>
+          <text class="val" x="468" y="153">37.6</text>
+        </g>
+      </svg>
+      <table class="dtable" id="tblA">
+        <tr><th>Model</th><th style="text-align:right">CharXiv-RQ</th></tr>
+        <tr><td>MiMo-VL-7B-RL</td><td class="num">56.5</td></tr>
+        <tr><td>Qwen2.5-VL-7B</td><td class="num">42.5</td></tr>
+        <tr><td>InternVL3</td><td class="num">37.6</td></tr>
+      </table>
+      <p class="fnote">Source: MiMo-VL Technical Report, arXiv <a href="https://arxiv.org/abs/2506.03569">2506.03569</a>.
+      CharXiv-RQ = reasoning questions over charts. All three scores reported side-by-side in the same paper,
+      so they are directly comparable.</p>
+    </figure>
+
+    <div class="note win reveal"><span class="ico">✓</span><b>Why this is the headline chart:</b> reading a
+    scanned invoice <em>is</em> chart/document reasoning. A 14-point lead here is the single most decision-relevant
+    gap in the whole comparison — and it comes from a model the same size as our baseline.</div>
+  </section>
+
+  <hr class="soft">
+
+  <!-- ===================== CHART B ===================== -->
+  <section class="wrap wide">
+    <h2 class="reveal">The baseline is no pushover</h2>
+    <p class="reveal">Before crowning a challenger, respect the incumbent. Qwen2.5-VL-7B's own document and OCR
+    profile is genuinely strong — this is the bar every rival has to clear on <em>our</em> eval set, not just on
+    a leaderboard.</p>
+
+    <figure class="fig reveal" id="figB">
+      <p class="ftitle">Qwen2.5-VL-7B — document &amp; OCR profile</p>
+      <p class="fsub">Score out of 100 · higher is better · single model, its published results</p>
+      <div class="legend">
+        <span><i style="background:#4453c6"></i>Qwen2.5-VL-7B-Instruct</span>
+        <button class="tbtn" data-table="tblB">Show data table</button>
+      </div>
+      <!-- vertical bars, scale 0..100 over height 170 (y 30..200), px/unit=1.7 -->
+      <svg id="svgB" viewBox="0 0 720 250" width="100%" role="img" aria-label="Qwen2.5-VL-7B: DocVQA 95.7, ChartQA 87.3, OCRBench 86.4, CC-OCR 77.8">
+        <defs>
+          <linearGradient id="gBar" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0" stop-color="#6d7cf0"/><stop offset="1" stop-color="#3a47b4"/></linearGradient>
+        </defs>
+        <g class="grid">
+          <line x1="70" y1="200" x2="700" y2="200"/>
+          <line x1="70" y1="157.5" x2="700" y2="157.5"/>
+          <line x1="70" y1="115" x2="700" y2="115"/>
+          <line x1="70" y1="72.5" x2="700" y2="72.5"/>
+          <line x1="70" y1="30" x2="700" y2="30"/>
+        </g>
+        <g class="tick" text-anchor="end">
+          <text x="58" y="204">0</text><text x="58" y="161">25</text>
+          <text x="58" y="119">50</text><text x="58" y="76">75</text><text x="58" y="34">100</text>
+        </g>
+        <!-- 4 bars centered at x=150,290,430,570 ; width 82 -->
+        <g class="bargrp" data-name="DocVQA" data-val="95.7">
+          <rect class="bar v" x="109" y="37.3" width="82" height="162.7" rx="7" fill="url(#gBar)"/>
+          <text class="val" x="150" y="27" text-anchor="middle">95.7</text>
+          <text class="glab" x="150" y="222" text-anchor="middle">DocVQA</text>
+        </g>
+        <g class="bargrp" data-name="ChartQA" data-val="87.3">
+          <rect class="bar v" x="249" y="51.6" width="82" height="148.4" rx="7" fill="url(#gBar)"/>
+          <text class="val" x="290" y="41.6" text-anchor="middle">87.3</text>
+          <text class="glab" x="290" y="222" text-anchor="middle">ChartQA</text>
+        </g>
+        <g class="bargrp" data-name="OCRBench" data-val="86.4">
+          <rect class="bar v" x="389" y="53.1" width="82" height="146.9" rx="7" fill="url(#gBar)"/>
+          <text class="val" x="430" y="43.1" text-anchor="middle">86.4</text>
+          <text class="glab" x="430" y="222" text-anchor="middle">OCRBench</text>
+        </g>
+        <g class="bargrp" data-name="CC-OCR" data-val="77.8">
+          <rect class="bar v" x="529" y="67.7" width="82" height="132.3" rx="7" fill="url(#gBar)"/>
+          <text class="val" x="570" y="57.7" text-anchor="middle">77.8</text>
+          <text class="glab" x="570" y="222" text-anchor="middle">CC-OCR</text>
+        </g>
+      </svg>
+      <table class="dtable" id="tblB">
+        <tr><th>Benchmark</th><th style="text-align:right">Score</th></tr>
+        <tr><td>DocVQA</td><td class="num">95.7</td></tr>
+        <tr><td>ChartQA</td><td class="num">87.3</td></tr>
+        <tr><td>OCRBench</td><td class="num">86.4</td></tr>
+        <tr><td>CC-OCR</td><td class="num">77.8</td></tr>
+      </table>
+      <p class="fnote">Source: published Qwen2.5-VL-7B-Instruct results via
+      <a href="https://llm-stats.com/models/compare/qwen2.5-vl-7b-vs-qwen3-vl-8b-thinking">llm-stats.com</a>.
+      OCRBench shown normalised to a 0–100 scale.</p>
+    </figure>
+  </section>
+
+  <hr class="soft">
+
+  <!-- ===================== VRAM ===================== -->
+  <section class="wrap">
+    <h2 class="reveal">The constraint that decides it: VRAM</h2>
+    <p class="reveal">Benchmarks pick the smartest model. Your budget picks the one you can actually run. A 7B model
+    in full precision is roughly 15&nbsp;GB of weights alone — which leaves no room for the KV cache on a 16&nbsp;GB
+    card. So on the cheap box, <b>a quantized build isn't optional</b>:</p>
+
+    <div class="note warn reveal"><span class="ico">▲</span><b>Fits today, quantized:</b> Qwen2.5-VL (AWQ),
+    GLM-4.1V-9B-Thinking (AWQ), InternVL3-9B. <b>Won't fit in full precision:</b> MiMo-VL-7B-RL and Pixtral-12B —
+    they need a community AWQ/GPTQ quant, or the ~24&nbsp;GB reference tier. "Best on benchmarks" and "fits the
+    budget" are not always the same model — and that tension is itself a finding worth putting in front of the
+    decision.</p>
+
+    <p class="reveal">Every candidate speaks the same OpenAI-compatible API, so swapping is a one-line change —
+    serve, run the eval set, stop, serve the next:</p>
+    <pre class="reveal"><code>vllm serve dengcao/GLM-4.1V-9B-Thinking-AWQ \
+  --max-model-len 8192 --gpu-memory-utilization 0.92 --port 8000 \
+  --limit-mm-per-prompt '{"image":4}'</code></pre>
+  </section>
+
+  <hr class="soft">
+
+  <section class="wrap">
+    <h2 class="reveal">The verdict — for now</h2>
+    <p class="reveal">The real answer comes from our own ~40-question eval set on synthetic ERP data, not a public
+    leaderboard. But the shape of the race is clear: <b>Qwen2.5-VL is the safe, well-fitting baseline</b>;
+    <b>GLM-4.1V is the easiest rival to actually test</b> at this VRAM tier; and <b>MiMo-VL is the one to beat on
+    document understanding</b> — if we can squeeze it onto the box. Next step: build the scorecard and let execution
+    accuracy, OCR field-match, and measured latency settle it.</p>
+    <div class="note reveal"><span class="ico">→</span><b>What this page is not:</b> a final scorecard. These are
+    public benchmarks that guide which models are worth loading. The verdict comes from Stage&nbsp;2 self-hosted runs
+    on our own data.</div>
+  </section>
+</main>
+
+<div id="tip"></div>
+
+<footer>Private AI Assistant for Frappe · Spec A companion · benchmarks as of July 2026</footer>
+
+<script>
+  // Reveal-on-scroll (subtle) + trigger chart bar growth
+  const io = new IntersectionObserver((entries)=>{
+    entries.forEach(e=>{
+      if(!e.isIntersecting) return;
+      e.target.classList.add('in');
+      if(e.target.classList.contains('fig')){
+        e.target.querySelectorAll('.bar').forEach((b,i)=>{
+          setTimeout(()=>b.classList.add('in'), 90*i);
+        });
+      }
+      io.unobserve(e.target);
+    });
+  }, {threshold:0.18});
+  document.querySelectorAll('.reveal, .fig').forEach(el=>io.observe(el));
+
+  // Data-table toggles
+  document.querySelectorAll('.tbtn').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      const t = document.getElementById(btn.dataset.table);
+      const show = t.style.display !== 'table';
+      t.style.display = show ? 'table' : 'none';
+      btn.textContent = show ? 'Hide data table' : 'Show data table';
+    });
+  });
+
+  // Hover tooltip on every bar group
+  const tip = document.getElementById('tip');
+  document.querySelectorAll('.bargrp').forEach(g=>{
+    const name = g.dataset.name, val = g.dataset.val;
+    g.addEventListener('mousemove', ev=>{
+      tip.innerHTML = '<b>'+name+'</b> · '+val;
+      tip.style.left = (ev.clientX + 14)+'px';
+      tip.style.top  = (ev.clientY - 10)+'px';
+      tip.classList.add('on');
+    });
+    g.addEventListener('mouseleave', ()=> tip.classList.remove('on'));
+  });
+</script>
+</body>
+</html>

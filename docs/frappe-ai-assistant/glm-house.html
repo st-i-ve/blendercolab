@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Beach Lifeguard Tower</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            font-family: 'Press Start 2P', cursive;
+            background: linear-gradient(to bottom right, #e67c45, #f9a825);
+            background-size: 400% 400%;
+            animation: gradientShift 15s ease infinite;
+            overflow: hidden;
+        }
+        .container {
+            text-align: center;
+            color: white;
+            animation: fadeIn 2s ease;
+        }
+        .container img {
+            width: 100%;
+            max-width: 600px;
+            border-radius: 8px;
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
+            animation: glow 3s ease-in-out infinite;
+        }
+        @keyframes gradientShift {
+            0% { background-position: 0% 50%; }
+            50% { background-position: 100% 50%; }
+            100% { background-position: 0% 50%; }
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+        @keyframes glow {
+            0%, 100% { box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2); }
+            50% { box-shadow: 0 8px 16px rgba(255, 165, 0, 0.5); }
+        }
+    </style>
+    <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="container">
+        <img src="https://images.unsplash.com/photo-1430953450049-5a403896eac4?auto=format&fit=crop&q=80" alt="A lifeguard tower stands alone on a empty beach at sunset, with a soft gradient sky and calm sea" />
+        <p style="margin-top: 20px; font-size: 1.2em; text-align: center;">On the sand kissed by twilight's gentle hue, the lifeguard tower stands watch, guardian of the sea beneath a sky painted in dreams of day's last embrace.</p>
+    </div>
+</body>
+</html>
