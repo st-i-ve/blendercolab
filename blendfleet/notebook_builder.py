@@ -62,8 +62,8 @@ def build(frames: list[int], settings: RenderSettings, dataset_slug: str,
 import os, subprocess, psutil
 FRAMES = {frames!r}
 RES_X, RES_Y = {settings.resolution_x}, {settings.resolution_y}
-SAMPLES, FMT = {settings.samples}, "{settings.file_format}"
-BLENDER_VERSION = "{settings.blender_version}"
+SAMPLES, FMT = {settings.samples}, {settings.file_format!r}
+BLENDER_VERSION = {settings.blender_version!r}
 
 vm = psutil.virtual_memory()
 print(f"CPU {{psutil.cpu_count(logical=True)}} cores | RAM {{vm.total/2**30:.1f}} GB")
