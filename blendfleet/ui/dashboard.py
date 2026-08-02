@@ -34,6 +34,11 @@ class Dashboard(QMainWindow):
         # the objects the SSE threads are mutating and reset progress to 0
         # on the very next poll.
         self._live_progress: dict[str, int] = {}
+        # Keyed by account label. Populated by _refresh_quota(), which is
+        # best-effort: a fetch failure for one or all accounts must never
+        # raise -- it only ever downgrades the displayed figure to
+        # "unavailable" (see FINDING 1, task 9 fix round 1).
+        self._quota_cache: dict[str, str] = {}
         self.setWindowTitle("BlendFleet")
         self.resize(900, 620)
 
@@ -79,15 +84,16 @@ class Dashboard(QMainWindow):
             btns.addWidget(b)
         v.addLayout(btns)
 
-        self.table = QTableWidget(0, 5)
+        self.table = QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels(
-            ["Account", "Kaggle user", "Frames", "State", "Progress"])
+            ["Account", "Kaggle user", "Quota (API)", "Frames", "State", "Progress"])
         self.table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.Stretch)
         v.addWidget(self.table)
 
         note = QLabel(
-            f'Quota shown per account is the <b>API</b> figure. It has been '
+            f'The <b>Quota (API)</b> column above is exactly that: the figure '
+            f'the Kaggle API reports right now, not a guarantee. It has been '
             f'observed to disagree with <a href="{SETTINGS_URL}">your settings '
             f'page</a> — check both before a long run.')
         note.setOpenExternalLinks(True)
@@ -96,7 +102,7 @@ class Dashboard(QMainWindow):
 
         self.timer = QTimer(self); self.timer.timeout.connect(self._poll)
         self.timer.start(30_000)
-        self._refresh_accounts(); self._update_eta()
+        self._refresh_accounts(); self._update_eta(); self._refresh_quota()
 
     # --- helpers ---
     def _refresh_accounts(self) -> None:
@@ -115,7 +121,30 @@ class Dashboard(QMainWindow):
 
     def _manage(self) -> None:
         SetupDialog(self.store, self).exec()
-        self._refresh_accounts(); self._update_eta()
+        self._refresh_accounts(); self._update_eta(); self._refresh_quota()
+
+    def _refresh_quota(self) -> None:
+        """Best-effort per-account GPU quota fetch, straight from
+        KaggleClient.quota(). Never allowed to raise: a single account's
+        fetch failing (rate limit, network blip, revoked token, a fake/stub
+        client_factory with no quota() at all) must not break the dashboard
+        or block a render -- it only ever downgrades that account's figure
+        to "unavailable"."""
+        try:
+            client_factory = self.fleet_factory(self.store.list()).client_factory
+        except Exception:
+            client_factory = None
+        for acct in self.store.list():
+            if client_factory is None:
+                self._quota_cache[acct.label] = "unavailable"
+                continue
+            try:
+                q = client_factory(acct.token).quota()
+                used_h = q.used_seconds / 3600.0
+                total_h = q.total_seconds / 3600.0
+                self._quota_cache[acct.label] = f"{used_h:.1f} / {total_h:.1f} h"
+            except Exception:
+                self._quota_cache[acct.label] = "unavailable"
 
     def _pick(self) -> None:
         f, _ = QFileDialog.getOpenFileName(self, "Select .blend", "",
@@ -141,6 +170,7 @@ class Dashboard(QMainWindow):
             fleet = self.fleet_factory(self.store.list())
             st = fleet.launch(self.blend, settings,
                               self.start.value(), self.end.value())
+            self._refresh_quota()
             self._render_table(st)
             self._start_progress_threads(st)
         except Exception as e:
@@ -182,13 +212,12 @@ class Dashboard(QMainWindow):
         if not d:
             return
         from blendfleet.collector import collect
-        from blendfleet.kaggle_client import KaggleClient
         fleet = self.fleet_factory(self.store.list())
         st = fleet.load()
         if st is None:
             QMessageBox.information(self, "Nothing to collect", "No job found.")
             return
-        r = collect(st, self.store.list(), lambda t: KaggleClient(t), Path(d))
+        r = collect(st, self.store.list(), fleet.client_factory, Path(d))
         msg = f"Copied {r.copied} frame(s)."
         if r.missing_frames:
             msg += (f"\n\nSTILL MISSING {len(r.missing_frames)}: "
@@ -204,6 +233,10 @@ class Dashboard(QMainWindow):
                 self._render_table(st)
         except Exception:
             pass          # a transient poll failure must not kill the dashboard
+        try:
+            self._refresh_quota()
+        except Exception:
+            pass          # same guarantee for the quota side-channel
 
     def _render_table(self, st) -> None:
         self.table.setRowCount(len(st.workers))
@@ -211,8 +244,10 @@ class Dashboard(QMainWindow):
             self.table.setItem(i, 0, QTableWidgetItem(w.label))
             self.table.setItem(i, 1, QTableWidgetItem(w.username))
             self.table.setItem(i, 2, QTableWidgetItem(
+                self._quota_cache.get(w.label, "—")))
+            self.table.setItem(i, 3, QTableWidgetItem(
                 f"{len(w.frames)} ({w.frames[0] if w.frames else '-'}…)"))
-            self.table.setItem(i, 3, QTableWidgetItem(w.state))
+            self.table.setItem(i, 4, QTableWidgetItem(w.state))
             bar = QProgressBar()
             bar.setMaximum(max(len(w.frames), 1))
             # w.frames_done reflects only what was persisted to disk; a
@@ -221,7 +256,7 @@ class Dashboard(QMainWindow):
             # the dashboard-level cache is the authoritative live value.
             bar.setValue(max(self._live_progress.get(w.kernel_slug, 0),
                              w.frames_done))
-            self.table.setCellWidget(i, 4, bar)
+            self.table.setCellWidget(i, 5, bar)
 
     def closeEvent(self, event) -> None:
         self._stop.set()
