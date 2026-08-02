@@ -227,6 +227,124 @@ def test_dataset_version_other_400_surfaces_real_message(tmp_path):
     assert "did not finish uploading" not in message
 
 
+# ------------------------------------------------------- upload preflight --
+# Task 2: use blendfleet/uploader.py instead of relying on kaggle's own
+# upload_files()/_upload_blob(), which silently drops a file and returns
+# None when its retries run out (see blendfleet/uploader.py's docstring).
+# These stub the injected upload_blob_fn (never touching the network) to
+# reproduce both observed failure shapes -- raising, and returning a falsy
+# token -- and assert the real Kaggle create/version API method is NEVER
+# reached in either case: the 400 from an empty file list must never even
+# be possible, because the request is never sent.
+
+def _staged_folder(tmp_path, filename="big.blend", size=500):
+    folder = tmp_path / "stage"
+    folder.mkdir()
+    (folder / filename).write_bytes(b"B" * size)
+    (folder / "dataset-metadata.json").write_text("{}")
+    return folder
+
+
+def test_upload_raises_refuses_locally_and_never_calls_dataset_create_version(tmp_path):
+    folder = _staged_folder(tmp_path)
+
+    def failing_upload(path, on_progress):
+        from blendfleet.uploader import UploadError
+        raise UploadError("upload failed after 6 retries", status=503, body="unavailable")
+
+    c, api = client()
+    c._upload_blob_fn = failing_upload
+
+    with pytest.raises(KaggleError) as exc_info:
+        c.dataset_version(folder, "update big.blend")
+
+    message = str(exc_info.value)
+    assert "did not complete" in message
+    assert "retry the render" in message.lower()
+    # the real Kaggle API method must NEVER have been invoked
+    assert api.versioned == []
+
+
+def test_upload_yields_no_token_refuses_locally_and_never_calls_dataset_create_version(tmp_path):
+    """Even a hypothetical upload path that fails "some other way" -- by
+    returning a falsy token instead of raising -- must still be caught
+    locally, never handed to Kaggle as if it were a real upload."""
+    folder = _staged_folder(tmp_path)
+
+    def no_token_upload(path, on_progress):
+        return None
+
+    c, api = client()
+    c._upload_blob_fn = no_token_upload
+
+    with pytest.raises(KaggleError, match="no blob token"):
+        c.dataset_create(folder)
+
+    assert api.created == []
+
+
+def test_upload_success_proceeds_to_dataset_create_version(tmp_path):
+    folder = _staged_folder(tmp_path)
+    calls = []
+
+    def fake_upload(path, on_progress):
+        calls.append(path.name)
+        return "tok-123"
+
+    c, api = client()
+    c._upload_blob_fn = fake_upload
+
+    c.dataset_version(folder, "update big.blend")
+
+    assert calls == ["big.blend"], "only the real data file, never the metadata json"
+    assert len(api.versioned) == 1
+
+
+def test_on_progress_threaded_through_to_the_uploader(tmp_path):
+    folder = _staged_folder(tmp_path)
+    seen_progress = []
+
+    def fake_upload(path, on_progress):
+        seen_progress.append(on_progress)
+        return "tok-abc"
+
+    c, api = client()
+    c._upload_blob_fn = fake_upload
+    marker = object()
+
+    c.dataset_create(folder, on_progress=marker)
+
+    assert seen_progress == [marker]
+
+
+def test_preflighted_file_is_not_uploaded_a_second_time_via_the_patched_api(tmp_path):
+    """Once dataset_version has reliably uploaded the file itself, kaggle's
+    own (real) _upload_blob must not re-upload the same file again over the
+    network -- the patched method should just hand back the token already
+    obtained. This is the mechanism that avoids doubling upload time/bytes
+    for a large .blend."""
+    folder = _staged_folder(tmp_path)
+    call_count = {"n": 0}
+
+    def fake_upload(path, on_progress):
+        call_count["n"] += 1
+        return f"tok-{call_count['n']}"
+
+    c, api = client()
+    c._upload_blob_fn = fake_upload
+
+    c.dataset_version(folder, "update big.blend")
+    assert call_count["n"] == 1
+
+    # Simulate what kaggle's own dataset_create_version would do internally
+    # (kaggle_api_extended.py's upload_files() -> _upload_file() ->
+    # self._upload_blob(full_path, quiet, blob_type, upload_context)).
+    full_path = str(folder / "big.blend")
+    token = api._upload_blob(full_path, True, None, None)
+    assert token == "tok-1"
+    assert call_count["n"] == 1, "must reuse the cached token, not upload again"
+
+
 def test_push_never_treated_as_noop():
     # kernels push ALWAYS starts a run; no unchanged-content short circuit
     c, api = client()

@@ -13,10 +13,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+import requests
 from requests.exceptions import HTTPError
+
+from blendfleet.uploader import UploadError, upload_file
 
 # Status strings returned by ApiGetKernelSessionStatusResponse.status
 ACTIVE_STATES = {"queued", "running"}
+
+# Kaggle's own dataset-metadata files -- never data to upload as a blob.
+# Mirrors kaggle_api_extended.py's DATASET_METADATA_FILE/OLD_DATASET_METADATA_FILE
+# (dataset-metadata.json / datapackage.json), which upload_files() skips too.
+_METADATA_FILENAMES = {"dataset-metadata.json", "datapackage.json"}
 
 # Extensions Blender can be asked to write from the dashboard's Format combo
 # (PNG -> .png, JPEG -> .jpg). fetch_output() must look for all of them or a
@@ -82,6 +90,47 @@ def _raise_dataset_upload_error(action: str, e: HTTPError) -> None:
             "the render."
         ) from e
     raise KaggleError(f"{action} failed: {detail}") from e
+
+
+class _RequestsPutTransport:
+    """Real `blendfleet.uploader.Transport` backed by `requests`.
+
+    Satisfies the Transport protocol's duck-typed contract exactly:
+    `.put(url, data, headers)` plus a `.token` attribute. `token` is set
+    from the blob-upload-session start response (see `_start_blob_upload`
+    below) -- per uploader.py's own docstring, the real Kaggle blob token
+    lives there, never in the GCS PUT response body, so the transport
+    (which owns the session) is what has to carry it.
+
+    The `create_url` a session hands back is a presigned GCS resumable-
+    upload URL (confirmed live in docs/upload-concurrency-findings.md) --
+    no Authorization header is needed or added on the PUT itself.
+    """
+
+    def __init__(self, token: str):
+        self.token = token
+
+    def put(self, url: str, data, headers: dict):
+        return requests.put(url, data=data, headers=headers)
+
+
+def _start_blob_upload(sdk, path: Path, blob_type) -> tuple[str, str]:
+    """Open a real Kaggle/GCS resumable-upload session for `path`.
+
+    Mirrors kaggle_api_extended.py::_upload_blob's own call to
+    `kaggle.blobs.blob_api_client.start_blob_upload(ApiStartBlobUploadRequest)`
+    -- that response is where the session URL (`create_url`) and the blob
+    `token` actually come from. Returns (session_url, token).
+    """
+    from kagglesdk.blobs.types.blob_api_service import ApiStartBlobUploadRequest
+
+    request = ApiStartBlobUploadRequest()
+    request.type = blob_type
+    request.name = path.name
+    request.content_length = path.stat().st_size
+    request.last_modified_epoch_seconds = int(path.stat().st_mtime)
+    response = sdk.blobs.blob_api_client.start_blob_upload(request)
+    return response.create_url, response.token
 
 
 @dataclass
@@ -151,10 +200,20 @@ def _default_sdk_factory(token: str):
 class KaggleClient:
     def __init__(self, token: str,
                  api_factory: Callable = _default_api_factory,
-                 sdk_factory: Callable = _default_sdk_factory) -> None:
+                 sdk_factory: Callable = _default_sdk_factory,
+                 upload_blob_fn: Callable[[Path, Callable | None], str] | None = None
+                 ) -> None:
         self.token = token
         self._api_factory = api_factory
         self._sdk_factory = sdk_factory
+        # Injectable so tests never touch the network; production default
+        # is the real, reliable uploader (blendfleet.uploader.upload_file)
+        # instead of the kaggle package's own upload_files()/_upload_blob(),
+        # which silently drops a file and returns None when its retries run
+        # out (see blendfleet/uploader.py's module docstring). A test stub
+        # that raises UploadError, or one that returns a falsy token, must
+        # both be treated as "did not upload" by _preflight_upload below.
+        self._upload_blob_fn = upload_blob_fn or self._default_upload_blob
         self._api = None
 
     @property
@@ -162,6 +221,79 @@ class KaggleClient:
         if self._api is None:
             self._api = self._api_factory(self.token)
         return self._api
+
+    def _default_upload_blob(self, path: Path,
+                              on_progress: Callable | None = None) -> str:
+        """Real single-file upload: open a genuine blob-upload session
+        against Kaggle, then hand the PUT to blendfleet.uploader.upload_file
+        (retries with resume, raises UploadError instead of returning None).
+        """
+        from kagglesdk.blobs.types.blob_api_service import ApiBlobType
+
+        sdk = self._sdk_factory(self.token)
+        session_url, token = _start_blob_upload(sdk, path, ApiBlobType.DATASET)
+        transport = _RequestsPutTransport(token=token)
+        return upload_file(path, session_url, transport, on_progress=on_progress)
+
+    def _files_to_upload(self, folder: Path) -> list[Path]:
+        """Every real data file staged in `folder` -- everything except
+        Kaggle's own dataset-metadata files, which are never blobs."""
+        if not folder.exists():
+            return []
+        return sorted(p for p in folder.iterdir()
+                      if p.is_file() and p.name not in _METADATA_FILENAMES)
+
+    def _preflight_upload(self, folder: Path,
+                          on_progress: Callable | None) -> dict[str, str]:
+        """Upload every real file in `folder` reliably BEFORE any create/
+        version request is ever sent to Kaggle -- the second, independent
+        defence against the empty-file-list 400: even if the upload fails
+        in some way that doesn't raise (a stub/future implementation that
+        merely returns a falsy token), this refuses locally with a clear
+        message instead of letting a create/version call go out with
+        nothing attached. Returns {filename: token} so the caller can wire
+        the already-uploaded tokens into kaggle's own upload path instead
+        of uploading the same file a second time.
+        """
+        tokens: dict[str, str] = {}
+        for path in self._files_to_upload(folder):
+            try:
+                token = self._upload_blob_fn(path, on_progress)
+            except UploadError as e:
+                raise KaggleError(
+                    f"upload of {path.name} did not complete: {e} -- the "
+                    "file was not fully uploaded, so nothing was submitted "
+                    "to Kaggle. This usually means a slow or flaky "
+                    "connection; retry the render."
+                ) from e
+            if not token:
+                raise KaggleError(
+                    f"upload of {path.name} did not complete: no blob token "
+                    "was returned, so nothing was submitted to Kaggle. "
+                    "Retry the render."
+                )
+            tokens[path.name] = token
+        return tokens
+
+    def _patch_upload_blob(self, tokens: dict[str, str],
+                           on_progress: Callable | None) -> None:
+        """Replace the real KaggleApi's private `_upload_blob` with one that
+        returns the token we already obtained in `_preflight_upload`,
+        instead of letting kaggle's own dataset_create_new/dataset_create_
+        version re-upload the same file a second time over the network via
+        its flaky one-shot-retry path. A no-op on the fake API used by
+        tests (which never calls `_upload_blob` at all), and safe for any
+        file NOT already preflighted (falls back to the real reliable
+        uploader rather than kaggle's flaky one).
+        """
+        def reliable_upload_blob(full_path, quiet, blob_type, upload_context,
+                                 content_type=None):
+            name = Path(full_path).name
+            if name in tokens:
+                return tokens[name]
+            return self._upload_blob_fn(Path(full_path), on_progress)
+
+        self.api._upload_blob = reliable_upload_blob
 
     # ---------------- identity ----------------
     def whoami(self) -> str:
@@ -199,14 +331,22 @@ class KaggleClient:
         except Exception:
             return False
 
-    def dataset_create(self, folder: Path) -> None:
+    def dataset_create(self, folder: Path,
+                       on_progress: Callable | None = None) -> None:
+        folder = Path(folder)
+        tokens = self._preflight_upload(folder, on_progress)
+        self._patch_upload_blob(tokens, on_progress)
         try:
             self.api.dataset_create_new(folder=str(folder), dir_mode="skip",
                                         convert_to_csv=False, public=False)
         except HTTPError as e:
             _raise_dataset_upload_error("Dataset creation", e)
 
-    def dataset_version(self, folder: Path, message: str) -> None:
+    def dataset_version(self, folder: Path, message: str,
+                        on_progress: Callable | None = None) -> None:
+        folder = Path(folder)
+        tokens = self._preflight_upload(folder, on_progress)
+        self._patch_upload_blob(tokens, on_progress)
         try:
             self.api.dataset_create_version(folder=str(folder),
                                             version_notes=message,

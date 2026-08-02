@@ -18,8 +18,8 @@ class FakeClient:
 
     def whoami(self): return "user_" + self.token[-1]
     def dataset_exists(self, slug): return False
-    def dataset_create(self, folder): self.dataset_creates += 1
-    def dataset_version(self, folder, message): self.dataset_versions += 1
+    def dataset_create(self, folder, on_progress=None): self.dataset_creates += 1
+    def dataset_version(self, folder, message, on_progress=None): self.dataset_versions += 1
     def push_kernel(self, folder): self.pushed += 1
     def status(self, slug): return KernelStatus(state=self.state)
     def cancel(self, slug): self.cancelled.append(slug); return True
