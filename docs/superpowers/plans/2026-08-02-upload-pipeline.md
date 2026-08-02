@@ -1,5 +1,10 @@
 # Upload Pipeline Implementation Plan
 
+> **SUPERSEDED 2026-08-03 by `2026-08-03-upload-and-ui.md`.**
+> This plan claimed dataset sharing was impossible via the API. It is not --
+> proven live by adding and removing a collaborator on a private dataset.
+> Do not execute this plan.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make uploading a 63 MB `.blend` to Kaggle reliable, visible, and — where the user opts in — done once instead of once per account.
@@ -28,10 +33,14 @@
 | A dropped file yields `400 {"message":"Please upload at least one file"}` | captured live |
 | A real interrupted upload leaves `upload_complete: false` in the resumable cache | found on the user's disk for their 66,116,606-byte file |
 | Progress goes to `tqdm` on stdout — invisible in a `console=False` exe | `upload_complete()` |
-| **No collaborator/sharing RPC exists** in `DatasetApiService` | full RPC listing: create, version, delete, download, get, list, update-metadata, upload-file |
+| **Sharing IS automatable** — `ApiUpdateDatasetMetadataRequest.settings.collaborators` | proven live 2026-08-03: added `dansbecker` as READER to a private dataset, read it back, removed it |
+| `update_dataset_metadata` REPLACES the whole settings object | omitting `is_private` would silently make a project public; omitting licenses errors |
+| It returns `{"errors": [...]}` with HTTP 200 | success must be checked by reading that array, not the status code |
 | Resume offset is queried via `_resume_upload` before continuing | `upload_complete(resume=True)` |
 
-**Consequence:** chunking is not about parallelism within a file. Resumable protocols hand out sequential ranges. Chunking matters because it **bounds the retry unit** — an 8 MB chunk that fails costs 8 MB, not 63 — and because it is the only way to report real progress.
+**Consequence:** chunking bounds the retry unit — an 8 MB chunk that fails costs 8 MB, not 63 — and is the only way to report real progress. Whether chunks can also fly **concurrently** (the user's "highway with several lanes") depends on the endpoint accepting out-of-order ranges, which resumable protocols usually do not. **Task 0 settles that before anything is built on it.**
+
+**An earlier version of this plan stated that dataset sharing was impossible via API. That was wrong** — it was concluded from the RPC *names* without reading what the request bodies carry. Sharing is automatable, which removes the manual step and cuts a 3-friend job from 189 MB to 63 MB.
 
 ---
 
