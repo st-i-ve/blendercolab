@@ -236,12 +236,16 @@ class Dashboard(QMainWindow):
         if not d:
             return
         from blendfleet.collector import collect
-        fleet = self.fleet_factory(self.store.list())
-        st = fleet.load()
-        if st is None:
-            QMessageBox.information(self, "Nothing to collect", "No job found.")
+        try:
+            fleet = self.fleet_factory(self.store.list())
+            st = fleet.load()
+            if st is None:
+                QMessageBox.information(self, "Nothing to collect", "No job found.")
+                return
+            r = collect(st, self.store.list(), fleet.client_factory, Path(d))
+        except Exception as e:
+            QMessageBox.critical(self, "Collect failed", str(e))
             return
-        r = collect(st, self.store.list(), fleet.client_factory, Path(d))
         msg = f"Copied {r.copied} frame(s)."
         if r.missing_frames:
             msg += (f"\n\nSTILL MISSING {len(r.missing_frames)}: "
