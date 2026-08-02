@@ -324,9 +324,36 @@ class KaggleClient:
         """A missing or invisible dataset raises HTTPError 403, not 404 --
         Kaggle does not reveal whether a private dataset exists. Any failure
         is therefore treated as 'not usable by us', which is what callers mean.
+
+        Only reliable for a dataset THIS account owns (or has previously
+        interacted with) -- see dataset_reachable() below for why this must
+        NOT be used to check a collaborator's access to someone else's
+        dataset.
         """
         try:
             self.api.dataset_status(slug)
+            return True
+        except Exception:
+            return False
+
+    def dataset_reachable(self, slug: str) -> bool:
+        """True iff THIS account can actually read dataset `slug` right now
+        -- including when it is owned by someone else and shared via a
+        collaborator grant (Task 3).
+
+        Measured live: dataset_status() (what dataset_exists() uses) 404s
+        for a non-owner account regardless of whether that account has a
+        genuine READER grant -- it only ever reflects datasets the calling
+        account itself owns, so it is useless for checking "can my friend
+        reach the dataset I just shared with them". dataset_list_files(),
+        however, IS gated on real read access: confirmed live to 403 for a
+        friend with no grant and succeed once READER was granted (see
+        task-3-report.md). This is therefore the check used to verify
+        sharing actually took effect, not just that the grant call
+        returned cleanly.
+        """
+        try:
+            self.api.dataset_list_files(slug)
             return True
         except Exception:
             return False

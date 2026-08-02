@@ -50,9 +50,10 @@ class FakeApi:
     """Stands in for KaggleApi. Raises what the real API actually raises."""
 
     def __init__(self, status="COMPLETE", dataset_ok=True, kernels=None,
-                 create_error=None, version_error=None):
+                 create_error=None, version_error=None, list_files_ok=True):
         self._status = status
         self._dataset_ok = dataset_ok
+        self._list_files_ok = list_files_ok
         self._kernels = kernels if kernels is not None else [
             FakeKernel("stivestivewithani/remember-render")]
         self._create_error = create_error
@@ -83,6 +84,11 @@ class FakeApi:
             # the real API raises HTTPError 403 here, never a 404
             raise RuntimeError("403 Client Error: Forbidden for url: ...")
         return "ready"
+
+    def dataset_list_files(self, slug):
+        if not self._list_files_ok:
+            raise RuntimeError("403 Client Error: Forbidden for url: ...")
+        return {"datasetFiles": []}
 
     def dataset_create_new(self, folder, **kw):
         if self._create_error is not None:
@@ -166,6 +172,36 @@ def test_dataset_exists_true_when_status_returns():
 def test_dataset_exists_false_on_403_not_404():
     c, _ = client(dataset_ok=False)
     assert c.dataset_exists("me/x") is False
+
+
+# ------------------------------------------- dataset_reachable (Task 3) --
+# Live check (task-3-report.md) found dataset_status() 404s for a
+# non-owner account even with a genuine READER grant -- it only reflects
+# datasets the calling account owns. dataset_list_files() is the one that
+# is actually gated on real read access. dataset_reachable() must use
+# THAT, and must disagree with dataset_exists() in exactly the scenario
+# that was measured live: dataset_status() failing while the account can
+# really read the dataset.
+
+def test_dataset_reachable_true_when_list_files_succeeds():
+    c, _ = client(list_files_ok=True)
+    assert c.dataset_reachable("owner/x") is True
+
+
+def test_dataset_reachable_false_when_list_files_forbidden():
+    c, _ = client(list_files_ok=False)
+    assert c.dataset_reachable("owner/x") is False
+
+
+def test_dataset_reachable_disagrees_with_dataset_exists_for_a_shared_dataset():
+    """Reproduces the live finding: dataset_status() (dataset_exists) 404s
+    for a friend with a real grant, while dataset_list_files()
+    (dataset_reachable) correctly reflects that the grant works."""
+    c, _ = client(dataset_ok=False, list_files_ok=True)
+    assert c.dataset_exists("owner/x") is False, \
+        "dataset_status is owner-only -- must still fail here"
+    assert c.dataset_reachable("owner/x") is True, \
+        "dataset_list_files must correctly show the real grant works"
 
 
 def test_dataset_create_passes_skip_dir_mode_and_private(tmp_path):

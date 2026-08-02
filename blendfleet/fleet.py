@@ -1,10 +1,15 @@
 """Fleet orchestration: split frames across accounts and drive each one.
 
 Coordination is entirely client-side. Each account gets a DISJOINT stride of
-frames (via assignment.assign_frames) and its OWN dataset upload -- the
-Kaggle API has no way to add dataset collaborators, so N accounts means N
-uploads. Accounts never talk to each other; this module just fans work out
-and polls each one independently.
+frames (via assignment.assign_frames). Task 3 changed how the .blend gets to
+Kaggle: dataset sharing turned out to be automatable
+(ApiUpdateDatasetMetadataRequest.settings.collaborators, see
+blendfleet/sharing.py), so the FIRST account (accounts[0], "the owner")
+uploads the .blend exactly once, every other account's username is granted
+READER on that one dataset, and every worker's kernel references the
+owner's dataset slug -- N accounts no longer means N uploads. Accounts
+never talk to each other directly; this module just fans work out, grants
+access up front, and polls each account independently.
 """
 from __future__ import annotations
 
@@ -14,6 +19,7 @@ from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Callable
 
+from blendfleet import sharing
 from blendfleet.accounts import Account
 from blendfleet.assignment import assign_frames
 from blendfleet.dataset_sync import sync_blend
@@ -59,6 +65,17 @@ class FleetBusyError(RuntimeError):
     State is a single slot on disk, so launching over the top of a live job
     would orphan its kernels: nothing left on disk to cancel or collect them
     with, while they keep spending other people's GPU quota.
+    """
+
+
+class UnreachableAccountsError(RuntimeError):
+    """A friend was granted READER but still can't reach the dataset.
+
+    Raised BEFORE any kernel is pushed -- nothing has been started or spent
+    yet. Without this check, a friend whose grant didn't actually take
+    (propagation delay, a role that got silently dropped, etc.) would only
+    find out when their kernel fails at run time with an opaque "dataset not
+    found", long after their GPU quota started ticking.
     """
 
 
@@ -127,6 +144,51 @@ class Fleet:
         job_id = uuid.uuid4().hex[:8]
         buckets = assign_frames(start_frame, end_frame, len(self.accounts))
         stem = blend.stem.lower().replace("_", "-")
+        dataset_name = f"{stem}-blend"
+
+        # Resolve a client + username for every account up front: needed
+        # for the push loop below regardless, and for the grant/verify
+        # step that has to happen before it.
+        clients: dict[str, object] = {}
+        usernames: dict[str, str] = {}
+        for account in self.accounts:
+            client = self.client_factory(account.token)
+            clients[account.label] = client
+            usernames[account.label] = account.username or client.whoami()
+
+        owner = self.accounts[0]
+        owner_client = clients[owner.label]
+        owner_username = usernames[owner.label]
+        dataset_slug = f"{owner_username}/{dataset_name}"
+
+        # One upload, shared by every account (Task 3) -- dataset sharing is
+        # automatable, so N accounts no longer means N uploads.
+        sync_blend(owner_client, blend, dataset_slug,
+                   self.work_dir / "ds_owner")
+
+        friends = self.accounts[1:]
+        friend_usernames = [usernames[a.label] for a in friends]
+        if friend_usernames:
+            sdk = owner_client._sdk_factory(owner_client.token)
+            current = sharing.get_settings(sdk, owner_username, dataset_name)
+            sharing.grant_readers(sdk, owner_username, dataset_name,
+                                  friend_usernames, current)
+
+            # Verify access actually landed, not just that the write
+            # returned cleanly -- see UnreachableAccountsError. Deliberately
+            # dataset_reachable(), NOT dataset_exists(): dataset_exists()
+            # is built on dataset_status(), which was measured live to 404
+            # for a non-owner account even with a genuine READER grant (see
+            # task-3-report.md) -- it only reflects datasets an account
+            # owns, so it would refuse every shared launch here.
+            unreachable = [usernames[a.label] for a in friends
+                          if not clients[a.label].dataset_reachable(dataset_slug)]
+            if unreachable:
+                raise UnreachableAccountsError(
+                    "granted READER access but the dataset is still not "
+                    f"reachable for: {', '.join(unreachable)}. Nothing has "
+                    "been started -- retry once Kaggle's grant has "
+                    "propagated.")
 
         st = FleetState(job_id=job_id, blend_name=blend.name,
                         start_frame=start_frame, end_frame=end_frame,
@@ -138,16 +200,9 @@ class Fleet:
         # still leaves accounts 1 and 2 on disk, cancellable and collectable.
         try:
             for account, frames in zip(self.accounts, buckets):
-                client = self.client_factory(account.token)
-                username = account.username or client.whoami()
-
-                dataset_slug = f"{username}/{stem}-blend"
+                client = clients[account.label]
+                username = usernames[account.label]
                 kernel_slug = f"{username}/{stem}-render-{job_id}"
-
-                # Each account needs its OWN copy: the API cannot add dataset
-                # collaborators, so N accounts means N uploads.
-                sync_blend(client, blend, dataset_slug,
-                           self.work_dir / f"ds_{account.label}")
 
                 kern_dir = self.work_dir / f"kern_{account.label}"
                 build(frames, settings, dataset_slug, kern_dir, kernel_slug)

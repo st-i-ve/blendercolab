@@ -4,20 +4,61 @@ import blendfleet.platform_paths as pp
 from blendfleet.accounts import Account
 from blendfleet.kaggle_client import KernelStatus, Quota
 from blendfleet.notebook_builder import RenderSettings
-from blendfleet.fleet import Fleet, FleetBusyError, WorkerState
+from blendfleet.fleet import Fleet, FleetBusyError, UnreachableAccountsError, WorkerState
+
+
+class FakeDatasetApiClient:
+    """Stands in for sdk.datasets.dataset_api_client -- Task 3 sharing.
+    Constant, network-free responses: correctness of the sharing calls
+    THEMSELVES (traps 1 and 2, preserving collaborators) is covered by
+    tests/test_sharing.py; these fleet-level tests only care that
+    Fleet.launch calls out to it at the right time with the right accounts.
+    """
+
+    def __init__(self):
+        self.updated = []
+
+    def get_dataset_metadata(self, request):
+        class Info:
+            title = ""
+            licenses = []
+            collaborators = []
+
+        class Resp:
+            info = Info()
+        return Resp()
+
+    def update_dataset_metadata(self, request):
+        self.updated.append(request)
+
+        class Resp:
+            errors = []
+        return Resp()
+
+
+class FakeSdk:
+    def __init__(self):
+        self.datasets = type("D", (), {
+            "dataset_api_client": FakeDatasetApiClient()})()
 
 
 class FakeClient:
-    def __init__(self, token, state="running"):
+    def __init__(self, token, state="running", dataset_exists=True,
+                 dataset_reachable=True):
         self.token = token
         self.state = state
         self.pushed = 0
         self.cancelled = []
         self.dataset_creates = 0
         self.dataset_versions = 0
+        self._dataset_exists = dataset_exists
+        self._dataset_reachable = dataset_reachable
+        self.sdk = FakeSdk()
+        self._sdk_factory = lambda tok: self.sdk
 
     def whoami(self): return "user_" + self.token[-1]
-    def dataset_exists(self, slug): return False
+    def dataset_exists(self, slug): return self._dataset_exists
+    def dataset_reachable(self, slug): return self._dataset_reachable
     def dataset_create(self, folder, on_progress=None): self.dataset_creates += 1
     def dataset_version(self, folder, message, on_progress=None): self.dataset_versions += 1
     def push_kernel(self, folder): self.pushed += 1
@@ -60,17 +101,88 @@ def test_launch_pushes_one_kernel_per_account(blend, tmp_path):
     assert all(c.pushed == 1 for c in clients.values())
 
 
-def test_launch_uploads_dataset_once_per_account(blend, tmp_path):
-    """The Kaggle API cannot add dataset collaborators, so N accounts must
-    mean N separate uploads -- never one shared dataset."""
+def test_launch_uploads_dataset_exactly_once_for_n_accounts(blend, tmp_path):
+    """Task 3: dataset sharing is automatable, so N accounts must mean
+    exactly ONE upload total -- never one copy per account."""
     clients = {}
     def factory(tok):
         clients[tok] = FakeClient(tok); return clients[tok]
     f = Fleet(accounts(3), factory, tmp_path / "w")
     f.launch(blend, RenderSettings(1920, 1080, 128), 1, 9)
     assert len(clients) == 3
-    assert all(c.dataset_creates == 1 for c in clients.values())
-    assert all(c.dataset_versions == 0 for c in clients.values())
+    total_uploads = sum(c.dataset_creates + c.dataset_versions
+                        for c in clients.values())
+    assert total_uploads == 1
+
+
+def test_launch_uses_the_owner_slug_for_every_worker(blend, tmp_path):
+    """All kernels must reference the SAME (owner's) dataset -- that is the
+    entire point of sharing instead of uploading N copies."""
+    import json as _json
+
+    accts = accounts(3)
+    f = Fleet(accts, lambda t: FakeClient(t), tmp_path / "w")
+    f.launch(blend, RenderSettings(1920, 1080, 128), 1, 9)
+
+    owner_username = "user_" + accts[0].token[-1]
+    for account in accts:
+        meta = _json.loads(
+            (tmp_path / "w" / f"kern_{account.label}" /
+             "kernel-metadata.json").read_text())
+        assert meta["dataset_sources"] == [f"{owner_username}/remember-blend"]
+
+
+def test_launch_grants_every_friend_username_reader_in_one_call(blend, tmp_path):
+    accts = accounts(3)
+    clients = {}
+    def factory(tok):
+        clients[tok] = FakeClient(tok); return clients[tok]
+    f = Fleet(accts, factory, tmp_path / "w")
+    f.launch(blend, RenderSettings(1920, 1080, 128), 1, 9)
+
+    owner_client = clients[accts[0].token]
+    updated = owner_client.sdk.datasets.dataset_api_client.updated
+    assert len(updated) == 1, "exactly one grant call, not one per friend"
+    granted = {c.username for c in updated[0].settings.collaborators}
+    assert granted == {"user_" + accts[1].token[-1], "user_" + accts[2].token[-1]}
+    assert updated[0].settings.is_private is True
+    assert len(updated[0].settings.licenses) == 1
+
+
+def test_launch_skips_sharing_calls_for_a_single_account(blend, tmp_path):
+    """No friends -- grant/verify must never fire, and there's nothing to
+    check reachability for."""
+    clients = {}
+    def factory(tok):
+        clients[tok] = FakeClient(tok); return clients[tok]
+    f = Fleet(accounts(1), factory, tmp_path / "w")
+    f.launch(blend, RenderSettings(1920, 1080, 128), 1, 9)
+    only = next(iter(clients.values()))
+    assert only.sdk.datasets.dataset_api_client.updated == []
+
+
+def test_launch_refuses_when_a_friend_is_still_unreachable_after_grant(blend, tmp_path):
+    """A grant that returns cleanly but doesn't actually take (propagation
+    delay, silently dropped role, ...) must be caught before anything is
+    started -- not surfaced later as an opaque kernel failure."""
+    accts = accounts(3)
+    unreachable_token = accts[2].token
+    clients = {}
+
+    def factory(tok):
+        reachable = tok != unreachable_token
+        clients[tok] = FakeClient(tok, dataset_reachable=reachable)
+        return clients[tok]
+
+    f = Fleet(accts, factory, tmp_path / "w")
+    with pytest.raises(UnreachableAccountsError) as exc_info:
+        f.launch(blend, RenderSettings(1920, 1080, 128), 1, 9)
+
+    message = str(exc_info.value)
+    assert "user_" + unreachable_token[-1] in message
+    # nothing must have been started
+    assert all(c.pushed == 0 for c in clients.values())
+    assert f.load() is None
 
 
 def test_frames_are_disjoint_and_complete(blend, tmp_path):
