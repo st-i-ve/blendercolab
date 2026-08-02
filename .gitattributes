@@ -1,0 +1,13 @@
+# Shell scripts MUST keep LF endings. Git's autocrlf on Windows would
+# otherwise check them out with CRLF, and a CRLF shebang fails on Linux
+# with a confusing "bad interpreter: No such file or directory".
+*.sh text eol=lf
+
+# PowerShell is Windows-side; CRLF is fine and expected there.
+*.ps1 text eol=crlf
+
+# Binary assets must never be line-ending converted.
+*.png binary
+*.ico binary
+*.pdf binary
+*.blend binary

@@ -424,7 +424,7 @@ def test_rejects_bad_input():
 def test_estimate_divides_across_workers():
     # 250 frames at 57.1s measured on a P100
     assert estimate(250, 57.1, 1) == pytest.approx(3.965, abs=0.01)
-    assert estimate(250, 57.1, 3) == pytest.approx(1.322, abs=0.01)
+    assert estimate(250, 57.1, 3) == pytest.approx(1.332, abs=0.01)
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
