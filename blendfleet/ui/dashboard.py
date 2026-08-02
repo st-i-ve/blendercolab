@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
 
 from blendfleet.accounts import AccountStore
 from blendfleet.assignment import estimate
-from blendfleet.fleet import Fleet
+from blendfleet.fleet import Fleet, FleetBusyError
 from blendfleet.log_stream import stream_progress
 from blendfleet.notebook_builder import RenderSettings
 from blendfleet.ui.setup_dialog import SetupDialog
@@ -173,6 +173,8 @@ class Dashboard(QMainWindow):
             self._refresh_quota()
             self._render_table(st)
             self._start_progress_threads(st)
+        except FleetBusyError as e:
+            QMessageBox.warning(self, "Render already running", str(e))
         except Exception as e:
             QMessageBox.critical(self, "Launch failed", str(e))
         finally:
@@ -203,9 +205,31 @@ class Dashboard(QMainWindow):
                 QMessageBox.StandardButton.Yes:
             return
         try:
-            self.fleet_factory(self.store.list()).cancel_all()
+            results = self.fleet_factory(self.store.list()).cancel_all()
         except Exception as e:
             QMessageBox.warning(self, "Cancel failed", str(e))
+            return
+        results = list(results or [])
+        if not results:
+            QMessageBox.information(self, "Nothing to cancel",
+                                    "No job found to cancel.")
+            return
+        failed = [r for r in results if not r.ok]
+        if not failed:
+            QMessageBox.information(
+                self, "Cancelled",
+                f"Cancel requested for {len(results)} kernel(s).")
+            return
+        # A silent cancel failure is the worst outcome in the app: the user
+        # believes the render stopped while it keeps draining a friend's
+        # weekly GPU quota. Name every account that did not stop.
+        detail = "\n".join(f"• {r.label} ({r.kernel_slug}): {r.error}"
+                           for r in failed)
+        QMessageBox.warning(
+            self, "Cancel FAILED",
+            f"{len(failed)} of {len(results)} kernel(s) were NOT cancelled and "
+            f"may still be running:\n\n{detail}\n\n"
+            f"Stop them manually at kaggle.com → the notebook → Stop session.")
 
     def _collect(self) -> None:
         d = QFileDialog.getExistingDirectory(self, "Save frames to")

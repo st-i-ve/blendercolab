@@ -16,6 +16,12 @@ class CollectReport:
     per_worker: dict[str, int] = field(default_factory=dict)
 
 
+def _wipe(staging: Path) -> None:
+    """Remove a staging dir, tolerating a file another process still holds."""
+    if staging.exists():
+        shutil.rmtree(staging, ignore_errors=True)
+
+
 def collect(fleet_state, accounts, client_factory: Callable,
             dest: Path) -> CollectReport:
     """Pull every worker's output into one folder, renamed by real frame number.
@@ -36,21 +42,33 @@ def collect(fleet_state, accounts, client_factory: Callable,
             continue
         client = client_factory(acct.token)
         staging = dest / f".raw_{w.label}"
-        files = client.fetch_output(w.kernel_slug, staging)
+        # Staging must start empty. Left-over frames from an EARLIER job
+        # collected into this same folder would be re-globbed into `found`
+        # and silently subtracted from missing_frames -- exactly inverting
+        # the guarantee this function makes.
+        _wipe(staging)
+        try:
+            files = client.fetch_output(w.kernel_slug, staging)
 
-        n = 0
-        for src in sorted(files):
-            m = FRAME_RE.search(src.name)
-            if not m:
-                continue
-            frame = int(m.group(1))
-            is_new = frame not in found
-            shutil.copy(src, dest / f"{stem}_{frame:04d}.png")
-            found.add(frame)
-            if is_new:
-                n += 1
-                report.copied += 1
-        report.per_worker[w.label] = n
+            n = 0
+            for src in sorted(files):
+                m = FRAME_RE.search(src.name)
+                if not m:
+                    continue
+                frame = int(m.group(1))
+                is_new = frame not in found
+                # Keep the source extension: the render format is a user
+                # choice (PNG or JPEG) and a .jpg renamed to .png is a
+                # corrupt file, not a converted one.
+                suffix = src.suffix.lower()
+                shutil.copy(src, dest / f"{stem}_{frame:04d}{suffix}")
+                found.add(frame)
+                if is_new:
+                    n += 1
+                    report.copied += 1
+            report.per_worker[w.label] = n
+        finally:
+            _wipe(staging)
 
     expected = range(fleet_state.start_frame, fleet_state.end_frame + 1)
     report.missing_frames = sorted(f for f in expected if f not in found)

@@ -189,3 +189,46 @@ def test_fetch_output_returns_pngs(tmp_path):
     c, _ = client()
     got = c.fetch_output("x/y", tmp_path / "out")
     assert [p.name for p in got] == ["f_0001.png"]
+
+
+def test_fetch_output_returns_jpegs_too(tmp_path):
+    """The dashboard offers JPEG; globbing *.png only made that a dead
+    option that quietly collected zero frames."""
+    class JpegApi(FakeApi):
+        def kernels_output(self, slug, path):
+            Path(path).mkdir(parents=True, exist_ok=True)
+            (Path(path) / "f_0001.jpg").write_bytes(b"JPG")
+            (Path(path) / "f_0002.jpeg").write_bytes(b"JPG")
+            (Path(path) / "notes.txt").write_bytes(b"ignore me")
+
+    c, _ = client(api=JpegApi())
+    got = c.fetch_output("x/y", tmp_path / "out")
+    assert [p.name for p in got] == ["f_0001.jpg", "f_0002.jpeg"]
+
+
+def test_sdk_factory_passes_the_token_instead_of_setting_the_environment():
+    """CRITICAL C2: kagglesdk.KaggleClient accepts api_token=, so nothing
+    here may write the process-global KAGGLE_API_TOKEN."""
+    import os
+    import kagglesdk
+    from blendfleet.kaggle_client import ENV_TOKEN, _default_sdk_factory
+
+    seen = {}
+
+    class Recorder:
+        def __init__(self, api_token=None, **kw):
+            seen["api_token"] = api_token
+            seen["env"] = os.environ.get(ENV_TOKEN)
+
+    original = kagglesdk.KaggleClient
+    kagglesdk.KaggleClient = Recorder
+    prior = os.environ.pop(ENV_TOKEN, None)
+    try:
+        _default_sdk_factory(TOKEN)
+    finally:
+        kagglesdk.KaggleClient = original
+        if prior is not None:
+            os.environ[ENV_TOKEN] = prior
+
+    assert seen["api_token"] == TOKEN
+    assert seen["env"] is None

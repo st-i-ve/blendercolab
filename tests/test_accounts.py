@@ -31,6 +31,31 @@ def test_rejects_duplicate_token():
         s.add(Account(label="other", token=VALID))
 
 
+def test_rejects_duplicate_label():
+    """The label -- not the token -- is the join key used by fleet.poll(),
+    cancel_all(), collect() and the dashboard. Two accounts sharing one
+    label means a worker driven with the wrong person's token."""
+    s = AccountStore()
+    s.add(Account(label="me", token=VALID))
+    with pytest.raises(ValueError, match="label"):
+        s.add(Account(label="me", token="KGAT_" + "b" * 32))
+    assert len(s.list()) == 1
+
+
+def test_duplicate_label_error_names_the_label():
+    s = AccountStore()
+    s.add(Account(label="james", token=VALID))
+    with pytest.raises(ValueError, match="james"):
+        s.add(Account(label="james", token="KGAT_" + "c" * 32))
+
+
+def test_different_labels_are_fine():
+    s = AccountStore()
+    s.add(Account(label="me", token=VALID))
+    s.add(Account(label="friend", token="KGAT_" + "b" * 32))
+    assert [a.label for a in s.list()] == ["me", "friend"]
+
+
 def test_roundtrips_through_disk():
     s = AccountStore()
     s.add(Account(label="me", token=VALID, username="stivestivewithani"))

@@ -8,12 +8,29 @@ goes through KaggleApi / kagglesdk instead.
 from __future__ import annotations
 
 import os
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 # Status strings returned by ApiGetKernelSessionStatusResponse.status
 ACTIVE_STATES = {"queued", "running"}
+
+# Extensions Blender can be asked to write from the dashboard's Format combo
+# (PNG -> .png, JPEG -> .jpg). fetch_output() must look for all of them or a
+# JPEG render silently collects zero frames.
+IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg")
+
+ENV_TOKEN = "KAGGLE_API_TOKEN"
+
+# Guards the ONLY remaining set-environment-then-construct sequence in the
+# app (_default_api_factory). kaggle's KaggleApi has no api_token= parameter:
+# authenticate() reads os.environ, and it does a network round trip
+# (_introspect_token) between the read and the credential landing on the
+# instance. Two threads racing through that window authenticate as each
+# other. Everything else passes api_token= explicitly and never touches
+# os.environ at all.
+_ENV_TOKEN_LOCK = threading.Lock()
 
 
 class KaggleError(Exception):
@@ -40,18 +57,48 @@ class Quota:
                             # been observed to disagree with this figure.
 
 
+def _with_env_token(token: str, construct: Callable):
+    """Run `construct()` with KAGGLE_API_TOKEN set to `token`, serialized.
+
+    Last resort, used only where the library gives us no way to pass a token
+    in. The lock is held across the whole set-construct-restore sequence so
+    the global can never be observed by another thread holding a different
+    token, and the previous value is restored afterwards so the token does
+    not linger process-wide (child processes, crash dumps).
+    """
+    with _ENV_TOKEN_LOCK:
+        previous = os.environ.get(ENV_TOKEN)
+        os.environ[ENV_TOKEN] = token
+        try:
+            return construct()
+        finally:
+            if previous is None:
+                os.environ.pop(ENV_TOKEN, None)
+            else:
+                os.environ[ENV_TOKEN] = previous
+
+
 def _default_api_factory(token: str):
-    os.environ["KAGGLE_API_TOKEN"] = token
+    """KaggleApi takes no api_token argument (checked against the installed
+    kaggle package): authenticate() reads the environment. Lock-guarded.
+    After authenticate() the token lives on api.config_values, so every later
+    call on that instance is bound to this account regardless of the global.
+    """
     from kaggle.api.kaggle_api_extended import KaggleApi
-    api = KaggleApi()
-    api.authenticate()
-    return api
+
+    def construct():
+        api = KaggleApi()
+        api.authenticate()
+        return api
+
+    return _with_env_token(token, construct)
 
 
 def _default_sdk_factory(token: str):
-    os.environ["KAGGLE_API_TOKEN"] = token
+    """Env-free: kagglesdk.KaggleClient accepts api_token= and only falls
+    back to os.environ when it is None (kaggle_http_client.py:268)."""
     from kagglesdk import KaggleClient as SdkClient
-    return SdkClient()
+    return SdkClient(api_token=token)
 
 
 class KaggleClient:
@@ -138,7 +185,12 @@ class KaggleClient:
 
     def cancel(self, slug: str) -> bool:
         """The CLI has no cancel subcommand, which is why this is widely
-        believed impossible. The SDK exposes the RPC."""
+        believed impossible. The SDK exposes the RPC.
+
+        Returns False rather than raising, but the caller MUST report that:
+        a cancel that quietly failed leaves somebody else's GPU quota
+        draining. fleet.cancel_all() turns this into a per-account result.
+        """
         try:
             from kagglesdk.kernels.types.kernels_api_service import (
                 ApiCancelKernelSessionRequest)
@@ -152,7 +204,13 @@ class KaggleClient:
             return False
 
     def fetch_output(self, slug: str, dest: Path) -> list[Path]:
+        """Return every rendered image, whatever format was selected.
+
+        Globbing *.png only made the dashboard's JPEG option a dead setting:
+        Blender wrote .jpg and collect() then reported every frame missing.
+        """
         dest = Path(dest)
         dest.mkdir(parents=True, exist_ok=True)
         self.api.kernels_output(slug, path=str(dest))
-        return sorted(dest.rglob("*.png"))
+        return sorted(p for p in dest.rglob("*")
+                      if p.suffix.lower() in IMAGE_SUFFIXES)

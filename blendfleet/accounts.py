@@ -35,6 +35,16 @@ class AccountStore:
             )
         if any(a.token == account.token for a in self._accounts):
             raise ValueError("that token is already registered")
+        # The label -- not the token -- is the join key used by fleet.poll(),
+        # fleet.cancel_all(), collector.collect() and the dashboard table.
+        # Two accounts sharing a label means one worker gets driven with the
+        # wrong account's token: polled, cancelled and collected against
+        # somebody else's kernel.
+        if any(a.label == account.label for a in self._accounts):
+            raise ValueError(
+                f"the label {account.label!r} is already in use. Labels must be "
+                "unique: they are how each render worker is matched back to "
+                "its account.")
         self._accounts.append(account)
 
     def remove(self, label: str) -> None:

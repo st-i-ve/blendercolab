@@ -7,7 +7,6 @@ kernel completes, so neither can drive a live progress bar.
 from __future__ import annotations
 
 import json
-import os
 import re
 import threading
 from typing import Callable
@@ -43,8 +42,15 @@ def parse_progress(line: str) -> tuple[int, int] | None:
 def stream_progress(token: str, user_name: str, kernel_slug: str,
                     on_progress: Callable[[int, int], None],
                     stop_event: threading.Event | None = None) -> None:
-    """Block, calling on_progress(done, total) as lines arrive."""
-    os.environ["KAGGLE_API_TOKEN"] = token
+    """Block, calling on_progress(done, total) as lines arrive.
+
+    The token is passed to KaggleClient explicitly and NEVER through
+    os.environ: the dashboard starts one of these threads per account
+    back-to-back, and a process-global written here was read back after an
+    import plus an HTTPS client construction -- long enough that most
+    threads authenticated with another account's token and then asked for a
+    private log stream they had no right to.
+    """
     from kagglesdk import KaggleClient
     from kagglesdk.kernels.types.kernels_api_service import (
         ApiGetKernelSessionLogsStreamRequest)
@@ -54,7 +60,8 @@ def stream_progress(token: str, user_name: str, kernel_slug: str,
     req.kernel_slug = kernel_slug
     req.wait_for_logs_url_seconds = 30
 
-    resp = KaggleClient().kernels.kernels_api_client.get_kernel_session_logs_stream(req)
+    client = KaggleClient(api_token=token)
+    resp = client.kernels.kernels_api_client.get_kernel_session_logs_stream(req)
     for raw in resp.iter_lines(decode_unicode=True):
         if stop_event is not None and stop_event.is_set():
             return
