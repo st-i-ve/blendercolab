@@ -44,11 +44,13 @@ def collect(fleet_state, accounts, client_factory: Callable,
             if not m:
                 continue
             frame = int(m.group(1))
+            is_new = frame not in found
             shutil.copy(src, dest / f"{stem}_{frame:04d}.png")
             found.add(frame)
-            n += 1
+            if is_new:
+                n += 1
+                report.copied += 1
         report.per_worker[w.label] = n
-        report.copied += n
 
     expected = range(fleet_state.start_frame, fleet_state.end_frame + 1)
     report.missing_frames = sorted(f for f in expected if f not in found)
