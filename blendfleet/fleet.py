@@ -122,5 +122,12 @@ class Fleet:
         by_label = {a.label: a for a in self.accounts}
         for w in st.workers:
             acct = by_label.get(w.label)
-            if acct:
+            if not acct:
+                continue
+            try:
                 self.client_factory(acct.token).cancel(w.kernel_slug)
+            except Exception:
+                # One account's factory/cancel failing must not strand the
+                # rest -- an uncancelled kernel keeps burning GPU quota for
+                # hours, so every other worker still gets its shot.
+                continue
