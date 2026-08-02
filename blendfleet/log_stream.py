@@ -17,6 +17,16 @@ from typing import Callable
 # The `.*?` bridges the ok=/secs= fields between frame= and done=.
 PROGRESS_RE = re.compile(r"PROGRESS frame=(\d+) .*?done=(\d+)/(\d+)")
 
+# blendfleet/notebook_builder.py's background telemetry thread prints exactly:
+#   f"TELEMETRY gpu={idx} util={util} mem_used={mem_used} "
+#   f"mem_total={mem_total} temp={temp} power={power_val}"
+# One line per physical GPU -- never aggregated. power_val is "NA" when
+# nvidia-smi reports power.draw as "[N/A]" (some cards don't expose it).
+TELEMETRY_RE = re.compile(
+    r"TELEMETRY gpu=(\d+) util=(\d+) mem_used=(\d+) mem_total=(\d+) "
+    r"temp=(\d+) power=(NA|[\d.]+)"
+)
+
 
 def is_end_of_log(line: str) -> bool:
     return "END_OF_LOG" in line
@@ -37,6 +47,37 @@ def parse_progress(line: str) -> tuple[int, int] | None:
     if not m:
         return None
     return int(m.group(2)), int(m.group(3))
+
+
+def parse_telemetry(line: str) -> dict | None:
+    """Return a per-GPU telemetry record from one SSE line, or None.
+
+    Never aggregates: each GPU's TELEMETRY line yields its own record, keyed
+    by "gpu" (the physical GPU index), so two GPUs reporting independently
+    produce two independent dicts.
+    """
+    if not line.startswith("data:"):
+        return None
+    payload = line[len("data:"):].strip()
+    try:
+        obj = json.loads(payload)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if obj.get("stream_name") != "stdout":
+        return None
+    m = TELEMETRY_RE.search(obj.get("data", ""))
+    if not m:
+        return None
+    power_raw = m.group(6)
+    power = None if power_raw == "NA" else float(power_raw)
+    return {
+        "gpu": int(m.group(1)),
+        "util": int(m.group(2)),
+        "mem_used": int(m.group(3)),
+        "mem_total": int(m.group(4)),
+        "temp": int(m.group(5)),
+        "power": power,
+    }
 
 
 def stream_progress(token: str, user_name: str, kernel_slug: str,
