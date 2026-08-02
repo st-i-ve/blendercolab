@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, QUrl
@@ -12,6 +13,7 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
 from blendfleet.accounts import AccountStore
 from blendfleet.assignment import estimate
 from blendfleet.fleet import Fleet
+from blendfleet.log_stream import stream_progress
 from blendfleet.notebook_builder import RenderSettings
 from blendfleet.ui.setup_dialog import SetupDialog
 
@@ -25,6 +27,13 @@ class Dashboard(QMainWindow):
         self.store = store
         self.fleet_factory = fleet_factory
         self.blend: Path | None = None
+        self._stop = threading.Event()
+        # Keyed by kernel_slug (stable across polls) rather than kept on the
+        # WorkerState instance: fleet.poll() rebuilds fresh WorkerState
+        # objects from disk every timer tick, which would otherwise orphan
+        # the objects the SSE threads are mutating and reset progress to 0
+        # on the very next poll.
+        self._live_progress: dict[str, int] = {}
         self.setWindowTitle("BlendFleet")
         self.resize(900, 620)
 
@@ -133,10 +142,30 @@ class Dashboard(QMainWindow):
             st = fleet.launch(self.blend, settings,
                               self.start.value(), self.end.value())
             self._render_table(st)
+            self._start_progress_threads(st)
         except Exception as e:
             QMessageBox.critical(self, "Launch failed", str(e))
         finally:
             self.render_btn.setEnabled(True)
+
+    def _start_progress_threads(self, st) -> None:
+        """One daemon thread per worker, reading its SSE log stream live.
+        `kernels logs`/`kernels output` return nothing until COMPLETE
+        (verified 2026-07-31), so this is the only source of live progress.
+        """
+        self._live_progress.clear()
+        for acct, w in zip(self.store.list(), st.workers):
+            def run(acct=acct, w=w):
+                def bump(done, total):
+                    w.frames_done = done
+                    self._live_progress[w.kernel_slug] = done
+                try:
+                    stream_progress(acct.token, w.username,
+                                    w.kernel_slug.split("/", 1)[1], bump,
+                                    self._stop)
+                except Exception:
+                    pass  # a dead stream must never kill the render or the UI
+            threading.Thread(target=run, daemon=True).start()
 
     def _cancel(self) -> None:
         if QMessageBox.question(self, "Cancel all",
@@ -186,5 +215,14 @@ class Dashboard(QMainWindow):
             self.table.setItem(i, 3, QTableWidgetItem(w.state))
             bar = QProgressBar()
             bar.setMaximum(max(len(w.frames), 1))
-            bar.setValue(w.frames_done)
+            # w.frames_done reflects only what was persisted to disk; a
+            # freshly-loaded WorkerState from fleet.poll() starts at 0 even
+            # while the SSE thread is live-updating a separate instance, so
+            # the dashboard-level cache is the authoritative live value.
+            bar.setValue(max(self._live_progress.get(w.kernel_slug, 0),
+                             w.frames_done))
             self.table.setCellWidget(i, 4, bar)
+
+    def closeEvent(self, event) -> None:
+        self._stop.set()
+        super().closeEvent(event)
