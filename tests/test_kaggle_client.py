@@ -1,11 +1,38 @@
 import datetime as _dt
+import json
 from pathlib import Path
 
 import pytest
+from requests.exceptions import HTTPError
 
 from blendfleet.kaggle_client import KaggleClient, KaggleError
 
 TOKEN = "KGAT_" + "a" * 32
+
+
+class FakeResponse:
+    """Stands in for requests.Response: only .json()/.text are used."""
+
+    def __init__(self, status_code: int, body: dict):
+        self.status_code = status_code
+        self._body = body
+        self.text = json.dumps(body)
+
+    def json(self):
+        return self._body
+
+
+def make_http_error(status_code: int, message: str) -> HTTPError:
+    """Build an HTTPError shaped like the real Kaggle API's 400 responses:
+    {"error": {"code": ..., "message": ..., "status": "INVALID_ARGUMENT"}}."""
+    resp = FakeResponse(status_code, {
+        "error": {"code": status_code, "message": message,
+                  "status": "INVALID_ARGUMENT"}})
+    e = HTTPError(f"{status_code} Client Error: Bad Request for url: "
+                  "https://api.kaggle.com/v1/datasets.DatasetApiService/"
+                  "CreateDatasetVersion")
+    e.response = resp
+    return e
 
 
 class FakeKernel:
@@ -22,11 +49,14 @@ class FakeStatus:
 class FakeApi:
     """Stands in for KaggleApi. Raises what the real API actually raises."""
 
-    def __init__(self, status="COMPLETE", dataset_ok=True, kernels=None):
+    def __init__(self, status="COMPLETE", dataset_ok=True, kernels=None,
+                 create_error=None, version_error=None):
         self._status = status
         self._dataset_ok = dataset_ok
         self._kernels = kernels if kernels is not None else [
             FakeKernel("stivestivewithani/remember-render")]
+        self._create_error = create_error
+        self._version_error = version_error
         self.pushed = []
         self.created = []
         self.versioned = []
@@ -55,9 +85,13 @@ class FakeApi:
         return "ready"
 
     def dataset_create_new(self, folder, **kw):
+        if self._create_error is not None:
+            raise self._create_error
         self.created.append((folder, kw))
 
     def dataset_create_version(self, folder, version_notes, **kw):
+        if self._version_error is not None:
+            raise self._version_error
         self.versioned.append((folder, version_notes, kw))
 
 
@@ -152,6 +186,45 @@ def test_dataset_version_passes_skip_dir_mode(tmp_path):
     folder, version_notes, kw = api.versioned[0]
     assert kw["dir_mode"] == "skip", "dir_mode zip nests payload, breaks /kaggle/input"
     assert version_notes == "my message"
+
+
+def test_dataset_version_no_file_400_raises_actionable_kaggle_error(tmp_path):
+    """Reproduces the real bug: kaggle's upload_files() exhausts its retry
+    budget on a file that fails to upload and silently proceeds without it,
+    so Kaggle 400s CreateDatasetVersion with "Please upload at least one
+    file". A bare HTTPError reads like a metadata bug; this must surface as
+    an actionable message about the upload, not the raw status line."""
+    error = make_http_error(400, "Please upload at least one file")
+    c, api = client(version_error=error)
+    with pytest.raises(KaggleError) as exc_info:
+        c.dataset_version(tmp_path, "update x.blend")
+    message = str(exc_info.value)
+    assert "did not finish uploading" in message
+    assert "retry the render" in message.lower()
+    assert "Please upload at least one file" in message
+    # the original HTTPError must still be reachable for diagnostics
+    assert isinstance(exc_info.value.__cause__, HTTPError)
+
+
+def test_dataset_create_no_file_400_raises_actionable_kaggle_error(tmp_path):
+    error = make_http_error(400, "Please upload at least one file")
+    c, api = client(create_error=error)
+    with pytest.raises(KaggleError) as exc_info:
+        c.dataset_create(tmp_path)
+    assert "did not finish uploading" in str(exc_info.value)
+
+
+def test_dataset_version_other_400_surfaces_real_message(tmp_path):
+    """A different 400 must not be mislabeled as an upload failure -- the
+    actual Kaggle message must reach the caller instead of the generic
+    status line OR the unrelated upload-failure hint."""
+    error = make_http_error(400, "Invalid dataset slug")
+    c, api = client(version_error=error)
+    with pytest.raises(KaggleError) as exc_info:
+        c.dataset_version(tmp_path, "update x.blend")
+    message = str(exc_info.value)
+    assert "Invalid dataset slug" in message
+    assert "did not finish uploading" not in message
 
 
 def test_push_never_treated_as_noop():

@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from requests.exceptions import HTTPError
+
 # Status strings returned by ApiGetKernelSessionStatusResponse.status
 ACTIVE_STATES = {"queued", "running"}
 
@@ -35,6 +37,51 @@ _ENV_TOKEN_LOCK = threading.Lock()
 
 class KaggleError(Exception):
     """A Kaggle call failed."""
+
+
+def _dataset_error_detail(e: HTTPError) -> str:
+    """Pull the actual reason out of an HTTPError from the dataset API.
+
+    requests' HTTPError.__str__ is just the status line ("400 Client Error:
+    Bad Request for url: ..."); the useful part -- Kaggle's JSON body, e.g.
+    {"error": {"message": "Please upload at least one file", ...}} -- is on
+    .response and never reaches the user otherwise.
+    """
+    resp = getattr(e, "response", None)
+    if resp is None:
+        return str(e)
+    try:
+        body = resp.json()
+        message = body.get("error", {}).get("message")
+        if message:
+            return message
+    except (ValueError, AttributeError):
+        pass
+    text = getattr(resp, "text", "") or ""
+    return text.strip() or str(e)
+
+
+def _raise_dataset_upload_error(action: str, e: HTTPError) -> None:
+    """Turn a raw dataset-upload HTTPError into an actionable KaggleError.
+
+    A file that fails to upload (flaky/slow connection, common with a large
+    .blend) does NOT raise on its own: the kaggle package's upload_files()
+    exhausts its internal retry budget and silently drops the file rather
+    than raising, then still submits the create/version call with no file
+    attached. Kaggle correctly 400s that with "Please upload at least one
+    file" -- but surfaced as a bare HTTPError this reads like a metadata or
+    API-usage bug rather than what it actually is: the upload never landed.
+    """
+    detail = _dataset_error_detail(e)
+    if "upload at least one file" in detail.lower():
+        raise KaggleError(
+            f"{action} failed: the .blend file did not finish uploading to "
+            "Kaggle, so the request was submitted with no file attached "
+            "(Kaggle said: \"" + detail + "\"). This usually means the "
+            "upload was interrupted by a slow or flaky connection -- retry "
+            "the render."
+        ) from e
+    raise KaggleError(f"{action} failed: {detail}") from e
 
 
 @dataclass
@@ -153,14 +200,20 @@ class KaggleClient:
             return False
 
     def dataset_create(self, folder: Path) -> None:
-        self.api.dataset_create_new(folder=str(folder), dir_mode="skip",
-                                    convert_to_csv=False, public=False)
+        try:
+            self.api.dataset_create_new(folder=str(folder), dir_mode="skip",
+                                        convert_to_csv=False, public=False)
+        except HTTPError as e:
+            _raise_dataset_upload_error("Dataset creation", e)
 
     def dataset_version(self, folder: Path, message: str) -> None:
-        self.api.dataset_create_version(folder=str(folder),
-                                        version_notes=message,
-                                        dir_mode="skip", convert_to_csv=False,
-                                        delete_old_versions=False)
+        try:
+            self.api.dataset_create_version(folder=str(folder),
+                                            version_notes=message,
+                                            dir_mode="skip", convert_to_csv=False,
+                                            delete_old_versions=False)
+        except HTTPError as e:
+            _raise_dataset_upload_error("Dataset versioning", e)
 
     # ---------------- kernels ----------------
     def push_kernel(self, folder: Path) -> None:
