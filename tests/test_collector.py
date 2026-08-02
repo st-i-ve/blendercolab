@@ -144,6 +144,26 @@ def test_staging_is_cleaned_up_even_when_a_fetch_raises(tmp_path):
     assert not list(out.glob(".raw_*"))
 
 
+def test_unclearable_staging_fails_loudly_rather_than_under_reporting(tmp_path,
+                                                                     monkeypatch):
+    """If the stale staging folder cannot be removed (locked file), collect
+    must raise -- not quietly count last job's frames as this job's."""
+    import blendfleet.collector as collector_mod
+
+    out = tmp_path / "out"
+    stale = out / ".raw_a0"
+    stale.mkdir(parents=True)
+    (stale / "f_0001.png").write_bytes(b"PNG")
+    monkeypatch.setattr(collector_mod.shutil, "rmtree",
+                        lambda *a, **k: None)   # rmtree silently does nothing
+
+    def factory(tok):
+        return FakeClient(tok, [])
+
+    with pytest.raises(RuntimeError, match="staging"):
+        collect(state(), accts(), factory, out)
+
+
 def test_collects_jpeg_frames_keeping_the_extension(tmp_path):
     """IMPORTANT 1: JPEG is a real option in the dashboard. Renaming a .jpg
     to .png would produce a corrupt file, not a converted one."""

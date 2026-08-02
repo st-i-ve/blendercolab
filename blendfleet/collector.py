@@ -47,6 +47,15 @@ def collect(fleet_state, accounts, client_factory: Callable,
         # and silently subtracted from missing_frames -- exactly inverting
         # the guarantee this function makes.
         _wipe(staging)
+        if staging.exists():
+            # rmtree is best-effort (a locked file on Windows). If the old
+            # frames are still there, FAIL LOUDLY: silently under-reporting
+            # missing frames is the one outcome this function exists to
+            # prevent.
+            raise RuntimeError(
+                f"could not clear stale staging folder {staging}. Delete it "
+                f"and collect again -- leaving it would make this report "
+                f"claim frames were rendered when they were not.")
         try:
             files = client.fetch_output(w.kernel_slug, staging)
 

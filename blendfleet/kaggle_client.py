@@ -213,4 +213,4 @@ class KaggleClient:
         dest.mkdir(parents=True, exist_ok=True)
         self.api.kernels_output(slug, path=str(dest))
         return sorted(p for p in dest.rglob("*")
-                      if p.suffix.lower() in IMAGE_SUFFIXES)
+                      if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES)
