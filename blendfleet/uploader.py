@@ -70,11 +70,27 @@ class UploadProgress:
     """One tick of upload progress, reported via `on_progress`.
 
     `uploaded` and `total` are absolute byte offsets into the whole file
-    (not relative to the current attempt), so `uploaded` always ends
-    exactly at `total` on success regardless of how many retries or
-    resumes happened along the way. `resumed_from` is 0 on a fresh
-    (non-resumed) attempt and the server's committed offset once a retry
-    has resumed past a failure, so a UI can say "resumed from 12 MB".
+    (not relative to the current attempt). `uploaded` is a **high-water
+    mark**: it never decreases across the whole upload, including across
+    a resume, and always ends exactly at `total` on success.
+
+    This matters because `uploaded` is driven by bytes locally handed to
+    the transport (`read()` calls), not by bytes the server has actually
+    committed -- a real socket hands data to the OS/TCP buffer well ahead
+    of what GCS acknowledges. So a failed attempt can have locally read
+    (and reported) further than the server's `committed_offset` turns out
+    to be; the resumed attempt then starts back at that lower committed
+    offset and re-reads bytes already reported once. Rather than let the
+    UI-visible number jump backwards (indistinguishable from the upload
+    losing progress), those re-read bytes are reported as a clamp at the
+    previous high-water mark -- the bar holds steady instead of rewinding,
+    then advances again once local reads pass the earlier mark. This can
+    make `uploaded` momentarily lag behind what was truly re-sent on the
+    wire, but it is never allowed to go down.
+
+    `resumed_from` is 0 on a fresh (non-resumed) attempt and the server's
+    committed offset once a retry has resumed past a failure, so a UI can
+    say "resumed from 12 MB".
     """
 
     uploaded: int
@@ -118,20 +134,46 @@ def _status_of(response) -> int | None:
     return getattr(response, "status_code", None)
 
 
+class _ProgressReporter:
+    """Turns per-attempt local `uploaded` values into the high-water-mark
+    sequence documented on `UploadProgress`: shared across every attempt
+    of one `upload_file` call (unlike `_InstrumentedReader`, which is
+    recreated per attempt), so it can remember the best value seen so far
+    even after a failed attempt is torn down and a resumed one starts
+    reading from a lower, server-committed offset.
+    """
+
+    def __init__(self, on_progress: Callable[[UploadProgress], None] | None):
+        self._on_progress = on_progress
+        self.high_water = 0
+
+    def report(self, local_uploaded: int, total: int, rate_bps: float,
+               retries: int, resumed_from: int) -> None:
+        if self._on_progress is None:
+            return
+        # Clamp: never emit less than the best value already shown, even
+        # though a resumed attempt's local reads legitimately start lower.
+        reported = max(local_uploaded, self.high_water)
+        self.high_water = reported
+        self._on_progress(UploadProgress(
+            uploaded=reported, total=total, rate_bps=rate_bps,
+            retries=retries, resumed_from=resumed_from))
+
+
 class _InstrumentedReader:
     """Wraps an open file positioned at `start`, calling `on_progress`
-    every `progress_interval` bytes actually read (not scheduled -- read),
-    so progress reflects bytes genuinely handed to the transport. This is
-    how progress is reported without splitting the PUT into chunks.
+    (via `reporter`) every `progress_interval` bytes actually read (not
+    scheduled -- read), so progress reflects bytes genuinely handed to the
+    transport. This is how progress is reported without splitting the PUT
+    into chunks.
     """
 
     def __init__(self, fp, start: int, total: int, progress_interval: int,
-                 on_progress: Callable[[UploadProgress], None] | None,
-                 resumed_from: int, retries: int):
+                 reporter: _ProgressReporter, resumed_from: int, retries: int):
         self._fp = fp
         self._total = total
         self._progress_interval = max(1, progress_interval)
-        self._on_progress = on_progress
+        self._reporter = reporter
         self._resumed_from = resumed_from
         self._retries = retries
         self._uploaded = start
@@ -147,10 +189,8 @@ class _InstrumentedReader:
             n = len(chunk)
             self._uploaded += n
             self._since_tick += n
-            if self._on_progress is not None and (
-                self._since_tick >= self._progress_interval
-                or self._uploaded >= self._total
-            ):
+            if (self._since_tick >= self._progress_interval
+                    or self._uploaded >= self._total):
                 self._emit()
         return chunk
 
@@ -158,9 +198,8 @@ class _InstrumentedReader:
         elapsed = max(time.monotonic() - self._attempt_start, 1e-9)
         sent_this_attempt = self._uploaded - self._resumed_from
         rate_bps = sent_this_attempt / elapsed
-        self._on_progress(UploadProgress(
-            uploaded=self._uploaded, total=self._total, rate_bps=rate_bps,
-            retries=self._retries, resumed_from=self._resumed_from))
+        self._reporter.report(self._uploaded, self._total, rate_bps,
+                               self._retries, self._resumed_from)
         self._since_tick = 0
 
 
@@ -194,6 +233,22 @@ def committed_offset(session_url: str, total: int, transport: Transport) -> int:
         f"could not determine committed offset: server returned "
         f"status={status!r} body={_body_of(response)!r}",
         status=status, body=_body_of(response))
+
+
+def _require_token(transport: Transport) -> str:
+    """A transport that reports success but hands back no token would
+    silently reproduce the exact bug this module exists to fix: a file
+    that never really made it, only surfacing several layers later as
+    Kaggle's "Please upload at least one file" 400. Refuse locally instead.
+    """
+    token = getattr(transport, "token", None)
+    if not token:
+        raise UploadError(
+            "upload reported success but the transport returned no blob "
+            "token (got {!r}) -- refusing to proceed as if the file "
+            "landed".format(token),
+            status=None, body="")
+    return token
 
 
 def _backoff_delay(attempt: int, rand_fn: Callable[[], float]) -> float:
@@ -234,6 +289,7 @@ def upload_file(path, session_url: str, transport: Transport,
     retries = 0
     last_status: int | None = None
     last_body = ""
+    reporter = _ProgressReporter(on_progress)
 
     while True:
         try:
@@ -247,12 +303,12 @@ def upload_file(path, session_url: str, transport: Transport,
                     headers["Content-Length"] = str(total)
                 reader = _InstrumentedReader(
                     fp, start=start, total=total,
-                    progress_interval=progress_interval, on_progress=on_progress,
+                    progress_interval=progress_interval, reporter=reporter,
                     resumed_from=resumed_from, retries=retries)
                 response = transport.put(session_url, data=reader, headers=headers)
             status = _status_of(response)
             if status in (200, 201):
-                return transport.token
+                return _require_token(transport)
             last_status, last_body = status, _body_of(response)
         except UploadError:
             raise
@@ -271,6 +327,6 @@ def upload_file(path, session_url: str, transport: Transport,
             resumed_from = offset
         start = offset
         if start >= total:
-            return transport.token  # already fully committed server-side
+            return _require_token(transport)  # already fully committed server-side
 
         sleep_fn(_backoff_delay(retries, rand_fn))

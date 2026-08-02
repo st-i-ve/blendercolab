@@ -235,6 +235,48 @@ def test_resumed_from_reported_on_the_resumed_attempt(tmp_path):
     assert resumed_events[-1].retries >= 1
 
 
+def test_progress_never_regresses_when_local_reads_outrun_committed_offset(tmp_path):
+    """Fix round 1, Finding 1: on_progress fires from bytes locally handed
+    to read(), not from bytes the server has actually committed -- a real
+    socket hands data to the OS/TCP buffer well ahead of what GCS
+    acknowledges. Here the transport locally accepts 15 MB before the
+    connection dies, but the server only committed 12 MB, so the resumed
+    attempt's reader starts at 12 MB -- *below* a value already reported.
+    The old `FakeTransport(_RaiseAfter(after_bytes,...), probe_plan=[...])`
+    always had after_bytes == the probed offset, so no existing test
+    (before this fix) could ever construct this divergence."""
+    size = 20 * MB
+    fifteen_mb = 15 * MB
+    twelve_mb = 12 * MB
+    content = _periodic_bytes(size)
+    f = make_file(tmp_path, size, fill=content)
+
+    transport = FakeTransport(
+        token="tok-clamped",
+        put_plan=[_RaiseAfter(fifteen_mb, ConnectionError("connection reset")),
+                  FakeResponse(200)],
+        probe_plan=[twelve_mb],
+    )
+    events: list[UploadProgress] = []
+
+    token = upload_file(f, "https://upload.example/session", transport,
+                         on_progress=events.append, progress_interval=MB,
+                         sleep_fn=lambda _seconds: None)
+
+    assert token == "tok-clamped"
+    uploaded_values = [e.uploaded for e in events]
+    assert all(b >= a for a, b in zip(uploaded_values, uploaded_values[1:])), \
+        "uploaded must never go backwards, even when a resume starts lower locally"
+    assert events[-1].uploaded == size
+
+    resumed_events = [e for e in events if e.resumed_from == twelve_mb]
+    assert resumed_events, "the resumed attempt must still report progress"
+    assert resumed_events[0].uploaded >= fifteen_mb, (
+        "the resumed attempt's first tick must be clamped to the earlier "
+        "15 MB high-water mark, not dip down to the 12 MB committed offset"
+    )
+
+
 # ---------------------------------------------------------------- Step 5 --
 
 def test_gives_up_after_max_retries_and_raises_upload_error(tmp_path):
@@ -330,12 +372,13 @@ def test_reader_read_zero_returns_empty_not_the_whole_remainder(tmp_path):
     """File-like contract: read(0) means 'read nothing'. A naive `if size`
     check treats 0 as falsy and falls through to read-everything, which
     would silently dump the whole remaining file into a single 'chunk'."""
-    from blendfleet.uploader import _InstrumentedReader
+    from blendfleet.uploader import _InstrumentedReader, _ProgressReporter
 
     f = make_file(tmp_path, 10, fill=b"0123456789")
     with f.open("rb") as fp:
         reader = _InstrumentedReader(fp, start=0, total=10, progress_interval=1024,
-                                      on_progress=None, resumed_from=0, retries=0)
+                                      reporter=_ProgressReporter(None),
+                                      resumed_from=0, retries=0)
         assert reader.read(0) == b""
         assert reader.read() == b"0123456789"
 
