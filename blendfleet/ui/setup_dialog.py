@@ -9,14 +9,27 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLineEdit,
                                QMessageBox)
 
 from blendfleet.accounts import Account, AccountStore
+from blendfleet.ui.messages import explain
+from blendfleet.ui.theme import ACCENT, TEXT_SECONDARY, WARNING
 
-# Verification state colours. Every state also carries a distinct
-# symbol/word so the list never relies on colour alone -- roughly 8% of men
-# cannot reliably tell red from green, which is why "not verified" is amber
-# rather than red rather than sitting on that exact pair.
-COLOR_VERIFIED = QColor(200, 230, 201)      # green
-COLOR_UNVERIFIED = QColor(255, 224, 178)    # amber
-COLOR_CHECKING = QColor(224, 224, 224)      # neutral grey
+# Verification state colours, pulled from the one app-wide palette
+# (blendfleet.ui.theme) so this dialog is never a separate look from the
+# rest of the app. Every state also carries a distinct symbol/word so the
+# list never relies on colour alone -- roughly 8% of men cannot reliably
+# tell red from green, which is why "not verified" is amber rather than red.
+def _wash(hex_color: str, alpha: int = 60) -> QColor:
+    """A translucent tint over the dialog's own dark surface, rather than
+    a solid pastel block -- the palette is warm-dark, so a full-strength
+    background fill would fight the rest of the theme instead of reading
+    as a status."""
+    c = QColor(hex_color)
+    c.setAlpha(alpha)
+    return c
+
+
+COLOR_VERIFIED = _wash(ACCENT)
+COLOR_UNVERIFIED = _wash(WARNING)
+COLOR_CHECKING = _wash(TEXT_SECONDARY)
 
 
 class _VerifyWorker(QThread):
@@ -119,7 +132,14 @@ class SetupDialog(QDialog):
         self._set_busy(True)
 
         def do_add() -> None:
-            self.store.add(account, verifier=self.verifier)
+            try:
+                self.store.add(account, verifier=self.verifier)
+            except Exception as e:
+                # Re-raised with the full what/why/next-step explanation
+                # already built in -- _VerifyWorker only ever forwards
+                # str(exc) to on_failure, so the friendly text has to be
+                # baked into the exception here, not applied afterwards.
+                raise RuntimeError(explain("Adding this account", e)) from e
             self.store.save()
 
         def on_success() -> None:
@@ -152,7 +172,11 @@ class SetupDialog(QDialog):
         self._refresh()
 
         def do_reverify() -> None:
-            self.store.reverify(label, verifier=self.verifier)
+            try:
+                self.store.reverify(label, verifier=self.verifier)
+            except Exception as e:
+                raise RuntimeError(
+                    explain("Re-verifying this account", e)) from e
             self.store.save()
 
         def on_success() -> None:

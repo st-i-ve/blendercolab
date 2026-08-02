@@ -126,7 +126,17 @@ class Fleet:
         return live
 
     def launch(self, blend: Path, settings: RenderSettings,
-               start_frame: int, end_frame: int) -> FleetState:
+               start_frame: int, end_frame: int,
+               on_progress: Callable | None = None) -> FleetState:
+        """Launch a render across every configured account.
+
+        `on_progress`, if given, is threaded straight through to
+        dataset_sync.sync_blend -> KaggleClient.dataset_create/version ->
+        blendfleet.uploader.upload_file, and is called with UploadProgress
+        ticks as the owner's .blend upload proceeds -- this is how a caller
+        (the dashboard's upload view) shows real upload progress instead of
+        the UI thread blocking silently for however long a 60+ MB PUT takes.
+        """
         if not self.accounts:
             raise ValueError("add at least one account before launching")
 
@@ -164,7 +174,7 @@ class Fleet:
         # One upload, shared by every account (Task 3) -- dataset sharing is
         # automatable, so N accounts no longer means N uploads.
         sync_blend(owner_client, blend, dataset_slug,
-                   self.work_dir / "ds_owner")
+                   self.work_dir / "ds_owner", on_progress=on_progress)
 
         friends = self.accounts[1:]
         friend_usernames = [usernames[a.label] for a in friends]

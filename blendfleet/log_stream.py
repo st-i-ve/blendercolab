@@ -82,8 +82,15 @@ def parse_telemetry(line: str) -> dict | None:
 
 def stream_progress(token: str, user_name: str, kernel_slug: str,
                     on_progress: Callable[[int, int], None],
-                    stop_event: threading.Event | None = None) -> None:
+                    stop_event: threading.Event | None = None,
+                    on_telemetry: Callable[[dict], None] | None = None) -> None:
     """Block, calling on_progress(done, total) as lines arrive.
+
+    `on_telemetry`, if given, is called with the parsed dict (see
+    parse_telemetry) for every TELEMETRY line on the same stream -- this is
+    the only source of live per-GPU utilisation/memory: it rides the exact
+    same SSE connection as frame progress, so a GPU panel does not need a
+    second stream of its own.
 
     The token is passed to KaggleClient explicitly and NEVER through
     os.environ: the dashboard starts one of these threads per account
@@ -113,3 +120,8 @@ def stream_progress(token: str, user_name: str, kernel_slug: str,
         got = parse_progress(raw)
         if got:
             on_progress(*got)
+            continue
+        if on_telemetry is not None:
+            record = parse_telemetry(raw)
+            if record:
+                on_telemetry(record)
