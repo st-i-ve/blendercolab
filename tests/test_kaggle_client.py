@@ -134,6 +134,26 @@ def test_dataset_exists_false_on_403_not_404():
     assert c.dataset_exists("me/x") is False
 
 
+def test_dataset_create_passes_skip_dir_mode_and_private(tmp_path):
+    c, api = client()
+    c.dataset_create(tmp_path)
+    # dataset_create_new captures the **kw dict; assert the safety-critical flags
+    assert len(api.created) == 1
+    folder, kw = api.created[0]
+    assert kw["dir_mode"] == "skip", "dir_mode zip nests payload, breaks /kaggle/input"
+    assert kw["public"] is False, "datasets must never be public by default"
+
+
+def test_dataset_version_passes_skip_dir_mode(tmp_path):
+    c, api = client()
+    c.dataset_version(tmp_path, "my message")
+    # dataset_create_version captures the **kw dict; assert the safety-critical flag
+    assert len(api.versioned) == 1
+    folder, version_notes, kw = api.versioned[0]
+    assert kw["dir_mode"] == "skip", "dir_mode zip nests payload, breaks /kaggle/input"
+    assert version_notes == "my message"
+
+
 def test_push_never_treated_as_noop():
     # kernels push ALWAYS starts a run; no unchanged-content short circuit
     c, api = client()

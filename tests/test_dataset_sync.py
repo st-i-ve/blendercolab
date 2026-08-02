@@ -39,17 +39,6 @@ def test_versions_when_present(blend, tmp_path):
     assert any(call[0] == "dataset_version" for call in c.calls)
 
 
-def test_never_uses_zip_mode(blend, tmp_path):
-    # The client already passes dir_mode="skip", never "zip".
-    # This test verifies the client methods are called correctly.
-    c = FakeClient(exists=False)
-    sync_blend(c, blend, "me/x", tmp_path / "stage")
-    # If we were calling _exec with argv, we'd check for "zip" in the string.
-    # With the Python API, dir_mode is handled by the client, so we just
-    # verify that dataset_create was called with the right folder.
-    assert any(call[0] == "dataset_create" for call in c.calls)
-
-
 def test_metadata_written_correctly(blend, tmp_path):
     stage = tmp_path / "stage"
     sync_blend(FakeClient(), blend, "me/remember-blend", stage)
