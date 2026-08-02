@@ -25,7 +25,13 @@ both:
    `is_private=True` (unconditionally -- never trust what the caller's
    `current_settings` says), exactly one license, and the FULL
    collaborator list (existing collaborators carried over untouched, plus
-   whatever this call is adding/removing) -- never a partial update.
+   whatever this call is adding/removing) -- never a partial update. The
+   SAME replace-clobbers-what-isn't-resent trap applies to every other
+   `DatasetSettings` field too (`subtitle`, `description`, `keywords`,
+   `expected_update_frequency`, `user_specified_sources`, `data`) -- see
+   `_build_settings` for how each is carried over from `current_settings`
+   so granting/revoking a reader can never silently wipe a description or
+   keywords the user set through the Kaggle web UI.
 2. The response is `{"errors": [...]}` with HTTP 200 -- there is no
    exception and no non-200 status to catch a failure from. A non-empty
    `errors` list IS the failure and must be inspected explicitly.
@@ -83,10 +89,38 @@ def _one_license(current_settings):
 
 
 def _build_settings(current_settings, collaborators):
+    """Rebuild the FULL `DatasetSettings` object from `current_settings`.
+
+    `update_dataset_metadata` replaces the whole object (trap 1) -- every
+    field not resent here would be silently wiped the moment a real user
+    has actually set it (a description or keywords added through the
+    Kaggle web UI, say) the next time a reader is granted or revoked. Every
+    field `DatasetInfo` (what `current_settings` -- from `get_settings` --
+    actually is) exposes a value for is therefore carried over unchanged,
+    except `is_private` (always forced True) and `licenses`/`collaborators`
+    (computed by the caller).
+
+    NOT preserved -- `image` (a `CroppedImageUpload` *upload* type):
+    `DatasetInfo` has no `image` field at all, so there is nothing to read
+    back here and nothing this function can round-trip. `DatasetSettings.
+    image`'s own docstring reads "If provided, will update the dataset
+    image", which suggests (but this has NOT been verified live) that
+    omitting it does NOT clear the existing image the way every other
+    field here would if omitted -- left unset deliberately rather than
+    guessed at.
+    """
     from kagglesdk.datasets.types.dataset_types import DatasetSettings
 
     settings = DatasetSettings()
     settings.title = getattr(current_settings, "title", "") or ""
+    settings.subtitle = getattr(current_settings, "subtitle", "") or ""
+    settings.description = getattr(current_settings, "description", "") or ""
+    settings.keywords = list(getattr(current_settings, "keywords", None) or [])
+    settings.expected_update_frequency = (
+        getattr(current_settings, "expected_update_frequency", "") or "")
+    settings.user_specified_sources = (
+        getattr(current_settings, "user_specified_sources", "") or "")
+    settings.data = list(getattr(current_settings, "data", None) or [])
     # ALWAYS True, no matter what current_settings reports: this call
     # REPLACES the settings object (trap 1), so omitting this would
     # silently publish someone's private Blender project.

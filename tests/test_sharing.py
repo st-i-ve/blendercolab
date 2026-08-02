@@ -11,7 +11,7 @@ task-3-report.md), and both must be pinned by a test:
    failure; there is no exception or bad status code to catch instead.
 """
 from kagglesdk.datasets.types.dataset_types import (
-    DatasetCollaborator, DatasetSettings, SettingsLicense)
+    DatasetCollaborator, DatasetSettings, DatasetSettingsFile, SettingsLicense)
 from kagglesdk.users.types.users_enums import CollaboratorType
 import pytest
 
@@ -120,6 +120,59 @@ def test_grant_readers_preserves_title_from_current_settings():
     grant_readers(sdk, "owner", "slug", ["dansbecker"], current)
 
     assert sdk.api_client.updated[0].settings.title == "my cool blend"
+
+
+def _fully_described_current_settings() -> DatasetSettings:
+    current = bare_current_settings()
+    current.title = "my cool blend"
+    current.subtitle = "a neat little scene"
+    current.description = "Rendered nightly across three accounts."
+    current.keywords = ["blender", "render-farm"]
+    current.expected_update_frequency = "weekly"
+    current.user_specified_sources = "my own render"
+    f = DatasetSettingsFile()
+    f.name = "scene.blend"
+    f.description = "the actual .blend"
+    current.data = [f]
+    return current
+
+
+def test_grant_readers_preserves_description_subtitle_keywords_and_more():
+    """The unnamed sibling of trap 1: update_dataset_metadata replaces the
+    WHOLE settings object, not just is_private/licenses. A description or
+    keywords set through the Kaggle web UI must not be silently wiped the
+    next time a reader is granted."""
+    sdk = FakeSdk()
+    current = _fully_described_current_settings()
+
+    grant_readers(sdk, "owner", "slug", ["dansbecker"], current)
+
+    sent = sdk.api_client.updated[0].settings
+    assert sent.subtitle == "a neat little scene"
+    assert sent.description == "Rendered nightly across three accounts."
+    assert sent.keywords == ["blender", "render-farm"]
+    assert sent.expected_update_frequency == "weekly"
+    assert sent.user_specified_sources == "my own render"
+    assert len(sent.data) == 1
+    assert sent.data[0].name == "scene.blend"
+    assert sent.data[0].description == "the actual .blend"
+
+
+def test_revoke_reader_preserves_description_subtitle_keywords_and_more():
+    """Same replace-clobbers-what-isn't-resent trap applies to revoke."""
+    sdk = FakeSdk()
+    current = _fully_described_current_settings()
+    current.collaborators = [collaborator("bob", CollaboratorType.READER)]
+
+    revoke_reader(sdk, "owner", "slug", "bob", current)
+
+    sent = sdk.api_client.updated[0].settings
+    assert sent.subtitle == "a neat little scene"
+    assert sent.description == "Rendered nightly across three accounts."
+    assert sent.keywords == ["blender", "render-farm"]
+    assert sent.expected_update_frequency == "weekly"
+    assert sent.user_specified_sources == "my own render"
+    assert len(sent.data) == 1 and sent.data[0].name == "scene.blend"
 
 
 # --------------------------------------------------------------------- 2 --
