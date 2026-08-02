@@ -57,33 +57,39 @@ The user wants a "highway with several lanes" — e.g. a 100 MB file as 10 MB ×
 
 ---
 
-### Task 1: Chunked resumable uploader
+### Task 1: Reliable, visible, resumable uploader
 
 **Files:** create `blendfleet/uploader.py`, `tests/test_uploader.py`
 
+**REVISED BY TASK 0's MEASUREMENTS. Read these before designing anything:**
+- Out-of-order ranges are **rejected** — the server aborts the connection, zero bytes committed.
+- Concurrent ranges are **rejected** — one in-flight request per session; the others are killed.
+- **Chunking is SLOWER**: 8 MB sequential chunks ran 0.59 MB/s vs 0.95 MB/s for one whole-file PUT. Chunking costs ~40% throughput and buys only a smaller retry unit.
+
+So do **not** chunk by default. Keep the single fast PUT and fix what is actually broken about it: invisible progress, ineffective retry, and silent failure.
+
 **Produces:**
-- `UploadProgress(uploaded, total, chunk_index, chunk_count, retries, lane=None)`
-- `upload_file(path, session_url, transport, on_progress=None, chunk_size=8*1024*1024, max_retries=5, resume_offset=0, lanes=1) -> str` returning the blob token
+- `UploadProgress(uploaded, total, rate_bps, retries, resumed_from)`
+- `upload_file(path, session_url, transport, on_progress=None, max_retries=6, progress_interval=1<<20) -> str` returning the blob token
 - `UploadError(Exception)` carrying last status and body
-- `probe_offset(session_url, total, transport) -> int`
+- `committed_offset(session_url, total, transport) -> int` — what the server already holds
 
 Must hold:
-- `Content-Range: bytes {start}-{end}/{total}` PUTs of at most `chunk_size`.
-- Each chunk retries independently with exponential backoff **and jitter**; a chunk failure never restarts the file.
-- Resume probes the server offset first and skips what it already has.
-- `on_progress` fires after every chunk — this is what the UI renders.
-- **Raises on giving up. Never returns None, never silent.**
-- `lanes > 1` only if Task 0 proved it works; otherwise the parameter must not exist.
+- **One PUT for the whole remaining range** — full throughput.
+- Progress comes from an **instrumented file reader** that fires `on_progress` every `progress_interval` bytes. This is how progress is reported without splitting the request.
+- On failure: query `committed_offset`, resume from there with `Content-Range`, retry with exponential backoff **and jitter**. A break at 90% resumes at 90%.
+- **Raises on giving up. Never returns None.** The silent `None` is why the user saw a 400 three layers from the cause.
+- Transport injected; tests do zero network.
 
-- [ ] **Step 1: failing test** — `FakeTransport` recording `Content-Range` headers. A 20 MB file at 8 MB chunks issues 3 PUTs with contiguous, non-overlapping ranges covering exactly `0..total-1`; `on_progress` fires 3 times, monotonically increasing, ending exactly at `total`.
+- [ ] **Step 1: failing test** — `FakeTransport` capturing the body and headers. A 20 MB file uploads in ONE PUT; `on_progress` fires repeatedly with monotonically increasing `uploaded` ending exactly at `total`; the returned token is the transport's.
 - [ ] **Step 2: run it, confirm it fails**
 - [ ] **Step 3: implement**
-- [ ] **Step 4: retry tests** — a transport failing chunk 2 twice then succeeding completes with `retries == 2` and re-sends **only** chunk 2 (assert chunk 1 was PUT exactly once). Failing forever raises `UploadError` naming the chunk and last status.
-- [ ] **Step 5: resume test** — `resume_offset` of 8 MB on a 20 MB file starts at 8388608, and progress accounts for skipped bytes.
-- [ ] **Step 6: edge cases** — empty file, smaller than one chunk, exactly one chunk. No zero-length PUT.
+- [ ] **Step 4: resume tests** — transport fails at 12 MB of 20 MB, then reports `committed_offset == 12 MB`. Assert the retry sends `Content-Range: bytes 12582912-20971519/20971520`, that only the remaining bytes are re-sent (NOT the whole file), and that `resumed_from` is reported so the UI can say "resumed from 12 MB".
+- [ ] **Step 5: give-up test** — a transport failing forever raises `UploadError` after `max_retries`, and the message names the last status and body. Assert it never returns None.
+- [ ] **Step 6: edge cases** — empty file, single-byte file, a server reporting an offset equal to total (already complete: return the token without re-uploading).
 - [ ] **Step 7: full suite + commit**
 
----
+**Do NOT add a `lanes` parameter.** Task 0 proved concurrency within a session is impossible; a parameter implying otherwise would be a lie in the API. Concurrency belongs across accounts, and in shared mode there is only one upload anyway.
 
 ### Task 2: Use the uploader; never submit an empty version
 
