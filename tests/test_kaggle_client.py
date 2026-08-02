@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from requests.exceptions import HTTPError
 
-from blendfleet.kaggle_client import KaggleClient, KaggleError
+from blendfleet.kaggle_client import KaggleClient, KaggleError, verify_token
 
 TOKEN = "KGAT_" + "a" * 32
 
@@ -262,6 +262,30 @@ def test_fetch_output_returns_pngs(tmp_path):
     c, _ = client()
     got = c.fetch_output("x/y", tmp_path / "out")
     assert [p.name for p in got] == ["f_0001.png"]
+
+
+def test_verify_token_returns_username_on_success():
+    got = verify_token(TOKEN, client_factory=lambda t: client()[0])
+    assert got == "stivestivewithani"
+
+
+def test_verify_token_returns_none_when_no_notebooks():
+    """whoami() raises KaggleError('...no notebooks...') for a token that is
+    perfectly valid but belongs to an account with no notebooks yet. That
+    must surface as an accepted-but-unresolved None, not an exception."""
+    c, _ = client(kernels=[])
+    got = verify_token(TOKEN, client_factory=lambda t: c)
+    assert got is None
+
+
+def test_verify_token_propagates_other_kaggle_errors():
+    class RevokedApi(FakeApi):
+        def kernels_list(self, mine=False, page_size=1):
+            raise RuntimeError("401 Client Error: Unauthorized")
+
+    revoked, _ = client(api=RevokedApi())
+    with pytest.raises(RuntimeError, match="Unauthorized"):
+        verify_token(TOKEN, client_factory=lambda t: revoked)
 
 
 def test_fetch_output_returns_jpegs_too(tmp_path):

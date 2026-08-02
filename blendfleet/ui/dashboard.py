@@ -22,10 +22,11 @@ SECONDS_PER_FRAME_DEFAULT = 57.1     # measured: 1920x1080, 128spp, Tesla P100
 
 
 class Dashboard(QMainWindow):
-    def __init__(self, store: AccountStore, fleet_factory) -> None:
+    def __init__(self, store: AccountStore, fleet_factory, verifier) -> None:
         super().__init__()
         self.store = store
         self.fleet_factory = fleet_factory
+        self.verifier = verifier
         self.blend: Path | None = None
         self._stop = threading.Event()
         # Keyed by kernel_slug (stable across polls) rather than kept on the
@@ -120,7 +121,7 @@ class Dashboard(QMainWindow):
             f"1920×1080/128spp — your scene will differ)")
 
     def _manage(self) -> None:
-        SetupDialog(self.store, self).exec()
+        SetupDialog(self.store, self.verifier, self).exec()
         self._refresh_accounts(); self._update_eta(); self._refresh_quota()
 
     def _refresh_quota(self) -> None:

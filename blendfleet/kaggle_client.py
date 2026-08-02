@@ -267,3 +267,26 @@ class KaggleClient:
         self.api.kernels_output(slug, path=str(dest))
         return sorted(p for p in dest.rglob("*")
                       if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES)
+
+
+def verify_token(token: str,
+                  client_factory: Callable[[str], "KaggleClient"] | None = None
+                  ) -> str | None:
+    """Confirm `token` actually works against Kaggle, for
+    accounts.AccountStore.add()/reverify() to use as a `verifier`.
+
+    Returns the resolved username on success. Returns None -- NOT a failure
+    -- when the token is valid but whoami() cannot resolve a handle because
+    the account has never created a notebook (see whoami()'s docstring);
+    that account is still accepted, just with an unresolved username. Any
+    other problem (revoked token, bad format, network down) propagates so
+    the caller can show the real error and refuse to add/re-verify.
+    """
+    factory = client_factory or KaggleClient
+    client = factory(token)
+    try:
+        return client.whoami()
+    except KaggleError as e:
+        if "no notebooks" in str(e).lower():
+            return None
+        raise
