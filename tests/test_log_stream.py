@@ -2,19 +2,21 @@ from blendfleet.log_stream import parse_progress, is_end_of_log
 
 
 def test_parses_a_real_sse_line():
+    # \\n (not \n): a real SSE payload carries the newline as a proper JSON
+    # escape sequence, not a raw control character embedded in the string.
     line = ('data: {"stream_name":"stdout","time":14.8,'
-            '"data":"PROGRESS frame=1 done=1/10\n"}')
+            '"data":"PROGRESS frame=1 done=1/10\\n"}')
     assert parse_progress(line) == (1, 10)
 
 
 def test_parses_later_frame():
     line = ('data: {"stream_name":"stdout","time":149.8,'
-            '"data":"PROGRESS frame=10 done=10/10\n"}')
+            '"data":"PROGRESS frame=10 done=10/10\\n"}')
     assert parse_progress(line) == (10, 10)
 
 
 def test_ignores_stderr_and_noise():
-    assert parse_progress('data: {"stream_name":"stderr","data":"warning\n"}') is None
+    assert parse_progress('data: {"stream_name":"stderr","data":"warning\\n"}') is None
     assert parse_progress("") is None
     assert parse_progress("event: ping") is None
     assert parse_progress("not json at all") is None

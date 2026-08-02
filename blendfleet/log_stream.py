@@ -29,10 +29,7 @@ def parse_progress(line: str) -> tuple[int, int] | None:
         return None
     payload = line[len("data:"):].strip()
     try:
-        # strict=False: some observed payloads carry a raw, unescaped control
-        # character (e.g. a literal newline) inside the "data" string value,
-        # which strict JSON rejects even though the value is otherwise fine.
-        obj = json.loads(payload, strict=False)
+        obj = json.loads(payload)
     except (json.JSONDecodeError, ValueError):
         return None
     if obj.get("stream_name") != "stdout":
