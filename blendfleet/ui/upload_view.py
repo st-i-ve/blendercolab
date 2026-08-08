@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (QLabel, QProgressBar, QSizePolicy, QVBoxLayout,
                                QWidget)
 
 from blendfleet.ui.formatting import format_bytes, format_eta, format_rate
-from blendfleet.ui.theme import TEXT_SECONDARY, WARNING, mono_font
+from blendfleet.ui.theme import WARNING, mono_font
 from blendfleet.uploader import UploadProgress
 
 STATE_IDLE = "idle"

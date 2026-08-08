@@ -483,3 +483,166 @@ def test_sdk_factory_passes_the_token_instead_of_setting_the_environment():
 
     assert seen["api_token"] == TOKEN
     assert seen["env"] is None
+
+
+# ------------------------------------------ identity binding (CRITICAL) --
+# KaggleApi.authenticate() is a CASCADE (kaggle_api_extended.py:1226-1252):
+# access token, then LEGACY API KEY, then OAuth, then anonymous. When the
+# token we exported is revoked/mistyped, _authenticate_with_access_token's
+# _introspect_token returns falsy and authenticate() drops silently through
+# to whatever is in this machine's own ~/.kaggle/kaggle.json.
+#
+# The account then authenticates as YOU: whoami returns your handle, the
+# account is stored verified=True under the wrong username, and
+# fleet.dataset_reachable() passes trivially because you can always read
+# your own dataset -- so UnreachableAccountsError never fires and the user
+# believes three friends are contributing while all three kernels burn
+# their own quota. These tests pin the check that makes that impossible.
+
+def _install_fake_kaggle_package(monkeypatch, api_instance):
+    """Put a fake `kaggle.api.kaggle_api_extended` in sys.modules.
+
+    Importing the real one is not an option here: kaggle/__init__.py
+    constructs a KaggleApi and calls authenticate() at import time, which
+    reads the developer's own ~/.kaggle/kaggle.json -- the very credential
+    whose leakage these tests are about.
+    """
+    import sys
+    import types
+
+    module = types.ModuleType("kaggle.api.kaggle_api_extended")
+    module.KaggleApi = lambda: api_instance
+    monkeypatch.setitem(sys.modules, "kaggle", types.ModuleType("kaggle"))
+    monkeypatch.setitem(sys.modules, "kaggle.api", types.ModuleType("kaggle.api"))
+    monkeypatch.setitem(sys.modules, "kaggle.api.kaggle_api_extended", module)
+
+
+class BoundToOtherTokenApi:
+    """A KaggleApi whose authenticate() binds a DIFFERENT token than the
+    one it was given -- the shape of a session that signed in as somebody
+    else."""
+
+    def __init__(self, binds: str):
+        self._binds = binds
+        self.config_values: dict = {}
+
+    def authenticate(self) -> None:
+        self.config_values = {"token": self._binds,
+                              "username": "somebody-else",
+                              "auth_method": "AuthMethod.ACCESS_TOKEN"}
+
+
+class LegacyApiKeyFallthroughApi:
+    """Exactly what the real cascade produces when the access token is
+    rejected: no `token` key at all, just the username/key pair read out of
+    the local ~/.kaggle/kaggle.json."""
+
+    def __init__(self, local_username: str = "the-owner-of-this-laptop"):
+        self._local_username = local_username
+        self.config_values: dict = {}
+
+    def authenticate(self) -> None:
+        self.config_values = {"username": self._local_username,
+                              "key": "0123456789abcdef",
+                              "auth_method": "AuthMethod.LEGACY_API_KEY"}
+
+
+class GoodApi:
+    def __init__(self, token: str):
+        self._token = token
+        self.config_values: dict = {}
+
+    def authenticate(self) -> None:
+        self.config_values = {"token": self._token,
+                              "username": "the-real-owner",
+                              "auth_method": "AuthMethod.ACCESS_TOKEN"}
+
+
+def test_api_factory_rejects_a_session_bound_to_a_different_token(monkeypatch):
+    from blendfleet.kaggle_client import _default_api_factory
+
+    other = "KGAT_" + "b" * 32
+    _install_fake_kaggle_package(monkeypatch, BoundToOtherTokenApi(binds=other))
+
+    with pytest.raises(KaggleError) as exc_info:
+        _default_api_factory(TOKEN, account="ada")
+
+    message = str(exc_info.value)
+    assert "ada" in message, "the message must name the account that failed"
+    assert "DIFFERENT account" in message
+    assert other not in message, "another account's token must never be echoed"
+
+
+def test_api_factory_rejects_the_legacy_apikey_fallthrough(monkeypatch):
+    """The actual production failure: a revoked friend token silently
+    authenticating as the machine's own kaggle.json credentials."""
+    from blendfleet.kaggle_client import _default_api_factory
+
+    _install_fake_kaggle_package(monkeypatch, LegacyApiKeyFallthroughApi())
+
+    with pytest.raises(KaggleError) as exc_info:
+        _default_api_factory(TOKEN, account="ada")
+
+    message = str(exc_info.value)
+    assert "was not accepted by Kaggle" in message
+    assert "fresh token" in message, "must say what the user should do next"
+
+
+def test_api_factory_accepts_a_session_actually_bound_to_our_token(monkeypatch):
+    from blendfleet.kaggle_client import _default_api_factory
+
+    api = GoodApi(TOKEN)
+    _install_fake_kaggle_package(monkeypatch, api)
+
+    assert _default_api_factory(TOKEN, account="ada") is api
+
+
+def test_api_factory_fails_closed_when_credentials_cannot_be_inspected(monkeypatch):
+    """If a future kaggle release moves config_values, this must REFUSE,
+    not wave the session through unverified -- an unverifiable identity is
+    the exact condition this check exists to catch."""
+    from blendfleet.kaggle_client import _default_api_factory
+
+    class OpaqueApi:
+        def authenticate(self) -> None:
+            pass
+
+    _install_fake_kaggle_package(monkeypatch, OpaqueApi())
+
+    with pytest.raises(KaggleError, match="could not confirm which Kaggle account"):
+        _default_api_factory(TOKEN, account="ada")
+
+
+def test_api_factory_masks_the_token_when_no_account_label_is_known(monkeypatch):
+    """verify_token runs before an account exists, so there is no label --
+    the message still has to identify which token failed without printing
+    the whole secret."""
+    from blendfleet.kaggle_client import _default_api_factory
+
+    _install_fake_kaggle_package(monkeypatch, LegacyApiKeyFallthroughApi())
+
+    with pytest.raises(KaggleError) as exc_info:
+        _default_api_factory(TOKEN)
+
+    message = str(exc_info.value)
+    assert TOKEN not in message, "the full token must never reach a dialog"
+    assert TOKEN[:9] in message, "but enough of it to tell tokens apart"
+
+
+def test_client_passes_its_label_to_the_identity_check(monkeypatch):
+    """KaggleClient(label=...) is the whole reason the error can say
+    'james' instead of a masked token."""
+    _install_fake_kaggle_package(monkeypatch, LegacyApiKeyFallthroughApi())
+
+    c = KaggleClient(TOKEN, label="james")
+    with pytest.raises(KaggleError, match="'james'"):
+        _ = c.api
+
+
+def test_verify_token_refuses_an_account_that_authenticated_as_someone_else(monkeypatch):
+    """End to end: this is what stops a revoked friend token being stored
+    verified=True under the developer's own username."""
+    _install_fake_kaggle_package(monkeypatch, LegacyApiKeyFallthroughApi())
+
+    with pytest.raises(KaggleError, match="was not accepted by Kaggle"):
+        verify_token(TOKEN)

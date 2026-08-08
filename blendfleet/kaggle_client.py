@@ -174,11 +174,67 @@ def _with_env_token(token: str, construct: Callable):
                 os.environ[ENV_TOKEN] = previous
 
 
-def _default_api_factory(token: str):
+# kaggle_api_extended.KaggleApi.CONFIG_NAME_TOKEN -- the key the access
+# token lands under in api.config_values once _authenticate_with_access_token
+# succeeds (confirmed against the installed package, kaggle_api_extended.py
+# lines 891-894 and 1305-1319). Hard-coded rather than imported so this
+# module does not import the kaggle package at import time.
+_CONFIG_NAME_TOKEN = "token"
+
+
+def _mask(token: str) -> str:
+    """A token fragment safe to put in an error message/log."""
+    return f"{token[:9]}…" if len(token) > 12 else "…"
+
+
+def _assert_bound_to_token(api, token: str, account: str | None) -> None:
+    """Refuse an API instance that did not actually authenticate as `token`.
+
+    KaggleApi.authenticate() is a CASCADE (kaggle_api_extended.py:1226-1252):
+    access token, then legacy API key, then OAuth, then anonymous. When the
+    token we put in the environment is revoked, mistyped or expired,
+    _authenticate_with_access_token()'s _introspect_token returns falsy and
+    authenticate() silently drops through to _authenticate_with_legacy_apikey()
+    -- i.e. to whatever is in the developer's own ~/.kaggle/kaggle.json.
+
+    The consequences are not cosmetic. A friend's dead token then
+    authenticates as YOU: verify_token -> whoami returns YOUR handle, the
+    account is stored verified=True under the wrong username, and
+    fleet.dataset_reachable() passes trivially because you can always read
+    your own dataset -- so UnreachableAccountsError never fires and the
+    user believes three friends are contributing while all three kernels
+    burn their own quota. Account verification is meaningless without this
+    check, so it fails closed: an api with no config_values at all (a
+    library rename) is rejected too, never waved through.
+    """
+    who = f"the account {account!r}" if account else \
+        f"the account with token {_mask(token)}"
+    values = getattr(api, "config_values", None)
+    if not isinstance(values, dict):
+        raise KaggleError(
+            f"could not confirm which Kaggle account {who} signed in as: the "
+            "installed kaggle package did not expose its resolved credentials "
+            "where BlendFleet expects them. Refusing to continue rather than "
+            "risk running this account's work on somebody else's quota -- "
+            "update BlendFleet, or reinstall the kaggle package.")
+    if values.get(_CONFIG_NAME_TOKEN) != token:
+        raise KaggleError(
+            f"the token for {who} was not accepted by Kaggle. Kaggle then "
+            "fell back to the credentials stored on this computer, so every "
+            "call would have run as a DIFFERENT account -- spending the wrong "
+            "person's GPU quota and reporting the wrong username as verified. "
+            "Nothing has been run. Ask them to generate a fresh token at "
+            "kaggle.com -> Settings -> API -> Generate New Token, then "
+            "re-verify the account under Manage accounts…")
+
+
+def _default_api_factory(token: str, account: str | None = None):
     """KaggleApi takes no api_token argument (checked against the installed
     kaggle package): authenticate() reads the environment. Lock-guarded.
     After authenticate() the token lives on api.config_values, so every later
-    call on that instance is bound to this account regardless of the global.
+    call on that instance is bound to this account regardless of the global
+    -- but ONLY if authenticate() actually used our token, which is exactly
+    what _assert_bound_to_token verifies before this instance escapes.
     """
     from kaggle.api.kaggle_api_extended import KaggleApi
 
@@ -187,7 +243,9 @@ def _default_api_factory(token: str):
         api.authenticate()
         return api
 
-    return _with_env_token(token, construct)
+    api = _with_env_token(token, construct)
+    _assert_bound_to_token(api, token, account)
+    return api
 
 
 def _default_sdk_factory(token: str):
@@ -199,12 +257,21 @@ def _default_sdk_factory(token: str):
 
 class KaggleClient:
     def __init__(self, token: str,
-                 api_factory: Callable = _default_api_factory,
+                 api_factory: Callable | None = None,
                  sdk_factory: Callable = _default_sdk_factory,
-                 upload_blob_fn: Callable[[Path, Callable | None], str] | None = None
+                 upload_blob_fn: Callable[[Path, Callable | None], str] | None = None,
+                 label: str | None = None
                  ) -> None:
         self.token = token
-        self._api_factory = api_factory
+        # `label` exists purely so the identity check in
+        # _assert_bound_to_token can name the account a user recognises
+        # ("james") instead of a masked token. The default factory is built
+        # here as a closure rather than being the parameter's default value
+        # so it can capture it; an injected factory (every test) is still
+        # called as factory(token) and is unaffected.
+        self.label = label
+        self._api_factory = api_factory or (
+            lambda tok: _default_api_factory(tok, label))
         self._sdk_factory = sdk_factory
         # Injectable so tests never touch the network; production default
         # is the real, reliable uploader (blendfleet.uploader.upload_file)

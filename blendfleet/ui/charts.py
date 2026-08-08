@@ -8,14 +8,13 @@ from __future__ import annotations
 
 from collections import deque
 
-from PySide6.QtCore import QRectF, Qt
+from PySide6.QtCore import QRectF
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import QGridLayout, QLabel, QSizePolicy, QWidget
 
 from blendfleet.fleet import WorkerState
 from blendfleet.ui.formatting import format_bytes
-from blendfleet.ui.theme import (BORDER, TELEMETRY, TEXT_PRIMARY,
-                                  TEXT_SECONDARY, WARNING, account_color,
+from blendfleet.ui.theme import (BORDER, TELEMETRY, WARNING, account_color,
                                   mono_font)
 
 # States fleet.WorkerState.state can carry that mean "this worker will not
@@ -44,13 +43,29 @@ def frame_owners(start_frame: int, end_frame: int,
 
 def frame_done(start_frame: int, end_frame: int,
                workers: list[WorkerState]) -> list[bool]:
-    """Whether each frame in [start_frame, end_frame] has been rendered.
+    """Whether each frame in [start_frame, end_frame] has been rendered --
+    APPROXIMATELY. Read the caveat below before trusting a cell.
 
-    WorkerState only carries a *count* of completed frames for that
-    worker (frames_done), not which specific frame numbers -- but Blender
-    renders a worker's assigned frame list strictly in order, so the first
-    `frames_done` entries of `worker.frames` are exactly the completed
-    ones.
+    WorkerState carries only a *count* of completed frames (frames_done),
+    never which frame numbers, and that count comes from the notebook's
+    `done=` field (notebook_builder.py:184), which counts SUCCESSES ONLY:
+    a frame whose Blender subprocess exits non-zero goes into `failed` and
+    does not advance `done`. Frames are attempted in order, so as long as
+    nothing fails, the first `frames_done` entries of worker.frames are
+    exactly the finished ones and this is exact.
+
+    The moment ONE frame fails, it is not. Say a worker owns [1, 4, 7, 10]
+    and frame 4 fails: done=3 after frame 10, and this function reports
+    1, 4 and 7 as complete -- frame 4 is painted done although it does not
+    exist, and frame 10 is painted pending although it does. Every later
+    cell for that worker is shifted by one per failure.
+
+    Fixing this properly means carrying explicit frame numbers all the way
+    from the notebook's PROGRESS line (which does print `frame=`) through
+    log_stream.parse_progress and WorkerState. Until then the
+    approximation is stated in the UI itself -- the filmstrip's own header
+    label in dashboard.py says so in words -- rather than only here, so
+    the person looking at the strip knows what it can and cannot tell them.
     """
     done_frames: set[int] = set()
     for w in workers:

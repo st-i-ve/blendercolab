@@ -180,3 +180,43 @@ def test_gpu_panel_clear_resets_to_empty(qapp):
                         "mem_total": 200, "temp": 60, "power": 10.0})
     panel.clear()
     assert panel.gpu_count == 0
+
+
+# ---------------- the frames_done approximation, stated out loud ----------
+# The notebook's `done=` counter (notebook_builder.py:184) counts SUCCESSES
+# ONLY -- a frame whose Blender subprocess exits non-zero lands in `failed`
+# and never advances it. frame_done() therefore assumes frames[:frames_done]
+# are the completed ones, which is exact until something fails and shifted
+# from then on. Carrying explicit frame numbers end to end is the real fix;
+# until then the approximation is documented where a user can see it, and
+# these tests keep both halves of that honest.
+
+def test_frame_done_is_exact_while_nothing_fails():
+    got = frame_done(1, 10, workers(frames_done=(2, 1, 0)))
+    done_frames = [f for f, ok in zip(range(1, 11), got) if ok]
+    assert done_frames == [1, 2, 4]
+
+
+def test_frame_done_shifts_after_a_failed_frame_the_known_approximation():
+    """Documents the limitation rather than pretending it is not there.
+
+    'you' owns [1, 4, 7, 10]. Suppose frame 4 failed and 1, 7 and 10 all
+    rendered: the notebook reports done=3, and this function can only say
+    'the first three', i.e. 1, 4, 7 -- painting frame 4 complete when it
+    does not exist and frame 10 pending when it does.
+    """
+    ws = workers(frames_done=(3, 0, 0))
+    got = frame_done(1, 10, ws)
+    reported = [f for f, ok in zip(range(1, 11), got) if ok]
+    assert reported == [1, 4, 7]
+    assert 10 not in reported, "the shift is real; this is what it looks like"
+
+
+def test_the_approximation_is_documented_in_frame_done():
+    """A user-visible caveat lives in the dashboard (see
+    test_dashboard.py); the reason lives here, next to the code."""
+    doc = frame_done.__doc__ or ""
+    assert "APPROXIMATELY" in doc
+    assert "notebook_builder.py:184" in doc, \
+        "point at the counter that makes this approximate"
+    assert "SUCCESSES ONLY" in doc

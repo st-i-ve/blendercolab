@@ -27,6 +27,53 @@ def qapp():
     return QApplication.instance() or QApplication([])
 
 
+@pytest.fixture(autouse=True)
+def stub_stream_progress(monkeypatch):
+    """No test may reach Kaggle's live SSE log stream.
+
+    Dashboard._start_progress_threads spawns one thread per worker straight
+    into log_stream.stream_progress, which opens a real HTTPS connection.
+    test_launch_success_updates_upload_filmstrip_and_table did not stub it,
+    so it did exactly that -- with fake KGAT_000… tokens -- and the threads
+    were never joined, outliving the module and dying inside
+    ssl.do_handshake while a later module ran (2 of 14 clean runs aborted).
+
+    Autouse rather than per-test: the leak was one missing stub away, and
+    "remember to stub it" is not a property a merge gate can rely on. A
+    test that wants to observe the streaming wiring overrides this with its
+    own fake (see
+    test_start_progress_threads_feeds_live_progress_and_telemetry).
+    """
+    def no_stream(token, user_name, kernel_slug, on_progress,
+                  stop_event=None, on_telemetry=None):
+        return None
+
+    monkeypatch.setattr(dashboard_mod, "stream_progress", no_stream)
+    return no_stream
+
+
+# Every Dashboard a test builds, torn down deterministically below. A
+# Dashboard owns QThreads and QTimers as Qt children; left to Python's
+# garbage collector it gets destroyed at an arbitrary later allocation --
+# possibly in the middle of an unrelated test -- and a C++ QThread
+# destroyed while its thread is still running aborts the process outright.
+_LIVE_DASHBOARDS: list = []
+
+
+@pytest.fixture(autouse=True)
+def close_dashboards(qapp):
+    yield
+    while _LIVE_DASHBOARDS:
+        dash = _LIVE_DASHBOARDS.pop()
+        dash.close()      # stops timers, signals the SSE threads, joins workers
+        settle(dash)
+        dash.deleteLater()
+    # deleteLater is only honoured while events are being processed; without
+    # this the C++ objects would still be alive and back on the GC's terms.
+    for _ in range(20):
+        QCoreApplication.processEvents()
+
+
 def pump(worker, timeout=2000) -> None:
     assert worker is not None
     assert worker.wait(timeout), "worker did not finish in time"
@@ -45,8 +92,15 @@ def settle(dash, timeout=2000) -> None:
     """
     for worker in (dash._poll_worker, dash._quota_worker,
                    dash._cancel_worker, dash._collect_worker):
-        if worker is not None:
+        if worker is None:
+            continue
+        try:
             assert worker.wait(timeout), "background worker did not finish in time"
+        except RuntimeError:
+            # The worker finished and its deleteLater() was processed, so
+            # the C++ QThread is already gone -- which is the state this
+            # was waiting for. Same case Dashboard.closeEvent handles.
+            pass
     for _ in range(10):
         QCoreApplication.processEvents()
 
@@ -136,13 +190,19 @@ def make_store(n=3):
     return store
 
 
-def make_dashboard(qapp, tmp_path, n=3):
-    store = make_store(n)
+def make_dashboard(qapp, tmp_path, n=3, store=None):
+    """Build a Dashboard and register it for deterministic teardown.
+
+    Everything goes through here (rather than constructing Dashboard
+    inline) so no instance can escape close_dashboards' cleanup.
+    """
+    store = make_store(n) if store is None else store
 
     def fleet_factory(accounts):
         return Fleet(accounts, lambda tok: FakeClient(tok), tmp_path / "w")
 
     dash = Dashboard(store, fleet_factory, verifier=lambda t: "someone")
+    _LIVE_DASHBOARDS.append(dash)
     settle(dash)   # let __init__'s initial quota-refresh worker finish
     return dash
 
@@ -225,13 +285,7 @@ def test_launch_failure_shows_friendly_message_not_raw_exception(qapp, tmp_path,
 
 def test_launch_with_no_accounts_shows_actionable_warning(qapp, tmp_path, monkeypatch):
     calls = stub_message_boxes(monkeypatch)
-    store = AccountStore()
-
-    def fleet_factory(accounts):
-        return Fleet(accounts, lambda tok: FakeClient(tok), tmp_path / "w")
-
-    dash = Dashboard(store, fleet_factory, verifier=lambda t: "someone")
-    settle(dash)
+    dash = make_dashboard(qapp, tmp_path, store=AccountStore())
     dash.blend = tmp_path / "x.blend"
     dash._launch()
     assert calls["warning"]
@@ -298,3 +352,18 @@ def test_start_progress_threads_feeds_live_progress_and_telemetry(qapp, tmp_path
     dash._live_tick()
     assert dash.gpu_panel.gpu_count >= 1
     dash.close()
+
+
+def test_the_filmstrip_tells_the_user_its_completed_cells_are_approximate(qapp, tmp_path):
+    """charts.frame_done can only approximate which frames are done (the
+    notebook reports a count of successes, not a list), so the UI has to
+    say so -- a caveat that lives only in a docstring is invisible to the
+    person reading a green cell as proof the frame exists."""
+    dash = make_dashboard(qapp, tmp_path)
+    labels = [w.text() for w in dash.findChildren(dashboard_mod.QLabel)]
+    filmstrip_headers = [t for t in labels if "Filmstrip" in t]
+    assert filmstrip_headers, "the filmstrip header label went missing"
+    header = filmstrip_headers[0]
+    assert "approximate" in header.lower()
+    assert "failed frame" in header.lower(), \
+        "say WHY it is approximate, not just that it is"

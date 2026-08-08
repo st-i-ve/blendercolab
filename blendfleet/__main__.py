@@ -42,7 +42,14 @@ def main() -> int:
         SetupDialog(store, verify_token).exec()
 
     def fleet_factory(accounts):
-        return Fleet(accounts, lambda t: KaggleClient(t), cache_dir() / "work")
+        # Tokens are unique per account (AccountStore.add enforces it), so
+        # this recovers the human label for whichever token the fleet asks
+        # for -- which is what lets KaggleClient's identity check name the
+        # account ("james") rather than a masked token.
+        labels = {a.token: a.label for a in accounts}
+        return Fleet(accounts,
+                     lambda t: KaggleClient(t, label=labels.get(t)),
+                     cache_dir() / "work")
 
     win = Dashboard(store, fleet_factory, verify_token)
     win.show()

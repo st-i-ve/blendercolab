@@ -5,7 +5,7 @@ import threading
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QThread, QTimer, Signal
 from PySide6.QtWidgets import (QComboBox, QFileDialog, QFormLayout,
                                QHBoxLayout, QHeaderView, QLabel, QMainWindow,
                                QMessageBox, QProgressBar, QPushButton,
@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (QComboBox, QFileDialog, QFormLayout,
 
 from blendfleet.accounts import AccountStore
 from blendfleet.assignment import estimate
-from blendfleet.fleet import Fleet, FleetBusyError, FleetState
+from blendfleet.fleet import Fleet, FleetState
 from blendfleet.log_stream import stream_progress
 from blendfleet.notebook_builder import RenderSettings
 from blendfleet.ui.charts import Filmstrip, GpuPanel
@@ -27,6 +27,10 @@ SETTINGS_URL = "https://www.kaggle.com/settings"
 SECONDS_PER_FRAME_DEFAULT = 57.1     # measured: 1920x1080, 128spp, Tesla P100
 POLL_INTERVAL_MS = 30_000            # real network calls: kernel status, quota
 LIVE_INTERVAL_MS = 2_000             # cheap: drain in-memory progress/telemetry
+# Per-thread budget for closeEvent to wait on an SSE log-stream thread.
+# log_stream closes the response within STOP_POLL_SECONDS of `_stop` being
+# set, so this is generous; it is a bound on shutdown, not the expected wait.
+STREAM_JOIN_TIMEOUT_S = 3.0
 
 
 class _AccountRow(QWidget):
@@ -138,6 +142,10 @@ class Dashboard(QMainWindow):
         self.verifier = verifier
         self.blend: Path | None = None
         self._stop = threading.Event()
+        # Every SSE log-stream thread started by _start_progress_threads,
+        # so closeEvent can join them instead of leaving N daemon threads
+        # mid-TLS while Qt destroys the window underneath them.
+        self._stream_threads: list[threading.Thread] = []
         self._launch_worker: _LaunchWorker | None = None
         # One in-flight _CallWorker per action -- kept so a periodic tick
         # (poll/quota) can skip rather than stack a new worker on top of a
@@ -256,8 +264,22 @@ class Dashboard(QMainWindow):
             btns.addWidget(b)
         v.addLayout(btns)
 
-        v.addWidget(QLabel("<b>Filmstrip</b> — one cell per frame, tinted by "
-                           "which account rendered it"))
+        # The "approximate" wording is not hedging -- it is the honest
+        # description of what this widget can know. See charts.frame_done:
+        # the notebook reports a COUNT of successful frames, not which ones,
+        # so the strip assumes the first N of each account's stride are the
+        # finished ones. That holds exactly until a frame fails, after which
+        # every later cell for that account is shifted by one. Saying so
+        # here is the fix the review asked for: the user must not read a
+        # green cell as proof that that specific frame exists.
+        filmstrip_header = QLabel(
+            "<b>Filmstrip</b> — one cell per frame, tinted by which account "
+            "rendered it. Completed cells are <b>approximate</b>: the render "
+            "reports how many frames succeeded, not which, so a failed frame "
+            "shifts every later cell for that account. Collect frames… is the "
+            "authoritative list of what actually exists.")
+        filmstrip_header.setWordWrap(True)
+        v.addWidget(filmstrip_header)
         self.filmstrip = Filmstrip()
         v.addWidget(self.filmstrip)
         self.filmstrip_caption = QLabel("no frames yet")
@@ -463,9 +485,32 @@ class Dashboard(QMainWindow):
         `kernels logs`/`kernels output` return nothing until COMPLETE
         (verified 2026-07-31), so this is the only source of live progress
         and the only source of live per-GPU telemetry.
+
+        Workers are matched to accounts by LABEL, never by position.
+        zip(self.store.list(), st.workers) silently mispairs the moment the
+        two lists stop lining up -- remove an account between launching and
+        the launch returning and every later worker would be streamed with
+        the wrong person's token, which is both a privacy leak and a stream
+        that simply 403s. Label is the join key everywhere else in this app
+        (fleet.poll, fleet.cancel_all, collector.collect); it is the join
+        key here too.
         """
         self._live_progress.clear()
-        for acct, w in zip(self.store.list(), st.workers):
+        # Drop the threads from the previous job that have already unwound,
+        # so a long session's worth of renders does not accumulate dead
+        # Thread objects that closeEvent then walks every time.
+        self._stream_threads = [t for t in self._stream_threads if t.is_alive()]
+        by_label = {a.label: a for a in self.store.list()}
+        for w in st.workers:
+            acct = by_label.get(w.label)
+            if acct is None:
+                # The account was removed while the launch was in flight.
+                # No token, so no stream -- but the kernel is already
+                # running and still shows in the table; skipping is the
+                # only safe option, streaming it with somebody else's
+                # token is not.
+                continue
+
             def run(acct=acct, w=w):
                 def bump(done, total):
                     w.frames_done = done
@@ -483,7 +528,15 @@ class Dashboard(QMainWindow):
                                     self._stop, on_telemetry=telemetry)
                 except Exception:
                     pass  # a dead stream must never kill the render or the UI
-            threading.Thread(target=run, daemon=True).start()
+            thread = threading.Thread(target=run, daemon=True,
+                                      name=f"blendfleet-log-stream-{w.label}")
+            # Kept, not fired and forgotten: closeEvent has to be able to
+            # WAIT for these. A daemon thread still inside SSL when the
+            # interpreter tears down is what aborts the process (the same
+            # leak that made the test suite non-deterministic), and
+            # "daemon=True" only hides it, it does not prevent it.
+            self._stream_threads.append(thread)
+            thread.start()
 
     def _cancel(self) -> None:
         """Cancel is user-initiated and its entire purpose is stopping
@@ -736,4 +789,12 @@ class Dashboard(QMainWindow):
                 # the underlying C++ QThread is gone, which is exactly the
                 # "not running any more" outcome we were waiting for.
                 pass
+        # The SSE threads too. `_stop` above makes each one's response get
+        # closed (log_stream._close_when_stopped), so this join is short --
+        # but it has to happen, because a daemon thread still inside SSL
+        # when the process tears down is what produces
+        # "Fatal Python error: Aborted".
+        for thread in self._stream_threads:
+            thread.join(timeout=STREAM_JOIN_TIMEOUT_S)
+        self._stream_threads = [t for t in self._stream_threads if t.is_alive()]
         super().closeEvent(event)

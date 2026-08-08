@@ -28,6 +28,74 @@ TELEMETRY_RE = re.compile(
 )
 
 
+# How long a stream thread may sit inside the network stack with no way to
+# notice stop_event. kagglesdk passes no timeout at all to requests
+# (kaggle_http_client.py: `self._session.send(http_request, **settings)`,
+# where settings comes from merge_environment_settings and never carries
+# one), so without this a thread blocked in connect/TLS-handshake/read
+# waits forever -- which is precisely the "closeEvent cannot wait it out"
+# failure: N daemon threads still mid-SSL while Qt tears the window down.
+#
+# The read timeout is generous on purpose. The kernel's own telemetry
+# thread prints a TELEMETRY line every 5s (notebook_builder.py) and the
+# request itself may be held open for up to wait_for_logs_url_seconds (30)
+# before the first byte, so 120s is far longer than any healthy gap while
+# still bounding a dead connection.
+CONNECT_TIMEOUT_SECONDS = 20.0
+READ_TIMEOUT_SECONDS = 120.0
+
+# How often the closer thread re-checks stop_event. Small: this is the
+# latency between "the user closed the window" and "the blocked socket is
+# torn down", and closeEvent waits on it.
+STOP_POLL_SECONDS = 0.25
+
+
+def _install_request_timeout(client, timeout) -> bool:
+    """Give `client`'s requests.Session a default timeout.
+
+    kagglesdk exposes no timeout parameter anywhere, so the only injection
+    point is the Session it builds internally. Best-effort by design: if a
+    future kagglesdk reshuffles its internals this returns False and the
+    stream still runs (just without the backstop) rather than taking the
+    dashboard down over a private attribute.
+    """
+    try:
+        http = client.http_client()
+        http._init_session()
+        session = http._session
+        if session is None:
+            return False
+        original_send = session.send
+
+        def send(request, **kwargs):
+            kwargs.setdefault("timeout", timeout)
+            return original_send(request, **kwargs)
+
+        session.send = send
+        return True
+    except Exception:      # noqa: BLE001 -- a missing internal is not fatal
+        return False
+
+
+def _close_when_stopped(resp, stop_event: threading.Event,
+                        finished: threading.Event) -> None:
+    """Close `resp` as soon as `stop_event` is set.
+
+    stop_event used to be checked only BETWEEN received lines, so a thread
+    parked in a blocking socket read never saw it -- the stream was
+    effectively unstoppable and closeEvent had nothing it could wait for.
+    Closing the response from here makes the blocked read raise, which
+    unwinds the streaming thread immediately.
+    """
+    while not finished.is_set():
+        if stop_event.wait(STOP_POLL_SECONDS):
+            try:
+                resp.close()
+            except Exception:   # noqa: BLE001 -- already tearing down
+                pass
+            return
+
+
 def is_end_of_log(line: str) -> bool:
     return "END_OF_LOG" in line
 
@@ -108,20 +176,51 @@ def stream_progress(token: str, user_name: str, kernel_slug: str,
     req.kernel_slug = kernel_slug
     req.wait_for_logs_url_seconds = 30
 
+    # Cheapest possible stop: never open a connection at all if the caller
+    # has already asked everything to unwind (window closed between the
+    # thread being started and it getting scheduled).
+    if stop_event is not None and stop_event.is_set():
+        return
+
     client = KaggleClient(api_token=token)
+    _install_request_timeout(client,
+                             (CONNECT_TIMEOUT_SECONDS, READ_TIMEOUT_SECONDS))
     resp = client.kernels.kernels_api_client.get_kernel_session_logs_stream(req)
-    for raw in resp.iter_lines(decode_unicode=True):
-        if stop_event is not None and stop_event.is_set():
-            return
-        if not raw:
-            continue
-        if is_end_of_log(raw):
-            return
-        got = parse_progress(raw)
-        if got:
-            on_progress(*got)
-            continue
-        if on_telemetry is not None:
-            record = parse_telemetry(raw)
-            if record:
-                on_telemetry(record)
+
+    finished = threading.Event()
+    closer: threading.Thread | None = None
+    if stop_event is not None:
+        closer = threading.Thread(
+            target=_close_when_stopped, args=(resp, stop_event, finished),
+            name="blendfleet-log-stream-closer", daemon=True)
+        closer.start()
+
+    try:
+        for raw in resp.iter_lines(decode_unicode=True):
+            if stop_event is not None and stop_event.is_set():
+                return
+            if not raw:
+                continue
+            if is_end_of_log(raw):
+                return
+            got = parse_progress(raw)
+            if got:
+                on_progress(*got)
+                continue
+            if on_telemetry is not None:
+                record = parse_telemetry(raw)
+                if record:
+                    on_telemetry(record)
+    finally:
+        # Order matters: release the closer first so it cannot outlive this
+        # call, then drop the connection, then make sure the closer really
+        # is gone before returning -- a stream thread that has "finished"
+        # while quietly leaving a helper behind is the same leak in a
+        # smaller costume.
+        finished.set()
+        try:
+            resp.close()
+        except Exception:       # noqa: BLE001
+            pass
+        if closer is not None:
+            closer.join(timeout=STOP_POLL_SECONDS * 8)

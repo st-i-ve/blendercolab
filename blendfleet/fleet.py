@@ -14,6 +14,8 @@ access up front, and polls each account independently.
 from __future__ import annotations
 
 import json
+import re
+import unicodedata
 import uuid
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
@@ -27,6 +29,65 @@ from blendfleet.notebook_builder import RenderSettings, build
 from blendfleet.platform_paths import state_dir
 
 STATE_FILE = "fleet.json"
+
+# Kaggle slugs (dataset AND kernel) accept lowercase letters, digits and
+# dashes -- nothing else. A .blend called "big buck bunny.blend" used to be
+# lower()ed with "_"->"-" and nothing more, producing
+# "user/big buck bunny-blend", which Kaggle rejects. Worse, the rejection
+# arrived from dataset_create -- i.e. AFTER the whole .blend had been
+# uploaded -- so the user waited out a full 60 MB upload to be told the
+# name was wrong. Everything below runs before a single byte is sent.
+_SLUG_STRIP_RE = re.compile(r"[^a-z0-9]+")
+
+# Kaggle rejects very short slugs, and the stem is only part of what gets
+# built from it ("<stem>-blend", "<stem>-render-<8 hex>"), so it is also
+# capped well under Kaggle's ~50 character slug limit rather than letting a
+# long filename fail at the same late, post-upload moment.
+MIN_STEM_LENGTH = 3
+MAX_STEM_LENGTH = 30
+
+
+class InvalidBlendNameError(ValueError):
+    """The .blend's filename cannot be turned into a usable Kaggle slug.
+
+    Raised BEFORE the upload starts (see slug_stem), because the whole
+    point is that the user finds out in a second rather than after a
+    60 MB upload has run to completion and been rejected.
+    """
+
+
+def slugify_stem(name: str) -> str:
+    """Reduce `name` to the [a-z0-9-] alphabet Kaggle slugs allow.
+
+    Accents are folded to their ASCII base ("Ünïcödé" -> "unicode") rather
+    than dropped outright, so an accented filename still produces a
+    recognisable slug. Every remaining run of disallowed characters --
+    spaces, punctuation, underscores, emoji, CJK -- collapses to a single
+    dash, and leading/trailing dashes are stripped. May legitimately
+    return "" (e.g. a name that is entirely CJK or punctuation); it is
+    slug_stem's job to refuse that, not this function's.
+    """
+    folded = (unicodedata.normalize("NFKD", name)
+              .encode("ascii", "ignore").decode("ascii"))
+    return _SLUG_STRIP_RE.sub("-", folded.lower()).strip("-")
+
+
+def slug_stem(blend: Path) -> str:
+    """The validated slug stem for `blend`, or raise InvalidBlendNameError.
+
+    Called at the very top of launch(), before any upload, so an unusable
+    filename costs the user a dialog rather than a completed upload.
+    """
+    stem = slugify_stem(Path(blend).stem)[:MAX_STEM_LENGTH].strip("-")
+    if len(stem) < MIN_STEM_LENGTH:
+        raise InvalidBlendNameError(
+            f"the file name {Path(blend).name!r} cannot be turned into a "
+            "Kaggle dataset name. Kaggle only accepts lowercase letters, "
+            "digits and dashes, and after removing everything else there "
+            f"were fewer than {MIN_STEM_LENGTH} characters left. Rename the "
+            "file to something like 'big-buck-bunny.blend' and try again -- "
+            "nothing has been uploaded.")
+    return stem
 
 
 @dataclass
@@ -140,6 +201,13 @@ class Fleet:
         if not self.accounts:
             raise ValueError("add at least one account before launching")
 
+        # Validate the name FIRST -- before the busy check, before the
+        # upload, before anything that costs time or quota. An unusable
+        # filename used to surface as a Kaggle 400 from dataset_create,
+        # i.e. only after the entire .blend had finished uploading.
+        stem = slug_stem(blend)
+        dataset_name = f"{stem}-blend"
+
         # Single-slot state file: launching over a live job would overwrite
         # the only record of the running kernels, leaving them uncancellable
         # and uncollectable while they spend other people's GPU quota.
@@ -153,8 +221,6 @@ class Fleet:
 
         job_id = uuid.uuid4().hex[:8]
         buckets = assign_frames(start_frame, end_frame, len(self.accounts))
-        stem = blend.stem.lower().replace("_", "-")
-        dataset_name = f"{stem}-blend"
 
         # Resolve a client + username for every account up front: needed
         # for the push loop below regardless, and for the grant/verify
