@@ -34,6 +34,23 @@ def pump(worker, timeout=2000) -> None:
         QCoreApplication.processEvents()
 
 
+def settle(dash, timeout=2000) -> None:
+    """Wait for whichever background _CallWorker(s) are in flight (e.g.
+    the quota refresh Dashboard.__init__ kicks off) and drain their
+    queued cross-thread signals, so a test sees a settled state instead
+    of racing a background thread. Also used as teardown: closing the
+    dashboard runs the same wait via closeEvent, so no QThread is ever
+    left running (and possibly garbage-collected mid-flight) once a test
+    function returns.
+    """
+    for worker in (dash._poll_worker, dash._quota_worker,
+                   dash._cancel_worker, dash._collect_worker):
+        if worker is not None:
+            assert worker.wait(timeout), "background worker did not finish in time"
+    for _ in range(10):
+        QCoreApplication.processEvents()
+
+
 def stub_message_boxes(monkeypatch):
     calls = {"warning": [], "critical": [], "information": []}
     for kind in calls:
@@ -126,6 +143,7 @@ def make_dashboard(qapp, tmp_path, n=3):
         return Fleet(accounts, lambda tok: FakeClient(tok), tmp_path / "w")
 
     dash = Dashboard(store, fleet_factory, verifier=lambda t: "someone")
+    settle(dash)   # let __init__'s initial quota-refresh worker finish
     return dash
 
 
@@ -137,13 +155,15 @@ def test_empty_state_shows_no_frames_and_placeholders(qapp, tmp_path):
     assert dash.filmstrip_caption.text() == "no frames yet"
     assert not dash.upload_view._rows
     assert dash.gpu_panel.gpu_count == 0
-    assert len(dash.rail_rows_layout) if hasattr(dash.rail_rows_layout, "__len__") \
-        else True  # rail built without raising
+    assert dash.rail_rows_layout.count() == 3
+    assert dash.poll_status_label.text() == ""
+    dash.close()
 
 
 def test_rail_shows_one_row_per_account(qapp, tmp_path):
     dash = make_dashboard(qapp, tmp_path, n=3)
     assert dash.rail_rows_layout.count() == 3
+    dash.close()
 
 
 # ---------------- launch success: in-progress -> complete ----------------
@@ -173,6 +193,7 @@ def test_launch_success_updates_upload_filmstrip_and_table(qapp, tmp_path):
     assert len(dash._last_state.workers) == 3
     assert dash.filmstrip.total_frames == 9
     assert dash.table.rowCount() == 3
+    dash.close()
 
 
 def test_launch_failure_shows_friendly_message_not_raw_exception(qapp, tmp_path, monkeypatch):
@@ -197,6 +218,7 @@ def test_launch_failure_shows_friendly_message_not_raw_exception(qapp, tmp_path,
         assert "retry the render" in message
         # never a bare traceback/exception repr
         assert "Traceback" not in message
+        dash.close()
     finally:
         FakeClient.fail_upload = False
 
@@ -209,11 +231,13 @@ def test_launch_with_no_accounts_shows_actionable_warning(qapp, tmp_path, monkey
         return Fleet(accounts, lambda tok: FakeClient(tok), tmp_path / "w")
 
     dash = Dashboard(store, fleet_factory, verifier=lambda t: "someone")
+    settle(dash)
     dash.blend = tmp_path / "x.blend"
     dash._launch()
     assert calls["warning"]
     title, message = calls["warning"][0]
     assert "add" in message.lower()
+    dash.close()
 
 
 def test_launch_with_bad_frame_range_shows_actionable_warning(qapp, tmp_path, monkeypatch):
@@ -227,6 +251,7 @@ def test_launch_with_bad_frame_range_shows_actionable_warning(qapp, tmp_path, mo
     dash._launch()
     assert calls["warning"]
     assert "end frame" in calls["warning"][0][1].lower()
+    dash.close()
 
 
 # ---------------- GPU telemetry drains onto the UI thread ----------------
@@ -241,6 +266,7 @@ def test_live_tick_drains_queued_telemetry_into_gpu_panel(qapp, tmp_path):
         "temp": 45, "power": None}))
     dash._live_tick()
     assert dash.gpu_panel.gpu_count == 2
+    dash.close()
 
 
 def test_start_progress_threads_feeds_live_progress_and_telemetry(qapp, tmp_path, monkeypatch):
@@ -271,3 +297,4 @@ def test_start_progress_threads_feeds_live_progress_and_telemetry(qapp, tmp_path
     assert dash._live_progress   # at least one worker reported live progress
     dash._live_tick()
     assert dash.gpu_panel.gpu_count >= 1
+    dash.close()

@@ -3,6 +3,7 @@ from __future__ import annotations
 import queue
 import threading
 from pathlib import Path
+from typing import Callable
 
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtWidgets import (QComboBox, QFileDialog, QFormLayout,
@@ -49,13 +50,16 @@ class _AccountRow(QWidget):
         self.set_verified(account.verified)
 
     def set_verified(self, verified: bool) -> None:
+        # The word is part of the visible label, not a tooltip: a tooltip
+        # is invisible to anyone not hovering, and to screen readers in
+        # many configurations, which defeats the entire "symbol + word"
+        # rule this exists for (see SetupDialog._refresh, which this
+        # matches).
         if verified:
-            self.status.setText("✓")
-            self.status.setToolTip("verified")
+            self.status.setText("✓ verified")
             self.status.setStyleSheet(f"color: {ACCENT};")
         else:
-            self.status.setText("✗")
-            self.status.setToolTip("not verified")
+            self.status.setText("✗ not verified")
             self.status.setStyleSheet(f"color: {WARNING};")
 
 
@@ -95,6 +99,37 @@ class _LaunchWorker(QThread):
             self.succeeded.emit(st)
 
 
+class _CallWorker(QThread):
+    """Runs one arbitrary no-argument callable off the UI thread.
+
+    This is the same pattern as _LaunchWorker (and setup_dialog.py's
+    _VerifyWorker) generalised for every OTHER action that makes a real
+    Kaggle API call: polling kernel status, refreshing quota, cancelling,
+    collecting frames. All four used to run straight on the button-click/
+    timer-tick handler, which is exactly the frozen-window bug this branch
+    exists to fix -- see FINDING 1, task 5 fix round 1. `action` is a
+    gerund phrase ("Checking render status", "Cancelling the render", ...)
+    used to build a friendly message via blendfleet.ui.messages.explain if
+    `fn` raises; callers never see a raw exception on `failed`.
+    """
+
+    succeeded = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, fn: Callable[[], object], action: str, parent=None) -> None:
+        super().__init__(parent)
+        self._fn = fn
+        self._action = action
+
+    def run(self) -> None:
+        try:
+            result = self._fn()
+        except Exception as e:  # noqa: BLE001 -- turned into a friendly message
+            self.failed.emit(explain(self._action, e))
+        else:
+            self.succeeded.emit(result)
+
+
 class Dashboard(QMainWindow):
     def __init__(self, store: AccountStore, fleet_factory, verifier) -> None:
         super().__init__()
@@ -104,6 +139,13 @@ class Dashboard(QMainWindow):
         self.blend: Path | None = None
         self._stop = threading.Event()
         self._launch_worker: _LaunchWorker | None = None
+        # One in-flight _CallWorker per action -- kept so a periodic tick
+        # (poll/quota) can skip rather than stack a new worker on top of a
+        # still-running one, and so closeEvent() has something to wait on.
+        self._poll_worker: _CallWorker | None = None
+        self._quota_worker: _CallWorker | None = None
+        self._cancel_worker: _CallWorker | None = None
+        self._collect_worker: _CallWorker | None = None
         self._last_state: FleetState | None = None
         # Keyed by kernel_slug (stable across polls) rather than kept on the
         # WorkerState instance: fleet.poll() rebuilds fresh WorkerState
@@ -116,10 +158,10 @@ class Dashboard(QMainWindow):
         # UI thread, so telemetry never goes straight from a worker thread
         # into GpuPanel.
         self._telemetry_queue: "queue.Queue[tuple[str, dict]]" = queue.Queue()
-        # Keyed by account label. Populated by _refresh_quota(), which is
-        # best-effort: a fetch failure for one or all accounts must never
-        # raise -- it only ever downgrades the displayed figure to
-        # "unavailable" (see FINDING 1, task 9 fix round 1).
+        # Keyed by account label. Populated by _refresh_quota_async(),
+        # which is best-effort: a fetch failure for one or all accounts
+        # must never raise -- it only ever downgrades the displayed
+        # figure to "unavailable" (see FINDING 1, task 9 fix round 1).
         self._quota_cache: dict[str, str] = {}
         self.setWindowTitle("BlendFleet")
         self.resize(1180, 760)
@@ -145,14 +187,14 @@ class Dashboard(QMainWindow):
 
         self._refresh_accounts()
         self._update_eta()
-        self._refresh_quota()
+        self._refresh_quota_async()
         self._refresh_views()
 
     # ---------------- layout ----------------
     def _build_rail(self) -> QWidget:
         rail = QWidget()
         rail.setObjectName("rail")
-        rail.setFixedWidth(200)
+        rail.setFixedWidth(230)
         v = QVBoxLayout(rail)
         v.setContentsMargins(0, 8, 0, 8)
         title = QLabel("<b>accounts</b>")
@@ -238,6 +280,16 @@ class Dashboard(QMainWindow):
             QHeaderView.ResizeMode.Stretch)
         v.addWidget(self.table)
 
+        # A visible degraded-state marker for the periodic status poll --
+        # see FINDING 3, task 5 fix round 1: a poll failure used to be
+        # swallowed completely silently, with nothing like quota's
+        # "unavailable" fallback. Hidden (empty) whenever the last poll
+        # succeeded.
+        self.poll_status_label = QLabel("")
+        self.poll_status_label.setWordWrap(True)
+        self.poll_status_label.setStyleSheet(f"color: {WARNING};")
+        v.addWidget(self.poll_status_label)
+
         note = QLabel(
             f'The <b>Quota (API)</b> column above is exactly that: the figure '
             f'the Kaggle API reports right now, not a guarantee. It has been '
@@ -270,30 +322,62 @@ class Dashboard(QMainWindow):
 
     def _manage(self) -> None:
         SetupDialog(self.store, self.verifier, self).exec()
-        self._refresh_accounts(); self._update_eta(); self._refresh_quota()
+        self._refresh_accounts(); self._update_eta(); self._refresh_quota_async()
 
-    def _refresh_quota(self) -> None:
+    def _refresh_quota_async(self) -> None:
         """Best-effort per-account GPU quota fetch, straight from
-        KaggleClient.quota(). Never allowed to raise: a single account's
-        fetch failing (rate limit, network blip, revoked token, a fake/stub
-        client_factory with no quota() at all) must not break the dashboard
-        or block a render -- it only ever downgrades that account's figure
-        to "unavailable"."""
-        try:
-            client_factory = self.fleet_factory(self.store.list()).client_factory
-        except Exception:
-            client_factory = None
-        for acct in self.store.list():
-            if client_factory is None:
-                self._quota_cache[acct.label] = "unavailable"
-                continue
+        KaggleClient.quota() -- run off the UI thread (FINDING 1, task 5
+        fix round 1: this used to block the window on one real HTTP round
+        trip per account). Skips rather than stacks a second worker if a
+        previous quota fetch is still in flight (e.g. the 30s poll timer
+        firing again before a slow fetch returned).
+
+        The work callable is itself already best-effort and never allowed
+        to raise: a single account's fetch failing (rate limit, network
+        blip, revoked token, a fake/stub client_factory with no quota() at
+        all) must not break the dashboard or block a render -- it only
+        ever downgrades that account's figure to "unavailable".
+        """
+        if self._quota_worker is not None:
+            return
+        accounts = self.store.list()
+
+        def work() -> dict[str, str]:
             try:
-                q = client_factory(acct.token).quota()
-                used_h = q.used_seconds / 3600.0
-                total_h = q.total_seconds / 3600.0
-                self._quota_cache[acct.label] = f"{used_h:.1f} / {total_h:.1f} h"
+                client_factory = self.fleet_factory(accounts).client_factory
             except Exception:
-                self._quota_cache[acct.label] = "unavailable"
+                client_factory = None
+            result: dict[str, str] = {}
+            for acct in accounts:
+                if client_factory is None:
+                    result[acct.label] = "unavailable"
+                    continue
+                try:
+                    q = client_factory(acct.token).quota()
+                    used_h = q.used_seconds / 3600.0
+                    total_h = q.total_seconds / 3600.0
+                    result[acct.label] = f"{used_h:.1f} / {total_h:.1f} h"
+                except Exception:
+                    result[acct.label] = "unavailable"
+            return result
+
+        worker = _CallWorker(work, "Refreshing quota", self)
+        self._quota_worker = worker
+
+        def done_ok(result: dict) -> None:
+            self._quota_worker = None
+            self._quota_cache.update(result)
+            self._refresh_views()
+
+        def done_fail(_message: str) -> None:
+            # work() above never actually raises (every account is
+            # individually guarded), so this is belt-and-braces only.
+            self._quota_worker = None
+
+        worker.succeeded.connect(done_ok)
+        worker.failed.connect(done_fail)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
 
     def _pick(self) -> None:
         f, _ = QFileDialog.getOpenFileName(self, "Select .blend", "",
@@ -350,6 +434,12 @@ class Dashboard(QMainWindow):
         self._launch_worker.start()
 
     def _on_launch_succeeded(self, st: FleetState) -> None:
+        # Cleared here (not just left to worker.finished.connect(deleteLater)):
+        # the Python attribute would otherwise go on pointing at a QThread
+        # whose C++ object Qt has already destroyed, and closeEvent()'s
+        # teardown loop calling .isRunning() on that stale reference raises
+        # shiboken's "already deleted" RuntimeError.
+        self._launch_worker = None
         owner_label = self.store.list()[0].label if self.store.list() else ""
         if owner_label:
             self.upload_view.set_complete(owner_label)
@@ -357,11 +447,12 @@ class Dashboard(QMainWindow):
         self.render_btn.setText("RENDER ACROSS FLEET")
         self._live_progress.clear()
         self._last_state = st
-        self._refresh_quota()
+        self._refresh_quota_async()
         self._refresh_views()
         self._start_progress_threads(st)
 
     def _on_launch_failed(self, owner_label: str, message: str) -> None:
+        self._launch_worker = None
         self.upload_view.set_failed(owner_label, message)
         self.render_btn.setEnabled(True)
         self.render_btn.setText("RENDER ACROSS FLEET")
@@ -395,16 +486,49 @@ class Dashboard(QMainWindow):
             threading.Thread(target=run, daemon=True).start()
 
     def _cancel(self) -> None:
+        """Cancel is user-initiated and its entire purpose is stopping
+        other people's GPU quota from draining -- of everything in this
+        app, it is the one action that must never freeze the window at
+        the moment the user needs it to respond (FINDING 1, task 5 fix
+        round 1). The button is disabled for the duration and re-enabled
+        from both the success and failure paths, so the user always gets
+        feedback instead of a dead window.
+        """
         if QMessageBox.question(self, "Cancel all",
                                 "Stop every running render?") != \
                 QMessageBox.StandardButton.Yes:
             return
-        try:
-            results = self.fleet_factory(self.store.list()).cancel_all()
-        except Exception as e:
-            QMessageBox.warning(self, "Could not cancel",
-                                explain("Cancelling the render", e))
-            return
+        if self._cancel_worker is not None:
+            return   # a cancel is already in flight -- the button is disabled too
+        accounts = self.store.list()
+
+        def work():
+            return self.fleet_factory(accounts).cancel_all()
+
+        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.setText("Cancelling…")
+
+        worker = _CallWorker(work, "Cancelling the render", self)
+        self._cancel_worker = worker
+
+        def done_ok(results) -> None:
+            self._cancel_worker = None
+            self.cancel_btn.setEnabled(True)
+            self.cancel_btn.setText("Cancel all")
+            self._show_cancel_results(results)
+
+        def done_fail(message: str) -> None:
+            self._cancel_worker = None
+            self.cancel_btn.setEnabled(True)
+            self.cancel_btn.setText("Cancel all")
+            QMessageBox.warning(self, "Could not cancel", message)
+
+        worker.succeeded.connect(done_ok)
+        worker.failed.connect(done_fail)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def _show_cancel_results(self, results) -> None:
         results = list(results or [])
         if not results:
             QMessageBox.information(
@@ -431,46 +555,106 @@ class Dashboard(QMainWindow):
             f"Stop them by hand at kaggle.com → the notebook → Stop session.")
 
     def _collect(self) -> None:
+        """Downloading rendered output (`fetch_output`) is real, and
+        potentially slow, network I/O -- moved off the UI thread for the
+        same reason as _cancel above (FINDING 1, task 5 fix round 1)."""
         d = QFileDialog.getExistingDirectory(self, "Save frames to")
         if not d:
             return
+        if self._collect_worker is not None:
+            return   # a collect is already in flight -- the button is disabled too
         from blendfleet.collector import collect
-        try:
-            fleet = self.fleet_factory(self.store.list())
+        accounts = self.store.list()
+
+        def work():
+            fleet = self.fleet_factory(accounts)
             st = fleet.load()
             if st is None:
+                return None
+            return collect(st, accounts, fleet.client_factory, Path(d))
+
+        self.collect_btn.setEnabled(False)
+        self.collect_btn.setText("Collecting…")
+
+        worker = _CallWorker(work, "Collecting frames", self)
+        self._collect_worker = worker
+
+        def done_ok(r) -> None:
+            self._collect_worker = None
+            self.collect_btn.setEnabled(True)
+            self.collect_btn.setText("Collect frames…")
+            if r is None:
                 QMessageBox.information(
                     self, "Nothing to collect",
                     "No render job was found -- start a render first.")
                 return
-            r = collect(st, self.store.list(), fleet.client_factory, Path(d))
-        except Exception as e:
-            QMessageBox.critical(self, "Could not collect frames",
-                                 explain("Collecting frames", e))
-            return
-        msg = f"Copied {r.copied} frame(s) to {d}."
-        if r.missing_frames:
-            msg += (f"\n\n{len(r.missing_frames)} frame(s) are still "
-                    f"missing (not rendered yet, or the render failed for "
-                    f"that account): {r.missing_frames[:20]}"
-                    f"{'…' if len(r.missing_frames) > 20 else ''}\n\n"
-                    "Collect again once those accounts finish.")
-        QMessageBox.information(self, "Frames collected", msg)
+            msg = f"Copied {r.copied} frame(s) to {d}."
+            if r.missing_frames:
+                msg += (f"\n\n{len(r.missing_frames)} frame(s) are still "
+                        f"missing (not rendered yet, or the render failed "
+                        f"for that account): {r.missing_frames[:20]}"
+                        f"{'…' if len(r.missing_frames) > 20 else ''}\n\n"
+                        "Collect again once those accounts finish.")
+            QMessageBox.information(self, "Frames collected", msg)
+
+        def done_fail(message: str) -> None:
+            self._collect_worker = None
+            self.collect_btn.setEnabled(True)
+            self.collect_btn.setText("Collect frames…")
+            QMessageBox.critical(self, "Could not collect frames", message)
+
+        worker.succeeded.connect(done_ok)
+        worker.failed.connect(done_fail)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
 
     # ---------------- polling / live refresh ----------------
     def _poll(self) -> None:
-        try:
-            fleet = self.fleet_factory(self.store.list())
-            st = fleet.poll()
+        """Refresh every worker's kernel status from Kaggle.
+
+        Runs off the UI thread (FINDING 1, task 5 fix round 1): this fires
+        on a 30s timer and makes one real HTTP call per account
+        (fleet.poll() -> KaggleClient.status()), so with even 3 accounts
+        it used to be able to lock up the window on 3 blocking calls
+        twice a minute, forever. Skips this tick entirely -- rather than
+        stacking a second worker on top of a still-running one -- if the
+        previous poll has not returned yet.
+
+        A poll failure must still never kill the dashboard, but silently
+        swallowing it (the old behaviour) left the user with no idea the
+        table had gone stale -- see FINDING 3. poll_status_label now
+        carries a visible, worded degraded-state message instead, cleared
+        again the moment a poll succeeds.
+        """
+        if self._poll_worker is not None:
+            return
+        accounts = self.store.list()
+
+        def work():
+            return self.fleet_factory(accounts).poll()
+
+        worker = _CallWorker(work, "Checking render status", self)
+        self._poll_worker = worker
+
+        def done_ok(st) -> None:
+            self._poll_worker = None
             if st:
                 self._last_state = st
-        except Exception:
-            pass          # a transient poll failure must not kill the dashboard
-        try:
-            self._refresh_quota()
-        except Exception:
-            pass          # same guarantee for the quota side-channel
-        self._refresh_views()
+            self.poll_status_label.setText("")
+            self._refresh_views()
+
+        def done_fail(message: str) -> None:
+            self._poll_worker = None
+            self.poll_status_label.setText(
+                f"⚠ {message} Showing the last known render status.")
+            self._refresh_views()
+
+        worker.succeeded.connect(done_ok)
+        worker.failed.connect(done_fail)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+        self._refresh_quota_async()
 
     def _live_tick(self) -> None:
         """Cheap, frequent refresh: drain telemetry samples collected by
@@ -530,5 +714,26 @@ class Dashboard(QMainWindow):
             self.table.setCellWidget(i, 5, bar)
 
     def closeEvent(self, event) -> None:
-        self._stop.set()
+        self._stop.set()          # tells the daemon SSE threads to unwind
+        self.timer.stop()
+        self.live_timer.stop()
+        # Threads must not outlive the window (FINDING 1, task 5 fix
+        # round 1): wait for whichever _CallWorker/_LaunchWorker happens
+        # to be in flight rather than letting Qt destroy a QObject whose
+        # thread is still running underneath it. Bounded so a genuinely
+        # stuck network call cannot hang application shutdown forever.
+        for worker in (self._launch_worker, self._poll_worker,
+                       self._quota_worker, self._cancel_worker,
+                       self._collect_worker):
+            if worker is None:
+                continue
+            try:
+                if worker.isRunning():
+                    worker.wait(5000)
+            except RuntimeError:
+                # The worker finished and its deleteLater() was already
+                # processed between the None-check above and this call --
+                # the underlying C++ QThread is gone, which is exactly the
+                # "not running any more" outcome we were waiting for.
+                pass
         super().closeEvent(event)

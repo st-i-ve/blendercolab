@@ -395,7 +395,18 @@ class KaggleClient:
         except ValueError:
             return KernelStatus(state="not_started")
         except Exception as e:
-            raise KaggleError(str(e)) from e
+            # Bare str(e) used to be re-raised verbatim here -- fine for a
+            # test asserting on the underlying text, useless for a user
+            # staring at a dialog with no idea whether to wait or worry.
+            # Keep the original detail (still present in the message, so
+            # existing callers/tests that grep for it still match) but wrap
+            # it in what happened and what to do next.
+            raise KaggleError(
+                f"could not check the render status for {slug}: {e}. This "
+                "is usually a transient network or rate-limit problem -- "
+                "BlendFleet will try again on the next check; if it keeps "
+                "happening, confirm this account still has a valid token "
+                "under Manage accounts…") from e
         # r.status may be an enum whose str() is "KernelWorkerStatus.COMPLETE",
         # or a plain string "COMPLETE". Normalise both to "complete".
         raw = str(getattr(r, "status", ""))
