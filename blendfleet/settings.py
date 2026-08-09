@@ -26,7 +26,14 @@ class Settings:
     fullscreen: bool = False
 
     def __post_init__(self) -> None:
-        if self.accent not in ACCENTS:
+        # Total, not just "wrong value": a hand-edited or forward-dated
+        # config can hand this an unhashable value (a list or dict from
+        # `"accent": ["a"]` / `{"accent": {"x": 1}}`), and `x not in dict`
+        # raises TypeError for those rather than returning False. Checking
+        # isinstance first means every construction path -- not just
+        # load()'s except clause -- is safe against any JSON-representable
+        # value, not only the ones that happen to be hashable.
+        if not isinstance(self.accent, str) or self.accent not in ACCENTS:
             self.accent = DEFAULT_ACCENT
 
     def _path(self) -> Path:

@@ -61,3 +61,48 @@ def test_every_real_accent_name_round_trips():
         assert s.accent == name
         s.save()
         assert Settings.load().accent == name
+
+
+# ---------------- malformed accent values, direct construction ----------------
+# `x not in ACCENTS` raises TypeError for unhashable x instead of returning
+# False, so the fallback must check the type first. Covering the full space
+# a hand-edited or forward-dated config could contain: a plain unknown
+# string is already covered above; here every other JSON-representable
+# shape must also fall back rather than raise.
+
+@pytest.mark.parametrize("bad_accent", [
+    None,
+    42,        # wrong scalar type
+    3.5,
+    True,      # bool is technically an int but still not a valid accent
+    [1, 2],    # unhashable
+    {"x": 1},  # unhashable
+])
+def test_malformed_accent_falls_back_rather_than_raising(bad_accent):
+    s = Settings(accent=bad_accent)
+    assert s.accent == DEFAULT_ACCENT
+
+
+# ---------------- malformed accent values, via load() ----------------
+
+@pytest.mark.parametrize("bad_accent_json", [
+    "null",
+    "42",
+    "[1, 2]",
+    '{"x": 1}',
+])
+def test_load_with_malformed_accent_in_file_falls_back(bad_accent_json):
+    p = pp.config_dir() / "settings.json"
+    p.write_text(
+        '{"accent": %s, "fullscreen": false}' % bad_accent_json,
+        encoding="utf-8")
+    s = Settings.load()
+    assert s.accent == DEFAULT_ACCENT
+
+
+def test_load_with_accent_key_entirely_missing_falls_back():
+    p = pp.config_dir() / "settings.json"
+    p.write_text(json.dumps({"fullscreen": True}), encoding="utf-8")
+    s = Settings.load()
+    assert s.accent == DEFAULT_ACCENT
+    assert s.fullscreen is True
