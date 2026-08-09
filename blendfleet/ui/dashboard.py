@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -15,6 +16,7 @@ from PySide6.QtWidgets import (QComboBox, QFileDialog, QFormLayout,
 from blendfleet.accounts import AccountStore
 from blendfleet.assignment import estimate
 from blendfleet.fleet import Fleet, FleetState
+from blendfleet.instance_state import GpuSnapshot, InstanceSnapshot, InstanceStore
 from blendfleet.log_stream import stream_progress
 from blendfleet.notebook_builder import RenderSettings
 from blendfleet.ui.charts import Filmstrip, GpuPanel
@@ -167,6 +169,22 @@ class Dashboard(QMainWindow):
         # UI thread, so telemetry never goes straight from a worker thread
         # into GpuPanel.
         self._telemetry_queue: "queue.Queue[tuple[str, dict]]" = queue.Queue()
+        # Last-known hardware per account, cached across app restarts so an
+        # idle card (Task 4) can show what an account last ran on -- Kaggle
+        # has no idle instances to poll instead. Loaded once here; every
+        # write goes through _record_instance_snapshot below.
+        self.instance_store = InstanceStore.load()
+        # Per-run accumulator: label -> {gpu index -> mem_total}, built up
+        # from telemetry as it arrives so a multi-GPU account's snapshot
+        # reflects every GPU seen, not just whichever one's line happened
+        # to be first. Reset in _start_progress_threads, i.e. as each new
+        # render starts.
+        self._instance_gpus: dict[str, dict[int, int]] = {}
+        # Labels already persisted for the CURRENT run. Recording once per
+        # account per run (not once per telemetry sample, which arrives
+        # every ~5s for as long as the render runs) is the whole point --
+        # see _record_instance_snapshot.
+        self._recorded_instance_labels: set[str] = set()
         # Keyed by account label. Populated by _refresh_quota_async(),
         # which is best-effort: a fetch failure for one or all accounts
         # must never raise -- it only ever downgrades the displayed
@@ -511,6 +529,11 @@ class Dashboard(QMainWindow):
         key here too.
         """
         self._live_progress.clear()
+        # A new render means new hardware may be handed out (Kaggle's
+        # allocation varies run to run) -- so the "already recorded this
+        # run" guard and its accumulator both reset here, per render.
+        self._instance_gpus.clear()
+        self._recorded_instance_labels.clear()
         # Drop the threads from the previous job that have already unwound,
         # so a long session's worth of renders does not accumulate dead
         # Thread objects that closeEvent then walks every time.
@@ -728,16 +751,47 @@ class Dashboard(QMainWindow):
         """Cheap, frequent refresh: drain telemetry samples collected by
         the background SSE threads into the GPU panel, and repaint the
         filmstrip/table with whatever live frame progress has arrived --
-        no network calls here, unlike _poll()."""
+        no network calls here, unlike _poll().
+
+        Recorded from this UI-thread drain side, not from the worker
+        closure that fills _telemetry_queue: that closure deliberately
+        does nothing but enqueue (widgets, and now the instance-state
+        write, must only ever happen off the SSE thread).
+        """
         drained = 0
+        newly_seen: set[str] = set()
         while drained < 200:  # bounded: never let a stuck consumer spin forever
             try:
                 label, record = self._telemetry_queue.get_nowait()
             except queue.Empty:
                 break
             self.gpu_panel.ingest(label, record)
+            self._instance_gpus.setdefault(label, {})[record["gpu"]] = record["mem_total"]
+            if label not in self._recorded_instance_labels:
+                newly_seen.add(label)
             drained += 1
+        for label in newly_seen:
+            self._record_instance_snapshot(label)
         self._refresh_views()
+
+    def _record_instance_snapshot(self, label: str) -> None:
+        """Persist one InstanceSnapshot for `label`, once for the current
+        run, from telemetry accumulated so far in _instance_gpus.
+
+        cpu_count and ram_total have no source through this wiring -- see
+        blendfleet/instance_state.py's module docstring -- so they are left
+        None rather than guessed.
+        """
+        self._recorded_instance_labels.add(label)
+        account = next((a for a in self.store.list() if a.label == label), None)
+        gpus = [GpuSnapshot(index=idx, mem_total=mem_total)
+               for idx, mem_total in sorted(self._instance_gpus.get(label, {}).items())]
+        snapshot = InstanceSnapshot(
+            username=account.username if account else None,
+            gpus=gpus, cpu_count=None, ram_total=None,
+            observed_at=time.time())
+        self.instance_store.record(label, snapshot)
+        self.instance_store.save()
 
     def _refresh_views(self) -> None:
         st = self._last_state

@@ -10,7 +10,8 @@ from PySide6.QtWidgets import QApplication
 import blendfleet.platform_paths as pp
 import blendfleet.ui.dashboard as dashboard_mod
 from blendfleet.accounts import Account, AccountStore
-from blendfleet.fleet import Fleet
+from blendfleet.fleet import Fleet, FleetState
+from blendfleet.instance_state import GpuSnapshot, InstanceStore
 from blendfleet.kaggle_client import KaggleError, KernelStatus, Quota
 from blendfleet.notebook_builder import RenderSettings
 from blendfleet.ui.dashboard import Dashboard
@@ -351,6 +352,93 @@ def test_start_progress_threads_feeds_live_progress_and_telemetry(qapp, tmp_path
     assert dash._live_progress   # at least one worker reported live progress
     dash._live_tick()
     assert dash.gpu_panel.gpu_count >= 1
+    dash.close()
+
+
+# ---------------- last-known instance hardware (Task 3) ----------------
+
+def test_live_tick_records_instance_snapshot_from_telemetry(qapp, tmp_path):
+    dash = make_dashboard(qapp, tmp_path)
+    dash._telemetry_queue.put(("acct0", {
+        "gpu": 0, "util": 87, "mem_used": 6144, "mem_total": 15360,
+        "temp": 71, "power": 58.0}))
+    dash._telemetry_queue.put(("acct0", {
+        "gpu": 1, "util": 12, "mem_used": 1024, "mem_total": 15360,
+        "temp": 45, "power": None}))
+    dash._live_tick()
+
+    snap = dash.instance_store.get("acct0")
+    assert snap is not None
+    assert snap.username == "user_0"   # make_store's Account.username
+    assert snap.gpus == [GpuSnapshot(index=0, mem_total=15360),
+                         GpuSnapshot(index=1, mem_total=15360)]
+    # No source for these through the telemetry wiring -- left None, not
+    # guessed.
+    assert snap.cpu_count is None
+    assert snap.ram_total is None
+    dash.close()
+
+
+def test_instance_snapshot_is_persisted_to_disk(qapp, tmp_path):
+    dash = make_dashboard(qapp, tmp_path)
+    dash._telemetry_queue.put(("acct0", {
+        "gpu": 0, "util": 50, "mem_used": 100, "mem_total": 200,
+        "temp": 60, "power": 10.0}))
+    dash._live_tick()
+    dash.close()
+
+    reloaded = InstanceStore.load()
+    assert reloaded.get("acct0").gpus == [GpuSnapshot(index=0, mem_total=200)]
+
+
+def test_instance_snapshot_recorded_once_per_run_not_per_sample(qapp, tmp_path):
+    """Persisting to disk on every telemetry sample would be wasteful --
+    the account's snapshot for the current run is written once, on the
+    first telemetry seen for it, not re-written as later samples for the
+    same GPU keep arriving every ~5s."""
+    dash = make_dashboard(qapp, tmp_path)
+    dash._telemetry_queue.put(("acct0", {
+        "gpu": 0, "util": 50, "mem_used": 100, "mem_total": 200,
+        "temp": 60, "power": 10.0}))
+    dash._live_tick()
+    first = dash.instance_store.get("acct0")
+    assert first is not None
+
+    # A later sample for the SAME run must not move observed_at forward or
+    # otherwise re-record.
+    dash._telemetry_queue.put(("acct0", {
+        "gpu": 0, "util": 99, "mem_used": 150, "mem_total": 200,
+        "temp": 65, "power": 12.0}))
+    dash._live_tick()
+    second = dash.instance_store.get("acct0")
+    assert second.observed_at == first.observed_at
+    dash.close()
+
+
+def test_instance_snapshot_re_recorded_on_next_render(qapp, tmp_path):
+    """Kaggle's allocation varies between runs, so the once-per-run guard
+    must reset when a NEW render starts, not stay latched forever."""
+    dash = make_dashboard(qapp, tmp_path)
+    dash._telemetry_queue.put(("acct0", {
+        "gpu": 0, "util": 50, "mem_used": 100, "mem_total": 200,
+        "temp": 60, "power": 10.0}))
+    dash._live_tick()
+    first = dash.instance_store.get("acct0")
+
+    time.sleep(0.01)   # observed_at must move forward on the next record
+    dash._start_progress_threads(FleetState("job", "b.blend", 1, 1, []))
+    dash._telemetry_queue.put(("acct0", {
+        "gpu": 0, "util": 20, "mem_used": 80, "mem_total": 200,
+        "temp": 55, "power": 8.0}))
+    dash._live_tick()
+    second = dash.instance_store.get("acct0")
+    assert second.observed_at > first.observed_at
+    dash.close()
+
+
+def test_account_with_no_history_has_no_snapshot(qapp, tmp_path):
+    dash = make_dashboard(qapp, tmp_path)
+    assert dash.instance_store.get("acct0") is None
     dash.close()
 
 
