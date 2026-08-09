@@ -20,7 +20,8 @@ from blendfleet.notebook_builder import RenderSettings
 from blendfleet.ui.charts import Filmstrip, GpuPanel
 from blendfleet.ui.messages import explain
 from blendfleet.ui.setup_dialog import SetupDialog
-from blendfleet.ui.theme import ACCENT, WARNING, account_color, mono_font
+from blendfleet.ui.theme import (ACCENT, WARNING, account_color, brand_icon,
+                                  mono_font)
 from blendfleet.ui.upload_view import UploadView
 
 SETTINGS_URL = "https://www.kaggle.com/settings"
@@ -205,6 +206,20 @@ class Dashboard(QMainWindow):
         rail.setFixedWidth(230)
         v = QVBoxLayout(rail)
         v.setContentsMargins(0, 8, 0, 8)
+
+        # The brand mark, tinted to the active accent (see theme.brand_icon)
+        # rather than shipped as a fixed-colour logo -- so it belongs to the
+        # app's own chrome and follows whichever accent the user picked,
+        # instead of reading as a sticker pasted over it.
+        brand = QHBoxLayout()
+        brand.setContentsMargins(8, 0, 8, 8)
+        brand.setSpacing(8)
+        mark = QLabel()
+        mark.setPixmap(brand_icon(ACCENT, 28).pixmap(28, 28))
+        brand.addWidget(mark)
+        brand.addWidget(QLabel("<b>BlendFleet</b>"), 1)
+        v.addLayout(brand)
+
         title = QLabel("<b>accounts</b>")
         title.setContentsMargins(8, 0, 8, 4)
         v.addWidget(title)

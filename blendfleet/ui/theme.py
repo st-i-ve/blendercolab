@@ -151,6 +151,7 @@ MONO_FONT_FALLBACK = "Consolas"
 ASSETS_DIR = Path(__file__).resolve().parents[2] / "assets"
 FONTS_DIR = ASSETS_DIR / "fonts"
 ICONS_DIR = ASSETS_DIR / "icons"
+LOGO_DIR = ASSETS_DIR / "logo"
 
 # The five TTFs vendored under assets/fonts/ (Apache-2.0) -- every one of
 # them must register, not just enough to make the family name resolve, so
@@ -422,6 +423,46 @@ def icon(name: str, color: str, size: int = 24) -> QIcon:
     if pixmap.isNull():
         raise ValueError(f"icon {name!r} rendered a null pixmap")
     return QIcon(pixmap)
+
+
+def brand_icon(color: str, size: int = 32) -> QIcon:
+    """The BlendFleet mark, tinted to `color`.
+
+    assets/logo/mark-white.png is the tintable master `make_logo.py`
+    derives from newLogo.png: flat white RGB, shape carried entirely by
+    the alpha channel -- the same "recolour a stencil" contract as
+    icon()'s SVGs, just rasterised instead of vector, because the source
+    art is a photographed contact sheet rather than something that can be
+    hand-authored as an SVG. Composited with SourceIn (paint `color` only
+    where the mask has alpha) rather than a second asset per accent, so
+    the in-app glyph follows the active accent the same way icon() does,
+    with one file instead of five.
+
+    Raises FileNotFoundError/ValueError on the same terms as icon(): a
+    missing or unrenderable mark must fail a test, not show up as a blank
+    square in the rail at runtime.
+    """
+    path = LOGO_DIR / "mark-white.png"
+    if not path.exists():
+        raise FileNotFoundError(f"brand mark not found at {path}")
+    mask = QPixmap(str(path))
+    if mask.isNull():
+        raise ValueError(f"brand mark at {path} did not load as a pixmap")
+    mask = mask.scaled(size, size, Qt.AspectRatioMode.KeepAspectRatio,
+                       Qt.TransformationMode.SmoothTransformation)
+    tinted = QPixmap(mask.size())
+    tinted.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(tinted)
+    try:
+        painter.drawPixmap(0, 0, mask)
+        painter.setCompositionMode(
+            QPainter.CompositionMode.CompositionMode_SourceIn)
+        painter.fillRect(tinted.rect(), QColor(color))
+    finally:
+        painter.end()
+    if tinted.isNull():
+        raise ValueError("brand mark rendered a null pixmap")
+    return QIcon(tinted)
 
 
 # Every icon name the app is documented to reference (see the Task 1

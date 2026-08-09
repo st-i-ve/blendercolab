@@ -22,8 +22,9 @@ def _icon_path() -> Path | None:
     candidates = []
     meipass = getattr(sys, "_MEIPASS", None)
     if meipass:
-        candidates.append(Path(meipass) / "assets" / "blendfleet_icon_256.png")
-    candidates.append(Path(__file__).parent.parent / "assets" / "blendfleet_icon_256.png")
+        candidates.append(Path(meipass) / "assets" / "logo" / "app-icon-256.png")
+    candidates.append(
+        Path(__file__).parent.parent / "assets" / "logo" / "app-icon-256.png")
     for c in candidates:
         if c.exists():
             return c
