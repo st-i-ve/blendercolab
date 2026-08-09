@@ -10,6 +10,7 @@ from blendfleet.kaggle_client import KaggleClient, verify_token
 from blendfleet.platform_paths import cache_dir
 from blendfleet.ui.dashboard import Dashboard
 from blendfleet.ui.setup_dialog import SetupDialog
+from blendfleet.ui.theme import apply_theme
 
 
 def _icon_path() -> Path | None:
@@ -31,6 +32,8 @@ def _icon_path() -> Path | None:
 
 def main() -> int:
     app = QApplication(sys.argv)
+    apply_theme(app)   # one theme, applied here, before any window is shown --
+                       # so it cascades to every dialog created afterwards.
     icon = _icon_path()
     if icon is not None:
         app.setWindowIcon(QIcon(str(icon)))
@@ -39,7 +42,14 @@ def main() -> int:
         SetupDialog(store, verify_token).exec()
 
     def fleet_factory(accounts):
-        return Fleet(accounts, lambda t: KaggleClient(t), cache_dir() / "work")
+        # Tokens are unique per account (AccountStore.add enforces it), so
+        # this recovers the human label for whichever token the fleet asks
+        # for -- which is what lets KaggleClient's identity check name the
+        # account ("james") rather than a masked token.
+        labels = {a.token: a.label for a in accounts}
+        return Fleet(accounts,
+                     lambda t: KaggleClient(t, label=labels.get(t)),
+                     cache_dir() / "work")
 
     win = Dashboard(store, fleet_factory, verify_token)
     win.show()

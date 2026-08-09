@@ -112,6 +112,50 @@ open("/kaggle/working/render_setup.py", "w").write({SETUP_SCRIPT!r})
 print("wrote render_setup.py")
 '''
 
+    c_telemetry = '''
+import subprocess, threading
+
+def _telemetry_loop(stop_event, interval=5):
+    # Runs on a background thread so a telemetry hiccup can never abort a
+    # render frame. Per-GPU lines only -- never aggregated, since Kaggle's
+    # GPU allocation isn't guaranteed (a GPU request once returned a single
+    # P100 instead of the expected T4 x2), so each card must be independently
+    # visible.
+    while not stop_event.is_set():
+        try:
+            p = subprocess.run(
+                ["nvidia-smi",
+                 "--query-gpu=index,utilization.gpu,memory.used,memory.total,"
+                 "temperature.gpu,power.draw",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=10)
+        except FileNotFoundError:
+            return  # CPU-only session: no nvidia-smi -- stop quietly
+        except Exception:
+            stop_event.wait(interval)
+            continue
+        if p.returncode == 0:
+            for row in p.stdout.strip().splitlines():
+                parts = [x.strip() for x in row.split(",")]
+                if len(parts) != 6:
+                    continue
+                idx, util, mem_used, mem_total, temp, power = parts
+                try:
+                    power_val = f"{float(power):.0f}"
+                except ValueError:
+                    power_val = "NA"  # power.draw reported as "[N/A]"
+                print(f"TELEMETRY gpu={idx} util={util} mem_used={mem_used} "
+                      f"mem_total={mem_total} temp={temp} power={power_val}",
+                      flush=True)
+        stop_event.wait(interval)
+
+_telemetry_stop = threading.Event()
+_telemetry_thread = threading.Thread(target=_telemetry_loop,
+                                     args=(_telemetry_stop,), daemon=True)
+_telemetry_thread.start()
+print("[telemetry] background GPU sampler started")
+'''
+
     c4 = '''
 import os, glob, time, shutil, subprocess
 WORK = "/kaggle/tmp/work"
@@ -144,9 +188,10 @@ for frame in FRAMES:
 print("DONE", sorted(done), "FAILED", sorted(failed))
 for f in sorted(glob.glob(f"{OUT}/*")):
     print(f"  {os.path.basename(f)} {os.path.getsize(f)//1024} KB")
+_telemetry_stop.set()
 '''
 
-    nb = {"cells": [_code(c1), _code(c2), _code(c3), _code(c4)],
+    nb = {"cells": [_code(c1), _code(c2), _code(c3), _code(c_telemetry), _code(c4)],
           "metadata": {"kernelspec": {"display_name": "Python 3",
                                       "language": "python", "name": "python3"},
                        "language_info": {"name": "python"}},

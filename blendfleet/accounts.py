@@ -42,7 +42,15 @@ class AccountStore:
     def __init__(self, accounts: list[Account] | None = None) -> None:
         self._accounts: list[Account] = list(accounts or [])
 
-    def add(self, account: Account, verifier: Verifier | None = None) -> None:
+    def validate(self, account: Account) -> None:
+        """Every rule an account must satisfy that costs no I/O at all.
+
+        Split out of add() so a caller that has to verify on a background
+        thread (the setup dialog) can still run these checks FIRST, on its
+        own thread, and keep the original guarantee that a bad format or a
+        duplicate never triggers a network call. Raises; returns None when
+        the account is acceptable.
+        """
         if not TOKEN_RE.match(account.token):
             raise TokenFormatError(
                 "Expected a token like KGAT_ followed by 32 hex characters. "
@@ -60,6 +68,9 @@ class AccountStore:
                 f"the label {account.label!r} is already in use. Labels must be "
                 "unique: they are how each render worker is matched back to "
                 "its account.")
+
+    def add(self, account: Account, verifier: Verifier | None = None) -> None:
+        self.validate(account)
         # verifier=None (the default) skips verification entirely -- kept so
         # callers that only care about format/duplicate rules (and every
         # pre-existing test) don't need a network stub. The setup dialog

@@ -1,25 +1,67 @@
+import re
 from pathlib import Path
 import pytest
 import blendfleet.platform_paths as pp
 from blendfleet.accounts import Account
 from blendfleet.kaggle_client import KernelStatus, Quota
 from blendfleet.notebook_builder import RenderSettings
-from blendfleet.fleet import Fleet, FleetBusyError, WorkerState
+from blendfleet.fleet import Fleet, FleetBusyError, UnreachableAccountsError, WorkerState
+
+
+class FakeDatasetApiClient:
+    """Stands in for sdk.datasets.dataset_api_client -- Task 3 sharing.
+    Constant, network-free responses: correctness of the sharing calls
+    THEMSELVES (traps 1 and 2, preserving collaborators) is covered by
+    tests/test_sharing.py; these fleet-level tests only care that
+    Fleet.launch calls out to it at the right time with the right accounts.
+    """
+
+    def __init__(self):
+        self.updated = []
+
+    def get_dataset_metadata(self, request):
+        class Info:
+            title = ""
+            licenses = []
+            collaborators = []
+
+        class Resp:
+            info = Info()
+        return Resp()
+
+    def update_dataset_metadata(self, request):
+        self.updated.append(request)
+
+        class Resp:
+            errors = []
+        return Resp()
+
+
+class FakeSdk:
+    def __init__(self):
+        self.datasets = type("D", (), {
+            "dataset_api_client": FakeDatasetApiClient()})()
 
 
 class FakeClient:
-    def __init__(self, token, state="running"):
+    def __init__(self, token, state="running", dataset_exists=True,
+                 dataset_reachable=True):
         self.token = token
         self.state = state
         self.pushed = 0
         self.cancelled = []
         self.dataset_creates = 0
         self.dataset_versions = 0
+        self._dataset_exists = dataset_exists
+        self._dataset_reachable = dataset_reachable
+        self.sdk = FakeSdk()
+        self._sdk_factory = lambda tok: self.sdk
 
     def whoami(self): return "user_" + self.token[-1]
-    def dataset_exists(self, slug): return False
-    def dataset_create(self, folder): self.dataset_creates += 1
-    def dataset_version(self, folder, message): self.dataset_versions += 1
+    def dataset_exists(self, slug): return self._dataset_exists
+    def dataset_reachable(self, slug): return self._dataset_reachable
+    def dataset_create(self, folder, on_progress=None): self.dataset_creates += 1
+    def dataset_version(self, folder, message, on_progress=None): self.dataset_versions += 1
     def push_kernel(self, folder): self.pushed += 1
     def status(self, slug): return KernelStatus(state=self.state)
     def cancel(self, slug): self.cancelled.append(slug); return True
@@ -60,17 +102,88 @@ def test_launch_pushes_one_kernel_per_account(blend, tmp_path):
     assert all(c.pushed == 1 for c in clients.values())
 
 
-def test_launch_uploads_dataset_once_per_account(blend, tmp_path):
-    """The Kaggle API cannot add dataset collaborators, so N accounts must
-    mean N separate uploads -- never one shared dataset."""
+def test_launch_uploads_dataset_exactly_once_for_n_accounts(blend, tmp_path):
+    """Task 3: dataset sharing is automatable, so N accounts must mean
+    exactly ONE upload total -- never one copy per account."""
     clients = {}
     def factory(tok):
         clients[tok] = FakeClient(tok); return clients[tok]
     f = Fleet(accounts(3), factory, tmp_path / "w")
     f.launch(blend, RenderSettings(1920, 1080, 128), 1, 9)
     assert len(clients) == 3
-    assert all(c.dataset_creates == 1 for c in clients.values())
-    assert all(c.dataset_versions == 0 for c in clients.values())
+    total_uploads = sum(c.dataset_creates + c.dataset_versions
+                        for c in clients.values())
+    assert total_uploads == 1
+
+
+def test_launch_uses_the_owner_slug_for_every_worker(blend, tmp_path):
+    """All kernels must reference the SAME (owner's) dataset -- that is the
+    entire point of sharing instead of uploading N copies."""
+    import json as _json
+
+    accts = accounts(3)
+    f = Fleet(accts, lambda t: FakeClient(t), tmp_path / "w")
+    f.launch(blend, RenderSettings(1920, 1080, 128), 1, 9)
+
+    owner_username = "user_" + accts[0].token[-1]
+    for account in accts:
+        meta = _json.loads(
+            (tmp_path / "w" / f"kern_{account.label}" /
+             "kernel-metadata.json").read_text())
+        assert meta["dataset_sources"] == [f"{owner_username}/remember-blend"]
+
+
+def test_launch_grants_every_friend_username_reader_in_one_call(blend, tmp_path):
+    accts = accounts(3)
+    clients = {}
+    def factory(tok):
+        clients[tok] = FakeClient(tok); return clients[tok]
+    f = Fleet(accts, factory, tmp_path / "w")
+    f.launch(blend, RenderSettings(1920, 1080, 128), 1, 9)
+
+    owner_client = clients[accts[0].token]
+    updated = owner_client.sdk.datasets.dataset_api_client.updated
+    assert len(updated) == 1, "exactly one grant call, not one per friend"
+    granted = {c.username for c in updated[0].settings.collaborators}
+    assert granted == {"user_" + accts[1].token[-1], "user_" + accts[2].token[-1]}
+    assert updated[0].settings.is_private is True
+    assert len(updated[0].settings.licenses) == 1
+
+
+def test_launch_skips_sharing_calls_for_a_single_account(blend, tmp_path):
+    """No friends -- grant/verify must never fire, and there's nothing to
+    check reachability for."""
+    clients = {}
+    def factory(tok):
+        clients[tok] = FakeClient(tok); return clients[tok]
+    f = Fleet(accounts(1), factory, tmp_path / "w")
+    f.launch(blend, RenderSettings(1920, 1080, 128), 1, 9)
+    only = next(iter(clients.values()))
+    assert only.sdk.datasets.dataset_api_client.updated == []
+
+
+def test_launch_refuses_when_a_friend_is_still_unreachable_after_grant(blend, tmp_path):
+    """A grant that returns cleanly but doesn't actually take (propagation
+    delay, silently dropped role, ...) must be caught before anything is
+    started -- not surfaced later as an opaque kernel failure."""
+    accts = accounts(3)
+    unreachable_token = accts[2].token
+    clients = {}
+
+    def factory(tok):
+        reachable = tok != unreachable_token
+        clients[tok] = FakeClient(tok, dataset_reachable=reachable)
+        return clients[tok]
+
+    f = Fleet(accts, factory, tmp_path / "w")
+    with pytest.raises(UnreachableAccountsError) as exc_info:
+        f.launch(blend, RenderSettings(1920, 1080, 128), 1, 9)
+
+    message = str(exc_info.value)
+    assert "user_" + unreachable_token[-1] in message
+    # nothing must have been started
+    assert all(c.pushed == 0 for c in clients.values())
+    assert f.load() is None
 
 
 def test_frames_are_disjoint_and_complete(blend, tmp_path):
@@ -336,3 +449,98 @@ def test_cancel_all_reports_worker_with_no_account_as_failure(blend, tmp_path):
 def test_cancel_all_with_no_job_returns_empty(tmp_path):
     f = Fleet(accounts(1), lambda t: FakeClient(t), tmp_path / "w")
     assert f.cancel_all() == []
+
+
+# ------------------------------------------------- dataset slug scrubbing --
+# `stem = blend.stem.lower().replace("_", "-")` was the ONLY transform, so a
+# .blend with spaces in its name -- extremely common -- produced
+# "user/big buck bunny-blend", which is not a valid Kaggle slug. And because
+# dataset_create uploads first and validates second, the user waited out a
+# full 60 MB upload before being told the name was wrong. The same stem also
+# feeds kernel_slug, so both were broken by the same character.
+
+import json as _json_slug
+
+from blendfleet.fleet import InvalidBlendNameError, slug_stem, slugify_stem
+
+
+@pytest.mark.parametrize("name, expected", [
+    ("big buck bunny", "big-buck-bunny"),          # spaces: the common case
+    ("Remember_The_Titans", "remember-the-titans"),  # underscores + case
+    ("scene(final)[v2]!", "scene-final-v2"),       # punctuation
+    ("my....scene", "my-scene"),                   # runs collapse to one dash
+    ("--leading-and-trailing--", "leading-and-trailing"),
+    ("Ünïcödé Scéne", "unicode-scene"),            # accents fold to ASCII
+    ("shot 42", "shot-42"),                        # digits survive
+])
+def test_slugify_produces_a_valid_kaggle_slug(name, expected):
+    got = slugify_stem(name)
+    assert got == expected
+    assert re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)*", got), \
+        "slug must be lowercase alphanumerics separated by single dashes"
+
+
+@pytest.mark.parametrize("name", ["日本語", "!!!", "   ", "___", "--", ""])
+def test_slugify_can_legitimately_scrub_a_name_to_nothing(name):
+    assert slugify_stem(name) == ""
+
+
+@pytest.mark.parametrize("name", ["日本語.blend", "!!!.blend", "  .blend",
+                                  "a.blend", "ab.blend"])
+def test_slug_stem_refuses_a_name_that_scrubs_to_nothing_or_too_little(name):
+    with pytest.raises(InvalidBlendNameError) as exc_info:
+        slug_stem(Path(name))
+    message = str(exc_info.value)
+    assert name in message, "the message must name the offending file"
+    assert "Rename the file" in message, "must say what to do next"
+    assert "nothing has been uploaded" in message.lower()
+
+
+def test_slug_stem_caps_a_very_long_name():
+    """A 200-character filename would otherwise blow Kaggle's slug length
+    limit -- and fail at the same late, post-upload moment."""
+    stem = slug_stem(Path("a" * 200 + ".blend"))
+    assert len(stem) <= 30
+    assert not stem.endswith("-")
+
+
+def test_launch_with_spaces_in_the_filename_builds_valid_slugs(tmp_path):
+    """The end-to-end version of the bug: a .blend with spaces must produce
+    usable dataset AND kernel slugs, not "user/big buck bunny-blend"."""
+    blend = tmp_path / "Big Buck Bunny.blend"
+    blend.write_bytes(b"X" * 100)
+    accts = accounts(2)
+    f = Fleet(accts, lambda t: FakeClient(t), tmp_path / "w")
+    st = f.launch(blend, RenderSettings(1920, 1080, 128), 1, 4)
+
+    meta = _json_slug.loads(
+        (tmp_path / "w" / f"kern_{accts[0].label}" /
+         "kernel-metadata.json").read_text())
+    dataset_slug = meta["dataset_sources"][0]
+    assert dataset_slug == "user_0/big-buck-bunny-blend"
+    for worker in st.workers:
+        owner, name = worker.kernel_slug.split("/", 1)
+        assert re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)*", name), worker.kernel_slug
+        assert name.startswith("big-buck-bunny-render-")
+
+
+def test_an_unusable_filename_is_rejected_before_anything_is_uploaded(tmp_path):
+    """The half of this that actually costs the user time: validation has to
+    happen BEFORE dataset_create, not inside it."""
+    blend = tmp_path / "日本語.blend"
+    blend.write_bytes(b"X" * 100)
+    clients = {}
+
+    def factory(tok):
+        clients[tok] = FakeClient(tok)
+        return clients[tok]
+
+    f = Fleet(accounts(3), factory, tmp_path / "w")
+    with pytest.raises(InvalidBlendNameError):
+        f.launch(blend, RenderSettings(1920, 1080, 128), 1, 9)
+
+    uploads = sum(c.dataset_creates + c.dataset_versions
+                  for c in clients.values())
+    assert uploads == 0, "the user must not wait out an upload to be told the name is bad"
+    assert all(c.pushed == 0 for c in clients.values())
+    assert f.load() is None, "nothing was started, so no state may be written"

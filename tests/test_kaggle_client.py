@@ -50,9 +50,10 @@ class FakeApi:
     """Stands in for KaggleApi. Raises what the real API actually raises."""
 
     def __init__(self, status="COMPLETE", dataset_ok=True, kernels=None,
-                 create_error=None, version_error=None):
+                 create_error=None, version_error=None, list_files_ok=True):
         self._status = status
         self._dataset_ok = dataset_ok
+        self._list_files_ok = list_files_ok
         self._kernels = kernels if kernels is not None else [
             FakeKernel("stivestivewithani/remember-render")]
         self._create_error = create_error
@@ -83,6 +84,11 @@ class FakeApi:
             # the real API raises HTTPError 403 here, never a 404
             raise RuntimeError("403 Client Error: Forbidden for url: ...")
         return "ready"
+
+    def dataset_list_files(self, slug):
+        if not self._list_files_ok:
+            raise RuntimeError("403 Client Error: Forbidden for url: ...")
+        return {"datasetFiles": []}
 
     def dataset_create_new(self, folder, **kw):
         if self._create_error is not None:
@@ -168,6 +174,36 @@ def test_dataset_exists_false_on_403_not_404():
     assert c.dataset_exists("me/x") is False
 
 
+# ------------------------------------------- dataset_reachable (Task 3) --
+# Live check (task-3-report.md) found dataset_status() 404s for a
+# non-owner account even with a genuine READER grant -- it only reflects
+# datasets the calling account owns. dataset_list_files() is the one that
+# is actually gated on real read access. dataset_reachable() must use
+# THAT, and must disagree with dataset_exists() in exactly the scenario
+# that was measured live: dataset_status() failing while the account can
+# really read the dataset.
+
+def test_dataset_reachable_true_when_list_files_succeeds():
+    c, _ = client(list_files_ok=True)
+    assert c.dataset_reachable("owner/x") is True
+
+
+def test_dataset_reachable_false_when_list_files_forbidden():
+    c, _ = client(list_files_ok=False)
+    assert c.dataset_reachable("owner/x") is False
+
+
+def test_dataset_reachable_disagrees_with_dataset_exists_for_a_shared_dataset():
+    """Reproduces the live finding: dataset_status() (dataset_exists) 404s
+    for a friend with a real grant, while dataset_list_files()
+    (dataset_reachable) correctly reflects that the grant works."""
+    c, _ = client(dataset_ok=False, list_files_ok=True)
+    assert c.dataset_exists("owner/x") is False, \
+        "dataset_status is owner-only -- must still fail here"
+    assert c.dataset_reachable("owner/x") is True, \
+        "dataset_list_files must correctly show the real grant works"
+
+
 def test_dataset_create_passes_skip_dir_mode_and_private(tmp_path):
     c, api = client()
     c.dataset_create(tmp_path)
@@ -225,6 +261,124 @@ def test_dataset_version_other_400_surfaces_real_message(tmp_path):
     message = str(exc_info.value)
     assert "Invalid dataset slug" in message
     assert "did not finish uploading" not in message
+
+
+# ------------------------------------------------------- upload preflight --
+# Task 2: use blendfleet/uploader.py instead of relying on kaggle's own
+# upload_files()/_upload_blob(), which silently drops a file and returns
+# None when its retries run out (see blendfleet/uploader.py's docstring).
+# These stub the injected upload_blob_fn (never touching the network) to
+# reproduce both observed failure shapes -- raising, and returning a falsy
+# token -- and assert the real Kaggle create/version API method is NEVER
+# reached in either case: the 400 from an empty file list must never even
+# be possible, because the request is never sent.
+
+def _staged_folder(tmp_path, filename="big.blend", size=500):
+    folder = tmp_path / "stage"
+    folder.mkdir()
+    (folder / filename).write_bytes(b"B" * size)
+    (folder / "dataset-metadata.json").write_text("{}")
+    return folder
+
+
+def test_upload_raises_refuses_locally_and_never_calls_dataset_create_version(tmp_path):
+    folder = _staged_folder(tmp_path)
+
+    def failing_upload(path, on_progress):
+        from blendfleet.uploader import UploadError
+        raise UploadError("upload failed after 6 retries", status=503, body="unavailable")
+
+    c, api = client()
+    c._upload_blob_fn = failing_upload
+
+    with pytest.raises(KaggleError) as exc_info:
+        c.dataset_version(folder, "update big.blend")
+
+    message = str(exc_info.value)
+    assert "did not complete" in message
+    assert "retry the render" in message.lower()
+    # the real Kaggle API method must NEVER have been invoked
+    assert api.versioned == []
+
+
+def test_upload_yields_no_token_refuses_locally_and_never_calls_dataset_create_version(tmp_path):
+    """Even a hypothetical upload path that fails "some other way" -- by
+    returning a falsy token instead of raising -- must still be caught
+    locally, never handed to Kaggle as if it were a real upload."""
+    folder = _staged_folder(tmp_path)
+
+    def no_token_upload(path, on_progress):
+        return None
+
+    c, api = client()
+    c._upload_blob_fn = no_token_upload
+
+    with pytest.raises(KaggleError, match="no blob token"):
+        c.dataset_create(folder)
+
+    assert api.created == []
+
+
+def test_upload_success_proceeds_to_dataset_create_version(tmp_path):
+    folder = _staged_folder(tmp_path)
+    calls = []
+
+    def fake_upload(path, on_progress):
+        calls.append(path.name)
+        return "tok-123"
+
+    c, api = client()
+    c._upload_blob_fn = fake_upload
+
+    c.dataset_version(folder, "update big.blend")
+
+    assert calls == ["big.blend"], "only the real data file, never the metadata json"
+    assert len(api.versioned) == 1
+
+
+def test_on_progress_threaded_through_to_the_uploader(tmp_path):
+    folder = _staged_folder(tmp_path)
+    seen_progress = []
+
+    def fake_upload(path, on_progress):
+        seen_progress.append(on_progress)
+        return "tok-abc"
+
+    c, api = client()
+    c._upload_blob_fn = fake_upload
+    marker = object()
+
+    c.dataset_create(folder, on_progress=marker)
+
+    assert seen_progress == [marker]
+
+
+def test_preflighted_file_is_not_uploaded_a_second_time_via_the_patched_api(tmp_path):
+    """Once dataset_version has reliably uploaded the file itself, kaggle's
+    own (real) _upload_blob must not re-upload the same file again over the
+    network -- the patched method should just hand back the token already
+    obtained. This is the mechanism that avoids doubling upload time/bytes
+    for a large .blend."""
+    folder = _staged_folder(tmp_path)
+    call_count = {"n": 0}
+
+    def fake_upload(path, on_progress):
+        call_count["n"] += 1
+        return f"tok-{call_count['n']}"
+
+    c, api = client()
+    c._upload_blob_fn = fake_upload
+
+    c.dataset_version(folder, "update big.blend")
+    assert call_count["n"] == 1
+
+    # Simulate what kaggle's own dataset_create_version would do internally
+    # (kaggle_api_extended.py's upload_files() -> _upload_file() ->
+    # self._upload_blob(full_path, quiet, blob_type, upload_context)).
+    full_path = str(folder / "big.blend")
+    token = api._upload_blob(full_path, True, None, None)
+    assert token == "tok-1"
+    assert call_count["n"] == 1, "must reuse the cached token, not upload again"
 
 
 def test_push_never_treated_as_noop():
@@ -329,3 +483,166 @@ def test_sdk_factory_passes_the_token_instead_of_setting_the_environment():
 
     assert seen["api_token"] == TOKEN
     assert seen["env"] is None
+
+
+# ------------------------------------------ identity binding (CRITICAL) --
+# KaggleApi.authenticate() is a CASCADE (kaggle_api_extended.py:1226-1252):
+# access token, then LEGACY API KEY, then OAuth, then anonymous. When the
+# token we exported is revoked/mistyped, _authenticate_with_access_token's
+# _introspect_token returns falsy and authenticate() drops silently through
+# to whatever is in this machine's own ~/.kaggle/kaggle.json.
+#
+# The account then authenticates as YOU: whoami returns your handle, the
+# account is stored verified=True under the wrong username, and
+# fleet.dataset_reachable() passes trivially because you can always read
+# your own dataset -- so UnreachableAccountsError never fires and the user
+# believes three friends are contributing while all three kernels burn
+# their own quota. These tests pin the check that makes that impossible.
+
+def _install_fake_kaggle_package(monkeypatch, api_instance):
+    """Put a fake `kaggle.api.kaggle_api_extended` in sys.modules.
+
+    Importing the real one is not an option here: kaggle/__init__.py
+    constructs a KaggleApi and calls authenticate() at import time, which
+    reads the developer's own ~/.kaggle/kaggle.json -- the very credential
+    whose leakage these tests are about.
+    """
+    import sys
+    import types
+
+    module = types.ModuleType("kaggle.api.kaggle_api_extended")
+    module.KaggleApi = lambda: api_instance
+    monkeypatch.setitem(sys.modules, "kaggle", types.ModuleType("kaggle"))
+    monkeypatch.setitem(sys.modules, "kaggle.api", types.ModuleType("kaggle.api"))
+    monkeypatch.setitem(sys.modules, "kaggle.api.kaggle_api_extended", module)
+
+
+class BoundToOtherTokenApi:
+    """A KaggleApi whose authenticate() binds a DIFFERENT token than the
+    one it was given -- the shape of a session that signed in as somebody
+    else."""
+
+    def __init__(self, binds: str):
+        self._binds = binds
+        self.config_values: dict = {}
+
+    def authenticate(self) -> None:
+        self.config_values = {"token": self._binds,
+                              "username": "somebody-else",
+                              "auth_method": "AuthMethod.ACCESS_TOKEN"}
+
+
+class LegacyApiKeyFallthroughApi:
+    """Exactly what the real cascade produces when the access token is
+    rejected: no `token` key at all, just the username/key pair read out of
+    the local ~/.kaggle/kaggle.json."""
+
+    def __init__(self, local_username: str = "the-owner-of-this-laptop"):
+        self._local_username = local_username
+        self.config_values: dict = {}
+
+    def authenticate(self) -> None:
+        self.config_values = {"username": self._local_username,
+                              "key": "0123456789abcdef",
+                              "auth_method": "AuthMethod.LEGACY_API_KEY"}
+
+
+class GoodApi:
+    def __init__(self, token: str):
+        self._token = token
+        self.config_values: dict = {}
+
+    def authenticate(self) -> None:
+        self.config_values = {"token": self._token,
+                              "username": "the-real-owner",
+                              "auth_method": "AuthMethod.ACCESS_TOKEN"}
+
+
+def test_api_factory_rejects_a_session_bound_to_a_different_token(monkeypatch):
+    from blendfleet.kaggle_client import _default_api_factory
+
+    other = "KGAT_" + "b" * 32
+    _install_fake_kaggle_package(monkeypatch, BoundToOtherTokenApi(binds=other))
+
+    with pytest.raises(KaggleError) as exc_info:
+        _default_api_factory(TOKEN, account="ada")
+
+    message = str(exc_info.value)
+    assert "ada" in message, "the message must name the account that failed"
+    assert "DIFFERENT account" in message
+    assert other not in message, "another account's token must never be echoed"
+
+
+def test_api_factory_rejects_the_legacy_apikey_fallthrough(monkeypatch):
+    """The actual production failure: a revoked friend token silently
+    authenticating as the machine's own kaggle.json credentials."""
+    from blendfleet.kaggle_client import _default_api_factory
+
+    _install_fake_kaggle_package(monkeypatch, LegacyApiKeyFallthroughApi())
+
+    with pytest.raises(KaggleError) as exc_info:
+        _default_api_factory(TOKEN, account="ada")
+
+    message = str(exc_info.value)
+    assert "was not accepted by Kaggle" in message
+    assert "fresh token" in message, "must say what the user should do next"
+
+
+def test_api_factory_accepts_a_session_actually_bound_to_our_token(monkeypatch):
+    from blendfleet.kaggle_client import _default_api_factory
+
+    api = GoodApi(TOKEN)
+    _install_fake_kaggle_package(monkeypatch, api)
+
+    assert _default_api_factory(TOKEN, account="ada") is api
+
+
+def test_api_factory_fails_closed_when_credentials_cannot_be_inspected(monkeypatch):
+    """If a future kaggle release moves config_values, this must REFUSE,
+    not wave the session through unverified -- an unverifiable identity is
+    the exact condition this check exists to catch."""
+    from blendfleet.kaggle_client import _default_api_factory
+
+    class OpaqueApi:
+        def authenticate(self) -> None:
+            pass
+
+    _install_fake_kaggle_package(monkeypatch, OpaqueApi())
+
+    with pytest.raises(KaggleError, match="could not confirm which Kaggle account"):
+        _default_api_factory(TOKEN, account="ada")
+
+
+def test_api_factory_masks_the_token_when_no_account_label_is_known(monkeypatch):
+    """verify_token runs before an account exists, so there is no label --
+    the message still has to identify which token failed without printing
+    the whole secret."""
+    from blendfleet.kaggle_client import _default_api_factory
+
+    _install_fake_kaggle_package(monkeypatch, LegacyApiKeyFallthroughApi())
+
+    with pytest.raises(KaggleError) as exc_info:
+        _default_api_factory(TOKEN)
+
+    message = str(exc_info.value)
+    assert TOKEN not in message, "the full token must never reach a dialog"
+    assert TOKEN[:9] in message, "but enough of it to tell tokens apart"
+
+
+def test_client_passes_its_label_to_the_identity_check(monkeypatch):
+    """KaggleClient(label=...) is the whole reason the error can say
+    'james' instead of a masked token."""
+    _install_fake_kaggle_package(monkeypatch, LegacyApiKeyFallthroughApi())
+
+    c = KaggleClient(TOKEN, label="james")
+    with pytest.raises(KaggleError, match="'james'"):
+        _ = c.api
+
+
+def test_verify_token_refuses_an_account_that_authenticated_as_someone_else(monkeypatch):
+    """End to end: this is what stops a revoked friend token being stored
+    verified=True under the developer's own username."""
+    _install_fake_kaggle_package(monkeypatch, LegacyApiKeyFallthroughApi())
+
+    with pytest.raises(KaggleError, match="was not accepted by Kaggle"):
+        verify_token(TOKEN)

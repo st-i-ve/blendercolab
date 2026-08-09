@@ -82,12 +82,55 @@ def test_progress_print_flushes(tmp_path, settings):
     # log stream sees nothing until the kernel exits -- the render appears
     # frozen for its entire duration.
     joined = "\n".join(cells_src(build([1], settings, "me/x", tmp_path, "me/r")))
-    assert joined.count("flush=True") == 1, "expected exactly one flush=True"
+    # one flush=True for PROGRESS, one for TELEMETRY (see test_telemetry_*
+    # below) -- never more, never fewer.
+    assert joined.count("flush=True") == 2, "expected exactly two flush=True"
     idx_progress = joined.index('print(f"PROGRESS')
-    idx_flush = joined.index("flush=True")
+    idx_flush = joined.index("flush=True", idx_progress)
     # flush=True must belong to the PROGRESS print call itself, not some
     # unrelated statement elsewhere in the notebook.
     assert idx_progress < idx_flush < idx_progress + 200
+
+
+def test_telemetry_print_flushes(tmp_path, settings):
+    # Same non-negotiable as PROGRESS: without flush=True nothing streams
+    # live and the GPU panel would look frozen.
+    joined = "\n".join(cells_src(build([1], settings, "me/x", tmp_path, "me/r")))
+    idx_telemetry = joined.index('print(f"TELEMETRY')
+    idx_flush = joined.index("flush=True", idx_telemetry)
+    assert idx_telemetry < idx_flush < idx_telemetry + 300
+
+
+def test_telemetry_is_per_gpu_not_aggregated(tmp_path, settings):
+    # Kaggle's GPU allocation isn't guaranteed (a GPU request once returned
+    # a single P100 instead of the expected T4 x2) -- each physical GPU must
+    # report its own line, keyed by index, never a fleet-wide average.
+    joined = "\n".join(cells_src(build([1], settings, "me/x", tmp_path, "me/r")))
+    assert "query-gpu=index,utilization.gpu,memory.used,memory.total" in joined
+    assert 'f"TELEMETRY gpu={idx}' in joined
+
+
+def test_telemetry_thread_is_background_and_daemon(tmp_path, settings):
+    # Must not interfere with rendering: runs on its own thread, and must
+    # not keep the kernel alive if the main render logic exits first.
+    joined = "\n".join(cells_src(build([1], settings, "me/x", tmp_path, "me/r")))
+    assert "threading.Thread(target=_telemetry_loop" in joined
+    assert "daemon=True" in joined
+    assert "_telemetry_stop.set()" in joined
+
+
+def test_telemetry_degrades_silently_without_nvidia_smi(tmp_path, settings):
+    # This dev machine genuinely has no nvidia-smi on PATH (verified with
+    # `which nvidia-smi` -> not found), so executing the generated telemetry
+    # cell here exercises the real CPU-only-session path end to end: no
+    # mocking of subprocess, no crash, thread exits quietly on its own.
+    cells = cells_src(build([1], settings, "me/x", tmp_path, "me/r"))
+    telemetry_src = next(c for c in cells if "_telemetry_loop" in c)
+    ns: dict = {}
+    exec(compile(telemetry_src, "<telemetry_cell>", "exec"), ns)
+    ns["_telemetry_thread"].join(timeout=10)
+    assert not ns["_telemetry_thread"].is_alive(), (
+        "telemetry thread should exit quietly when nvidia-smi is absent")
 
 
 def test_no_hardcoded_gpu_model_in_device_selection(tmp_path, settings):

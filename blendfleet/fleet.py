@@ -1,19 +1,27 @@
 """Fleet orchestration: split frames across accounts and drive each one.
 
 Coordination is entirely client-side. Each account gets a DISJOINT stride of
-frames (via assignment.assign_frames) and its OWN dataset upload -- the
-Kaggle API has no way to add dataset collaborators, so N accounts means N
-uploads. Accounts never talk to each other; this module just fans work out
-and polls each one independently.
+frames (via assignment.assign_frames). Task 3 changed how the .blend gets to
+Kaggle: dataset sharing turned out to be automatable
+(ApiUpdateDatasetMetadataRequest.settings.collaborators, see
+blendfleet/sharing.py), so the FIRST account (accounts[0], "the owner")
+uploads the .blend exactly once, every other account's username is granted
+READER on that one dataset, and every worker's kernel references the
+owner's dataset slug -- N accounts no longer means N uploads. Accounts
+never talk to each other directly; this module just fans work out, grants
+access up front, and polls each account independently.
 """
 from __future__ import annotations
 
 import json
+import re
+import unicodedata
 import uuid
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Callable
 
+from blendfleet import sharing
 from blendfleet.accounts import Account
 from blendfleet.assignment import assign_frames
 from blendfleet.dataset_sync import sync_blend
@@ -21,6 +29,65 @@ from blendfleet.notebook_builder import RenderSettings, build
 from blendfleet.platform_paths import state_dir
 
 STATE_FILE = "fleet.json"
+
+# Kaggle slugs (dataset AND kernel) accept lowercase letters, digits and
+# dashes -- nothing else. A .blend called "big buck bunny.blend" used to be
+# lower()ed with "_"->"-" and nothing more, producing
+# "user/big buck bunny-blend", which Kaggle rejects. Worse, the rejection
+# arrived from dataset_create -- i.e. AFTER the whole .blend had been
+# uploaded -- so the user waited out a full 60 MB upload to be told the
+# name was wrong. Everything below runs before a single byte is sent.
+_SLUG_STRIP_RE = re.compile(r"[^a-z0-9]+")
+
+# Kaggle rejects very short slugs, and the stem is only part of what gets
+# built from it ("<stem>-blend", "<stem>-render-<8 hex>"), so it is also
+# capped well under Kaggle's ~50 character slug limit rather than letting a
+# long filename fail at the same late, post-upload moment.
+MIN_STEM_LENGTH = 3
+MAX_STEM_LENGTH = 30
+
+
+class InvalidBlendNameError(ValueError):
+    """The .blend's filename cannot be turned into a usable Kaggle slug.
+
+    Raised BEFORE the upload starts (see slug_stem), because the whole
+    point is that the user finds out in a second rather than after a
+    60 MB upload has run to completion and been rejected.
+    """
+
+
+def slugify_stem(name: str) -> str:
+    """Reduce `name` to the [a-z0-9-] alphabet Kaggle slugs allow.
+
+    Accents are folded to their ASCII base ("Ünïcödé" -> "unicode") rather
+    than dropped outright, so an accented filename still produces a
+    recognisable slug. Every remaining run of disallowed characters --
+    spaces, punctuation, underscores, emoji, CJK -- collapses to a single
+    dash, and leading/trailing dashes are stripped. May legitimately
+    return "" (e.g. a name that is entirely CJK or punctuation); it is
+    slug_stem's job to refuse that, not this function's.
+    """
+    folded = (unicodedata.normalize("NFKD", name)
+              .encode("ascii", "ignore").decode("ascii"))
+    return _SLUG_STRIP_RE.sub("-", folded.lower()).strip("-")
+
+
+def slug_stem(blend: Path) -> str:
+    """The validated slug stem for `blend`, or raise InvalidBlendNameError.
+
+    Called at the very top of launch(), before any upload, so an unusable
+    filename costs the user a dialog rather than a completed upload.
+    """
+    stem = slugify_stem(Path(blend).stem)[:MAX_STEM_LENGTH].strip("-")
+    if len(stem) < MIN_STEM_LENGTH:
+        raise InvalidBlendNameError(
+            f"the file name {Path(blend).name!r} cannot be turned into a "
+            "Kaggle dataset name. Kaggle only accepts lowercase letters, "
+            "digits and dashes, and after removing everything else there "
+            f"were fewer than {MIN_STEM_LENGTH} characters left. Rename the "
+            "file to something like 'big-buck-bunny.blend' and try again -- "
+            "nothing has been uploaded.")
+    return stem
 
 
 @dataclass
@@ -59,6 +126,17 @@ class FleetBusyError(RuntimeError):
     State is a single slot on disk, so launching over the top of a live job
     would orphan its kernels: nothing left on disk to cancel or collect them
     with, while they keep spending other people's GPU quota.
+    """
+
+
+class UnreachableAccountsError(RuntimeError):
+    """A friend was granted READER but still can't reach the dataset.
+
+    Raised BEFORE any kernel is pushed -- nothing has been started or spent
+    yet. Without this check, a friend whose grant didn't actually take
+    (propagation delay, a role that got silently dropped, etc.) would only
+    find out when their kernel fails at run time with an opaque "dataset not
+    found", long after their GPU quota started ticking.
     """
 
 
@@ -109,9 +187,26 @@ class Fleet:
         return live
 
     def launch(self, blend: Path, settings: RenderSettings,
-               start_frame: int, end_frame: int) -> FleetState:
+               start_frame: int, end_frame: int,
+               on_progress: Callable | None = None) -> FleetState:
+        """Launch a render across every configured account.
+
+        `on_progress`, if given, is threaded straight through to
+        dataset_sync.sync_blend -> KaggleClient.dataset_create/version ->
+        blendfleet.uploader.upload_file, and is called with UploadProgress
+        ticks as the owner's .blend upload proceeds -- this is how a caller
+        (the dashboard's upload view) shows real upload progress instead of
+        the UI thread blocking silently for however long a 60+ MB PUT takes.
+        """
         if not self.accounts:
             raise ValueError("add at least one account before launching")
+
+        # Validate the name FIRST -- before the busy check, before the
+        # upload, before anything that costs time or quota. An unusable
+        # filename used to surface as a Kaggle 400 from dataset_create,
+        # i.e. only after the entire .blend had finished uploading.
+        stem = slug_stem(blend)
+        dataset_name = f"{stem}-blend"
 
         # Single-slot state file: launching over a live job would overwrite
         # the only record of the running kernels, leaving them uncancellable
@@ -126,7 +221,50 @@ class Fleet:
 
         job_id = uuid.uuid4().hex[:8]
         buckets = assign_frames(start_frame, end_frame, len(self.accounts))
-        stem = blend.stem.lower().replace("_", "-")
+
+        # Resolve a client + username for every account up front: needed
+        # for the push loop below regardless, and for the grant/verify
+        # step that has to happen before it.
+        clients: dict[str, object] = {}
+        usernames: dict[str, str] = {}
+        for account in self.accounts:
+            client = self.client_factory(account.token)
+            clients[account.label] = client
+            usernames[account.label] = account.username or client.whoami()
+
+        owner = self.accounts[0]
+        owner_client = clients[owner.label]
+        owner_username = usernames[owner.label]
+        dataset_slug = f"{owner_username}/{dataset_name}"
+
+        # One upload, shared by every account (Task 3) -- dataset sharing is
+        # automatable, so N accounts no longer means N uploads.
+        sync_blend(owner_client, blend, dataset_slug,
+                   self.work_dir / "ds_owner", on_progress=on_progress)
+
+        friends = self.accounts[1:]
+        friend_usernames = [usernames[a.label] for a in friends]
+        if friend_usernames:
+            sdk = owner_client._sdk_factory(owner_client.token)
+            current = sharing.get_settings(sdk, owner_username, dataset_name)
+            sharing.grant_readers(sdk, owner_username, dataset_name,
+                                  friend_usernames, current)
+
+            # Verify access actually landed, not just that the write
+            # returned cleanly -- see UnreachableAccountsError. Deliberately
+            # dataset_reachable(), NOT dataset_exists(): dataset_exists()
+            # is built on dataset_status(), which was measured live to 404
+            # for a non-owner account even with a genuine READER grant (see
+            # task-3-report.md) -- it only reflects datasets an account
+            # owns, so it would refuse every shared launch here.
+            unreachable = [usernames[a.label] for a in friends
+                          if not clients[a.label].dataset_reachable(dataset_slug)]
+            if unreachable:
+                raise UnreachableAccountsError(
+                    "granted READER access but the dataset is still not "
+                    f"reachable for: {', '.join(unreachable)}. Nothing has "
+                    "been started -- retry once Kaggle's grant has "
+                    "propagated.")
 
         st = FleetState(job_id=job_id, blend_name=blend.name,
                         start_frame=start_frame, end_frame=end_frame,
@@ -138,16 +276,9 @@ class Fleet:
         # still leaves accounts 1 and 2 on disk, cancellable and collectable.
         try:
             for account, frames in zip(self.accounts, buckets):
-                client = self.client_factory(account.token)
-                username = account.username or client.whoami()
-
-                dataset_slug = f"{username}/{stem}-blend"
+                client = clients[account.label]
+                username = usernames[account.label]
                 kernel_slug = f"{username}/{stem}-render-{job_id}"
-
-                # Each account needs its OWN copy: the API cannot add dataset
-                # collaborators, so N accounts means N uploads.
-                sync_blend(client, blend, dataset_slug,
-                           self.work_dir / f"ds_{account.label}")
 
                 kern_dir = self.work_dir / f"kern_{account.label}"
                 build(frames, settings, dataset_slug, kern_dir, kernel_slug)
