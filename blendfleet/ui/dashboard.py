@@ -20,10 +20,10 @@ from blendfleet.instance_state import GpuSnapshot, InstanceSnapshot, InstanceSto
 from blendfleet.log_stream import stream_progress
 from blendfleet.notebook_builder import RenderSettings
 from blendfleet.ui.charts import Filmstrip, GpuPanel
+from blendfleet.ui.instance_card import InstanceCard
 from blendfleet.ui.messages import explain
 from blendfleet.ui.setup_dialog import SetupDialog
-from blendfleet.ui.theme import (ACCENT, WARNING, account_color, brand_icon,
-                                  mono_font)
+from blendfleet.ui.theme import ACCENT, WARNING, brand_icon, mono_font
 from blendfleet.ui.upload_view import UploadView
 
 SETTINGS_URL = "https://www.kaggle.com/settings"
@@ -34,40 +34,6 @@ LIVE_INTERVAL_MS = 2_000             # cheap: drain in-memory progress/telemetry
 # log_stream closes the response within STOP_POLL_SECONDS of `_stop` being
 # set, so this is generous; it is a bound on shutdown, not the expected wait.
 STREAM_JOIN_TIMEOUT_S = 3.0
-
-
-class _AccountRow(QWidget):
-    """One rail entry: a verification status (symbol + word, never colour
-    alone) plus the account's own tint colour -- the same colour that
-    tints its frames in the filmstrip below, so the rail doubles as a
-    legend."""
-
-    def __init__(self, index: int, account, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        h = QHBoxLayout(self)
-        h.setContentsMargins(8, 6, 8, 6)
-        dot = QLabel("●")
-        dot.setStyleSheet(f"color: {account_color(index).name()}; font-size: 13pt;")
-        self.status = QLabel()
-        self.status.setFont(mono_font(9))
-        self.name = QLabel(account.label)
-        h.addWidget(dot)
-        h.addWidget(self.status)
-        h.addWidget(self.name, 1)
-        self.set_verified(account.verified)
-
-    def set_verified(self, verified: bool) -> None:
-        # The word is part of the visible label, not a tooltip: a tooltip
-        # is invisible to anyone not hovering, and to screen readers in
-        # many configurations, which defeats the entire "symbol + word"
-        # rule this exists for (see SetupDialog._refresh, which this
-        # matches).
-        if verified:
-            self.status.setText("✓ verified")
-            self.status.setStyleSheet(f"color: {ACCENT};")
-        else:
-            self.status.setText("✗ not verified")
-            self.status.setStyleSheet(f"color: {WARNING};")
 
 
 class _LaunchWorker(QThread):
@@ -205,6 +171,13 @@ class Dashboard(QMainWindow):
         # must never raise -- it only ever downgrades the displayed
         # figure to "unavailable" (see FINDING 1, task 9 fix round 1).
         self._quota_cache: dict[str, str] = {}
+        # Keyed by account label, one InstanceCard per account -- the rich
+        # per-account "SaaS dashboard" cards (Task 4) that live in the
+        # rail. Rebuilt (and this dict replaced) only by _refresh_accounts;
+        # every tick just calls setters on the existing widgets, so a
+        # card's live Sparkline history is never reset out from under a
+        # still-rendering account.
+        self._instance_cards: dict[str, InstanceCard] = {}
         self.setWindowTitle("BlendFleet")
         self.resize(1180, 760)
 
@@ -236,7 +209,11 @@ class Dashboard(QMainWindow):
     def _build_rail(self) -> QWidget:
         rail = QWidget()
         rail.setObjectName("rail")
-        rail.setFixedWidth(230)
+        # Wide enough for a card's quota/hardware line, not just a name --
+        # the old fixed-width rail (230px) was sized for _AccountRow's
+        # single line of text; InstanceCard needs room for a GPU row's
+        # sparkline + numbers without wrapping every value.
+        rail.setFixedWidth(320)
         v = QVBoxLayout(rail)
         v.setContentsMargins(0, 8, 0, 8)
 
@@ -253,14 +230,20 @@ class Dashboard(QMainWindow):
         brand.addWidget(QLabel("<b>BlendFleet</b>"), 1)
         v.addLayout(brand)
 
-        title = QLabel("<b>accounts</b>")
+        title = QLabel("<b>instances</b>")
         title.setContentsMargins(8, 0, 8, 4)
         v.addWidget(title)
 
+        # One InstanceCard per account (see blendfleet/ui/instance_card.py):
+        # quota (live) plus EITHER last-known hardware OR (only while that
+        # account is actually rendering) live per-GPU gauges. Rebuilt only
+        # by _refresh_accounts -- i.e. when the account list itself
+        # changes -- never on a poll/telemetry tick, so a card's Sparkline
+        # history survives every tick in between.
         self.rail_rows_holder = QWidget()
         self.rail_rows_layout = QVBoxLayout(self.rail_rows_holder)
-        self.rail_rows_layout.setContentsMargins(0, 0, 0, 0)
-        self.rail_rows_layout.setSpacing(0)
+        self.rail_rows_layout.setContentsMargins(4, 0, 4, 0)
+        self.rail_rows_layout.setSpacing(8)
         v.addWidget(self.rail_rows_holder)
         v.addStretch(1)
 
@@ -372,14 +355,26 @@ class Dashboard(QMainWindow):
 
     # --- helpers ---
     def _refresh_accounts(self) -> None:
+        """Rebuild one InstanceCard per account. Only called when the
+        account list itself changes (init, and after Manage accounts…
+        closes) -- never from a poll/telemetry tick, so a card's live
+        Sparkline history is never wiped out from under a still-rendering
+        account. Immediately re-synced from currently known state (quota
+        cache, cached hardware, current worker) via _refresh_views() below,
+        so a freshly (re)built card is never blank until the next tick.
+        """
         while self.rail_rows_layout.count():
             item = self.rail_rows_layout.takeAt(0)
             w = item.widget()
             if w is not None:
                 w.setParent(None)
                 w.deleteLater()
+        self._instance_cards = {}
         for i, a in enumerate(self.store.list()):
-            self.rail_rows_layout.addWidget(_AccountRow(i, a))
+            card = InstanceCard(i, a)
+            self._instance_cards[a.label] = card
+            self.rail_rows_layout.addWidget(card)
+        self._refresh_views()
 
     def _update_eta(self) -> None:
         n = max(len(self.store.list()), 1)
@@ -789,6 +784,15 @@ class Dashboard(QMainWindow):
             except queue.Empty:
                 break
             self.gpu_panel.ingest(label, record)
+            card = self._instance_cards.get(label)
+            if card is not None:
+                # InstanceCard.ingest_telemetry itself refuses to do
+                # anything once that account's worker has definitely
+                # stopped (error/complete/cancelled) or there is none at
+                # all (see its own docstring) -- this call site does not
+                # need to duplicate that check, only route the sample to
+                # the right card.
+                card.ingest_telemetry(record)
             self._instance_gpus.setdefault(label, {})[record["gpu"]] = record["mem_total"]
             if label not in self._recorded_instance_labels:
                 newly_seen.add(label)
@@ -850,6 +854,7 @@ class Dashboard(QMainWindow):
     def _refresh_views(self) -> None:
         st = self._last_state
         if st is None:
+            self._refresh_instance_cards(None)
             self.filmstrip.set_empty()
             self.filmstrip_caption.setText("no frames yet")
             self.table.setRowCount(0)
@@ -858,6 +863,7 @@ class Dashboard(QMainWindow):
             live = self._live_progress.get(w.kernel_slug, 0)
             if live > w.frames_done:
                 w.frames_done = live
+        self._refresh_instance_cards(st)
         self._render_table(st)
         self.filmstrip.set_workers(st.start_frame, st.end_frame, st.workers)
         self.filmstrip_caption.setText(
@@ -865,6 +871,22 @@ class Dashboard(QMainWindow):
             f" · {len(st.workers)} account(s)")
         self.project_label.setText(
             f"<b>{st.blend_name}</b>  frames {st.start_frame}-{st.end_frame}")
+
+    def _refresh_instance_cards(self, st: FleetState | None) -> None:
+        """Push everything an InstanceCard needs -- quota, cached hardware,
+        current worker -- into every card that already exists. Cheap and
+        safe to call every tick: these three setters only ever update
+        widget text/visibility, never rebuild a card, so a GPU row's
+        Sparkline history survives every call in between two renders.
+        """
+        workers_by_label = {w.label: w for w in (st.workers if st else [])}
+        for account in self.store.list():
+            card = self._instance_cards.get(account.label)
+            if card is None:
+                continue
+            card.set_quota(self._quota_cache.get(account.label))
+            card.set_snapshot(self.instance_store.get(account.label))
+            card.set_worker(workers_by_label.get(account.label))
 
     def _render_table(self, st: FleetState) -> None:
         # Quota and frame counts are machine data -- set in monospace with

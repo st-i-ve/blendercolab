@@ -10,8 +10,8 @@ from PySide6.QtWidgets import QApplication
 import blendfleet.platform_paths as pp
 import blendfleet.ui.dashboard as dashboard_mod
 from blendfleet.accounts import Account, AccountStore
-from blendfleet.fleet import Fleet, FleetState
-from blendfleet.instance_state import GpuSnapshot, InstanceStore
+from blendfleet.fleet import Fleet, FleetState, WorkerState
+from blendfleet.instance_state import GpuSnapshot, InstanceSnapshot, InstanceStore
 from blendfleet.kaggle_client import KaggleError, KernelStatus, Quota
 from blendfleet.notebook_builder import RenderSettings
 from blendfleet.ui.dashboard import Dashboard
@@ -224,6 +224,125 @@ def test_empty_state_shows_no_frames_and_placeholders(qapp, tmp_path):
 def test_rail_shows_one_row_per_account(qapp, tmp_path):
     dash = make_dashboard(qapp, tmp_path, n=3)
     assert dash.rail_rows_layout.count() == 3
+    dash.close()
+
+
+# ---------------- InstanceCard wiring (Task 4) ----------------
+
+def test_rail_shows_one_instance_card_per_account_starting_idle(qapp, tmp_path):
+    dash = make_dashboard(qapp, tmp_path, n=3)
+    assert set(dash._instance_cards) == {"acct0", "acct1", "acct2"}
+    for card in dash._instance_cards.values():
+        assert card.status_word.text() == "idle"
+        assert card.idle_container.isHidden() is False
+        assert card.live_container.isHidden() is True
+    dash.close()
+
+
+def test_quota_cache_flows_into_instance_cards(qapp, tmp_path):
+    """make_dashboard() already waits out __init__'s initial quota-refresh
+    worker -- FakeClient.quota() returns Quota(0, 21600, ...), i.e. 6h
+    total, 0 used."""
+    dash = make_dashboard(qapp, tmp_path, n=1)
+    card = dash._instance_cards["acct0"]
+    assert card.quota_value.text() == "0.0 / 6.0 h"
+    assert card.quota_marker.text() == "live"
+    dash.close()
+
+
+def test_last_known_hardware_flows_into_the_idle_instance_card(qapp, tmp_path):
+    dash = make_dashboard(qapp, tmp_path, n=1)
+    dash.instance_store.record("acct0", InstanceSnapshot(
+        username="user_0",
+        gpus=[GpuSnapshot(index=0, mem_total=16280,
+                          model="Tesla P100-PCIE-16GB")],
+        cpu_count=4, ram_total=31.3, observed_at=time.time() - 7200))
+    dash._refresh_views()
+
+    card = dash._instance_cards["acct0"]
+    assert "2h ago" in card.last_run_value.text()
+    assert "Tesla P100-PCIE-16GB" in card.last_run_value.text()
+    assert "4 vCPU" in card.last_run_value.text()
+    assert "31.3 GB" in card.last_run_value.text()
+    dash.close()
+
+
+def test_live_telemetry_flows_into_the_matching_instance_card_only(qapp, tmp_path):
+    """Two accounts, telemetry for only one -- the OTHER account's card
+    must show nothing live, per-account, never aggregated."""
+    dash = make_dashboard(qapp, tmp_path, n=2)
+    dash._last_state = FleetState(
+        job_id="job", blend_name="x.blend", start_frame=1, end_frame=2,
+        workers=[
+            WorkerState(label="acct0", username="user_0",
+                       kernel_slug="user_0/k0", frames=[1, 2], state="running"),
+            WorkerState(label="acct1", username="user_1",
+                       kernel_slug="user_1/k1", frames=[1, 2], state="running"),
+        ])
+    dash._refresh_views()
+
+    dash._telemetry_queue.put(("acct0", {
+        "gpu": 0, "util": 87, "mem_used": 6144, "mem_total": 15360,
+        "temp": 71, "power": 58.0}))
+    dash._live_tick()
+
+    assert 0 in dash._instance_cards["acct0"]._gpu_rows
+    assert dash._instance_cards["acct1"]._gpu_rows == {}
+    dash.close()
+
+
+def test_launch_success_reflects_in_the_instance_card_status(qapp, tmp_path):
+    dash = make_dashboard(qapp, tmp_path, n=1)
+    blend = tmp_path / "remember.blend"
+    blend.write_bytes(b"x" * 100)
+    dash.blend = blend
+    dash.start.setValue(1)
+    dash.end.setValue(4)
+    dash._launch()
+    pump(dash._launch_worker)
+
+    card = dash._instance_cards["acct0"]
+    # fleet.WorkerState defaults every freshly-launched worker to "queued"
+    # -- Kaggle has not been polled yet, so the card must say exactly that,
+    # not jump straight to "rendering".
+    assert card.status_word.text() == "queued"
+    dash.close()
+
+
+def test_telemetry_arriving_while_still_queued_shows_a_live_card(qapp, tmp_path, monkeypatch):
+    """The same poll/telemetry race blendfleet/ui/instance_card.py's
+    InstanceCard docstring describes, exercised end-to-end: dashboard.py's
+    30s status poll has not run yet (the worker is still "queued"), but a
+    telemetry sample has already arrived on the SSE stream -- the card's
+    live body must reflect that immediately, not wait for the next poll."""
+    def fake_stream_progress(token, user_name, kernel_slug, on_progress,
+                             stop_event=None, on_telemetry=None,
+                             on_hardware=None):
+        on_progress(1, 4)
+        if on_telemetry:
+            on_telemetry({"gpu": 0, "util": 50, "mem_used": 100,
+                         "mem_total": 200, "temp": 60, "power": 10.0})
+
+    monkeypatch.setattr(dashboard_mod, "stream_progress", fake_stream_progress)
+
+    dash = make_dashboard(qapp, tmp_path, n=1)
+    blend = tmp_path / "remember.blend"
+    blend.write_bytes(b"x" * 100)
+    dash.blend = blend
+    dash.start.setValue(1)
+    dash.end.setValue(4)
+    dash._launch()
+    pump(dash._launch_worker)
+
+    deadline = time.monotonic() + 2.0
+    while not dash._live_progress and time.monotonic() < deadline:
+        time.sleep(0.01)
+    dash._live_tick()
+
+    card = dash._instance_cards["acct0"]
+    assert card.status_word.text() == "queued"        # poll hasn't run yet
+    assert card.live_container.isHidden() is False    # telemetry already is
+    assert 0 in card._gpu_rows
     dash.close()
 
 
