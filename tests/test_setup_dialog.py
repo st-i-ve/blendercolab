@@ -12,8 +12,9 @@ from PySide6.QtCore import QCoreApplication
 from PySide6.QtWidgets import QApplication
 
 import blendfleet.platform_paths as pp
+import blendfleet.ui.theme as theme
 from blendfleet.accounts import Account, AccountStore
-from blendfleet.ui.setup_dialog import SetupDialog
+from blendfleet.ui.setup_dialog import SetupDialog, _wash
 
 VALID = "KGAT_" + "a" * 32
 
@@ -27,6 +28,18 @@ def tmp_config(tmp_path, monkeypatch):
 @pytest.fixture(scope="module")
 def qapp():
     return QApplication.instance() or QApplication([])
+
+
+@pytest.fixture(autouse=True)
+def _restore_active_accent(qapp):
+    """test_verified_row_background_tracks_the_live_accent below calls
+    theme.apply() with every non-default accent -- see test_theme.py's
+    fixture of the same name for why that process-global state must not
+    leak into other test modules run later in the same session."""
+    original = theme._active_accent_name
+    yield
+    theme._active_accent_name = original
+    theme.apply(qapp, original)
 
 
 # Every SetupDialog a test builds. A dialog owns its _VerifyWorker QThread
@@ -126,6 +139,27 @@ def test_add_with_failing_verifier_does_not_add_and_keeps_entered_values(qapp, m
     assert dlg.token.text() == VALID
     assert dlg.add_btn.text() == "Add"
     assert dlg.add_btn.isEnabled()
+
+
+# ---------------- accent: resolved at use time, not import time ----------
+# THE bug the Task 6 brief calls out by name: this module used to compute
+# `COLOR_VERIFIED = _wash(ACCENT)` once, at ITS OWN import time, via
+# `from ... import ACCENT`. _verified_color() now calls current_accent()
+# every time _refresh() runs, so a live accent switch is reflected the
+# next time this dialog's list repaints.
+
+@pytest.mark.parametrize("name", list(theme.ACCENTS))
+def test_verified_row_background_tracks_the_live_accent(qapp, monkeypatch, name):
+    stub_warnings(monkeypatch)
+    theme.apply(qapp, name)
+    store = AccountStore()
+    store.add(Account(label="james", token=VALID), verifier=lambda t: "j")
+    dlg = make_dialog(store, verifier=lambda t: "j")
+
+    expected = _wash(theme.ACCENTS[name].base)
+    actual = dlg.list.item(0).background().color()
+    assert (actual.red(), actual.green(), actual.blue(), actual.alpha()) == \
+        (expected.red(), expected.green(), expected.blue(), expected.alpha())
 
 
 def test_add_accepts_valid_token_with_no_notebooks(qapp, monkeypatch):

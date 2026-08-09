@@ -4,17 +4,20 @@ import time
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PySide6.QtCore import QCoreApplication
+from PySide6.QtCore import QCoreApplication, Qt
 from PySide6.QtWidgets import QApplication
 
 import blendfleet.platform_paths as pp
 import blendfleet.ui.dashboard as dashboard_mod
+import blendfleet.ui.theme as theme
 from blendfleet.accounts import Account, AccountStore
 from blendfleet.fleet import Fleet, FleetState, WorkerState
 from blendfleet.instance_state import GpuSnapshot, InstanceSnapshot, InstanceStore
 from blendfleet.kaggle_client import KaggleError, KernelStatus, Quota
 from blendfleet.notebook_builder import RenderSettings
+from blendfleet.settings import Settings
 from blendfleet.ui.dashboard import Dashboard
+from blendfleet.ui.theme import ACCENTS
 
 
 @pytest.fixture(autouse=True)
@@ -26,6 +29,19 @@ def tmp_cfg(tmp_path, monkeypatch):
 @pytest.fixture(scope="module")
 def qapp():
     return QApplication.instance() or QApplication([])
+
+
+@pytest.fixture(autouse=True)
+def _restore_active_accent(qapp):
+    """test_switching_accent_live_repaints_the_brand_mark_without_restart
+    below calls theme.apply() with every non-default accent -- see
+    test_theme.py's fixture of the same name for why that process-global
+    state must not leak into other test modules run later in the same
+    session."""
+    original = theme._active_accent_name
+    yield
+    theme._active_accent_name = original
+    theme.apply(qapp, original)
 
 
 @pytest.fixture(autouse=True)
@@ -104,6 +120,25 @@ def settle(dash, timeout=2000) -> None:
             pass
     for _ in range(10):
         QCoreApplication.processEvents()
+
+
+def wait_until(condition, timeout=2.0) -> None:
+    """Poll `condition` (a no-arg callable) until it is true, pumping the
+    Qt event loop between checks, rather than a fixed processEvents()
+    count. Window-state changes (showFullScreen()/showMaximized(), and
+    the child visibility that follows from them) apply synchronously in
+    isolation, but were observed to occasionally lag by a tick or two
+    under the offscreen QPA platform after many windows have already
+    been created and torn down earlier in the same test session --
+    exactly the kind of eventual-consistency settle() above exists to
+    wait out for background workers.
+    """
+    deadline = time.monotonic() + timeout
+    while not condition():
+        if time.monotonic() > deadline:
+            assert condition(), "condition was never satisfied in time"
+        QCoreApplication.processEvents()
+        time.sleep(0.01)
 
 
 def stub_message_boxes(monkeypatch):
@@ -635,6 +670,144 @@ def test_snapshot_still_records_with_none_hardware_fields_when_banner_never_arri
     assert snap.cpu_count is None
     assert snap.ram_total is None
     assert snap.gpus == [GpuSnapshot(index=0, mem_total=200, model=None)]
+    dash.close()
+
+
+# ---------------- full screen: maximised default, F11, a way out ---------
+
+def test_dashboard_loads_its_own_settings_when_none_given(qapp, tmp_path):
+    """Every existing test in this module constructs Dashboard with no
+    settings= -- this is the fallback the Task 6 brief's "persisted"
+    requirement depends on staying test-compatible."""
+    dash = make_dashboard(qapp, tmp_path, n=1)
+    assert dash.settings.accent == "orange"
+    assert dash.settings.fullscreen is False
+    dash.close()
+
+
+def test_toggle_fullscreen_enters_and_persists(qapp, tmp_path):
+    dash = make_dashboard(qapp, tmp_path, n=1)
+    assert dash.isFullScreen() is False
+    assert dash.exit_fullscreen_btn.isVisible() is False
+
+    dash._toggle_fullscreen()
+    wait_until(lambda: dash.isFullScreen())
+    wait_until(lambda: dash.exit_fullscreen_btn.isVisible())
+    assert dash.settings.fullscreen is True
+
+    reloaded = Settings.load()
+    assert reloaded.fullscreen is True
+    dash.close()
+
+
+def test_toggle_fullscreen_again_leaves_full_screen_and_hides_the_exit_button(
+        qapp, tmp_path):
+    dash = make_dashboard(qapp, tmp_path, n=1)
+    dash._toggle_fullscreen()
+    wait_until(lambda: dash.isFullScreen())
+    dash._toggle_fullscreen()
+    wait_until(lambda: not dash.isFullScreen())
+    wait_until(lambda: not dash.exit_fullscreen_btn.isVisible())
+    assert dash.settings.fullscreen is False
+    dash.close()
+
+
+def test_escape_exits_full_screen(qapp, tmp_path):
+    """The exit_fullscreen_btn is the primary visible way out, but Esc is
+    the other conventional one -- never zero ways back out of a real
+    full-screen toggle."""
+    from PySide6.QtCore import QEvent
+    from PySide6.QtGui import QKeyEvent
+
+    dash = make_dashboard(qapp, tmp_path, n=1)
+    dash._toggle_fullscreen()
+    wait_until(lambda: dash.isFullScreen())
+
+    event = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Escape,
+                      Qt.KeyboardModifier.NoModifier)
+    dash.keyPressEvent(event)
+    wait_until(lambda: not dash.isFullScreen())
+    dash.close()
+
+
+def test_escape_does_nothing_when_not_full_screen(qapp, tmp_path):
+    from PySide6.QtCore import QEvent
+    from PySide6.QtGui import QKeyEvent
+
+    dash = make_dashboard(qapp, tmp_path, n=1)
+    event = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Escape,
+                      Qt.KeyboardModifier.NoModifier)
+    dash.keyPressEvent(event)   # must not raise, must not enter full screen
+    assert dash.isFullScreen() is False
+    dash.close()
+
+
+def test_show_at_startup_maximises_by_default(qapp, tmp_path):
+    dash = make_dashboard(qapp, tmp_path, n=1)
+    dash.show_at_startup()
+    wait_until(lambda: dash.isMaximized())
+    assert dash.isFullScreen() is False
+    dash.close()
+
+
+def test_show_at_startup_honours_a_stored_fullscreen_preference(qapp, tmp_path):
+    settings = Settings(fullscreen=True)
+    dash = Dashboard(make_store(1), lambda accounts: Fleet(
+        accounts, lambda tok: FakeClient(tok), tmp_path / "w"),
+        verifier=lambda t: "someone", settings=settings)
+    _LIVE_DASHBOARDS.append(dash)
+    settle(dash)
+    dash.show_at_startup()
+    wait_until(lambda: dash.isFullScreen())
+    wait_until(lambda: dash.exit_fullscreen_btn.isVisible())
+    dash.close()
+
+
+# ---------------- accent: live, without a restart (Task 6) ----------------
+# THE bug the Task 6 brief calls out by name: rendering with the red accent
+# selected used to produce zero red pixels anywhere, because dashboard.py
+# captured `ACCENT` at ITS OWN import time (`from ... import ACCENT`) and
+# never looked at it again. This proves the fix end-to-end through
+# Dashboard's real brand-mark pixmap, not just a stylesheet string.
+
+def _image_has_color(image, hex_color: str) -> bool:
+    from PySide6.QtGui import QColor
+    target = QColor(hex_color)
+    for y in range(image.height()):
+        for x in range(image.width()):
+            px = image.pixelColor(x, y)
+            if px.alpha() > 0 and (px.red(), px.green(), px.blue()) == \
+                    (target.red(), target.green(), target.blue()):
+                return True
+    return False
+
+
+@pytest.mark.parametrize("name", ["orange", "green", "purple", "blue", "red"])
+def test_switching_accent_live_repaints_the_brand_mark_without_restart(
+        qapp, tmp_path, name):
+    dash = make_dashboard(qapp, tmp_path, n=1)
+    theme.apply(qapp, name)   # e.g. what SettingsView's swatch click does
+    image = dash.brand_mark.pixmap().toImage()
+    assert _image_has_color(image, ACCENTS[name].base), (
+        f"the {name!r} accent does not appear in the brand mark after a "
+        "live switch -- Dashboard must repaint chrome it painted with an "
+        "explicit accent colour, not just leave it as it was at __init__")
+    dash.close()
+
+
+def test_switching_accent_live_also_repaints_every_instance_card(
+        qapp, tmp_path):
+    dash = make_dashboard(qapp, tmp_path, n=1)
+    dash._last_state = FleetState(
+        job_id="job", blend_name="x.blend", start_frame=1, end_frame=2,
+        workers=[WorkerState(label="acct0", username="user_0",
+                             kernel_slug="user_0/k0", frames=[1, 2],
+                             state="running")])
+    dash._refresh_views()
+
+    theme.apply(qapp, "red")
+    image = dash._instance_cards["acct0"].status_icon.pixmap().toImage()
+    assert _image_has_color(image, ACCENTS["red"].base)
     dash.close()
 
 

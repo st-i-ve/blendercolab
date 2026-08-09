@@ -19,7 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QSize, Qt
+from PySide6.QtCore import QByteArray, QObject, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QFontDatabase, QIcon, QPainter, QPixmap
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import QApplication
@@ -112,10 +112,59 @@ def resolve_accent(name: str) -> AccentPalette:
 
 # Backward-compatible module-level accent -- other modules import this by
 # value (`from blendfleet.ui.theme import ACCENT`), which only reflects
-# whichever accent was active at import time. Re-theming code that needs
-# to follow a live accent switch should use resolve_accent()/apply()
-# instead of this constant.
+# whichever accent was active at import time. THIS IS A TRAP: a reviewer
+# confirmed on Task 4 that rendering with the red accent selected produced
+# zero red pixels anywhere, because instance_card.py/dashboard.py/
+# setup_dialog.py all captured this constant with `from ... import ACCENT`
+# at their own import time and never looked at it again. Nothing in this
+# codebase may import this name any more -- call current_accent() instead,
+# which re-resolves on every call. Kept only because it is cheap to keep and
+# some external/future script might still reach for the old name.
 ACCENT = ACCENTS[DEFAULT_ACCENT].base
+
+# The accent actually in effect app-wide right now -- set by apply() below,
+# read by current_accent(). A plain module global (not hidden behind a
+# class) because it has exactly one writer (apply()) and any number of
+# readers, and every reader wants the SAME process-wide value: there is
+# only ever one active accent for the whole application, never one per
+# widget.
+_active_accent_name: str = DEFAULT_ACCENT
+
+
+def current_accent() -> AccentPalette:
+    """The AccentPalette for whichever accent is active RIGHT NOW.
+
+    Call this at paint/use time (inside a method, not at module import),
+    so a widget built before an accent switch still picks up the new
+    colour the next time it repaints -- unlike the frozen `ACCENT`
+    constant above, which is exactly the bug this function exists to fix.
+    """
+    return resolve_accent(_active_accent_name)
+
+
+def current_accent_name() -> str:
+    """The name (e.g. "purple") of the accent current_accent() resolves."""
+    return _active_accent_name
+
+
+class _ThemeSignal(QObject):
+    """A process-wide notifier for "the active accent just changed".
+
+    QApplication's own stylesheet cascade (see apply()) already repaints
+    everything styled purely through QSS the moment setStyleSheet() is
+    called again -- buttons, borders, progress bars. It does NOT repaint
+    a QLabel whose colour was set with an explicit setStyleSheet()/pixmap
+    call (a status icon, a brand mark tinted to the accent, a "live"
+    marker) -- those were painted once, from whatever current_accent()
+    returned at THAT moment, and stay that colour until something tells
+    them to repaint. `changed` is that something: apply() emits it after
+    every call, and any widget holding one of those explicit accent
+    colours connects to it and re-fetches current_accent() when it fires.
+    """
+    changed = Signal()
+
+
+theme_signal = _ThemeSignal()
 
 # A small, fixed set of account tint colours for the filmstrip and rail
 # status dots. Cycled by account index. Deliberately distinct in both hue
@@ -247,10 +296,30 @@ QLabel[secondary="true"] {{
     color: {TEXT_SECONDARY};
 }}
 
-#rail, #card, QListWidget, QTableWidget {{
+QListWidget, QTableWidget {{
     background-color: {BG_SURFACE};
     border: 1px solid {BORDER};
     border-radius: 6px;
+}}
+
+/* The rail recedes to the SHELL colour rather than the SURFACE colour
+every other panel uses, so the InstanceCards sitting inside it (below)
+read as a level above their container -- elevation by a genuine lightness
+step, not a decorative drop shadow, which is what still holds up on a
+warm-dark palette this close in contrast already. */
+#rail {{
+    background-color: {BG_SHELL};
+    border-right: 1px solid {BORDER};
+}}
+
+/* Cards sit INSIDE the rail (see dashboard.py's InstanceCard, one per
+account) -- lighter than the rail behind them (elevation), with a touch
+more corner rounding than the squarer panels around them so they read as
+distinct, liftable units rather than another strip of the sidebar. */
+#card {{
+    background-color: {BG_SURFACE};
+    border: 1px solid {BORDER};
+    border-radius: 8px;
 }}
 
 QPushButton {{
@@ -378,12 +447,21 @@ def apply(app: QApplication, accent: str = DEFAULT_ACCENT) -> None:
     cascades to every widget created afterwards, including dialogs
     (SetupDialog) opened later -- that is the mechanism that guarantees no
     dialog is ever left unstyled.
+
+    Also updates the module-global `_active_accent_name` (what
+    current_accent() reads) and emits `theme_signal.changed`, in that
+    order, BEFORE returning -- so a connected slot that calls
+    current_accent() during the signal handler already sees the new
+    accent, not the one being replaced.
     """
+    global _active_accent_name
     register_fonts()
-    palette = resolve_accent(accent)
+    _active_accent_name = accent if accent in ACCENTS else DEFAULT_ACCENT
+    palette = ACCENTS[_active_accent_name]
     app.setStyle("Fusion")
     app.setFont(ui_font())
     app.setStyleSheet(_stylesheet(palette))
+    theme_signal.changed.emit()
 
 
 def apply_theme(app: QApplication) -> None:

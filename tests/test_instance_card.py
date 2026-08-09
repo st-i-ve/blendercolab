@@ -5,6 +5,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 from PySide6.QtWidgets import QApplication
 
+import blendfleet.ui.theme as theme
 from blendfleet.accounts import Account
 from blendfleet.fleet import WorkerState
 from blendfleet.instance_state import (DEFAULT_STALE_AFTER_SECONDS,
@@ -13,12 +14,40 @@ from blendfleet.ui.instance_card import (NEVER_RUN_TEXT, GpuLiveRow,
                                          InstanceCard, format_age,
                                          format_hardware_summary, is_live,
                                          status_for)
-from blendfleet.ui.theme import ACCENT, TEXT_SECONDARY, WARNING
+from blendfleet.ui.theme import ACCENT, ACCENTS, TEXT_SECONDARY, WARNING
 
 
 @pytest.fixture(scope="module")
 def qapp():
     return QApplication.instance() or QApplication([])
+
+
+@pytest.fixture(autouse=True)
+def _restore_active_accent(qapp):
+    """test_switching_accent_actually_repaints_the_status_icon below calls
+    theme.apply() with every non-default accent -- see test_theme.py's
+    fixture of the same name for why that process-global state must not
+    leak into other test modules that run later in the same session."""
+    original = theme._active_accent_name
+    yield
+    theme._active_accent_name = original
+    theme.apply(qapp, original)
+
+
+def _image_has_color(image, hex_color: str) -> bool:
+    """Whether any opaque pixel in `image` is exactly `hex_color` -- the
+    pixel-sampling proof the task brief asks for, not a string check
+    against a stylesheet that could be right while nothing on screen
+    actually is."""
+    from PySide6.QtGui import QColor
+    target = QColor(hex_color)
+    for y in range(image.height()):
+        for x in range(image.width()):
+            px = image.pixelColor(x, y)
+            if px.alpha() > 0 and (px.red(), px.green(), px.blue()) == \
+                    (target.red(), target.green(), target.blue()):
+                return True
+    return False
 
 
 def make_account(label="stive", username="stive", verified=True) -> Account:
@@ -327,3 +356,35 @@ def test_gpu_live_row_formats_percent_and_memory(qapp):
     assert row.util_value.text().strip() == "87%"
     assert "6.0 GB" in row.mem_value.text()
     assert "15.0 GB" in row.mem_value.text()
+
+
+# ---------------- proof: the accent actually reaches rendered pixels -----
+# THE bug the Task 6 brief calls out by name: a reviewer confirmed on Task
+# 4 that rendering with the red accent selected produced ZERO red pixels
+# anywhere, because status_for()/quota_marker captured `ACCENT` at THIS
+# module's own import time. status_for() now calls current_accent() at
+# call time, and this samples the actual rendered status-icon pixmap
+# rather than trusting a colour string.
+
+@pytest.mark.parametrize("name", ["orange", "green", "purple", "blue", "red"])
+def test_switching_accent_actually_repaints_the_status_icon(qapp, name):
+    theme.apply(qapp, name)
+    card = InstanceCard(0, make_account())
+    card.set_worker(make_worker(state="running"))
+    image = card.status_icon.pixmap().toImage()
+    assert _image_has_color(image, ACCENTS[name].base), (
+        f"the {name!r} accent's own colour ({ACCENTS[name].base}) does not "
+        "appear anywhere in the rendered 'rendering' status icon")
+
+
+@pytest.mark.parametrize("name", ["orange", "green", "purple", "blue", "red"])
+def test_switching_accent_actually_repaints_an_already_built_card(qapp, name):
+    """Not just a freshly-built card -- refresh_accent() (wired to
+    theme.theme_signal.changed by dashboard.py) must repaint a card built
+    BEFORE the switch, which is the live-without-restart requirement."""
+    card = InstanceCard(0, make_account())
+    card.set_worker(make_worker(state="running"))
+    theme.apply(qapp, name)
+    card.refresh_accent()
+    image = card.status_icon.pixmap().toImage()
+    assert _image_has_color(image, ACCENTS[name].base)

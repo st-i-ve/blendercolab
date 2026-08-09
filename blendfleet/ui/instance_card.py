@@ -45,8 +45,9 @@ from blendfleet.fleet import WorkerState
 from blendfleet.instance_state import InstanceSnapshot
 from blendfleet.ui.charts import Sparkline
 from blendfleet.ui.formatting import format_bytes
-from blendfleet.ui.theme import (ACCENT, TELEMETRY, TEXT_SECONDARY, WARNING,
-                                  account_color, icon, mono_font, ui_font)
+from blendfleet.ui.theme import (TELEMETRY, TEXT_SECONDARY, WARNING,
+                                  account_color, current_accent, icon,
+                                  mono_font, theme_signal, ui_font)
 
 # States fleet.WorkerState.state can carry -- kaggle_client.ACTIVE_STATES
 # duplicated as a literal set here (not imported) would tie this UI module
@@ -123,17 +124,18 @@ def status_for(worker: WorkerState | None,
         return "x", WARNING, "not verified"
     if worker is None:
         return "monitor", TEXT_SECONDARY, "idle"
+    accent = current_accent().base
     state = worker.state
     if state == _RUNNING_STATE:
-        return "activity", ACCENT, "rendering"
+        return "activity", accent, "rendering"
     if state == _QUEUED_STATE:
-        return "loader-circle", ACCENT, "queued"
+        return "loader-circle", accent, "queued"
     if state == _ERROR_STATE:
         return "triangle-alert", WARNING, "error"
     if state in _CANCELLED_STATES:
         return "square", TEXT_SECONDARY, "cancelled"
     if state == _COMPLETE_STATE:
-        return "circle-check", ACCENT, "complete"
+        return "circle-check", accent, "complete"
     return "circle-alert", TEXT_SECONDARY, state or "unknown"
 
 
@@ -264,7 +266,7 @@ class InstanceCard(QWidget):
         quota_row.addWidget(self.quota_value, 1)
         self.quota_marker = QLabel("")
         self.quota_marker.setFont(mono_font(9))
-        self.quota_marker.setStyleSheet(f"color: {ACCENT};")
+        self.quota_marker.setStyleSheet(f"color: {current_accent().base};")
         quota_row.addWidget(self.quota_marker)
         v.addLayout(quota_row)
 
@@ -302,6 +304,21 @@ class InstanceCard(QWidget):
 
         self._worker: WorkerState | None = None
         self.set_worker(None)
+        # The status icon/word and the quota "live" marker are painted with
+        # an explicit colour (current_accent().base at the moment they were
+        # set), not through the QApplication stylesheet cascade -- so they
+        # need telling, explicitly, when the accent changes. Qt disconnects
+        # this automatically once this card is destroyed.
+        theme_signal.changed.connect(self.refresh_accent)
+
+    # ---------------- live accent switch ----------------
+    def refresh_accent(self) -> None:
+        """Re-paint every explicitly-accent-coloured element from whatever
+        current_accent() returns right now. Connected to
+        theme.theme_signal.changed so a Settings accent change is reflected
+        without rebuilding (or restarting) this card."""
+        self.quota_marker.setStyleSheet(f"color: {current_accent().base};")
+        self.set_worker(self._worker)
 
     # ---------------- quota ----------------
     def set_quota(self, raw: str | None) -> None:

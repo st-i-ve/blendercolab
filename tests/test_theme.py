@@ -15,12 +15,29 @@ from PySide6.QtWidgets import QApplication
 
 import blendfleet.ui.theme as theme
 from blendfleet.ui.theme import (ACCENTS, DEFAULT_ACCENT, ICON_NAMES, WARNING,
-                                  apply, icon, resolve_accent)
+                                  apply, current_accent, current_accent_name,
+                                  icon, resolve_accent, theme_signal)
 
 
 @pytest.fixture(scope="module")
 def qapp():
     return QApplication.instance() or QApplication([])
+
+
+@pytest.fixture(autouse=True)
+def _restore_active_accent():
+    """theme._active_accent_name (what current_accent() reads) is process
+    state, deliberately -- there is exactly one active accent for the
+    whole running app. That means a test calling apply() with a
+    non-default accent (see test_warning_survives_the_red_accent below)
+    would otherwise leak that choice into every OTHER test module that
+    runs afterwards in the same pytest session, e.g. flipping
+    tests/test_instance_card.py's `colour == ACCENT` assertions onto
+    whatever accent this file last applied. Restored after every test in
+    this module regardless of which ones actually call apply()."""
+    original = theme._active_accent_name
+    yield
+    theme._active_accent_name = original
 
 
 # ---------------- WCAG contrast (independent implementation) ----------------
@@ -81,6 +98,51 @@ def test_unknown_accent_name_falls_back_to_default_rather_than_raising():
 def test_apply_with_unknown_accent_does_not_raise(qapp):
     apply(qapp, "not-a-real-accent")
     assert qapp.styleSheet()  # applied something rather than raising
+
+
+# ---------------- the ACCENT-frozen-at-import bug (Task 4 finding) --------
+# A reviewer confirmed on Task 4 that rendering with the red accent selected
+# produced ZERO red pixels anywhere: every consumer captured theme.ACCENT
+# with `from ... import ACCENT` at ITS OWN import time and never looked
+# again. current_accent()/theme_signal exist so that bug class cannot recur
+# -- these tests cover the mechanism itself; tests/test_instance_card.py and
+# tests/test_dashboard.py cover it end-to-end through real consumers,
+# sampling actual rendered pixels rather than trusting the stylesheet
+# string alone.
+
+def test_current_accent_defaults_to_the_default_accent():
+    assert current_accent_name() == DEFAULT_ACCENT
+    assert current_accent() == ACCENTS[DEFAULT_ACCENT]
+
+
+@pytest.mark.parametrize("name", ["orange", "green", "purple", "blue", "red"])
+def test_current_accent_follows_apply_unlike_the_frozen_constant(qapp, name):
+    apply(qapp, name)
+    assert current_accent_name() == name
+    assert current_accent() == ACCENTS[name]
+
+
+def test_current_accent_falls_back_for_an_unknown_applied_name(qapp):
+    apply(qapp, "ultraviolet")
+    assert current_accent_name() == DEFAULT_ACCENT
+    assert current_accent() == ACCENTS[DEFAULT_ACCENT]
+
+
+def test_apply_emits_theme_signal_with_the_new_accent_already_in_effect(qapp):
+    """A slot connected to theme_signal.changed that calls current_accent()
+    DURING the signal must see the NEW accent, not the one being replaced
+    -- apply()'s docstring promises this ordering explicitly."""
+    seen = []
+
+    def on_changed():
+        seen.append(current_accent_name())
+
+    theme_signal.changed.connect(on_changed)
+    try:
+        apply(qapp, "purple")
+    finally:
+        theme_signal.changed.disconnect(on_changed)
+    assert seen == ["purple"]
 
 
 # ---------------- Step 4: contrast ----------------
