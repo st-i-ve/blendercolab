@@ -17,6 +17,19 @@
 - **Never write `os.environ["KAGGLE_API_TOKEN"]`** outside the lock-guarded `_with_env_token`.
 - **Status is never conveyed by colour alone** — symbol + word. Failure uses amber, not red (~8% of men cannot distinguish red/green). **This survives every accent-colour choice**, including the red accent.
 - Qt objects in tests must be deterministically torn down, not left to GC — that caused fatal aborts before.
+
+- **One typeface family, one icon set.** UI text is **Roboto**; all numeric and
+  machine data is **Roboto Mono** (same family, so the app keeps a single voice
+  while figures stay fixed-width and do not reflow as they tick). Status icons
+  come from the vendored **Lucide** set in `assets/icons/`, never Unicode
+  glyphs — those render differently depending on the machine's fonts.
+  Both are already vendored and verified loading in Qt (`assets/fonts/`,
+  `assets/icons/`, licences alongside).
+- **Icons supplement labels, never replace them.** Every status is symbol AND
+  word. An icon-only status fails the same accessibility rule as colour-only.
+- Fonts must be registered via `QFontDatabase.addApplicationFont` at startup
+  and **bundled in the PyInstaller spec** — a frozen app has no access to the
+  source tree, and an unregistered family silently falls back to a system font.
 - No `Co-Authored-By` trailers on commits.
 
 ## The governing fact
@@ -43,7 +56,15 @@ So the instance console shows:
 - [ ] **Step 3: implement.** Derive each accent's hover/pressed/disabled shades from the base rather than hand-listing them, so adding a colour is one line.
 - [ ] **Step 4: contrast test** — assert every accent meets at least 4.5:1 against the shell background for text use. Compute it; do not eyeball. An accent that fails is a bug, not a taste question.
 - [ ] **Step 5: amber-survives-accent test** — assert the warning colour stays amber and is not derived from the accent, including when the accent IS red. Otherwise a red accent makes error states indistinguishable from normal ones.
-- [ ] **Step 6: full suite + commit**
+- [ ] **Step 6: register the bundled fonts and expose the icon set.** Load all
+  five TTFs from `assets/fonts/` via `QFontDatabase.addApplicationFont` at
+  startup and assert the families register (`Roboto`, `Roboto Mono`) — a
+  silent fallback to a system font is the failure mode here. Add an
+  `icon(name, colour)` helper that loads from `assets/icons/` and tints via
+  the SVG's `stroke="currentColor"`, so icons follow the active accent.
+  Test: every icon the app references exists on disk and loads non-null —
+  a missing icon must fail a test, not render as a blank square at runtime.
+- [ ] **Step 7: full suite + commit**
 
 ---
 
