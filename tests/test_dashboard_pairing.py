@@ -85,7 +85,7 @@ def test_streams_use_the_token_of_the_worker_s_own_account(dash, monkeypatch):
     seen = []
 
     def fake_stream(token, user_name, kernel_slug, on_progress,
-                    stop_event=None, on_telemetry=None):
+                    stop_event=None, on_telemetry=None, on_hardware=None):
         seen.append((token, kernel_slug))
 
     monkeypatch.setattr(dashboard_mod, "stream_progress", fake_stream)
@@ -105,7 +105,7 @@ def test_a_worker_whose_account_was_removed_is_skipped_not_mispaired(dash, monke
     seen = []
 
     def fake_stream(token, user_name, kernel_slug, on_progress,
-                    stop_event=None, on_telemetry=None):
+                    stop_event=None, on_telemetry=None, on_hardware=None):
         seen.append((token, kernel_slug))
 
     monkeypatch.setattr(dashboard_mod, "stream_progress", fake_stream)
@@ -128,7 +128,7 @@ def test_stream_threads_are_kept_so_close_can_join_them(dash, monkeypatch):
     started = []
 
     def fake_stream(token, user_name, kernel_slug, on_progress,
-                    stop_event=None, on_telemetry=None):
+                    stop_event=None, on_telemetry=None, on_hardware=None):
         started.append(kernel_slug)
 
     monkeypatch.setattr(dashboard_mod, "stream_progress", fake_stream)

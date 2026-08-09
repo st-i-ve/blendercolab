@@ -425,6 +425,46 @@ class KaggleClient:
         except Exception:
             return False
 
+    def dataset_file_size(self, slug: str, filename: str) -> int | None:
+        """The byte size Kaggle reports for `filename` inside dataset `slug`,
+        or None if this account's file listing for that dataset has no file
+        by that name at all (never uploaded, wrong name, or a grant that
+        covers the dataset but not yet its files).
+
+        Built on dataset_list_files -- the exact call dataset_reachable()
+        already uses -- rather than any new API surface. Checked against the
+        installed kagglesdk (kagglesdk.datasets.types.dataset_api_service.
+        ApiDatasetFile): its fields are ref, dataset_ref, owner_ref, name,
+        creation_date, description, file_type, url, total_bytes, columns --
+        there is no hash/checksum/etag field anywhere on it. So this is a
+        SIZE comparison, not a checksum, and it must never be described as
+        one: two different .blend files that happen to be exactly the same
+        number of bytes would pass this check. If a future kagglesdk release
+        adds a content hash, this should be upgraded to use it instead (see
+        test_installed_kagglesdk_dataset_file_exposes_no_content_hash, which
+        fails the day that stops being true).
+
+        Raises whatever dataset_list_files raises (e.g. an HTTPError-derived
+        403) when the account cannot reach the dataset at all -- that is a
+        DIFFERENT failure from "reachable but this file isn't in the
+        listing", see dataset_reachable(). Callers that need to tell the two
+        apart (fleet.launch does) call dataset_reachable() first.
+        """
+        response = self.api.dataset_list_files(slug)
+        files = getattr(response, "dataset_files", None)
+        if files is None and isinstance(response, dict):
+            files = response.get("datasetFiles")
+        for f in files or []:
+            if isinstance(f, dict):
+                name = f.get("name")
+                size = f.get("totalBytes", f.get("total_bytes"))
+            else:
+                name = getattr(f, "name", None)
+                size = getattr(f, "total_bytes", None)
+            if name == filename:
+                return size
+        return None
+
     def dataset_create(self, folder: Path,
                        on_progress: Callable | None = None) -> None:
         folder = Path(folder)

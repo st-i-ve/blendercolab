@@ -2,25 +2,33 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QThread, QTimer, Signal
+from PySide6.QtCore import QThread, QTimer, Qt, Signal
+from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (QComboBox, QFileDialog, QFormLayout,
                                QHBoxLayout, QHeaderView, QLabel, QMainWindow,
                                QMessageBox, QProgressBar, QPushButton,
-                               QSpinBox, QTableWidget, QTableWidgetItem,
-                               QVBoxLayout, QWidget)
+                               QSizePolicy, QSpinBox, QTableWidget,
+                               QTableWidgetItem, QVBoxLayout, QWidget)
 
 from blendfleet.accounts import AccountStore
 from blendfleet.assignment import estimate
 from blendfleet.fleet import Fleet, FleetState
+from blendfleet.instance_state import GpuSnapshot, InstanceSnapshot, InstanceStore
 from blendfleet.log_stream import stream_progress
 from blendfleet.notebook_builder import RenderSettings
+from blendfleet.settings import Settings
 from blendfleet.ui.charts import Filmstrip, GpuPanel
+from blendfleet.ui.instance_card import InstanceCard
 from blendfleet.ui.messages import explain
+from blendfleet.ui.settings_view import SettingsView
 from blendfleet.ui.setup_dialog import SetupDialog
-from blendfleet.ui.theme import ACCENT, WARNING, account_color, mono_font
+from blendfleet.ui.theme import (TEXT_SECONDARY, WARNING, brand_icon,
+                                  current_accent, icon, mono_font,
+                                  theme_signal)
 from blendfleet.ui.upload_view import UploadView
 
 SETTINGS_URL = "https://www.kaggle.com/settings"
@@ -31,40 +39,29 @@ LIVE_INTERVAL_MS = 2_000             # cheap: drain in-memory progress/telemetry
 # log_stream closes the response within STOP_POLL_SECONDS of `_stop` being
 # set, so this is generous; it is a bound on shutdown, not the expected wait.
 STREAM_JOIN_TIMEOUT_S = 3.0
-
-
-class _AccountRow(QWidget):
-    """One rail entry: a verification status (symbol + word, never colour
-    alone) plus the account's own tint colour -- the same colour that
-    tints its frames in the filmstrip below, so the rail doubles as a
-    legend."""
-
-    def __init__(self, index: int, account, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        h = QHBoxLayout(self)
-        h.setContentsMargins(8, 6, 8, 6)
-        dot = QLabel("●")
-        dot.setStyleSheet(f"color: {account_color(index).name()}; font-size: 13pt;")
-        self.status = QLabel()
-        self.status.setFont(mono_font(9))
-        self.name = QLabel(account.label)
-        h.addWidget(dot)
-        h.addWidget(self.status)
-        h.addWidget(self.name, 1)
-        self.set_verified(account.verified)
-
-    def set_verified(self, verified: bool) -> None:
-        # The word is part of the visible label, not a tooltip: a tooltip
-        # is invisible to anyone not hovering, and to screen readers in
-        # many configurations, which defeats the entire "symbol + word"
-        # rule this exists for (see SetupDialog._refresh, which this
-        # matches).
-        if verified:
-            self.status.setText("✓ verified")
-            self.status.setStyleSheet(f"color: {ACCENT};")
-        else:
-            self.status.setText("✗ not verified")
-            self.status.setStyleSheet(f"color: {WARNING};")
+# Spacing scale for the main content column -- named rather than sprinkled
+# as bare integers, so "generous breathing room at large sizes" (the Task 6
+# brief) is one deliberate set of numbers, not whatever a given widget
+# happened to be given when it was added.
+MARGIN = 24
+GAP = 14
+# Prose (not data) labels are capped to this width and left where they are
+# rather than stretching edge-to-edge -- at 2560px the main column is well
+# over 2000px wide, and a paragraph that wide is unreadable. The filmstrip,
+# GPU panel, upload view and table are deliberately NOT capped: they are
+# data-dense and genuinely benefit from the extra width.
+MAX_PROSE_WIDTH = 760
+# The main column (rail excluded) caps out here and centres, rather than
+# stretching to whatever is left of the window -- see _build_main's own
+# comment for the full reasoning. Chosen so it equals the main column's
+# actual width at 1920x1080 (1920 - 320 rail = 1600): nothing changes at
+# that size or below, only 2560+ gains side gutters instead of stretch.
+MAX_CONTENT_WIDTH = 1600
+# The frame-range/resolution/samples controls and the launch/cancel/collect
+# buttons are capped a second, tighter time within MAX_CONTENT_WIDTH -- a
+# number entry field is not more usable at 1600px than at 300px.
+MAX_CONTROLS_WIDTH = 640
+CONTROL_WIDTH = 160
 
 
 class _LaunchWorker(QThread):
@@ -135,11 +132,20 @@ class _CallWorker(QThread):
 
 
 class Dashboard(QMainWindow):
-    def __init__(self, store: AccountStore, fleet_factory, verifier) -> None:
+    def __init__(self, store: AccountStore, fleet_factory, verifier,
+                 settings: Settings | None = None) -> None:
         super().__init__()
         self.store = store
         self.fleet_factory = fleet_factory
         self.verifier = verifier
+        # Accepting an already-loaded Settings (see __main__.main, which
+        # applies its accent to the QApplication before any window shows)
+        # rather than always loading a fresh one here: the app must have
+        # exactly one Settings instance in play, not two copies that could
+        # drift the moment one of them is saved. Falling back to a fresh
+        # load keeps every existing test (which constructs Dashboard with
+        # no settings= at all) working unchanged.
+        self.settings = settings if settings is not None else Settings.load()
         self.blend: Path | None = None
         self._stop = threading.Event()
         # Every SSE log-stream thread started by _start_progress_threads,
@@ -166,13 +172,52 @@ class Dashboard(QMainWindow):
         # UI thread, so telemetry never goes straight from a worker thread
         # into GpuPanel.
         self._telemetry_queue: "queue.Queue[tuple[str, dict]]" = queue.Queue()
+        # Filled by the same SSE threads from the notebook's first-cell
+        # hardware banner (log_stream.parse_hardware_banner), drained on the
+        # UI thread by _live_tick alongside _telemetry_queue -- same
+        # widgets-only-from-the-UI-thread reasoning as telemetry above.
+        self._hardware_queue: "queue.Queue[tuple[str, dict]]" = queue.Queue()
+        # Last-known hardware per account, cached across app restarts so an
+        # idle card (Task 4) can show what an account last ran on -- Kaggle
+        # has no idle instances to poll instead. Loaded once here; every
+        # write goes through _record_instance_snapshot below.
+        self.instance_store = InstanceStore.load()
+        # Per-run accumulator: label -> {gpu index -> mem_total}, built up
+        # from telemetry as it arrives so a multi-GPU account's snapshot
+        # reflects every GPU seen, not just whichever one's line happened
+        # to be first. Reset in _start_progress_threads, i.e. as each new
+        # render starts.
+        self._instance_gpus: dict[str, dict[int, int]] = {}
+        # Per-run accumulator: label -> {"cpu_count":.., "ram_total":..},
+        # from the hardware banner's CPU/RAM line. Reset alongside
+        # _instance_gpus.
+        self._instance_hardware: dict[str, dict] = {}
+        # Per-run accumulator: label -> ordered list of GPU model names, in
+        # the order the hardware banner's nvidia-smi listing printed them
+        # (that listing carries no GPU index of its own -- see
+        # blendfleet/instance_state.py). Matched to telemetry's indexed
+        # GPUs by position when a snapshot is built.
+        self._instance_gpu_models: dict[str, list[str]] = {}
+        # Labels already persisted for the CURRENT run. Recording once per
+        # account per run (not once per telemetry sample, which arrives
+        # every ~5s for as long as the render runs) is the whole point --
+        # see _record_instance_snapshot.
+        self._recorded_instance_labels: set[str] = set()
         # Keyed by account label. Populated by _refresh_quota_async(),
         # which is best-effort: a fetch failure for one or all accounts
         # must never raise -- it only ever downgrades the displayed
         # figure to "unavailable" (see FINDING 1, task 9 fix round 1).
         self._quota_cache: dict[str, str] = {}
+        # Keyed by account label, one InstanceCard per account -- the rich
+        # per-account "SaaS dashboard" cards (Task 4) that live in the
+        # rail. Rebuilt (and this dict replaced) only by _refresh_accounts;
+        # every tick just calls setters on the existing widgets, so a
+        # card's live Sparkline history is never reset out from under a
+        # still-rendering account.
+        self._instance_cards: dict[str, InstanceCard] = {}
         self.setWindowTitle("BlendFleet")
-        self.resize(1180, 760)
+        self.resize(1180, 760)   # only matters until show_at_startup() runs;
+                                 # see its docstring for why that is not show()
 
         root = QWidget()
         outer = QHBoxLayout(root)
@@ -182,6 +227,26 @@ class Dashboard(QMainWindow):
 
         outer.addWidget(self._build_rail())
         outer.addWidget(self._build_main(), 1)
+
+        # F11 toggles real (borderless, chrome-free) full screen. A real
+        # toggle needs a real way back out that does not depend on the user
+        # remembering the same key -- self._exit_fullscreen_bar (built in
+        # _build_main) is that way out, shown only while full screen.
+        self._fullscreen_shortcut = QShortcut(QKeySequence("F11"), self)
+        self._fullscreen_shortcut.activated.connect(self._toggle_fullscreen)
+
+        # Chrome that is painted with an explicit accent colour rather than
+        # through the QApplication stylesheet cascade (the brand mark; every
+        # InstanceCard's status icon/quota marker) does not repaint itself
+        # just because theme.apply() changed the stylesheet -- see
+        # theme.theme_signal's own docstring. This is what makes a Settings
+        # accent change visible immediately instead of after a restart.
+        #
+        # The handle connect() returns is kept (not discarded) so
+        # closeEvent can disconnect this exact connection deterministically
+        # -- see closeEvent's comment for why a bound-method disconnect
+        # alone is not enough.
+        self._accent_connection = theme_signal.changed.connect(self._on_accent_changed)
 
         # Real network calls (kernel status, quota) -- infrequent.
         self.timer = QTimer(self)
@@ -202,17 +267,51 @@ class Dashboard(QMainWindow):
     def _build_rail(self) -> QWidget:
         rail = QWidget()
         rail.setObjectName("rail")
-        rail.setFixedWidth(230)
+        # Wide enough for a card's quota/hardware line, not just a name --
+        # the old fixed-width rail (230px) was sized for _AccountRow's
+        # single line of text; InstanceCard needs room for a GPU row's
+        # sparkline + numbers without wrapping every value.
+        rail.setFixedWidth(320)
         v = QVBoxLayout(rail)
-        v.setContentsMargins(0, 8, 0, 8)
-        title = QLabel("<b>accounts</b>")
+        v.setContentsMargins(0, GAP, 0, GAP)
+        v.setSpacing(GAP)
+
+        # The brand mark, tinted to the active accent (see theme.brand_icon)
+        # rather than shipped as a fixed-colour logo -- so it belongs to the
+        # app's own chrome and follows whichever accent the user picked,
+        # instead of reading as a sticker pasted over it. Kept on self (not
+        # a local var) because _on_accent_changed has to re-tint it after a
+        # live accent switch -- this pixmap was painted once, at this
+        # moment, and never repaints itself on its own.
+        brand = QHBoxLayout()
+        brand.setContentsMargins(8, 0, 8, 8)
+        brand.setSpacing(8)
+        self.brand_mark = QLabel()
+        self.brand_mark.setPixmap(brand_icon(current_accent().base, 28).pixmap(28, 28))
+        brand.addWidget(self.brand_mark)
+        brand.addWidget(QLabel("<b>BlendFleet</b>"), 1)
+        self.settings_btn = QPushButton()
+        self.settings_btn.setIcon(icon("settings", TEXT_SECONDARY, 16))
+        self.settings_btn.setToolTip("Settings — accent colour")
+        self.settings_btn.setFixedSize(30, 30)
+        self.settings_btn.clicked.connect(self._open_settings)
+        brand.addWidget(self.settings_btn)
+        v.addLayout(brand)
+
+        title = QLabel("<b>instances</b>")
         title.setContentsMargins(8, 0, 8, 4)
         v.addWidget(title)
 
+        # One InstanceCard per account (see blendfleet/ui/instance_card.py):
+        # quota (live) plus EITHER last-known hardware OR (only while that
+        # account is actually rendering) live per-GPU gauges. Rebuilt only
+        # by _refresh_accounts -- i.e. when the account list itself
+        # changes -- never on a poll/telemetry tick, so a card's Sparkline
+        # history survives every tick in between.
         self.rail_rows_holder = QWidget()
         self.rail_rows_layout = QVBoxLayout(self.rail_rows_holder)
-        self.rail_rows_layout.setContentsMargins(0, 0, 0, 0)
-        self.rail_rows_layout.setSpacing(0)
+        self.rail_rows_layout.setContentsMargins(4, 0, 4, 0)
+        self.rail_rows_layout.setSpacing(GAP)
         v.addWidget(self.rail_rows_holder)
         v.addStretch(1)
 
@@ -223,9 +322,78 @@ class Dashboard(QMainWindow):
         return rail
 
     def _build_main(self) -> QWidget:
+        # At 2560px the rail (fixed, 320px) leaves ~2240px for "main" --
+        # letting every child simply fill that is the "stretched two-column
+        # layout looks broken" failure the Task 6 brief names explicitly: a
+        # QSpinBox or a "Cancel all" button two thousand pixels wide is not
+        # more usable, it just looks unfinished. `content` below is the
+        # deliberate cap: the whole column tops out at MAX_CONTENT_WIDTH and
+        # centres, so surplus width at 2560+ becomes generous side gutters
+        # (the "breathing room at large sizes" half of the same brief)
+        # instead of stretch. The filmstrip/table/GPU panel/upload view
+        # still grow to fill THAT column -- they are data-dense and
+        # genuinely benefit from the extra width up to the cap; only the
+        # frame-range/resolution controls and the launch buttons are
+        # capped a second, tighter time (MAX_CONTROLS_WIDTH) because a
+        # number entry field or a button does not read as more usable at
+        # 1600px than at 300px, only less finished.
         main = QWidget()
-        v = QVBoxLayout(main)
-        v.setContentsMargins(16, 12, 16, 12)
+        outer = QHBoxLayout(main)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addStretch(1)
+        content = QWidget()
+        content.setMaximumWidth(MAX_CONTENT_WIDTH)
+        # Stretch factor 0 (the pre-fix value) means QHBoxLayout hands 100%
+        # of surplus width to the flanking addStretch(1) spacers regardless
+        # of content's maximumWidth -- the spacers "win" the space race
+        # before the cap is ever consulted, and content sits at a constant
+        # ~453px whether the window is 1920 or 2560 wide (measured live;
+        # this was the actual, reproduced bug, not a hypothetical one).
+        #
+        # Qt's QBoxLayout splits available width among stretchable items in
+        # proportion to their stretch factors, THEN reallocates whatever an
+        # item can't use (because its maximumWidth caps it) to the other
+        # stretchable items in the same proportion. A factor of 1 -- equal
+        # to each spacer's -- only wins content 1/3 of the surplus, not
+        # "up to its cap first": measured content stuck at ~646px at both
+        # 1280 and 1920px window width, only reaching 746px at 2560, nowhere
+        # near the 1600px cap. Giving content a stretch factor that swamps
+        # the spacers' (10_000 vs. 1 each) makes it claim ~10000/10002 of
+        # main's width -- i.e. effectively all of it -- up to its
+        # maximumWidth cap; only once it is capped does the leftover
+        # (~2/10002 of surplus, now the whole remainder) fall through to
+        # the spacers as side gutters. Measured with this value: content
+        # tracks main's width exactly (960px at 1280, 1600px at 1920 --
+        # main's width there equals the cap, so no gutters, matching the
+        # documented "nothing changes at 1920 or below" design) and holds
+        # at the 1600px cap at 2560 with gutters absorbing the rest.
+        content.setSizePolicy(QSizePolicy.Policy.Expanding,
+                               QSizePolicy.Policy.Preferred)
+        outer.addWidget(content, 10_000)
+        outer.addStretch(1)
+        # Exposed as an attribute (it was a bare local before) so a test can
+        # measure content.width() directly rather than re-deriving it from
+        # main's layout -- this is exactly the "verify by measurement, not
+        # description" gap that let the stretch-factor-0 bug above ship
+        # while a prior report claimed the layout worked.
+        self.content_column = content
+
+        v = QVBoxLayout(content)
+        v.setContentsMargins(MARGIN, MARGIN, MARGIN, MARGIN)
+        v.setSpacing(GAP)
+
+        # The one visible way back out of real full screen (F11) -- see
+        # _toggle_fullscreen. Hidden whenever the window is NOT full screen,
+        # which is the common case, so it never competes with the controls
+        # below for a sighted user who never touches F11 at all.
+        exit_row = QHBoxLayout()
+        exit_row.addStretch(1)
+        self.exit_fullscreen_btn = QPushButton(" Exit full screen (F11)")
+        self.exit_fullscreen_btn.setIcon(icon("x", TEXT_SECONDARY, 14))
+        self.exit_fullscreen_btn.clicked.connect(self._toggle_fullscreen)
+        self.exit_fullscreen_btn.setVisible(False)
+        exit_row.addWidget(self.exit_fullscreen_btn)
+        v.addLayout(exit_row)
 
         top = QHBoxLayout()
         self.project_label = QLabel("<b>no project selected</b>")
@@ -235,6 +403,17 @@ class Dashboard(QMainWindow):
         top.addWidget(browse)
         v.addLayout(top)
 
+        # The controls block: frame range, resolution, samples, format, and
+        # the three launch/cancel/collect buttons. Fixed-width and
+        # left-aligned within `content` (not stretched to fill it) -- see
+        # this method's own docstring comment above.
+        controls = QWidget()
+        controls.setMaximumWidth(MAX_CONTROLS_WIDTH)
+        controls_v = QVBoxLayout(controls)
+        controls_v.setContentsMargins(0, 0, 0, 0)
+        controls_v.setSpacing(GAP)
+        v.addWidget(controls, 0, Qt.AlignmentFlag.AlignLeft)
+
         form = QFormLayout()
         self.start = QSpinBox(); self.start.setRange(1, 1000000); self.start.setValue(1)
         self.end = QSpinBox(); self.end.setRange(1, 1000000); self.end.setValue(250)
@@ -242,13 +421,18 @@ class Dashboard(QMainWindow):
         self.ry = QSpinBox(); self.ry.setRange(64, 8192); self.ry.setValue(1080)
         self.spp = QSpinBox(); self.spp.setRange(1, 16384); self.spp.setValue(128)
         self.fmt = QComboBox(); self.fmt.addItems(["PNG", "JPEG"])
+        for spin in (self.start, self.end, self.rx, self.ry, self.spp):
+            spin.setFixedWidth(CONTROL_WIDTH)
+        self.fmt.setFixedWidth(CONTROL_WIDTH)
         for lbl, wdg in (("Start frame", self.start), ("End frame", self.end),
                          ("Width", self.rx), ("Height", self.ry),
                          ("Samples", self.spp), ("Format", self.fmt)):
             form.addRow(lbl, wdg)
-        v.addLayout(form)
+        controls_v.addLayout(form)
 
-        self.eta = QLabel(); v.addWidget(self.eta)
+        self.eta = QLabel()
+        self.eta.setWordWrap(True)
+        controls_v.addWidget(self.eta)
         for w in (self.start, self.end):
             w.valueChanged.connect(self._update_eta)
 
@@ -262,7 +446,7 @@ class Dashboard(QMainWindow):
         self.collect_btn.clicked.connect(self._collect)
         for b in (self.render_btn, self.cancel_btn, self.collect_btn):
             btns.addWidget(b)
-        v.addLayout(btns)
+        controls_v.addLayout(btns)
 
         # The "approximate" wording is not hedging -- it is the honest
         # description of what this widget can know. See charts.frame_done:
@@ -279,6 +463,7 @@ class Dashboard(QMainWindow):
             "shifts every later cell for that account. Collect frames… is the "
             "authoritative list of what actually exists.")
         filmstrip_header.setWordWrap(True)
+        filmstrip_header.setMaximumWidth(MAX_PROSE_WIDTH)
         v.addWidget(filmstrip_header)
         self.filmstrip = Filmstrip()
         v.addWidget(self.filmstrip)
@@ -309,6 +494,7 @@ class Dashboard(QMainWindow):
         # succeeded.
         self.poll_status_label = QLabel("")
         self.poll_status_label.setWordWrap(True)
+        self.poll_status_label.setMaximumWidth(MAX_PROSE_WIDTH)
         self.poll_status_label.setStyleSheet(f"color: {WARNING};")
         v.addWidget(self.poll_status_label)
 
@@ -319,19 +505,126 @@ class Dashboard(QMainWindow):
             f'page</a> — check both before a long run.')
         note.setOpenExternalLinks(True)
         note.setWordWrap(True)
+        note.setMaximumWidth(MAX_PROSE_WIDTH)
         v.addWidget(note)
+        # Capping the table's height (see _sync_table_height) means it no
+        # longer soaks up every pixel of leftover vertical space itself --
+        # without a trailing stretch here, Qt's box layout instead spreads
+        # that surplus as extra gaps between EVERY widget above (any
+        # non-Fixed vertical size policy can grow even at stretch factor 0
+        # if nothing else claims the space), which is a worse look than
+        # the one blank margin below the note that this produces instead.
+        v.addStretch(1)
         return main
+
+    # ---------------- window state: maximised/full-screen ----------------
+    def show_at_startup(self) -> None:
+        """Show the window for the first time, in whichever state
+        self.settings remembers -- full screen if the user last left it
+        that way, maximised otherwise.
+
+        NOT the same as plain .show(): calling .show() on a QMainWindow
+        that has never been shown displays it at whatever .resize() set
+        (see __init__) in a normal, restorable window -- it does not
+        maximise or full-screen it. __main__.main() calls this instead of
+        .show() for exactly that reason. Tests never call this (they only
+        construct/close Dashboards headlessly), so it has no bearing on
+        the test suite's own window state.
+        """
+        if self.settings.fullscreen:
+            self.showFullScreen()
+        else:
+            self.showMaximized()
+        # Driven by self.settings.fullscreen -- the state just REQUESTED --
+        # not by re-reading self.isFullScreen() immediately afterwards. See
+        # _toggle_fullscreen's own comment: querying window state back
+        # right after requesting a change is a genuine race, not merely a
+        # test artifact, since the platform applies it asynchronously.
+        self.exit_fullscreen_btn.setVisible(self.settings.fullscreen)
+
+    def _toggle_fullscreen(self) -> None:
+        """F11: real full screen (no window chrome at all) <-> maximised.
+
+        Persisted immediately, not just held in memory, so the next launch
+        opens in whichever state the user left this session in -- the
+        "persisted" half of the Task 6 brief's full-screen requirement.
+
+        Decides the TARGET state up front (`entering_fullscreen`) and drives
+        both showFullScreen()/showMaximized() and exit_fullscreen_btn's
+        visibility from that one boolean, rather than calling
+        self.showFullScreen() and then asking self.isFullScreen() what
+        happened: the platform applies a window-state change asynchronously,
+        so reading it back immediately can still observe the PRE-change
+        state and leave the exit button permanently stuck hidden -- a real
+        race, caught by tests/test_dashboard.py exercising this after many
+        other windows had already been cycled through the same QApplication.
+        """
+        entering_fullscreen = not self.isFullScreen()
+        if entering_fullscreen:
+            self.showFullScreen()
+        else:
+            self.showMaximized()
+        self.settings.fullscreen = entering_fullscreen
+        self.settings.save()
+        self.exit_fullscreen_btn.setVisible(entering_fullscreen)
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 -- Qt override
+        # Esc is the other conventional way out of full screen, alongside
+        # the visible exit_fullscreen_btn and F11 itself -- three ways
+        # back out, never zero. Only intercepted while actually full
+        # screen, so Esc keeps its normal (no-op, here) behaviour otherwise.
+        if self.isFullScreen() and event.key() == Qt.Key.Key_Escape:
+            self._toggle_fullscreen()
+            return
+        super().keyPressEvent(event)
+
+    # ---------------- settings (accent) ----------------
+    def _open_settings(self) -> None:
+        SettingsView(self.settings, self).exec()
+
+    def _on_accent_changed(self) -> None:
+        """theme.theme_signal fired -- re-paint every widget that captured
+        an accent colour explicitly (not through the QApplication
+        stylesheet cascade, which repaints itself) at the moment it was
+        built. See theme.theme_signal's docstring for the full mechanism.
+        """
+        accent = current_accent().base
+        self.brand_mark.setPixmap(brand_icon(accent, 28).pixmap(28, 28))
+        for card in self._instance_cards.values():
+            card.refresh_accent()
 
     # --- helpers ---
     def _refresh_accounts(self) -> None:
+        """Rebuild one InstanceCard per account. Only called when the
+        account list itself changes (init, and after Manage accounts…
+        closes) -- never from a poll/telemetry tick, so a card's live
+        Sparkline history is never wiped out from under a still-rendering
+        account. Immediately re-synced from currently known state (quota
+        cache, cached hardware, current worker) via _refresh_views() below,
+        so a freshly (re)built card is never blank until the next tick.
+        """
+        # Disconnect each outgoing card from theme_signal explicitly rather
+        # than trust deleteLater() + Qt's auto-disconnect-on-destroy timing
+        # -- see closeEvent's comment for why that was measured unreliable.
+        # This can run more than once per Dashboard lifetime (account list
+        # changes), so it matters here too, not just at final close.
+        # disconnect_theme_signal() is idempotent (InstanceCard tracks its
+        # own connection handle), so calling it again from closeEvent later
+        # for a card already disconnected here is a safe no-op.
+        for card in self._instance_cards.values():
+            card.disconnect_theme_signal()
         while self.rail_rows_layout.count():
             item = self.rail_rows_layout.takeAt(0)
             w = item.widget()
             if w is not None:
                 w.setParent(None)
                 w.deleteLater()
+        self._instance_cards = {}
         for i, a in enumerate(self.store.list()):
-            self.rail_rows_layout.addWidget(_AccountRow(i, a))
+            card = InstanceCard(i, a)
+            self._instance_cards[a.label] = card
+            self.rail_rows_layout.addWidget(card)
+        self._refresh_views()
 
     def _update_eta(self) -> None:
         n = max(len(self.store.list()), 1)
@@ -496,6 +789,13 @@ class Dashboard(QMainWindow):
         key here too.
         """
         self._live_progress.clear()
+        # A new render means new hardware may be handed out (Kaggle's
+        # allocation varies run to run) -- so the "already recorded this
+        # run" guard and its accumulator both reset here, per render.
+        self._instance_gpus.clear()
+        self._instance_hardware.clear()
+        self._instance_gpu_models.clear()
+        self._recorded_instance_labels.clear()
         # Drop the threads from the previous job that have already unwound,
         # so a long session's worth of renders does not accumulate dead
         # Thread objects that closeEvent then walks every time.
@@ -522,10 +822,16 @@ class Dashboard(QMainWindow):
                     # thread; _live_tick() drains this on a QTimer instead.
                     self._telemetry_queue.put((label, record))
 
+                def hardware(record, label=acct.label):
+                    # Same reasoning as telemetry() above: enqueue only,
+                    # never touch self.instance_store from this thread.
+                    self._hardware_queue.put((label, record))
+
                 try:
                     stream_progress(acct.token, w.username,
                                     w.kernel_slug.split("/", 1)[1], bump,
-                                    self._stop, on_telemetry=telemetry)
+                                    self._stop, on_telemetry=telemetry,
+                                    on_hardware=hardware)
                 except Exception:
                     pass  # a dead stream must never kill the render or the UI
             thread = threading.Thread(target=run, daemon=True,
@@ -713,28 +1019,102 @@ class Dashboard(QMainWindow):
         """Cheap, frequent refresh: drain telemetry samples collected by
         the background SSE threads into the GPU panel, and repaint the
         filmstrip/table with whatever live frame progress has arrived --
-        no network calls here, unlike _poll()."""
+        no network calls here, unlike _poll().
+
+        Recorded from this UI-thread drain side, not from the worker
+        closures that fill _telemetry_queue/_hardware_queue: those closures
+        deliberately do nothing but enqueue (widgets, and now the
+        instance-state write, must only ever happen off the SSE thread).
+        """
         drained = 0
+        newly_seen: set[str] = set()
         while drained < 200:  # bounded: never let a stuck consumer spin forever
             try:
                 label, record = self._telemetry_queue.get_nowait()
             except queue.Empty:
                 break
             self.gpu_panel.ingest(label, record)
+            card = self._instance_cards.get(label)
+            if card is not None:
+                # InstanceCard.ingest_telemetry itself refuses to do
+                # anything once that account's worker has definitely
+                # stopped (error/complete/cancelled) or there is none at
+                # all (see its own docstring) -- this call site does not
+                # need to duplicate that check, only route the sample to
+                # the right card.
+                card.ingest_telemetry(record)
+            self._instance_gpus.setdefault(label, {})[record["gpu"]] = record["mem_total"]
+            if label not in self._recorded_instance_labels:
+                newly_seen.add(label)
             drained += 1
+        # The hardware banner (notebook's first cell) always prints before
+        # the render loop's TELEMETRY lines start, so draining it here --
+        # ahead of the newly_seen recording below -- means a label's very
+        # first snapshot already has whatever hardware data arrived.
+        hw_drained = 0
+        while hw_drained < 200:  # same bound, same reason as telemetry above
+            try:
+                label, record = self._hardware_queue.get_nowait()
+            except queue.Empty:
+                break
+            if record["kind"] == "cpu_ram":
+                self._instance_hardware[label] = {
+                    "cpu_count": record["cpu_count"],
+                    "ram_total": record["ram_total"]}
+            elif record["kind"] == "gpu":
+                self._instance_gpu_models.setdefault(label, []).append(
+                    record["model"])
+            hw_drained += 1
+        for label in newly_seen:
+            self._record_instance_snapshot(label)
         self._refresh_views()
+
+    def _record_instance_snapshot(self, label: str) -> None:
+        """Persist one InstanceSnapshot for `label`, once for the current
+        run, from telemetry/hardware-banner data accumulated so far.
+
+        GPU model names come from _instance_gpu_models, matched to
+        telemetry's indexed GPUs by position -- the hardware banner's
+        nvidia-smi listing carries no index column of its own (see
+        blendfleet/instance_state.py's module docstring). cpu_count/
+        ram_total come from _instance_hardware; either stays None if that
+        banner never arrived for this run (stream dropped early, or a
+        CPU-only session with no nvidia-smi at all) rather than being
+        guessed.
+        """
+        self._recorded_instance_labels.add(label)
+        account = next((a for a in self.store.list() if a.label == label), None)
+        models = self._instance_gpu_models.get(label, [])
+        gpus = [
+            GpuSnapshot(index=idx, mem_total=mem_total,
+                       model=models[position] if position < len(models) else None)
+            for position, (idx, mem_total)
+            in enumerate(sorted(self._instance_gpus.get(label, {}).items()))
+        ]
+        hw = self._instance_hardware.get(label, {})
+        snapshot = InstanceSnapshot(
+            username=account.username if account else None,
+            gpus=gpus,
+            cpu_count=hw.get("cpu_count"),
+            ram_total=hw.get("ram_total"),
+            observed_at=time.time())
+        self.instance_store.record(label, snapshot)
+        self.instance_store.save()
 
     def _refresh_views(self) -> None:
         st = self._last_state
         if st is None:
+            self._refresh_instance_cards(None)
             self.filmstrip.set_empty()
             self.filmstrip_caption.setText("no frames yet")
             self.table.setRowCount(0)
+            self._sync_table_height()
             return
         for w in st.workers:
             live = self._live_progress.get(w.kernel_slug, 0)
             if live > w.frames_done:
                 w.frames_done = live
+        self._refresh_instance_cards(st)
         self._render_table(st)
         self.filmstrip.set_workers(st.start_frame, st.end_frame, st.workers)
         self.filmstrip_caption.setText(
@@ -742,6 +1122,22 @@ class Dashboard(QMainWindow):
             f" · {len(st.workers)} account(s)")
         self.project_label.setText(
             f"<b>{st.blend_name}</b>  frames {st.start_frame}-{st.end_frame}")
+
+    def _refresh_instance_cards(self, st: FleetState | None) -> None:
+        """Push everything an InstanceCard needs -- quota, cached hardware,
+        current worker -- into every card that already exists. Cheap and
+        safe to call every tick: these three setters only ever update
+        widget text/visibility, never rebuild a card, so a GPU row's
+        Sparkline history survives every call in between two renders.
+        """
+        workers_by_label = {w.label: w for w in (st.workers if st else [])}
+        for account in self.store.list():
+            card = self._instance_cards.get(account.label)
+            if card is None:
+                continue
+            card.set_quota(self._quota_cache.get(account.label))
+            card.set_snapshot(self.instance_store.get(account.label))
+            card.set_worker(workers_by_label.get(account.label))
 
     def _render_table(self, st: FleetState) -> None:
         # Quota and frame counts are machine data -- set in monospace with
@@ -765,11 +1161,66 @@ class Dashboard(QMainWindow):
             bar.setValue(max(self._live_progress.get(w.kernel_slug, 0),
                              w.frames_done))
             self.table.setCellWidget(i, 5, bar)
+        self._sync_table_height()
+
+    def _sync_table_height(self) -> None:
+        """Cap the table to roughly its own content height instead of the
+        QAbstractItemView default (Expanding vertically, filling whatever
+        column space is left over) -- with 3-4 accounts that used to leave
+        several hundred pixels of empty striped background below the last
+        real row, which reads as broken rather than spacious. Capped, not
+        fixed, and never below a handful of rows' worth: a fleet with many
+        more accounts than fit still scrolls inside the table rather than
+        pushing the note/poll-status text below it off screen.
+        """
+        row_h = self.table.verticalHeader().defaultSectionSize()
+        rows = max(self.table.rowCount(), 3)
+        header_h = self.table.horizontalHeader().height()
+        self.table.setMaximumHeight(header_h + rows * row_h + 6)
 
     def closeEvent(self, event) -> None:
         self._stop.set()          # tells the daemon SSE threads to unwind
         self.timer.stop()
         self.live_timer.stop()
+        # theme_signal is a process-global QObject that outlives any one
+        # Dashboard -- deleteLater() + processEvents() (close_dashboards, in
+        # the test harness) schedules this window's own destruction, which
+        # normally auto-disconnects its signal connections too, but that is
+        # a matter of WHEN the C++ side actually goes, not immediate. Measured
+        # (Task 5 fix round 1) alongside a much bigger factor -- see
+        # tests/test_dashboard.py's _restore_active_accent fixture -- that a
+        # test session accumulating enough not-yet-fully-deleted Dashboards/
+        # InstanceCards still connected here made every later
+        # theme.apply()/theme_signal.changed.emit() progressively slower,
+        # which is what looked like a hang. Disconnecting explicitly here
+        # removes this dashboard's own connections the moment it closes
+        # instead of waiting on deletion timing.
+        #
+        # This used to be `try: disconnect(bound_method) except (RuntimeError,
+        # TypeError): pass`, on the theory that a repeat disconnect "just
+        # emits a RuntimeWarning ... not an error worth stopping for". That
+        # theory is what hid the actual bug: PySide6's disconnect() does not
+        # raise on a redundant disconnect, it warns and returns, so the
+        # except clause never ran and never could -- every one of those
+        # disconnects was silently failing. And closeEvent DOES run more
+        # than once per Dashboard in practice: QMainWindow.close()
+        # re-invokes closeEvent every time it is called, including
+        # close_dashboards' teardown call after a test already closed the
+        # same dashboard itself (measured: 94 "Failed to disconnect"
+        # warnings across tests/test_dashboard.py, one per redundant
+        # disconnect, each leaving theme_signal connected to a widget this
+        # window no longer owns).
+        #
+        # The fix is to make a repeat call a no-op instead of a repeat
+        # disconnect, by tracking whether we are still connected -- the
+        # `_accent_connection` handle __init__ stored, cleared to None the
+        # first time it is actually used. No warning is possible because
+        # disconnect() is never asked to remove the same connection twice.
+        if self._accent_connection is not None:
+            theme_signal.changed.disconnect(self._accent_connection)
+            self._accent_connection = None
+        for card in self._instance_cards.values():
+            card.disconnect_theme_signal()
         # Threads must not outlive the window (FINDING 1, task 5 fix
         # round 1): wait for whichever _CallWorker/_LaunchWorker happens
         # to be in flight rather than letting Qt destroy a QObject whose

@@ -8,9 +8,10 @@ from blendfleet.accounts import AccountStore
 from blendfleet.fleet import Fleet
 from blendfleet.kaggle_client import KaggleClient, verify_token
 from blendfleet.platform_paths import cache_dir
+from blendfleet.settings import Settings
 from blendfleet.ui.dashboard import Dashboard
 from blendfleet.ui.setup_dialog import SetupDialog
-from blendfleet.ui.theme import apply_theme
+from blendfleet.ui.theme import apply
 
 
 def _icon_path() -> Path | None:
@@ -22,8 +23,9 @@ def _icon_path() -> Path | None:
     candidates = []
     meipass = getattr(sys, "_MEIPASS", None)
     if meipass:
-        candidates.append(Path(meipass) / "assets" / "blendfleet_icon_256.png")
-    candidates.append(Path(__file__).parent.parent / "assets" / "blendfleet_icon_256.png")
+        candidates.append(Path(meipass) / "assets" / "logo" / "app-icon-256.png")
+    candidates.append(
+        Path(__file__).parent.parent / "assets" / "logo" / "app-icon-256.png")
     for c in candidates:
         if c.exists():
             return c
@@ -32,8 +34,14 @@ def _icon_path() -> Path | None:
 
 def main() -> int:
     app = QApplication(sys.argv)
-    apply_theme(app)   # one theme, applied here, before any window is shown --
-                       # so it cascades to every dialog created afterwards.
+    # Settings loaded once, here, and the SAME instance handed to Dashboard
+    # below -- so the accent applied to the QApplication before any window
+    # or dialog shows (see theme.apply()'s own docstring on why that order
+    # matters: SetupDialog can appear before Dashboard does, on a fresh
+    # install with no accounts yet) is never at risk of drifting from
+    # whatever Dashboard's own settings-driven window state later reads.
+    settings = Settings.load()
+    apply(app, settings.accent)
     icon = _icon_path()
     if icon is not None:
         app.setWindowIcon(QIcon(str(icon)))
@@ -51,8 +59,8 @@ def main() -> int:
                      lambda t: KaggleClient(t, label=labels.get(t)),
                      cache_dir() / "work")
 
-    win = Dashboard(store, fleet_factory, verify_token)
-    win.show()
+    win = Dashboard(store, fleet_factory, verify_token, settings=settings)
+    win.show_at_startup()
     return app.exec()
 
 

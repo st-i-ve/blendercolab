@@ -46,14 +46,31 @@ class FakeStatus:
         self.failure_message = failure_message
 
 
+class FakeDatasetFile:
+    """Stands in for kagglesdk's ApiDatasetFile: only .name/.total_bytes."""
+
+    def __init__(self, name, total_bytes):
+        self.name = name
+        self.total_bytes = total_bytes
+
+
+class FakeListFilesResponse:
+    """Stands in for kagglesdk's ApiListDatasetFilesResponse."""
+
+    def __init__(self, files):
+        self.dataset_files = files
+
+
 class FakeApi:
     """Stands in for KaggleApi. Raises what the real API actually raises."""
 
     def __init__(self, status="COMPLETE", dataset_ok=True, kernels=None,
-                 create_error=None, version_error=None, list_files_ok=True):
+                 create_error=None, version_error=None, list_files_ok=True,
+                 list_files_response=None):
         self._status = status
         self._dataset_ok = dataset_ok
         self._list_files_ok = list_files_ok
+        self._list_files_response = list_files_response
         self._kernels = kernels if kernels is not None else [
             FakeKernel("stivestivewithani/remember-render")]
         self._create_error = create_error
@@ -88,6 +105,8 @@ class FakeApi:
     def dataset_list_files(self, slug):
         if not self._list_files_ok:
             raise RuntimeError("403 Client Error: Forbidden for url: ...")
+        if self._list_files_response is not None:
+            return self._list_files_response
         return {"datasetFiles": []}
 
     def dataset_create_new(self, folder, **kw):
@@ -202,6 +221,59 @@ def test_dataset_reachable_disagrees_with_dataset_exists_for_a_shared_dataset():
         "dataset_status is owner-only -- must still fail here"
     assert c.dataset_reachable("owner/x") is True, \
         "dataset_list_files must correctly show the real grant works"
+
+
+# ---------------------------------------------- dataset_file_size (Task 5) --
+# dataset_reachable() only proves an account can see A copy of the dataset,
+# not that it's the RIGHT one. dataset_file_size() is the size signal fleet
+# uses to catch a stale copy before any kernel is pushed. Built on the same
+# dataset_list_files() call -- no new API surface.
+
+def test_dataset_file_size_returns_bytes_for_a_known_file():
+    resp = FakeListFilesResponse([FakeDatasetFile("scene.blend", 1048576)])
+    c, _ = client(list_files_response=resp)
+    assert c.dataset_file_size("owner/x", "scene.blend") == 1048576
+
+
+def test_dataset_file_size_returns_none_for_an_unlisted_file():
+    """The dataset is reachable and has files -- just not one with this
+    name (typo, rename, or a grant that hasn't reached the file yet)."""
+    resp = FakeListFilesResponse([FakeDatasetFile("other.blend", 500)])
+    c, _ = client(list_files_response=resp)
+    assert c.dataset_file_size("owner/x", "scene.blend") is None
+
+
+def test_dataset_file_size_returns_none_when_dataset_has_no_files_at_all():
+    c, _ = client()  # default FakeApi: dataset_list_files -> {"datasetFiles": []}
+    assert c.dataset_file_size("owner/x", "scene.blend") is None
+
+
+def test_dataset_file_size_propagates_when_the_account_cannot_reach_the_dataset():
+    """A total-unreachable failure (403) is a DIFFERENT problem than 'missing
+    from an otherwise-readable listing' -- it must not be swallowed into a
+    quiet None here. Callers that need to tell these apart call
+    dataset_reachable() first (fleet.launch does)."""
+    c, _ = client(list_files_ok=False)
+    with pytest.raises(RuntimeError, match="Forbidden"):
+        c.dataset_file_size("owner/x", "scene.blend")
+
+
+def test_installed_kagglesdk_dataset_file_exposes_no_content_hash():
+    """Documents the fact that drove dataset_file_size's design: checked
+    against the actually-installed kagglesdk, ApiDatasetFile carries no
+    hash/checksum/etag field, only total_bytes -- so a content-hash check
+    is not available and dataset_file_size must not claim to be one. If a
+    future kagglesdk release adds one, this test fails and
+    dataset_file_size should be upgraded to use it."""
+    from kagglesdk.datasets.types.dataset_api_service import ApiDatasetFile
+
+    f = ApiDatasetFile()
+    fields = {name for name in dir(f) if not name.startswith("_")}
+    hash_like = {n for n in fields
+                if any(k in n.lower() for k in ("hash", "checksum", "etag", "md5", "sha1", "sha256"))}
+    assert hash_like == set(), (
+        f"kagglesdk now exposes {hash_like} -- upgrade dataset_file_size "
+        "to use it instead of a size-only comparison")
 
 
 def test_dataset_create_passes_skip_dir_mode_and_private(tmp_path):

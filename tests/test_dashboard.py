@@ -4,16 +4,20 @@ import time
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PySide6.QtCore import QCoreApplication
+from PySide6.QtCore import SIGNAL, QCoreApplication, QEvent, Qt
 from PySide6.QtWidgets import QApplication
 
 import blendfleet.platform_paths as pp
 import blendfleet.ui.dashboard as dashboard_mod
+import blendfleet.ui.theme as theme
 from blendfleet.accounts import Account, AccountStore
-from blendfleet.fleet import Fleet
+from blendfleet.fleet import Fleet, FleetState, WorkerState
+from blendfleet.instance_state import GpuSnapshot, InstanceSnapshot, InstanceStore
 from blendfleet.kaggle_client import KaggleError, KernelStatus, Quota
 from blendfleet.notebook_builder import RenderSettings
+from blendfleet.settings import Settings
 from blendfleet.ui.dashboard import Dashboard
+from blendfleet.ui.theme import ACCENTS
 
 
 @pytest.fixture(autouse=True)
@@ -25,6 +29,32 @@ def tmp_cfg(tmp_path, monkeypatch):
 @pytest.fixture(scope="module")
 def qapp():
     return QApplication.instance() or QApplication([])
+
+
+@pytest.fixture(autouse=True)
+def _restore_active_accent(qapp):
+    """test_switching_accent_live_repaints_the_brand_mark_without_restart
+    below calls theme.apply() with every non-default accent -- see
+    test_theme.py's fixture of the same name for why that process-global
+    state must not leak into other test modules run later in the same
+    session.
+
+    Only actually calls theme.apply() -- which restyles the WHOLE
+    QApplication, including every widget any earlier test in this
+    session left alive under the one shared QApplication -- when a test
+    genuinely changed the accent. Measured: calling it unconditionally on
+    every test's teardown (this file, test_instance_card.py and
+    test_settings_view.py all did) made test_dashboard.py alone take 75s
+    for 36 tests instead of a few seconds, growing call over call, and
+    made a full-suite run look like a hang rather than a slow pass. Only
+    a handful of tests in this file ever change the accent; the other
+    ~30+ do not need this at all.
+    """
+    original = theme._active_accent_name
+    yield
+    if theme._active_accent_name != original:
+        theme._active_accent_name = original
+        theme.apply(qapp, original)
 
 
 @pytest.fixture(autouse=True)
@@ -45,7 +75,7 @@ def stub_stream_progress(monkeypatch):
     test_start_progress_threads_feeds_live_progress_and_telemetry).
     """
     def no_stream(token, user_name, kernel_slug, on_progress,
-                  stop_event=None, on_telemetry=None):
+                  stop_event=None, on_telemetry=None, on_hardware=None):
         return None
 
     monkeypatch.setattr(dashboard_mod, "stream_progress", no_stream)
@@ -70,8 +100,24 @@ def close_dashboards(qapp):
         dash.deleteLater()
     # deleteLater is only honoured while events are being processed; without
     # this the C++ objects would still be alive and back on the GC's terms.
+    #
+    # processEvents() alone is not enough, though it looks like it should
+    # be: measured directly (no test framework involved) that 30+ calls to
+    # plain processEvents() after deleteLater() leave every widget of a
+    # closed, deleteLater()'d Dashboard still in QApplication.allWidgets()
+    # -- Qt does not fold DeferredDelete into a manual processEvents() pass
+    # the way it does for a real app.exec() loop. The explicit
+    # sendPostedEvents(None, DeferredDelete) call below is what actually
+    # flushes it; without it every Dashboard built by an earlier test in
+    # this module survives (as real, live QWidgets) for the rest of the
+    # session, and each one makes theme.apply()'s app.setStyleSheet() --
+    # which restyles every widget currently in the QApplication, not just
+    # the one that changed -- slower for every subsequent accent switch.
+    # This is what actually explained test_dashboard.py's runtime, not (or
+    # not only) the theme_signal disconnect leak fixed alongside this.
     for _ in range(20):
         QCoreApplication.processEvents()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
 
 def pump(worker, timeout=2000) -> None:
@@ -105,16 +151,29 @@ def settle(dash, timeout=2000) -> None:
         QCoreApplication.processEvents()
 
 
-def stub_message_boxes(monkeypatch):
-    calls = {"warning": [], "critical": [], "information": []}
-    for kind in calls:
-        monkeypatch.setattr(
-            f"blendfleet.ui.dashboard.QMessageBox.{kind}",
-            lambda parent, title, message, k=kind: calls[k].append((title, message)))
-    monkeypatch.setattr(
-        "blendfleet.ui.dashboard.QMessageBox.question",
-        lambda *a, **kw: dashboard_mod.QMessageBox.StandardButton.Yes)
-    return calls
+def wait_until(condition, timeout=2.0) -> None:
+    """Poll `condition` (a no-arg callable) until it is true, pumping the
+    Qt event loop between checks, rather than a fixed processEvents()
+    count. Window-state changes (showFullScreen()/showMaximized(), and
+    the child visibility that follows from them) apply synchronously in
+    isolation, but were observed to occasionally lag by a tick or two
+    under the offscreen QPA platform after many windows have already
+    been created and torn down earlier in the same test session --
+    exactly the kind of eventual-consistency settle() above exists to
+    wait out for background workers.
+    """
+    deadline = time.monotonic() + timeout
+    while not condition():
+        if time.monotonic() > deadline:
+            assert condition(), "condition was never satisfied in time"
+        QCoreApplication.processEvents()
+        time.sleep(0.01)
+
+
+# stub_message_boxes now lives in tests/conftest.py as a fixture -- the
+# sanctioned opt-in for a test that legitimately expects a dialog, paired
+# with the autouse no_unstubbed_dialogs guard that fails loudly (instead of
+# hanging) on any QMessageBox this module doesn't explicitly stub.
 
 
 class FakeSdk:
@@ -151,6 +210,16 @@ class FakeClient:
 
     def dataset_reachable(self, slug):
         return True
+
+    def dataset_file_size(self, slug, filename):
+        # Task 5: fleet.launch() now confirms every account's visible copy
+        # of the .blend matches the local file's size before pushing any
+        # kernel. Every blend this module's launch-path tests actually
+        # write is 100 bytes (see the `blend.write_bytes(b"x" * 100)` calls
+        # below) -- this suite exercises the dashboard's wiring, not Task
+        # 5's staleness detection itself (see tests/test_fleet.py for
+        # that), so it must match rather than spuriously fail launch.
+        return 100
 
     def dataset_create(self, folder, on_progress=None):
         if on_progress:
@@ -226,6 +295,125 @@ def test_rail_shows_one_row_per_account(qapp, tmp_path):
     dash.close()
 
 
+# ---------------- InstanceCard wiring (Task 4) ----------------
+
+def test_rail_shows_one_instance_card_per_account_starting_idle(qapp, tmp_path):
+    dash = make_dashboard(qapp, tmp_path, n=3)
+    assert set(dash._instance_cards) == {"acct0", "acct1", "acct2"}
+    for card in dash._instance_cards.values():
+        assert card.status_word.text() == "idle"
+        assert card.idle_container.isHidden() is False
+        assert card.live_container.isHidden() is True
+    dash.close()
+
+
+def test_quota_cache_flows_into_instance_cards(qapp, tmp_path):
+    """make_dashboard() already waits out __init__'s initial quota-refresh
+    worker -- FakeClient.quota() returns Quota(0, 21600, ...), i.e. 6h
+    total, 0 used."""
+    dash = make_dashboard(qapp, tmp_path, n=1)
+    card = dash._instance_cards["acct0"]
+    assert card.quota_value.text() == "0.0 / 6.0 h"
+    assert card.quota_marker.text() == "live"
+    dash.close()
+
+
+def test_last_known_hardware_flows_into_the_idle_instance_card(qapp, tmp_path):
+    dash = make_dashboard(qapp, tmp_path, n=1)
+    dash.instance_store.record("acct0", InstanceSnapshot(
+        username="user_0",
+        gpus=[GpuSnapshot(index=0, mem_total=16280,
+                          model="Tesla P100-PCIE-16GB")],
+        cpu_count=4, ram_total=31.3, observed_at=time.time() - 7200))
+    dash._refresh_views()
+
+    card = dash._instance_cards["acct0"]
+    assert "2h ago" in card.last_run_value.text()
+    assert "Tesla P100-PCIE-16GB" in card.last_run_value.text()
+    assert "4 vCPU" in card.last_run_value.text()
+    assert "31.3 GB" in card.last_run_value.text()
+    dash.close()
+
+
+def test_live_telemetry_flows_into_the_matching_instance_card_only(qapp, tmp_path):
+    """Two accounts, telemetry for only one -- the OTHER account's card
+    must show nothing live, per-account, never aggregated."""
+    dash = make_dashboard(qapp, tmp_path, n=2)
+    dash._last_state = FleetState(
+        job_id="job", blend_name="x.blend", start_frame=1, end_frame=2,
+        workers=[
+            WorkerState(label="acct0", username="user_0",
+                       kernel_slug="user_0/k0", frames=[1, 2], state="running"),
+            WorkerState(label="acct1", username="user_1",
+                       kernel_slug="user_1/k1", frames=[1, 2], state="running"),
+        ])
+    dash._refresh_views()
+
+    dash._telemetry_queue.put(("acct0", {
+        "gpu": 0, "util": 87, "mem_used": 6144, "mem_total": 15360,
+        "temp": 71, "power": 58.0}))
+    dash._live_tick()
+
+    assert 0 in dash._instance_cards["acct0"]._gpu_rows
+    assert dash._instance_cards["acct1"]._gpu_rows == {}
+    dash.close()
+
+
+def test_launch_success_reflects_in_the_instance_card_status(qapp, tmp_path):
+    dash = make_dashboard(qapp, tmp_path, n=1)
+    blend = tmp_path / "remember.blend"
+    blend.write_bytes(b"x" * 100)
+    dash.blend = blend
+    dash.start.setValue(1)
+    dash.end.setValue(4)
+    dash._launch()
+    pump(dash._launch_worker)
+
+    card = dash._instance_cards["acct0"]
+    # fleet.WorkerState defaults every freshly-launched worker to "queued"
+    # -- Kaggle has not been polled yet, so the card must say exactly that,
+    # not jump straight to "rendering".
+    assert card.status_word.text() == "queued"
+    dash.close()
+
+
+def test_telemetry_arriving_while_still_queued_shows_a_live_card(qapp, tmp_path, monkeypatch):
+    """The same poll/telemetry race blendfleet/ui/instance_card.py's
+    InstanceCard docstring describes, exercised end-to-end: dashboard.py's
+    30s status poll has not run yet (the worker is still "queued"), but a
+    telemetry sample has already arrived on the SSE stream -- the card's
+    live body must reflect that immediately, not wait for the next poll."""
+    def fake_stream_progress(token, user_name, kernel_slug, on_progress,
+                             stop_event=None, on_telemetry=None,
+                             on_hardware=None):
+        on_progress(1, 4)
+        if on_telemetry:
+            on_telemetry({"gpu": 0, "util": 50, "mem_used": 100,
+                         "mem_total": 200, "temp": 60, "power": 10.0})
+
+    monkeypatch.setattr(dashboard_mod, "stream_progress", fake_stream_progress)
+
+    dash = make_dashboard(qapp, tmp_path, n=1)
+    blend = tmp_path / "remember.blend"
+    blend.write_bytes(b"x" * 100)
+    dash.blend = blend
+    dash.start.setValue(1)
+    dash.end.setValue(4)
+    dash._launch()
+    pump(dash._launch_worker)
+
+    deadline = time.monotonic() + 2.0
+    while not dash._live_progress and time.monotonic() < deadline:
+        time.sleep(0.01)
+    dash._live_tick()
+
+    card = dash._instance_cards["acct0"]
+    assert card.status_word.text() == "queued"        # poll hasn't run yet
+    assert card.live_container.isHidden() is False    # telemetry already is
+    assert 0 in card._gpu_rows
+    dash.close()
+
+
 # ---------------- launch success: in-progress -> complete ----------------
 
 def test_launch_success_updates_upload_filmstrip_and_table(qapp, tmp_path):
@@ -256,8 +444,8 @@ def test_launch_success_updates_upload_filmstrip_and_table(qapp, tmp_path):
     dash.close()
 
 
-def test_launch_failure_shows_friendly_message_not_raw_exception(qapp, tmp_path, monkeypatch):
-    calls = stub_message_boxes(monkeypatch)
+def test_launch_failure_shows_friendly_message_not_raw_exception(qapp, tmp_path, stub_message_boxes):
+    calls = stub_message_boxes
     FakeClient.fail_upload = True
     try:
         dash = make_dashboard(qapp, tmp_path)
@@ -283,8 +471,8 @@ def test_launch_failure_shows_friendly_message_not_raw_exception(qapp, tmp_path,
         FakeClient.fail_upload = False
 
 
-def test_launch_with_no_accounts_shows_actionable_warning(qapp, tmp_path, monkeypatch):
-    calls = stub_message_boxes(monkeypatch)
+def test_launch_with_no_accounts_shows_actionable_warning(qapp, tmp_path, stub_message_boxes):
+    calls = stub_message_boxes
     dash = make_dashboard(qapp, tmp_path, store=AccountStore())
     dash.blend = tmp_path / "x.blend"
     dash._launch()
@@ -294,8 +482,8 @@ def test_launch_with_no_accounts_shows_actionable_warning(qapp, tmp_path, monkey
     dash.close()
 
 
-def test_launch_with_bad_frame_range_shows_actionable_warning(qapp, tmp_path, monkeypatch):
-    calls = stub_message_boxes(monkeypatch)
+def test_launch_with_bad_frame_range_shows_actionable_warning(qapp, tmp_path, stub_message_boxes):
+    calls = stub_message_boxes
     dash = make_dashboard(qapp, tmp_path)
     blend = tmp_path / "remember.blend"
     blend.write_bytes(b"x" * 10)
@@ -325,7 +513,8 @@ def test_live_tick_drains_queued_telemetry_into_gpu_panel(qapp, tmp_path):
 
 def test_start_progress_threads_feeds_live_progress_and_telemetry(qapp, tmp_path, monkeypatch):
     def fake_stream_progress(token, user_name, kernel_slug, on_progress,
-                             stop_event=None, on_telemetry=None):
+                             stop_event=None, on_telemetry=None,
+                             on_hardware=None):
         on_progress(2, 3)
         if on_telemetry:
             on_telemetry({"gpu": 0, "util": 50, "mem_used": 100,
@@ -352,6 +541,400 @@ def test_start_progress_threads_feeds_live_progress_and_telemetry(qapp, tmp_path
     dash._live_tick()
     assert dash.gpu_panel.gpu_count >= 1
     dash.close()
+
+
+# ---------------- last-known instance hardware (Task 3) ----------------
+
+def test_live_tick_records_instance_snapshot_from_telemetry(qapp, tmp_path):
+    dash = make_dashboard(qapp, tmp_path)
+    dash._telemetry_queue.put(("acct0", {
+        "gpu": 0, "util": 87, "mem_used": 6144, "mem_total": 15360,
+        "temp": 71, "power": 58.0}))
+    dash._telemetry_queue.put(("acct0", {
+        "gpu": 1, "util": 12, "mem_used": 1024, "mem_total": 15360,
+        "temp": 45, "power": None}))
+    dash._live_tick()
+
+    snap = dash.instance_store.get("acct0")
+    assert snap is not None
+    assert snap.username == "user_0"   # make_store's Account.username
+    assert snap.gpus == [GpuSnapshot(index=0, mem_total=15360),
+                         GpuSnapshot(index=1, mem_total=15360)]
+    # No source for these through the telemetry wiring -- left None, not
+    # guessed.
+    assert snap.cpu_count is None
+    assert snap.ram_total is None
+    dash.close()
+
+
+def test_instance_snapshot_is_persisted_to_disk(qapp, tmp_path):
+    dash = make_dashboard(qapp, tmp_path)
+    dash._telemetry_queue.put(("acct0", {
+        "gpu": 0, "util": 50, "mem_used": 100, "mem_total": 200,
+        "temp": 60, "power": 10.0}))
+    dash._live_tick()
+    dash.close()
+
+    reloaded = InstanceStore.load()
+    assert reloaded.get("acct0").gpus == [GpuSnapshot(index=0, mem_total=200)]
+
+
+def test_instance_snapshot_recorded_once_per_run_not_per_sample(qapp, tmp_path):
+    """Persisting to disk on every telemetry sample would be wasteful --
+    the account's snapshot for the current run is written once, on the
+    first telemetry seen for it, not re-written as later samples for the
+    same GPU keep arriving every ~5s."""
+    dash = make_dashboard(qapp, tmp_path)
+    dash._telemetry_queue.put(("acct0", {
+        "gpu": 0, "util": 50, "mem_used": 100, "mem_total": 200,
+        "temp": 60, "power": 10.0}))
+    dash._live_tick()
+    first = dash.instance_store.get("acct0")
+    assert first is not None
+
+    # A later sample for the SAME run must not move observed_at forward or
+    # otherwise re-record.
+    dash._telemetry_queue.put(("acct0", {
+        "gpu": 0, "util": 99, "mem_used": 150, "mem_total": 200,
+        "temp": 65, "power": 12.0}))
+    dash._live_tick()
+    second = dash.instance_store.get("acct0")
+    assert second.observed_at == first.observed_at
+    dash.close()
+
+
+def test_instance_snapshot_re_recorded_on_next_render(qapp, tmp_path):
+    """Kaggle's allocation varies between runs, so the once-per-run guard
+    must reset when a NEW render starts, not stay latched forever."""
+    dash = make_dashboard(qapp, tmp_path)
+    dash._telemetry_queue.put(("acct0", {
+        "gpu": 0, "util": 50, "mem_used": 100, "mem_total": 200,
+        "temp": 60, "power": 10.0}))
+    dash._live_tick()
+    first = dash.instance_store.get("acct0")
+
+    time.sleep(0.01)   # observed_at must move forward on the next record
+    dash._start_progress_threads(FleetState("job", "b.blend", 1, 1, []))
+    dash._telemetry_queue.put(("acct0", {
+        "gpu": 0, "util": 20, "mem_used": 80, "mem_total": 200,
+        "temp": 55, "power": 8.0}))
+    dash._live_tick()
+    second = dash.instance_store.get("acct0")
+    assert second.observed_at > first.observed_at
+    dash.close()
+
+
+def test_account_with_no_history_has_no_snapshot(qapp, tmp_path):
+    dash = make_dashboard(qapp, tmp_path)
+    assert dash.instance_store.get("acct0") is None
+    dash.close()
+
+
+# --------- hardware banner (cpu/ram/GPU model) rides the same stream ---------
+
+def test_live_tick_records_hardware_banner_fields_end_to_end(qapp, tmp_path):
+    """The notebook's first cell prints its hardware banner before the
+    render loop's TELEMETRY lines start -- exercised here in that same
+    order -- and _record_instance_snapshot must fold both queues into one
+    InstanceSnapshot with cpu_count, ram_total, and per-GPU model filled
+    in, not left None."""
+    dash = make_dashboard(qapp, tmp_path)
+    dash._hardware_queue.put(("acct0", {
+        "kind": "cpu_ram", "cpu_count": 4, "ram_total": 31.3}))
+    dash._hardware_queue.put(("acct0", {
+        "kind": "gpu", "model": "Tesla P100-PCIE-16GB", "mem_total": 16280}))
+    dash._telemetry_queue.put(("acct0", {
+        "gpu": 0, "util": 87, "mem_used": 6144, "mem_total": 16280,
+        "temp": 71, "power": 58.0}))
+    dash._live_tick()
+
+    snap = dash.instance_store.get("acct0")
+    assert snap is not None
+    assert snap.cpu_count == 4
+    assert snap.ram_total == 31.3
+    assert snap.gpus == [GpuSnapshot(index=0, mem_total=16280,
+                                     model="Tesla P100-PCIE-16GB")]
+    dash.close()
+
+
+def test_live_tick_matches_multiple_gpu_models_to_telemetry_indices_by_position(qapp, tmp_path):
+    dash = make_dashboard(qapp, tmp_path)
+    dash._hardware_queue.put(("acct0", {
+        "kind": "cpu_ram", "cpu_count": 4, "ram_total": 31.3}))
+    dash._hardware_queue.put(("acct0", {
+        "kind": "gpu", "model": "Tesla T4", "mem_total": 15360}))
+    dash._hardware_queue.put(("acct0", {
+        "kind": "gpu", "model": "Tesla T4", "mem_total": 15360}))
+    dash._telemetry_queue.put(("acct0", {
+        "gpu": 0, "util": 50, "mem_used": 100, "mem_total": 15360,
+        "temp": 60, "power": 10.0}))
+    dash._telemetry_queue.put(("acct0", {
+        "gpu": 1, "util": 12, "mem_used": 80, "mem_total": 15360,
+        "temp": 55, "power": 8.0}))
+    dash._live_tick()
+
+    snap = dash.instance_store.get("acct0")
+    assert snap.gpus == [GpuSnapshot(index=0, mem_total=15360, model="Tesla T4"),
+                         GpuSnapshot(index=1, mem_total=15360, model="Tesla T4")]
+    dash.close()
+
+
+def test_snapshot_still_records_with_none_hardware_fields_when_banner_never_arrives(qapp, tmp_path):
+    """No hardware-banner lines this run (e.g. the stream dropped before
+    the first cell finished) -- cpu_count/ram_total/model stay None rather
+    than blocking the telemetry-driven snapshot entirely."""
+    dash = make_dashboard(qapp, tmp_path)
+    dash._telemetry_queue.put(("acct0", {
+        "gpu": 0, "util": 50, "mem_used": 100, "mem_total": 200,
+        "temp": 60, "power": 10.0}))
+    dash._live_tick()
+
+    snap = dash.instance_store.get("acct0")
+    assert snap.cpu_count is None
+    assert snap.ram_total is None
+    assert snap.gpus == [GpuSnapshot(index=0, mem_total=200, model=None)]
+    dash.close()
+
+
+# ---------------- full screen: maximised default, F11, a way out ---------
+
+def test_dashboard_loads_its_own_settings_when_none_given(qapp, tmp_path):
+    """Every existing test in this module constructs Dashboard with no
+    settings= -- this is the fallback the Task 6 brief's "persisted"
+    requirement depends on staying test-compatible."""
+    dash = make_dashboard(qapp, tmp_path, n=1)
+    assert dash.settings.accent == "orange"
+    assert dash.settings.fullscreen is False
+    dash.close()
+
+
+def test_toggle_fullscreen_enters_and_persists(qapp, tmp_path):
+    dash = make_dashboard(qapp, tmp_path, n=1)
+    assert dash.isFullScreen() is False
+    assert dash.exit_fullscreen_btn.isVisible() is False
+
+    dash._toggle_fullscreen()
+    wait_until(lambda: dash.isFullScreen())
+    wait_until(lambda: dash.exit_fullscreen_btn.isVisible())
+    assert dash.settings.fullscreen is True
+
+    reloaded = Settings.load()
+    assert reloaded.fullscreen is True
+    dash.close()
+
+
+def test_toggle_fullscreen_again_leaves_full_screen_and_hides_the_exit_button(
+        qapp, tmp_path):
+    dash = make_dashboard(qapp, tmp_path, n=1)
+    dash._toggle_fullscreen()
+    wait_until(lambda: dash.isFullScreen())
+    dash._toggle_fullscreen()
+    wait_until(lambda: not dash.isFullScreen())
+    wait_until(lambda: not dash.exit_fullscreen_btn.isVisible())
+    assert dash.settings.fullscreen is False
+    dash.close()
+
+
+def test_escape_exits_full_screen(qapp, tmp_path):
+    """The exit_fullscreen_btn is the primary visible way out, but Esc is
+    the other conventional one -- never zero ways back out of a real
+    full-screen toggle."""
+    from PySide6.QtCore import QEvent
+    from PySide6.QtGui import QKeyEvent
+
+    dash = make_dashboard(qapp, tmp_path, n=1)
+    dash._toggle_fullscreen()
+    wait_until(lambda: dash.isFullScreen())
+
+    event = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Escape,
+                      Qt.KeyboardModifier.NoModifier)
+    dash.keyPressEvent(event)
+    wait_until(lambda: not dash.isFullScreen())
+    dash.close()
+
+
+def test_escape_does_nothing_when_not_full_screen(qapp, tmp_path):
+    from PySide6.QtCore import QEvent
+    from PySide6.QtGui import QKeyEvent
+
+    dash = make_dashboard(qapp, tmp_path, n=1)
+    event = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Escape,
+                      Qt.KeyboardModifier.NoModifier)
+    dash.keyPressEvent(event)   # must not raise, must not enter full screen
+    assert dash.isFullScreen() is False
+    dash.close()
+
+
+def test_show_at_startup_maximises_by_default(qapp, tmp_path):
+    dash = make_dashboard(qapp, tmp_path, n=1)
+    dash.show_at_startup()
+    wait_until(lambda: dash.isMaximized())
+    assert dash.isFullScreen() is False
+    dash.close()
+
+
+def test_show_at_startup_honours_a_stored_fullscreen_preference(qapp, tmp_path):
+    settings = Settings(fullscreen=True)
+    dash = Dashboard(make_store(1), lambda accounts: Fleet(
+        accounts, lambda tok: FakeClient(tok), tmp_path / "w"),
+        verifier=lambda t: "someone", settings=settings)
+    _LIVE_DASHBOARDS.append(dash)
+    settle(dash)
+    dash.show_at_startup()
+    wait_until(lambda: dash.isFullScreen())
+    wait_until(lambda: dash.exit_fullscreen_btn.isVisible())
+    dash.close()
+
+
+# ------------- content column width (Task 6 visual-pass fix) -------------
+# The bug: outer.addWidget(content, 0) in _build_main handed 100% of
+# surplus width to the two flanking addStretch(1) spacers regardless of
+# content's maximumWidth, so content sat at a MEASURED constant ~453px
+# whether the window was 1920 or 2560px wide -- a prior report claimed
+# this layout worked without ever querying a width, and a reviewer
+# disproved it in one measurement. This test measures, it does not
+# describe: it is the thing that would have caught the original bug and
+# must keep catching any regression back to it.
+
+def test_content_column_grows_with_window_but_never_exceeds_the_cap(
+        qapp, tmp_path):
+    dash = make_dashboard(qapp, tmp_path, n=1)
+    dash.show()
+    widths = {}
+    for w in (1280, 1920, 2560):
+        dash.resize(w, 900)
+        for _ in range(30):
+            QCoreApplication.processEvents()
+        widths[w] = dash.content_column.width()
+    dash.close()
+
+    assert widths[1280] < widths[2560], (
+        "content_column must grow as the window widens from 1280 to "
+        f"2560px -- measured widths: {widths}. A constant width here is "
+        "exactly the stretch-factor-0 bug this test guards against.")
+    assert widths[1920] <= dashboard_mod.MAX_CONTENT_WIDTH
+    assert widths[2560] <= dashboard_mod.MAX_CONTENT_WIDTH, (
+        f"content_column exceeded MAX_CONTENT_WIDTH "
+        f"({dashboard_mod.MAX_CONTENT_WIDTH}px) at 2560px window width: "
+        f"{widths[2560]}px")
+
+
+# ---------------- settings dialog (opened from the rail) -----------------
+
+def test_open_settings_shows_a_settings_view_for_the_dashboards_settings(
+        qapp, tmp_path, monkeypatch):
+    """Nothing before this exercised Dashboard._open_settings or a click on
+    settings_btn -- only SettingsView in isolation (see test_settings_view.py).
+    SettingsView.exec() drives its own modal event loop that only returns on
+    a click nothing under QT_QPA_PLATFORM=offscreen will ever deliver, so
+    exec itself is stubbed here (recording the instance instead of blocking)
+    rather than actually shown -- the same reasoning as
+    tests/conftest.py's no_unstubbed_dialogs guard, just for a QDialog
+    instead of a QMessageBox."""
+    opened = []
+
+    def fake_exec(self):
+        opened.append(self)
+        return dashboard_mod.SettingsView.DialogCode.Accepted
+
+    monkeypatch.setattr(dashboard_mod.SettingsView, "exec", fake_exec)
+
+    dash = make_dashboard(qapp, tmp_path, n=1)
+    dash.settings_btn.click()
+
+    assert len(opened) == 1
+    assert isinstance(opened[0], dashboard_mod.SettingsView)
+    assert opened[0].settings is dash.settings
+    dash.close()
+
+
+# ---------------- accent: live, without a restart (Task 6) ----------------
+# THE bug the Task 6 brief calls out by name: rendering with the red accent
+# selected used to produce zero red pixels anywhere, because dashboard.py
+# captured `ACCENT` at ITS OWN import time (`from ... import ACCENT`) and
+# never looked at it again. This proves the fix end-to-end through
+# Dashboard's real brand-mark pixmap, not just a stylesheet string.
+
+def _image_has_color(image, hex_color: str) -> bool:
+    from PySide6.QtGui import QColor
+    target = QColor(hex_color)
+    for y in range(image.height()):
+        for x in range(image.width()):
+            px = image.pixelColor(x, y)
+            if px.alpha() > 0 and (px.red(), px.green(), px.blue()) == \
+                    (target.red(), target.green(), target.blue()):
+                return True
+    return False
+
+
+@pytest.mark.parametrize("name", ["orange", "green", "purple", "blue", "red"])
+def test_switching_accent_live_repaints_the_brand_mark_without_restart(
+        qapp, tmp_path, name):
+    dash = make_dashboard(qapp, tmp_path, n=1)
+    theme.apply(qapp, name)   # e.g. what SettingsView's swatch click does
+    image = dash.brand_mark.pixmap().toImage()
+    assert _image_has_color(image, ACCENTS[name].base), (
+        f"the {name!r} accent does not appear in the brand mark after a "
+        "live switch -- Dashboard must repaint chrome it painted with an "
+        "explicit accent colour, not just leave it as it was at __init__")
+    dash.close()
+
+
+def test_switching_accent_live_also_repaints_every_instance_card(
+        qapp, tmp_path):
+    dash = make_dashboard(qapp, tmp_path, n=1)
+    dash._last_state = FleetState(
+        job_id="job", blend_name="x.blend", start_frame=1, end_frame=2,
+        workers=[WorkerState(label="acct0", username="user_0",
+                             kernel_slug="user_0/k0", frames=[1, 2],
+                             state="running")])
+    dash._refresh_views()
+
+    theme.apply(qapp, "red")
+    image = dash._instance_cards["acct0"].status_icon.pixmap().toImage()
+    assert _image_has_color(image, ACCENTS["red"].base)
+    dash.close()
+
+
+def test_closing_many_dashboards_does_not_leak_theme_signal_connections(
+        qapp, tmp_path):
+    """Regression test for the signal-lifetime leak fixed in Task 6.
+
+    theme.theme_signal is a process-global QObject that outlives every
+    Dashboard/InstanceCard connected to it. closeEvent used to try
+    `disconnect(bound_method)` wrapped in `except (RuntimeError,
+    TypeError)`, on the theory that a redundant disconnect "just emits a
+    RuntimeWarning ... not an error worth stopping for" -- but PySide6's
+    disconnect() does not raise on a redundant disconnect, so the except
+    clause never fired and never could, and every leftover connection
+    made theme.apply()/theme_signal.changed.emit() a little slower for
+    every later accent change (measured: 94 warnings and a 55s ->
+    expected ~10s tests/test_dashboard.py runtime before this fix).
+
+    A count of "Failed to disconnect" warnings would pass again the
+    moment PySide6 changes that message. What actually matters, and what
+    this asserts, is the property the warning was only a symptom of: the
+    number of live receivers on theme_signal.changed must return to its
+    starting point once every Dashboard/InstanceCard this test opened has
+    been closed and torn down -- not grow with each one, the way it would
+    if disconnecting were unreliable.
+    """
+    baseline = theme.theme_signal.receivers(SIGNAL("changed()"))
+    for _ in range(5):
+        dash = make_dashboard(qapp, tmp_path, n=3)
+        dash.close()
+        settle(dash)
+        dash.deleteLater()
+    for _ in range(20):
+        QCoreApplication.processEvents()
+
+    after = theme.theme_signal.receivers(SIGNAL("changed()"))
+    assert after == baseline, (
+        f"theme_signal.changed had {baseline} receiver(s) before this test "
+        f"opened and closed 5 Dashboards (3 InstanceCards each) and "
+        f"{after} after -- closing a Dashboard must remove its own and "
+        "every one of its cards' connections, not leave them for Qt's "
+        "eventual (and here, unreliable) auto-disconnect-on-destroy.")
 
 
 def test_the_filmstrip_tells_the_user_its_completed_cells_are_approximate(qapp, tmp_path):

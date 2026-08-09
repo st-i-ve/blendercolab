@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLineEdit,
 
 from blendfleet.accounts import Account, AccountStore
 from blendfleet.ui.messages import explain
-from blendfleet.ui.theme import ACCENT, TEXT_SECONDARY, WARNING
+from blendfleet.ui.theme import TEXT_SECONDARY, WARNING, current_accent
 
 # Verification state colours, pulled from the one app-wide palette
 # (blendfleet.ui.theme) so this dialog is never a separate look from the
@@ -27,9 +27,13 @@ def _wash(hex_color: str, alpha: int = 60) -> QColor:
     return c
 
 
-COLOR_VERIFIED = _wash(ACCENT)
-COLOR_UNVERIFIED = _wash(WARNING)
-COLOR_CHECKING = _wash(TEXT_SECONDARY)
+def _verified_color() -> QColor:
+    # Resolved at CALL time (inside _refresh(), every time the list
+    # repaints), not once at import -- a module-level `_wash(ACCENT)`
+    # constant here is exactly the bug that made the red accent produce
+    # zero red pixels on Task 4: it would freeze whichever accent was
+    # active when this module first imported and never look again.
+    return _wash(current_accent().base)
 
 
 class _VerifyWorker(QThread):
@@ -112,20 +116,23 @@ class SetupDialog(QDialog):
 
     # ---------------- rendering ----------------
     def _refresh(self) -> None:
+        color_checking = _wash(TEXT_SECONDARY)
+        color_verified = _verified_color()
+        color_unverified = _wash(WARNING)
         self.list.clear()
         for a in self.store.list():
             item = QListWidgetItem()
             if a.label in self._checking:
                 item.setText(f"…  {a.label}   (checking…)")
-                item.setBackground(QBrush(COLOR_CHECKING))
+                item.setBackground(QBrush(color_checking))
             elif a.verified:
                 item.setText(
                     f"✓  {a.label}   verified "
                     f"({a.username or 'username unresolved -- no notebooks yet'})")
-                item.setBackground(QBrush(COLOR_VERIFIED))
+                item.setBackground(QBrush(color_verified))
             else:
                 item.setText(f"✗  {a.label}   not verified")
-                item.setBackground(QBrush(COLOR_UNVERIFIED))
+                item.setBackground(QBrush(color_unverified))
             self.list.addItem(item)
 
     def _set_busy(self, busy: bool) -> None:
