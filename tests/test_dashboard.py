@@ -46,7 +46,7 @@ def stub_stream_progress(monkeypatch):
     test_start_progress_threads_feeds_live_progress_and_telemetry).
     """
     def no_stream(token, user_name, kernel_slug, on_progress,
-                  stop_event=None, on_telemetry=None):
+                  stop_event=None, on_telemetry=None, on_hardware=None):
         return None
 
     monkeypatch.setattr(dashboard_mod, "stream_progress", no_stream)
@@ -326,7 +326,8 @@ def test_live_tick_drains_queued_telemetry_into_gpu_panel(qapp, tmp_path):
 
 def test_start_progress_threads_feeds_live_progress_and_telemetry(qapp, tmp_path, monkeypatch):
     def fake_stream_progress(token, user_name, kernel_slug, on_progress,
-                             stop_event=None, on_telemetry=None):
+                             stop_event=None, on_telemetry=None,
+                             on_hardware=None):
         on_progress(2, 3)
         if on_telemetry:
             on_telemetry({"gpu": 0, "util": 50, "mem_used": 100,
@@ -439,6 +440,72 @@ def test_instance_snapshot_re_recorded_on_next_render(qapp, tmp_path):
 def test_account_with_no_history_has_no_snapshot(qapp, tmp_path):
     dash = make_dashboard(qapp, tmp_path)
     assert dash.instance_store.get("acct0") is None
+    dash.close()
+
+
+# --------- hardware banner (cpu/ram/GPU model) rides the same stream ---------
+
+def test_live_tick_records_hardware_banner_fields_end_to_end(qapp, tmp_path):
+    """The notebook's first cell prints its hardware banner before the
+    render loop's TELEMETRY lines start -- exercised here in that same
+    order -- and _record_instance_snapshot must fold both queues into one
+    InstanceSnapshot with cpu_count, ram_total, and per-GPU model filled
+    in, not left None."""
+    dash = make_dashboard(qapp, tmp_path)
+    dash._hardware_queue.put(("acct0", {
+        "kind": "cpu_ram", "cpu_count": 4, "ram_total": 31.3}))
+    dash._hardware_queue.put(("acct0", {
+        "kind": "gpu", "model": "Tesla P100-PCIE-16GB", "mem_total": 16280}))
+    dash._telemetry_queue.put(("acct0", {
+        "gpu": 0, "util": 87, "mem_used": 6144, "mem_total": 16280,
+        "temp": 71, "power": 58.0}))
+    dash._live_tick()
+
+    snap = dash.instance_store.get("acct0")
+    assert snap is not None
+    assert snap.cpu_count == 4
+    assert snap.ram_total == 31.3
+    assert snap.gpus == [GpuSnapshot(index=0, mem_total=16280,
+                                     model="Tesla P100-PCIE-16GB")]
+    dash.close()
+
+
+def test_live_tick_matches_multiple_gpu_models_to_telemetry_indices_by_position(qapp, tmp_path):
+    dash = make_dashboard(qapp, tmp_path)
+    dash._hardware_queue.put(("acct0", {
+        "kind": "cpu_ram", "cpu_count": 4, "ram_total": 31.3}))
+    dash._hardware_queue.put(("acct0", {
+        "kind": "gpu", "model": "Tesla T4", "mem_total": 15360}))
+    dash._hardware_queue.put(("acct0", {
+        "kind": "gpu", "model": "Tesla T4", "mem_total": 15360}))
+    dash._telemetry_queue.put(("acct0", {
+        "gpu": 0, "util": 50, "mem_used": 100, "mem_total": 15360,
+        "temp": 60, "power": 10.0}))
+    dash._telemetry_queue.put(("acct0", {
+        "gpu": 1, "util": 12, "mem_used": 80, "mem_total": 15360,
+        "temp": 55, "power": 8.0}))
+    dash._live_tick()
+
+    snap = dash.instance_store.get("acct0")
+    assert snap.gpus == [GpuSnapshot(index=0, mem_total=15360, model="Tesla T4"),
+                         GpuSnapshot(index=1, mem_total=15360, model="Tesla T4")]
+    dash.close()
+
+
+def test_snapshot_still_records_with_none_hardware_fields_when_banner_never_arrives(qapp, tmp_path):
+    """No hardware-banner lines this run (e.g. the stream dropped before
+    the first cell finished) -- cpu_count/ram_total/model stay None rather
+    than blocking the telemetry-driven snapshot entirely."""
+    dash = make_dashboard(qapp, tmp_path)
+    dash._telemetry_queue.put(("acct0", {
+        "gpu": 0, "util": 50, "mem_used": 100, "mem_total": 200,
+        "temp": 60, "power": 10.0}))
+    dash._live_tick()
+
+    snap = dash.instance_store.get("acct0")
+    assert snap.cpu_count is None
+    assert snap.ram_total is None
+    assert snap.gpus == [GpuSnapshot(index=0, mem_total=200, model=None)]
     dash.close()
 
 

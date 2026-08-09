@@ -160,3 +160,49 @@ def test_load_with_one_malformed_entry_still_loads_the_rest():
     store = InstanceStore.load()
     assert store.get("acct0") is None
     assert store.get("acct1").username == "friend"
+
+
+# ---------------- hardware banner fields (cpu_count/ram_total/GPU model) ----------------
+
+def test_snapshot_can_carry_cpu_ram_and_gpu_model():
+    """The fields the hardware-banner parser feeds -- previously always
+    None, now populated when the banner arrived for this run."""
+    snap = InstanceSnapshot(
+        username="stive",
+        gpus=[GpuSnapshot(index=0, mem_total=16280, model="Tesla P100-PCIE-16GB")],
+        cpu_count=4, ram_total=31.3, observed_at=1000.0)
+    assert snap.cpu_count == 4
+    assert snap.ram_total == 31.3
+    assert snap.gpus[0].model == "Tesla P100-PCIE-16GB"
+
+
+def test_gpu_model_round_trips_through_save_and_load():
+    store = InstanceStore()
+    store.record("acct0", InstanceSnapshot(
+        username="stive",
+        gpus=[GpuSnapshot(index=0, mem_total=15360, model="Tesla T4"),
+             GpuSnapshot(index=1, mem_total=15360, model="Tesla T4")],
+        cpu_count=4, ram_total=31.3, observed_at=12345.0))
+    store.save()
+
+    loaded = InstanceStore.load()
+    snap = loaded.get("acct0")
+    assert snap.cpu_count == 4
+    assert snap.ram_total == 31.3
+    assert snap.gpus == [GpuSnapshot(index=0, mem_total=15360, model="Tesla T4"),
+                         GpuSnapshot(index=1, mem_total=15360, model="Tesla T4")]
+
+
+def test_load_accepts_gpu_entries_from_before_model_existed():
+    """A file written before GpuSnapshot had a model field must not raise
+    KeyError -- model defaults to None, same discipline as cpu_count/
+    ram_total on the snapshot itself."""
+    p = pp.state_dir() / FILENAME
+    p.write_text(json.dumps({
+        "acct0": {"username": "stive", "observed_at": 500.0,
+                  "gpus": [{"index": 0, "mem_total": 16280}]}
+    }), encoding="utf-8")
+
+    store = InstanceStore.load()
+    snap = store.get("acct0")
+    assert snap.gpus == [GpuSnapshot(index=0, mem_total=16280, model=None)]

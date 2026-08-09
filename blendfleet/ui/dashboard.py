@@ -169,6 +169,11 @@ class Dashboard(QMainWindow):
         # UI thread, so telemetry never goes straight from a worker thread
         # into GpuPanel.
         self._telemetry_queue: "queue.Queue[tuple[str, dict]]" = queue.Queue()
+        # Filled by the same SSE threads from the notebook's first-cell
+        # hardware banner (log_stream.parse_hardware_banner), drained on the
+        # UI thread by _live_tick alongside _telemetry_queue -- same
+        # widgets-only-from-the-UI-thread reasoning as telemetry above.
+        self._hardware_queue: "queue.Queue[tuple[str, dict]]" = queue.Queue()
         # Last-known hardware per account, cached across app restarts so an
         # idle card (Task 4) can show what an account last ran on -- Kaggle
         # has no idle instances to poll instead. Loaded once here; every
@@ -180,6 +185,16 @@ class Dashboard(QMainWindow):
         # to be first. Reset in _start_progress_threads, i.e. as each new
         # render starts.
         self._instance_gpus: dict[str, dict[int, int]] = {}
+        # Per-run accumulator: label -> {"cpu_count":.., "ram_total":..},
+        # from the hardware banner's CPU/RAM line. Reset alongside
+        # _instance_gpus.
+        self._instance_hardware: dict[str, dict] = {}
+        # Per-run accumulator: label -> ordered list of GPU model names, in
+        # the order the hardware banner's nvidia-smi listing printed them
+        # (that listing carries no GPU index of its own -- see
+        # blendfleet/instance_state.py). Matched to telemetry's indexed
+        # GPUs by position when a snapshot is built.
+        self._instance_gpu_models: dict[str, list[str]] = {}
         # Labels already persisted for the CURRENT run. Recording once per
         # account per run (not once per telemetry sample, which arrives
         # every ~5s for as long as the render runs) is the whole point --
@@ -533,6 +548,8 @@ class Dashboard(QMainWindow):
         # allocation varies run to run) -- so the "already recorded this
         # run" guard and its accumulator both reset here, per render.
         self._instance_gpus.clear()
+        self._instance_hardware.clear()
+        self._instance_gpu_models.clear()
         self._recorded_instance_labels.clear()
         # Drop the threads from the previous job that have already unwound,
         # so a long session's worth of renders does not accumulate dead
@@ -560,10 +577,16 @@ class Dashboard(QMainWindow):
                     # thread; _live_tick() drains this on a QTimer instead.
                     self._telemetry_queue.put((label, record))
 
+                def hardware(record, label=acct.label):
+                    # Same reasoning as telemetry() above: enqueue only,
+                    # never touch self.instance_store from this thread.
+                    self._hardware_queue.put((label, record))
+
                 try:
                     stream_progress(acct.token, w.username,
                                     w.kernel_slug.split("/", 1)[1], bump,
-                                    self._stop, on_telemetry=telemetry)
+                                    self._stop, on_telemetry=telemetry,
+                                    on_hardware=hardware)
                 except Exception:
                     pass  # a dead stream must never kill the render or the UI
             thread = threading.Thread(target=run, daemon=True,
@@ -754,9 +777,9 @@ class Dashboard(QMainWindow):
         no network calls here, unlike _poll().
 
         Recorded from this UI-thread drain side, not from the worker
-        closure that fills _telemetry_queue: that closure deliberately
-        does nothing but enqueue (widgets, and now the instance-state
-        write, must only ever happen off the SSE thread).
+        closures that fill _telemetry_queue/_hardware_queue: those closures
+        deliberately do nothing but enqueue (widgets, and now the
+        instance-state write, must only ever happen off the SSE thread).
         """
         drained = 0
         newly_seen: set[str] = set()
@@ -770,25 +793,56 @@ class Dashboard(QMainWindow):
             if label not in self._recorded_instance_labels:
                 newly_seen.add(label)
             drained += 1
+        # The hardware banner (notebook's first cell) always prints before
+        # the render loop's TELEMETRY lines start, so draining it here --
+        # ahead of the newly_seen recording below -- means a label's very
+        # first snapshot already has whatever hardware data arrived.
+        hw_drained = 0
+        while hw_drained < 200:  # same bound, same reason as telemetry above
+            try:
+                label, record = self._hardware_queue.get_nowait()
+            except queue.Empty:
+                break
+            if record["kind"] == "cpu_ram":
+                self._instance_hardware[label] = {
+                    "cpu_count": record["cpu_count"],
+                    "ram_total": record["ram_total"]}
+            elif record["kind"] == "gpu":
+                self._instance_gpu_models.setdefault(label, []).append(
+                    record["model"])
+            hw_drained += 1
         for label in newly_seen:
             self._record_instance_snapshot(label)
         self._refresh_views()
 
     def _record_instance_snapshot(self, label: str) -> None:
         """Persist one InstanceSnapshot for `label`, once for the current
-        run, from telemetry accumulated so far in _instance_gpus.
+        run, from telemetry/hardware-banner data accumulated so far.
 
-        cpu_count and ram_total have no source through this wiring -- see
-        blendfleet/instance_state.py's module docstring -- so they are left
-        None rather than guessed.
+        GPU model names come from _instance_gpu_models, matched to
+        telemetry's indexed GPUs by position -- the hardware banner's
+        nvidia-smi listing carries no index column of its own (see
+        blendfleet/instance_state.py's module docstring). cpu_count/
+        ram_total come from _instance_hardware; either stays None if that
+        banner never arrived for this run (stream dropped early, or a
+        CPU-only session with no nvidia-smi at all) rather than being
+        guessed.
         """
         self._recorded_instance_labels.add(label)
         account = next((a for a in self.store.list() if a.label == label), None)
-        gpus = [GpuSnapshot(index=idx, mem_total=mem_total)
-               for idx, mem_total in sorted(self._instance_gpus.get(label, {}).items())]
+        models = self._instance_gpu_models.get(label, [])
+        gpus = [
+            GpuSnapshot(index=idx, mem_total=mem_total,
+                       model=models[position] if position < len(models) else None)
+            for position, (idx, mem_total)
+            in enumerate(sorted(self._instance_gpus.get(label, {}).items()))
+        ]
+        hw = self._instance_hardware.get(label, {})
         snapshot = InstanceSnapshot(
             username=account.username if account else None,
-            gpus=gpus, cpu_count=None, ram_total=None,
+            gpus=gpus,
+            cpu_count=hw.get("cpu_count"),
+            ram_total=hw.get("ram_total"),
             observed_at=time.time())
         self.instance_store.record(label, snapshot)
         self.instance_store.save()

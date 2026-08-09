@@ -15,15 +15,20 @@ losing it costs nothing but a "never run" placeholder until the next
 render. That is the same distinction that already put fleet.json in
 state_dir() rather than beside accounts.json.
 
-Known gap: telemetry (log_stream.parse_telemetry) carries only the
-physical GPU index and its total memory -- not the GPU model name, CPU
-count, or system RAM. Those are printed by the notebook's first cell
-(notebook_builder.py) to plain stdout, which log_stream.py does not parse
-(it only recognises PROGRESS and TELEMETRY lines). cpu_count and
-ram_total therefore have no available source through the wiring this
-task uses and are left None rather than fabricated or dropped from the
-shape the brief specifies; the GpuSnapshot list omits a model-name field
-for the same reason.
+cpu_count, ram_total, and each GPU's model name come from the notebook's
+first cell (notebook_builder.py), which prints them once per run to the
+same stdout the SSE stream carries -- log_stream.parse_hardware_banner
+parses that banner, and blendfleet/ui/dashboard.py wires it through
+stream_progress's on_hardware callback (same pattern as on_telemetry).
+Per-GPU memory still comes from telemetry (log_stream.parse_telemetry),
+which is the only source of the physical GPU *index*; the hardware
+banner's nvidia-smi listing has no index column, so its rows are matched
+to telemetry's indices by position (both list GPUs in nvidia-smi's own
+enumeration order). If the hardware-banner lines never arrive for a run
+(the stream drops before the first cell finishes, or a CPU-only session
+has no nvidia-smi at all) these fields stay None rather than being
+guessed -- the same discipline the rest of this module already applies to
+observed_at.
 """
 from __future__ import annotations
 
@@ -48,13 +53,16 @@ DEFAULT_STALE_AFTER_SECONDS = 24 * 60 * 60.0
 
 @dataclass
 class GpuSnapshot:
-    """One physical GPU as reported by telemetry during a run.
+    """One physical GPU as reported during a run.
 
-    No model name: see the module docstring's "Known gap" -- telemetry
-    never carries it.
+    `index` and `mem_total` come from telemetry (TELEMETRY lines carry the
+    physical GPU index; the hardware banner's nvidia-smi listing does
+    not). `model` comes from the hardware banner instead -- see the module
+    docstring -- and is None if that banner never arrived for this run.
     """
     index: int
     mem_total: int  # MiB, as reported by nvidia-smi via TELEMETRY lines
+    model: str | None = None  # e.g. "Tesla P100-PCIE-16GB", from the hardware banner
 
 
 @dataclass
@@ -125,7 +133,8 @@ class InstanceStore:
             if not isinstance(d, dict):
                 continue  # one malformed entry must not lose every account's history
             gpus = [
-                GpuSnapshot(index=g["index"], mem_total=g["mem_total"])
+                GpuSnapshot(index=g["index"], mem_total=g["mem_total"],
+                           model=g.get("model"))
                 for g in d.get("gpus", []) or []
                 if isinstance(g, dict) and "index" in g and "mem_total" in g
             ]

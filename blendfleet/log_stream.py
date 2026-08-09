@@ -27,6 +27,19 @@ TELEMETRY_RE = re.compile(
     r"temp=(\d+) power=(NA|[\d.]+)"
 )
 
+# blendfleet/notebook_builder.py's first cell prints, once per run, to the
+# same stdout the SSE stream carries:
+#   print(f"CPU {psutil.cpu_count(logical=True)} cores | RAM {vm.total/2**30:.1f} GB")
+#   print(<nvidia-smi --query-gpu=name,memory.total --format=csv,noheader output>)
+# The second print's argument is itself multi-line -- one row per physical
+# GPU, e.g. "Tesla T4, 15360 MiB" -- and Kaggle's log capture forwards it as
+# separate stdout lines, so each GPU row arrives as its own SSE frame, just
+# like TELEMETRY's one-line-per-GPU convention. The GPU count is never
+# fixed (a GPU request has come back a single P100 instead of the T4 x2
+# that was asked for), so the number of GPU rows genuinely varies.
+HARDWARE_CPU_RAM_RE = re.compile(r"CPU (\d+) cores \| RAM ([\d.]+) GB")
+HARDWARE_GPU_RE = re.compile(r"^(.+?),\s*(\d+)\s*MiB$")
+
 
 # How long a stream thread may sit inside the network stack with no way to
 # notice stop_event. kagglesdk passes no timeout at all to requests
@@ -148,10 +161,52 @@ def parse_telemetry(line: str) -> dict | None:
     }
 
 
+def parse_hardware_banner(line: str) -> dict | None:
+    """Return one record from the notebook's first-cell hardware banner, or None.
+
+    Two distinct shapes come out of the same banner, on separate stdout
+    lines (see the comment above HARDWARE_CPU_RAM_RE):
+      - {"kind": "cpu_ram", "cpu_count": int, "ram_total": float}
+      - {"kind": "gpu", "model": str, "mem_total": int}  -- one per GPU row
+
+    Same gate as parse_progress/parse_telemetry: only a `data:` SSE line
+    whose payload is valid JSON with stream_name == "stdout" is even
+    considered, so stderr, malformed JSON, and non-`data:` lines never
+    reach the regexes below. PROGRESS/TELEMETRY lines are also plain
+    stdout text on the same stream, so they are explicitly excluded before
+    the GPU-row regex gets a chance at them, rather than trusting the two
+    shapes to never collide by accident.
+    """
+    if not line.startswith("data:"):
+        return None
+    payload = line[len("data:"):].strip()
+    try:
+        obj = json.loads(payload)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if obj.get("stream_name") != "stdout":
+        return None
+    data = obj.get("data", "")
+    m = HARDWARE_CPU_RAM_RE.search(data)
+    if m:
+        return {"kind": "cpu_ram", "cpu_count": int(m.group(1)),
+                "ram_total": float(m.group(2))}
+    if PROGRESS_RE.search(data) or TELEMETRY_RE.search(data):
+        return None
+    m = HARDWARE_GPU_RE.match(data.strip())
+    if not m:
+        return None
+    model = m.group(1).strip()
+    if not model:
+        return None
+    return {"kind": "gpu", "model": model, "mem_total": int(m.group(2))}
+
+
 def stream_progress(token: str, user_name: str, kernel_slug: str,
                     on_progress: Callable[[int, int], None],
                     stop_event: threading.Event | None = None,
-                    on_telemetry: Callable[[dict], None] | None = None) -> None:
+                    on_telemetry: Callable[[dict], None] | None = None,
+                    on_hardware: Callable[[dict], None] | None = None) -> None:
     """Block, calling on_progress(done, total) as lines arrive.
 
     `on_telemetry`, if given, is called with the parsed dict (see
@@ -159,6 +214,12 @@ def stream_progress(token: str, user_name: str, kernel_slug: str,
     the only source of live per-GPU utilisation/memory: it rides the exact
     same SSE connection as frame progress, so a GPU panel does not need a
     second stream of its own.
+
+    `on_hardware`, if given, is called with the parsed dict (see
+    parse_hardware_banner) for every hardware-banner line on the same
+    stream -- the notebook's first cell prints CPU count, total RAM, and
+    the nvidia-smi GPU listing exactly once per run, and this is the only
+    way to see that text: no new network call, same SSE connection.
 
     The token is passed to KaggleClient explicitly and NEVER through
     os.environ: the dashboard starts one of these threads per account
@@ -211,6 +272,11 @@ def stream_progress(token: str, user_name: str, kernel_slug: str,
                 record = parse_telemetry(raw)
                 if record:
                     on_telemetry(record)
+                    continue
+            if on_hardware is not None:
+                hw_record = parse_hardware_banner(raw)
+                if hw_record:
+                    on_hardware(hw_record)
     finally:
         # Order matters: release the closer first so it cannot outlive this
         # call, then drop the connection, then make sure the closer really
