@@ -153,6 +153,16 @@ class FakeClient:
     def dataset_reachable(self, slug):
         return True
 
+    def dataset_file_size(self, slug, filename):
+        # Task 5: fleet.launch() now confirms every account's visible copy
+        # of the .blend matches the local file's size before pushing any
+        # kernel. Every blend this module's launch-path tests actually
+        # write is 100 bytes (see the `blend.write_bytes(b"x" * 100)` calls
+        # below) -- this suite exercises the dashboard's wiring, not Task
+        # 5's staleness detection itself (see tests/test_fleet.py for
+        # that), so it must match rather than spuriously fail launch.
+        return 100
+
     def dataset_create(self, folder, on_progress=None):
         if on_progress:
             from blendfleet.uploader import UploadProgress

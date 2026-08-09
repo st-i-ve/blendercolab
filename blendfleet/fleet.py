@@ -90,6 +90,49 @@ def slug_stem(blend: Path) -> str:
     return stem
 
 
+def _require_matching_dataset(client, username: str, slug: str,
+                              filename: str, expected_size: int) -> None:
+    """Raise StaleDatasetError unless `client`'s own view of `filename`
+    inside dataset `slug` is exactly `expected_size` bytes.
+
+    Two distinct failures get two distinct messages, deliberately -- see
+    Task 5's brief: a MISSING file (the listing has no entry for this name
+    at all) means access hasn't fully propagated or the file was never
+    shared -- the fix is to re-share/retry. A SIZE MISMATCH means the
+    dataset the account can see is real but is a different, stale upload --
+    the fix is to re-upload the current .blend. Telling a user to
+    "re-upload" when the real problem is a propagation delay (or vice
+    versa) sends them chasing the wrong fix.
+
+    Kaggle exposes no content hash on the installed SDK (see
+    KaggleClient.dataset_file_size's docstring) -- this is a size check,
+    and both messages say so plainly rather than implying a byte-for-byte
+    comparison that was never actually performed.
+    """
+    remote_size = client.dataset_file_size(slug, filename)
+    if remote_size is None:
+        raise StaleDatasetError(
+            f"{username} can reach dataset {slug!r}, but Kaggle's file "
+            f"listing for it has no file named {filename!r} at all. "
+            "Nothing has been started. This is not a stale copy -- the "
+            "file simply is not there for this account yet, most likely "
+            "because the READER grant has not finished propagating. "
+            "Re-share the dataset with this account (or just retry once "
+            "Kaggle has caught up) and launch again.")
+    if remote_size != expected_size:
+        raise StaleDatasetError(
+            f"{username}'s copy of {filename!r} is {remote_size} bytes on "
+            f"Kaggle, but the local file about to be rendered is "
+            f"{expected_size} bytes. Nothing has been started. Kaggle "
+            "exposes no content hash for dataset files, so this is a size "
+            "check, not a byte-for-byte comparison -- but a different size "
+            "means this account is looking at a STALE copy left over from "
+            "an earlier upload, not the scene you are about to render. "
+            "Re-upload the current .blend (just launch again -- the owner "
+            "always re-uploads) so every account sees the same, current "
+            "copy before retrying.")
+
+
 @dataclass
 class WorkerState:
     label: str
@@ -137,6 +180,25 @@ class UnreachableAccountsError(RuntimeError):
     (propagation delay, a role that got silently dropped, etc.) would only
     find out when their kernel fails at run time with an opaque "dataset not
     found", long after their GPU quota started ticking.
+    """
+
+
+class StaleDatasetError(RuntimeError):
+    """An account's visible copy of the .blend does not match the one about
+    to be rendered.
+
+    dataset_reachable() (see UnreachableAccountsError) proves an account can
+    see A copy of the dataset -- not that it is the RIGHT one. A stale copy
+    left over from an earlier upload passes that check just as well as a
+    current one, and the render then quietly produces the wrong scene --
+    discovered only from the output, hours and quota later.
+
+    Raised BEFORE any kernel is pushed for ANY account: a stale copy on one
+    account must never let the others start rendering against it while the
+    user is still being told about the first one. Covers both the owner's
+    own just-uploaded copy (checked right after sync_blend, before a single
+    friend is even granted access) and every friend's shared view of it
+    (checked right after dataset_reachable, before push_kernel).
     """
 
 
@@ -242,6 +304,19 @@ class Fleet:
         sync_blend(owner_client, blend, dataset_slug,
                    self.work_dir / "ds_owner", on_progress=on_progress)
 
+        # Confirm the upload that just happened actually landed as the
+        # right content -- the remote-side counterpart of dataset_sync.py's
+        # own local staging-size check. dataset_reachable()/dataset_exists()
+        # only prove the dataset is THERE; they say nothing about whether
+        # it's the file that was just uploaded versus a stale one from an
+        # earlier job with the same slug. Runs before a single friend is
+        # granted access or a single kernel is pushed -- in the no-friends
+        # ("per-account") case this is the ENTIRE verification, since there
+        # is nobody else to share with. See StaleDatasetError.
+        expected_size = blend.stat().st_size
+        _require_matching_dataset(owner_client, owner_username, dataset_slug,
+                                  blend.name, expected_size)
+
         friends = self.accounts[1:]
         friend_usernames = [usernames[a.label] for a in friends]
         if friend_usernames:
@@ -265,6 +340,17 @@ class Fleet:
                     f"reachable for: {', '.join(unreachable)}. Nothing has "
                     "been started -- retry once Kaggle's grant has "
                     "propagated.")
+
+            # Reachable proves a friend can see A copy -- not that it is
+            # the SAME copy just verified above for the owner. Each
+            # friend's OWN client is asked, in case Kaggle's read-side
+            # replication genuinely disagrees between accounts (the same
+            # kind of propagation lag dataset_reachable already accounts
+            # for). Still strictly before push_kernel: nothing started.
+            for account in friends:
+                _require_matching_dataset(
+                    clients[account.label], usernames[account.label],
+                    dataset_slug, blend.name, expected_size)
 
         st = FleetState(job_id=job_id, blend_name=blend.name,
                         start_frame=start_frame, end_frame=end_frame,

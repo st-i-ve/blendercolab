@@ -5,7 +5,8 @@ import blendfleet.platform_paths as pp
 from blendfleet.accounts import Account
 from blendfleet.kaggle_client import KernelStatus, Quota
 from blendfleet.notebook_builder import RenderSettings
-from blendfleet.fleet import Fleet, FleetBusyError, UnreachableAccountsError, WorkerState
+from blendfleet.fleet import (Fleet, FleetBusyError, StaleDatasetError,
+                              UnreachableAccountsError, WorkerState)
 
 
 class FakeDatasetApiClient:
@@ -43,9 +44,16 @@ class FakeSdk:
             "dataset_api_client": FakeDatasetApiClient()})()
 
 
+# Every `blend`-shaped fixture in this file writes exactly this many bytes
+# (see the `blend` fixture below and the two ad hoc blends further down) --
+# FakeClient's default dataset_file_size mirrors it so the many tests that
+# don't care about Task 5's size-verification match with zero extra setup.
+BLEND_SIZE = 100
+
+
 class FakeClient:
     def __init__(self, token, state="running", dataset_exists=True,
-                 dataset_reachable=True):
+                 dataset_reachable=True, remote_file_sizes=None):
         self.token = token
         self.state = state
         self.pushed = 0
@@ -56,10 +64,20 @@ class FakeClient:
         self._dataset_reachable = dataset_reachable
         self.sdk = FakeSdk()
         self._sdk_factory = lambda tok: self.sdk
+        # filename -> size (or None for "missing"), as THIS account's
+        # dataset_list_files would report it. Any filename not overridden
+        # here defaults to BLEND_SIZE, i.e. "matches" -- a test simulating
+        # a stale/missing remote copy for one account passes an explicit
+        # override for that account's client only.
+        self._remote_file_sizes = dict(remote_file_sizes or {})
 
     def whoami(self): return "user_" + self.token[-1]
     def dataset_exists(self, slug): return self._dataset_exists
     def dataset_reachable(self, slug): return self._dataset_reachable
+    def dataset_file_size(self, slug, filename):
+        if filename in self._remote_file_sizes:
+            return self._remote_file_sizes[filename]
+        return BLEND_SIZE
     def dataset_create(self, folder, on_progress=None): self.dataset_creates += 1
     def dataset_version(self, folder, message, on_progress=None): self.dataset_versions += 1
     def push_kernel(self, folder): self.pushed += 1
@@ -182,6 +200,123 @@ def test_launch_refuses_when_a_friend_is_still_unreachable_after_grant(blend, tm
     message = str(exc_info.value)
     assert "user_" + unreachable_token[-1] in message
     # nothing must have been started
+    assert all(c.pushed == 0 for c in clients.values())
+    assert f.load() is None
+
+
+# ---------------------------------------------------------------------------
+# Task 5: dataset_reachable() only proves an account can see A copy -- not
+# that it's the RIGHT one. StaleDatasetError closes that gap. Covers both
+# shared mode (a friend's view of the owner's dataset) and the per-account
+# case (a lone account's own just-uploaded copy).
+# ---------------------------------------------------------------------------
+
+def test_launch_refuses_when_a_friends_dataset_size_differs_from_local(blend, tmp_path):
+    """Shared mode: a friend's visible copy of the SAME dataset is a
+    different size than the local .blend -- a stale copy from an earlier
+    upload. Must refuse, name that account, and push ZERO kernels (not
+    merely raise)."""
+    accts = accounts(3)
+    stale_token = accts[2].token
+    clients = {}
+
+    def factory(tok):
+        sizes = {blend.name: 999} if tok == stale_token else None
+        clients[tok] = FakeClient(tok, remote_file_sizes=sizes)
+        return clients[tok]
+
+    f = Fleet(accts, factory, tmp_path / "w")
+    with pytest.raises(StaleDatasetError) as exc_info:
+        f.launch(blend, RenderSettings(1920, 1080, 128), 1, 9)
+
+    message = str(exc_info.value)
+    assert "user_" + stale_token[-1] in message
+    assert "999" in message and str(BLEND_SIZE) in message
+    assert all(c.pushed == 0 for c in clients.values())
+    assert f.load() is None
+
+
+def test_launch_succeeds_when_every_accounts_dataset_size_matches(blend, tmp_path):
+    accts = accounts(3)
+    clients = {}
+
+    def factory(tok):
+        clients[tok] = FakeClient(tok, remote_file_sizes={blend.name: BLEND_SIZE})
+        return clients[tok]
+
+    f = Fleet(accts, factory, tmp_path / "w")
+    st = f.launch(blend, RenderSettings(1920, 1080, 128), 1, 9)
+    assert len(st.workers) == 3
+    assert all(c.pushed == 1 for c in clients.values())
+
+
+def test_launch_refuses_with_different_advice_when_a_friends_copy_is_missing(blend, tmp_path):
+    """A friend who can reach the dataset but whose listing has no file by
+    this name at all is a DIFFERENT failure than a size mismatch, and needs
+    different advice: re-share/retry, not re-upload."""
+    accts = accounts(2)
+    missing_token = accts[1].token
+    clients = {}
+
+    def factory(tok):
+        sizes = {blend.name: None} if tok == missing_token else None
+        clients[tok] = FakeClient(tok, remote_file_sizes=sizes)
+        return clients[tok]
+
+    f = Fleet(accts, factory, tmp_path / "w")
+    with pytest.raises(StaleDatasetError) as exc_info:
+        f.launch(blend, RenderSettings(1920, 1080, 128), 1, 9)
+
+    message = str(exc_info.value)
+    assert "user_" + missing_token[-1] in message
+    assert "re-share" in message.lower()
+    assert "re-upload" not in message.lower(), \
+        "missing-file advice must not be worded like a size mismatch"
+    assert all(c.pushed == 0 for c in clients.values())
+    assert f.load() is None
+
+
+def test_missing_and_mismatch_advice_differ(blend, tmp_path):
+    """Directly pin that the two failure messages actually differ in their
+    advice, not just in which account they name."""
+    accts = accounts(2)
+
+    def mismatch_factory(tok):
+        sizes = {blend.name: 1} if tok == accts[1].token else None
+        return FakeClient(tok, remote_file_sizes=sizes)
+
+    def missing_factory(tok):
+        sizes = {blend.name: None} if tok == accts[1].token else None
+        return FakeClient(tok, remote_file_sizes=sizes)
+
+    with pytest.raises(StaleDatasetError) as mismatch_exc:
+        Fleet(accts, mismatch_factory, tmp_path / "w1").launch(
+            blend, RenderSettings(1920, 1080, 128), 1, 9)
+    with pytest.raises(StaleDatasetError) as missing_exc:
+        Fleet(accts, missing_factory, tmp_path / "w2").launch(
+            blend, RenderSettings(1920, 1080, 128), 1, 9)
+
+    assert str(mismatch_exc.value) != str(missing_exc.value)
+    assert "re-upload" in str(mismatch_exc.value).lower()
+    assert "re-upload" not in str(missing_exc.value).lower()
+
+
+def test_launch_refuses_when_the_owners_own_upload_lands_with_the_wrong_size(blend, tmp_path):
+    """Per-account case: a single account, nobody to share with. Even here,
+    the owner's own just-uploaded copy must be confirmed the right size
+    before any kernel is pushed."""
+    clients = {}
+
+    def factory(tok):
+        clients[tok] = FakeClient(tok, remote_file_sizes={blend.name: 1})
+        return clients[tok]
+
+    f = Fleet(accounts(1), factory, tmp_path / "w")
+    with pytest.raises(StaleDatasetError) as exc_info:
+        f.launch(blend, RenderSettings(1920, 1080, 128), 1, 4)
+
+    message = str(exc_info.value)
+    assert "user_" + accounts(1)[0].token[-1] in message
     assert all(c.pushed == 0 for c in clients.values())
     assert f.load() is None
 
