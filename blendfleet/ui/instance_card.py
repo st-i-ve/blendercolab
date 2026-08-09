@@ -307,9 +307,17 @@ class InstanceCard(QWidget):
         # The status icon/word and the quota "live" marker are painted with
         # an explicit colour (current_accent().base at the moment they were
         # set), not through the QApplication stylesheet cascade -- so they
-        # need telling, explicitly, when the accent changes. Qt disconnects
-        # this automatically once this card is destroyed.
-        theme_signal.changed.connect(self.refresh_accent)
+        # need telling, explicitly, when the accent changes.
+        #
+        # theme_signal is a process-global QObject that outlives this card,
+        # so Qt's "disconnect automatically when the receiver is destroyed"
+        # only fires once the underlying C++ object is actually gone --
+        # not at close()/deleteLater() time, and (measured) not reliably
+        # inside a single test session's lifetime either. The connection
+        # handle connect() returns is what disconnect_theme_signal() below
+        # uses to remove this exact connection deterministically, instead
+        # of leaving it for eventual GC -- see that method's docstring.
+        self._accent_connection = theme_signal.changed.connect(self.refresh_accent)
 
     # ---------------- live accent switch ----------------
     def refresh_accent(self) -> None:
@@ -319,6 +327,32 @@ class InstanceCard(QWidget):
         without rebuilding (or restarting) this card."""
         self.quota_marker.setStyleSheet(f"color: {current_accent().base};")
         self.set_worker(self._worker)
+
+    def disconnect_theme_signal(self) -> None:
+        """Remove this card's connection to theme.theme_signal, exactly
+        once, idempotently.
+
+        Dashboard calls this both when a card is discarded (account list
+        change) and again at its own closeEvent as a backstop -- the same
+        card can legitimately go through both paths, and Dashboard.close()
+        itself can run more than once (the test harness's close_dashboards
+        fixture closes every still-registered Dashboard even if the test
+        already closed it, and QMainWindow.close() re-invokes closeEvent
+        every time, not just the first).
+
+        Disconnecting the same connection twice does not raise in PySide6
+        -- it emits an unclosable "libpyside: Failed to disconnect ...
+        RuntimeWarning" and returns, so a try/except around it catches
+        nothing (measured: 94 such warnings per tests/test_dashboard.py
+        run, each one an accumulating connection that made every later
+        theme.apply() slower). Tracking the connection handle and clearing
+        it to None after use makes a repeat call a no-op instead of a
+        repeat disconnect, so there is nothing left for PySide6 to warn
+        about.
+        """
+        if self._accent_connection is not None:
+            theme_signal.changed.disconnect(self._accent_connection)
+            self._accent_connection = None
 
     # ---------------- quota ----------------
     def set_quota(self, raw: str | None) -> None:

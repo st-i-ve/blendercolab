@@ -11,8 +11,8 @@ from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (QComboBox, QFileDialog, QFormLayout,
                                QHBoxLayout, QHeaderView, QLabel, QMainWindow,
                                QMessageBox, QProgressBar, QPushButton,
-                               QSpinBox, QTableWidget, QTableWidgetItem,
-                               QVBoxLayout, QWidget)
+                               QSizePolicy, QSpinBox, QTableWidget,
+                               QTableWidgetItem, QVBoxLayout, QWidget)
 
 from blendfleet.accounts import AccountStore
 from blendfleet.assignment import estimate
@@ -241,7 +241,12 @@ class Dashboard(QMainWindow):
         # just because theme.apply() changed the stylesheet -- see
         # theme.theme_signal's own docstring. This is what makes a Settings
         # accent change visible immediately instead of after a restart.
-        theme_signal.changed.connect(self._on_accent_changed)
+        #
+        # The handle connect() returns is kept (not discarded) so
+        # closeEvent can disconnect this exact connection deterministically
+        # -- see closeEvent's comment for why a bound-method disconnect
+        # alone is not enough.
+        self._accent_connection = theme_signal.changed.connect(self._on_accent_changed)
 
         # Real network calls (kernel status, quota) -- infrequent.
         self.timer = QTimer(self)
@@ -338,8 +343,40 @@ class Dashboard(QMainWindow):
         outer.addStretch(1)
         content = QWidget()
         content.setMaximumWidth(MAX_CONTENT_WIDTH)
-        outer.addWidget(content, 0)
+        # Stretch factor 0 (the pre-fix value) means QHBoxLayout hands 100%
+        # of surplus width to the flanking addStretch(1) spacers regardless
+        # of content's maximumWidth -- the spacers "win" the space race
+        # before the cap is ever consulted, and content sits at a constant
+        # ~453px whether the window is 1920 or 2560 wide (measured live;
+        # this was the actual, reproduced bug, not a hypothetical one).
+        #
+        # Qt's QBoxLayout splits available width among stretchable items in
+        # proportion to their stretch factors, THEN reallocates whatever an
+        # item can't use (because its maximumWidth caps it) to the other
+        # stretchable items in the same proportion. A factor of 1 -- equal
+        # to each spacer's -- only wins content 1/3 of the surplus, not
+        # "up to its cap first": measured content stuck at ~646px at both
+        # 1280 and 1920px window width, only reaching 746px at 2560, nowhere
+        # near the 1600px cap. Giving content a stretch factor that swamps
+        # the spacers' (10_000 vs. 1 each) makes it claim ~10000/10002 of
+        # main's width -- i.e. effectively all of it -- up to its
+        # maximumWidth cap; only once it is capped does the leftover
+        # (~2/10002 of surplus, now the whole remainder) fall through to
+        # the spacers as side gutters. Measured with this value: content
+        # tracks main's width exactly (960px at 1280, 1600px at 1920 --
+        # main's width there equals the cap, so no gutters, matching the
+        # documented "nothing changes at 1920 or below" design) and holds
+        # at the 1600px cap at 2560 with gutters absorbing the rest.
+        content.setSizePolicy(QSizePolicy.Policy.Expanding,
+                               QSizePolicy.Policy.Preferred)
+        outer.addWidget(content, 10_000)
         outer.addStretch(1)
+        # Exposed as an attribute (it was a bare local before) so a test can
+        # measure content.width() directly rather than re-deriving it from
+        # main's layout -- this is exactly the "verify by measurement, not
+        # description" gap that let the stretch-factor-0 bug above ship
+        # while a prior report claimed the layout worked.
+        self.content_column = content
 
         v = QVBoxLayout(content)
         v.setContentsMargins(MARGIN, MARGIN, MARGIN, MARGIN)
@@ -566,6 +603,16 @@ class Dashboard(QMainWindow):
         cache, cached hardware, current worker) via _refresh_views() below,
         so a freshly (re)built card is never blank until the next tick.
         """
+        # Disconnect each outgoing card from theme_signal explicitly rather
+        # than trust deleteLater() + Qt's auto-disconnect-on-destroy timing
+        # -- see closeEvent's comment for why that was measured unreliable.
+        # This can run more than once per Dashboard lifetime (account list
+        # changes), so it matters here too, not just at final close.
+        # disconnect_theme_signal() is idempotent (InstanceCard tracks its
+        # own connection handle), so calling it again from closeEvent later
+        # for a card already disconnected here is a safe no-op.
+        for card in self._instance_cards.values():
+            card.disconnect_theme_signal()
         while self.rail_rows_layout.count():
             item = self.rail_rows_layout.takeAt(0)
             w = item.widget()
@@ -1135,6 +1182,45 @@ class Dashboard(QMainWindow):
         self._stop.set()          # tells the daemon SSE threads to unwind
         self.timer.stop()
         self.live_timer.stop()
+        # theme_signal is a process-global QObject that outlives any one
+        # Dashboard -- deleteLater() + processEvents() (close_dashboards, in
+        # the test harness) schedules this window's own destruction, which
+        # normally auto-disconnects its signal connections too, but that is
+        # a matter of WHEN the C++ side actually goes, not immediate. Measured
+        # (Task 5 fix round 1) alongside a much bigger factor -- see
+        # tests/test_dashboard.py's _restore_active_accent fixture -- that a
+        # test session accumulating enough not-yet-fully-deleted Dashboards/
+        # InstanceCards still connected here made every later
+        # theme.apply()/theme_signal.changed.emit() progressively slower,
+        # which is what looked like a hang. Disconnecting explicitly here
+        # removes this dashboard's own connections the moment it closes
+        # instead of waiting on deletion timing.
+        #
+        # This used to be `try: disconnect(bound_method) except (RuntimeError,
+        # TypeError): pass`, on the theory that a repeat disconnect "just
+        # emits a RuntimeWarning ... not an error worth stopping for". That
+        # theory is what hid the actual bug: PySide6's disconnect() does not
+        # raise on a redundant disconnect, it warns and returns, so the
+        # except clause never ran and never could -- every one of those
+        # disconnects was silently failing. And closeEvent DOES run more
+        # than once per Dashboard in practice: QMainWindow.close()
+        # re-invokes closeEvent every time it is called, including
+        # close_dashboards' teardown call after a test already closed the
+        # same dashboard itself (measured: 94 "Failed to disconnect"
+        # warnings across tests/test_dashboard.py, one per redundant
+        # disconnect, each leaving theme_signal connected to a widget this
+        # window no longer owns).
+        #
+        # The fix is to make a repeat call a no-op instead of a repeat
+        # disconnect, by tracking whether we are still connected -- the
+        # `_accent_connection` handle __init__ stored, cleared to None the
+        # first time it is actually used. No warning is possible because
+        # disconnect() is never asked to remove the same connection twice.
+        if self._accent_connection is not None:
+            theme_signal.changed.disconnect(self._accent_connection)
+            self._accent_connection = None
+        for card in self._instance_cards.values():
+            card.disconnect_theme_signal()
         # Threads must not outlive the window (FINDING 1, task 5 fix
         # round 1): wait for whichever _CallWorker/_LaunchWorker happens
         # to be in flight rather than letting Qt destroy a QObject whose

@@ -34,11 +34,18 @@ def qapp():
 def _restore_active_accent():
     """SettingsView calls theme.apply() live -- see test_theme.py's own
     fixture of the same name for why that state must not leak into later
-    test modules in the same pytest session."""
+    test modules in the same pytest session.
+
+    Only actually calls theme.apply() -- which restyles the WHOLE
+    QApplication, every widget any earlier test left alive under the one
+    shared QApplication included -- when a test genuinely changed the
+    accent; see tests/test_dashboard.py's fixture of the same name for
+    the measured cost of calling it unconditionally on every teardown."""
     original = theme._active_accent_name
     yield
-    theme._active_accent_name = original
-    theme.apply(QApplication.instance(), original)
+    if theme._active_accent_name != original:
+        theme._active_accent_name = original
+        theme.apply(QApplication.instance(), original)
 
 
 # Every SettingsView a test builds, torn down deterministically -- same

@@ -4,7 +4,7 @@ import time
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PySide6.QtCore import QCoreApplication, Qt
+from PySide6.QtCore import SIGNAL, QCoreApplication, QEvent, Qt
 from PySide6.QtWidgets import QApplication
 
 import blendfleet.platform_paths as pp
@@ -37,11 +37,24 @@ def _restore_active_accent(qapp):
     below calls theme.apply() with every non-default accent -- see
     test_theme.py's fixture of the same name for why that process-global
     state must not leak into other test modules run later in the same
-    session."""
+    session.
+
+    Only actually calls theme.apply() -- which restyles the WHOLE
+    QApplication, including every widget any earlier test in this
+    session left alive under the one shared QApplication -- when a test
+    genuinely changed the accent. Measured: calling it unconditionally on
+    every test's teardown (this file, test_instance_card.py and
+    test_settings_view.py all did) made test_dashboard.py alone take 75s
+    for 36 tests instead of a few seconds, growing call over call, and
+    made a full-suite run look like a hang rather than a slow pass. Only
+    a handful of tests in this file ever change the accent; the other
+    ~30+ do not need this at all.
+    """
     original = theme._active_accent_name
     yield
-    theme._active_accent_name = original
-    theme.apply(qapp, original)
+    if theme._active_accent_name != original:
+        theme._active_accent_name = original
+        theme.apply(qapp, original)
 
 
 @pytest.fixture(autouse=True)
@@ -87,8 +100,24 @@ def close_dashboards(qapp):
         dash.deleteLater()
     # deleteLater is only honoured while events are being processed; without
     # this the C++ objects would still be alive and back on the GC's terms.
+    #
+    # processEvents() alone is not enough, though it looks like it should
+    # be: measured directly (no test framework involved) that 30+ calls to
+    # plain processEvents() after deleteLater() leave every widget of a
+    # closed, deleteLater()'d Dashboard still in QApplication.allWidgets()
+    # -- Qt does not fold DeferredDelete into a manual processEvents() pass
+    # the way it does for a real app.exec() loop. The explicit
+    # sendPostedEvents(None, DeferredDelete) call below is what actually
+    # flushes it; without it every Dashboard built by an earlier test in
+    # this module survives (as real, live QWidgets) for the rest of the
+    # session, and each one makes theme.apply()'s app.setStyleSheet() --
+    # which restyles every widget currently in the QApplication, not just
+    # the one that changed -- slower for every subsequent accent switch.
+    # This is what actually explained test_dashboard.py's runtime, not (or
+    # not only) the theme_signal disconnect leak fixed alongside this.
     for _ in range(20):
         QCoreApplication.processEvents()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
 
 def pump(worker, timeout=2000) -> None:
@@ -141,16 +170,10 @@ def wait_until(condition, timeout=2.0) -> None:
         time.sleep(0.01)
 
 
-def stub_message_boxes(monkeypatch):
-    calls = {"warning": [], "critical": [], "information": []}
-    for kind in calls:
-        monkeypatch.setattr(
-            f"blendfleet.ui.dashboard.QMessageBox.{kind}",
-            lambda parent, title, message, k=kind: calls[k].append((title, message)))
-    monkeypatch.setattr(
-        "blendfleet.ui.dashboard.QMessageBox.question",
-        lambda *a, **kw: dashboard_mod.QMessageBox.StandardButton.Yes)
-    return calls
+# stub_message_boxes now lives in tests/conftest.py as a fixture -- the
+# sanctioned opt-in for a test that legitimately expects a dialog, paired
+# with the autouse no_unstubbed_dialogs guard that fails loudly (instead of
+# hanging) on any QMessageBox this module doesn't explicitly stub.
 
 
 class FakeSdk:
@@ -421,8 +444,8 @@ def test_launch_success_updates_upload_filmstrip_and_table(qapp, tmp_path):
     dash.close()
 
 
-def test_launch_failure_shows_friendly_message_not_raw_exception(qapp, tmp_path, monkeypatch):
-    calls = stub_message_boxes(monkeypatch)
+def test_launch_failure_shows_friendly_message_not_raw_exception(qapp, tmp_path, stub_message_boxes):
+    calls = stub_message_boxes
     FakeClient.fail_upload = True
     try:
         dash = make_dashboard(qapp, tmp_path)
@@ -448,8 +471,8 @@ def test_launch_failure_shows_friendly_message_not_raw_exception(qapp, tmp_path,
         FakeClient.fail_upload = False
 
 
-def test_launch_with_no_accounts_shows_actionable_warning(qapp, tmp_path, monkeypatch):
-    calls = stub_message_boxes(monkeypatch)
+def test_launch_with_no_accounts_shows_actionable_warning(qapp, tmp_path, stub_message_boxes):
+    calls = stub_message_boxes
     dash = make_dashboard(qapp, tmp_path, store=AccountStore())
     dash.blend = tmp_path / "x.blend"
     dash._launch()
@@ -459,8 +482,8 @@ def test_launch_with_no_accounts_shows_actionable_warning(qapp, tmp_path, monkey
     dash.close()
 
 
-def test_launch_with_bad_frame_range_shows_actionable_warning(qapp, tmp_path, monkeypatch):
-    calls = stub_message_boxes(monkeypatch)
+def test_launch_with_bad_frame_range_shows_actionable_warning(qapp, tmp_path, stub_message_boxes):
+    calls = stub_message_boxes
     dash = make_dashboard(qapp, tmp_path)
     blend = tmp_path / "remember.blend"
     blend.write_bytes(b"x" * 10)
@@ -763,6 +786,68 @@ def test_show_at_startup_honours_a_stored_fullscreen_preference(qapp, tmp_path):
     dash.close()
 
 
+# ------------- content column width (Task 6 visual-pass fix) -------------
+# The bug: outer.addWidget(content, 0) in _build_main handed 100% of
+# surplus width to the two flanking addStretch(1) spacers regardless of
+# content's maximumWidth, so content sat at a MEASURED constant ~453px
+# whether the window was 1920 or 2560px wide -- a prior report claimed
+# this layout worked without ever querying a width, and a reviewer
+# disproved it in one measurement. This test measures, it does not
+# describe: it is the thing that would have caught the original bug and
+# must keep catching any regression back to it.
+
+def test_content_column_grows_with_window_but_never_exceeds_the_cap(
+        qapp, tmp_path):
+    dash = make_dashboard(qapp, tmp_path, n=1)
+    dash.show()
+    widths = {}
+    for w in (1280, 1920, 2560):
+        dash.resize(w, 900)
+        for _ in range(30):
+            QCoreApplication.processEvents()
+        widths[w] = dash.content_column.width()
+    dash.close()
+
+    assert widths[1280] < widths[2560], (
+        "content_column must grow as the window widens from 1280 to "
+        f"2560px -- measured widths: {widths}. A constant width here is "
+        "exactly the stretch-factor-0 bug this test guards against.")
+    assert widths[1920] <= dashboard_mod.MAX_CONTENT_WIDTH
+    assert widths[2560] <= dashboard_mod.MAX_CONTENT_WIDTH, (
+        f"content_column exceeded MAX_CONTENT_WIDTH "
+        f"({dashboard_mod.MAX_CONTENT_WIDTH}px) at 2560px window width: "
+        f"{widths[2560]}px")
+
+
+# ---------------- settings dialog (opened from the rail) -----------------
+
+def test_open_settings_shows_a_settings_view_for_the_dashboards_settings(
+        qapp, tmp_path, monkeypatch):
+    """Nothing before this exercised Dashboard._open_settings or a click on
+    settings_btn -- only SettingsView in isolation (see test_settings_view.py).
+    SettingsView.exec() drives its own modal event loop that only returns on
+    a click nothing under QT_QPA_PLATFORM=offscreen will ever deliver, so
+    exec itself is stubbed here (recording the instance instead of blocking)
+    rather than actually shown -- the same reasoning as
+    tests/conftest.py's no_unstubbed_dialogs guard, just for a QDialog
+    instead of a QMessageBox."""
+    opened = []
+
+    def fake_exec(self):
+        opened.append(self)
+        return dashboard_mod.SettingsView.DialogCode.Accepted
+
+    monkeypatch.setattr(dashboard_mod.SettingsView, "exec", fake_exec)
+
+    dash = make_dashboard(qapp, tmp_path, n=1)
+    dash.settings_btn.click()
+
+    assert len(opened) == 1
+    assert isinstance(opened[0], dashboard_mod.SettingsView)
+    assert opened[0].settings is dash.settings
+    dash.close()
+
+
 # ---------------- accent: live, without a restart (Task 6) ----------------
 # THE bug the Task 6 brief calls out by name: rendering with the red accent
 # selected used to produce zero red pixels anywhere, because dashboard.py
@@ -809,6 +894,47 @@ def test_switching_accent_live_also_repaints_every_instance_card(
     image = dash._instance_cards["acct0"].status_icon.pixmap().toImage()
     assert _image_has_color(image, ACCENTS["red"].base)
     dash.close()
+
+
+def test_closing_many_dashboards_does_not_leak_theme_signal_connections(
+        qapp, tmp_path):
+    """Regression test for the signal-lifetime leak fixed in Task 6.
+
+    theme.theme_signal is a process-global QObject that outlives every
+    Dashboard/InstanceCard connected to it. closeEvent used to try
+    `disconnect(bound_method)` wrapped in `except (RuntimeError,
+    TypeError)`, on the theory that a redundant disconnect "just emits a
+    RuntimeWarning ... not an error worth stopping for" -- but PySide6's
+    disconnect() does not raise on a redundant disconnect, so the except
+    clause never fired and never could, and every leftover connection
+    made theme.apply()/theme_signal.changed.emit() a little slower for
+    every later accent change (measured: 94 warnings and a 55s ->
+    expected ~10s tests/test_dashboard.py runtime before this fix).
+
+    A count of "Failed to disconnect" warnings would pass again the
+    moment PySide6 changes that message. What actually matters, and what
+    this asserts, is the property the warning was only a symptom of: the
+    number of live receivers on theme_signal.changed must return to its
+    starting point once every Dashboard/InstanceCard this test opened has
+    been closed and torn down -- not grow with each one, the way it would
+    if disconnecting were unreliable.
+    """
+    baseline = theme.theme_signal.receivers(SIGNAL("changed()"))
+    for _ in range(5):
+        dash = make_dashboard(qapp, tmp_path, n=3)
+        dash.close()
+        settle(dash)
+        dash.deleteLater()
+    for _ in range(20):
+        QCoreApplication.processEvents()
+
+    after = theme.theme_signal.receivers(SIGNAL("changed()"))
+    assert after == baseline, (
+        f"theme_signal.changed had {baseline} receiver(s) before this test "
+        f"opened and closed 5 Dashboards (3 InstanceCards each) and "
+        f"{after} after -- closing a Dashboard must remove its own and "
+        "every one of its cards' connections, not leave them for Qt's "
+        "eventual (and here, unreliable) auto-disconnect-on-destroy.")
 
 
 def test_the_filmstrip_tells_the_user_its_completed_cells_are_approximate(qapp, tmp_path):

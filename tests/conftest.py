@@ -1,9 +1,9 @@
 """Suite-wide safety nets.
 
-Two of them, both autouse, both there for the same reason: the merge gate
-must be deterministic and must never touch the network.
+Three of them, all autouse, all there for the same reason: the merge gate
+must be deterministic and must never hang or touch the network.
 
-The bug they exist to prevent was real. tests/test_dashboard.py's
+The first two guards' bug was real. tests/test_dashboard.py's
 launch-success test did not stub `stream_progress`, so Dashboard's
 `_start_progress_threads` spawned real daemon threads that opened real
 HTTPS connections to kaggle.com with fake `KGAT_000…` tokens. Nothing
@@ -13,6 +13,17 @@ died with `Fatal Python error: Aborted`. A test that only *sometimes*
 reaches the network is worse than one that always does, because it passes
 in review and fails in CI, so these guards make both failure modes loud and
 immediate rather than probabilistic.
+
+The third guard's bug was also real, and more recent (Task 5's fix round
+1): a previously-always-succeeding dashboard test started failing once a
+new pre-launch check was added, its `QMessageBox.critical` failure path
+was never stubbed, and a REAL modal dialog under
+QT_QPA_PLATFORM=offscreen has no click to dismiss it -- the suite hung
+for 10+ minutes instead of reporting one failing test. Only 3 of that
+module's ~20 launch tests stubbed message boxes; the other ~17 relied on
+the success path never failing. `no_unstubbed_dialogs` below turns the
+NEXT such gap into an immediate, named assertion failure instead of a
+repeat of that hang.
 """
 from __future__ import annotations
 
@@ -21,6 +32,7 @@ import threading
 import time
 
 import pytest
+from PySide6.QtWidgets import QMessageBox
 
 
 class NetworkAccessInTestError(RuntimeError):
@@ -29,6 +41,16 @@ class NetworkAccessInTestError(RuntimeError):
 
 class LeakedThreadError(RuntimeError):
     """A test left a thread running past its own scope."""
+
+
+class UnstubbedDialogError(RuntimeError):
+    """A test reached a real QMessageBox instead of stubbing it.
+
+    Raised instead of letting the dialog actually show: under
+    QT_QPA_PLATFORM=offscreen a real modal dialog blocks forever waiting
+    for a click nothing will ever deliver, which is a hang, not a failure
+    -- see this module's docstring.
+    """
 
 
 # How long a thread started during a test may take to unwind after the test
@@ -115,3 +137,57 @@ def no_leaked_threads():
             f"returned: {names}. Every thread a test starts must be joined "
             "or stopped inside that test -- one still in flight during the "
             "next module's teardown is how this suite used to abort.")
+
+
+_DIALOG_KINDS = ("critical", "warning", "information", "question")
+
+
+@pytest.fixture(autouse=True)
+def no_unstubbed_dialogs(request, monkeypatch):
+    """Fail immediately, by name, if a real QMessageBox is about to show.
+
+    Patches the QMessageBox class itself (not a particular module's import
+    of it), so it holds regardless of which module reaches for
+    critical/warning/information/question -- same reasoning as no_network
+    blocking at the socket layer rather than at one caller.
+
+    A test that legitimately expects a dialog opts in with the
+    stub_message_boxes fixture below, which overrides these guards for
+    that test only (fixtures share one monkeypatch, so the later
+    monkeypatch.setattr wins and is unwound first when the test ends).
+    """
+    test_name = request.node.name
+
+    def make_guard(kind):
+        def guard(*args, **kwargs):
+            raise UnstubbedDialogError(
+                f"{test_name} triggered a real QMessageBox.{kind}(...) "
+                "without stubbing it. A real modal dialog blocks forever "
+                "under QT_QPA_PLATFORM=offscreen -- there is no click to "
+                "dismiss it, so this would hang the whole suite instead "
+                "of failing this one test. Add the stub_message_boxes "
+                "fixture to this test if a dialog is actually expected.")
+        return guard
+
+    for kind in _DIALOG_KINDS:
+        monkeypatch.setattr(QMessageBox, kind, make_guard(kind))
+
+
+@pytest.fixture
+def stub_message_boxes(monkeypatch):
+    """Sanctioned opt-in for a test that legitimately expects a dialog --
+    silences no_unstubbed_dialogs above for exactly this test.
+
+    Returns {"warning": [...], "critical": [...], "information": [...]} of
+    (title, message) pairs recorded instead of shown. question() always
+    answers Yes -- the only answer any current caller needs (Dashboard's
+    confirm-before-cancel-all).
+    """
+    calls = {"warning": [], "critical": [], "information": []}
+    for kind in calls:
+        monkeypatch.setattr(
+            QMessageBox, kind,
+            lambda parent, title, message, k=kind: calls[k].append((title, message)))
+    monkeypatch.setattr(QMessageBox, "question",
+                        lambda *a, **kw: QMessageBox.StandardButton.Yes)
+    return calls

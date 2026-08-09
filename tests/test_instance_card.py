@@ -27,11 +27,18 @@ def _restore_active_accent(qapp):
     """test_switching_accent_actually_repaints_the_status_icon below calls
     theme.apply() with every non-default accent -- see test_theme.py's
     fixture of the same name for why that process-global state must not
-    leak into other test modules that run later in the same session."""
+    leak into other test modules that run later in the same session.
+
+    Only actually calls theme.apply() -- which restyles the WHOLE
+    QApplication, every widget any earlier test left alive under the one
+    shared QApplication included -- when a test genuinely changed the
+    accent; see tests/test_dashboard.py's fixture of the same name for
+    the measured cost of calling it unconditionally on every teardown."""
     original = theme._active_accent_name
     yield
-    theme._active_accent_name = original
-    theme.apply(qapp, original)
+    if theme._active_accent_name != original:
+        theme._active_accent_name = original
+        theme.apply(qapp, original)
 
 
 def _image_has_color(image, hex_color: str) -> bool:
