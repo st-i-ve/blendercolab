@@ -16,7 +16,12 @@ here instead, so the whole app can only ever have one look.
 """
 from __future__ import annotations
 
-from PySide6.QtGui import QColor, QFont
+from dataclasses import dataclass
+from pathlib import Path
+
+from PySide6.QtCore import QByteArray, QSize, Qt
+from PySide6.QtGui import QColor, QFont, QFontDatabase, QIcon, QPainter, QPixmap
+from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import QApplication
 
 # ---------------- palette ----------------
@@ -26,15 +31,91 @@ from PySide6.QtWidgets import QApplication
 BG_SHELL = "#16181D"        # window / shell background
 BG_SURFACE = "#1E212A"      # raised surfaces: rail, cards, table
 BORDER = "#2A2F3A"          # dividers, borders, unfilled/gap cells
-ACCENT = "#F5792A"          # primary accent -- Blender orange
 WARNING = "#E8B33A"         # unverified / retrying / failed -- amber, NEVER
                              # paired with a red/green opposite: ~8% of men
-                             # cannot reliably tell that pair apart.
+                             # cannot reliably tell that pair apart. This is
+                             # a FIXED colour, independent of the selected
+                             # accent -- see AccentPalette below. If it were
+                             # derived from the accent, picking the red
+                             # accent would make error states visually
+                             # indistinguishable from ordinary chrome.
 TELEMETRY = "#4FD1C5"       # GPU utilisation/memory sparklines -- a cool
                              # teal so telemetry never competes visually
-                             # with the orange accent used for actions/state.
+                             # with the accent used for actions/state.
 TEXT_PRIMARY = "#C9CEDB"
 TEXT_SECONDARY = "#7C859B"
+
+
+# ---------------- accents ----------------
+@dataclass(frozen=True)
+class AccentPalette:
+    """The token set one accent colour expands into.
+
+    hover/pressed/disabled are computed from `base` (see `_accent` below)
+    rather than hand-listed per colour, so adding a new accent to ACCENTS
+    is one line, and every accent is guaranteed to define the full set --
+    no KeyError at paint time for a colour that forgot a shade.
+    """
+    base: str
+    hover: str
+    pressed: str
+    disabled: str
+
+
+def _mix(a: QColor, b: QColor, t: float) -> str:
+    """Linear RGB blend of `a` toward `b` by `t` in [0, 1], as a hex string."""
+    r = round(a.red() * (1 - t) + b.red() * t)
+    g = round(a.green() * (1 - t) + b.green() * t)
+    bch = round(a.blue() * (1 - t) + b.blue() * t)
+    return QColor(r, g, bch).name()
+
+
+def _accent(base: str) -> AccentPalette:
+    c = QColor(base)
+    return AccentPalette(
+        base=base,
+        hover=c.lighter(115).name(),
+        pressed=c.darker(115).name(),
+        # Muted toward the border colour, not black -- a disabled accent
+        # chip should read as "this surface", not "this surface plus a
+        # shadow".
+        disabled=_mix(c, QColor(BORDER), 0.6),
+    )
+
+
+# Every base value below is checked against BG_SHELL for >= 4.5:1 contrast
+# in tests/test_theme.py using the WCAG relative-luminance formula -- not
+# eyeballed. Red is the accent most likely to run short of that margin
+# against a dark shell, so its base sits comfortably above the threshold
+# (~4.9:1) rather than right at it.
+ACCENTS: dict[str, AccentPalette] = {
+    "orange": _accent("#F5792A"),   # Blender orange -- the original accent
+    "green": _accent("#4CAF6D"),
+    "purple": _accent("#9B7EDE"),
+    "blue": _accent("#5FB0F0"),
+    "red": _accent("#E85454"),
+}
+DEFAULT_ACCENT = "orange"
+
+
+def resolve_accent(name: str) -> AccentPalette:
+    """The named palette, or the default's if `name` is not one ACCENTS
+    knows about.
+
+    Falling back rather than raising is deliberate: a hand-edited config,
+    or a settings.json written by a future version with an accent this
+    build has never heard of, must not brick the app on startup with no
+    UI left to fix it from.
+    """
+    return ACCENTS.get(name, ACCENTS[DEFAULT_ACCENT])
+
+
+# Backward-compatible module-level accent -- other modules import this by
+# value (`from blendfleet.ui.theme import ACCENT`), which only reflects
+# whichever accent was active at import time. Re-theming code that needs
+# to follow a live accent switch should use resolve_accent()/apply()
+# instead of this constant.
+ACCENT = ACCENTS[DEFAULT_ACCENT].base
 
 # A small, fixed set of account tint colours for the filmstrip and rail
 # status dots. Cycled by account index. Deliberately distinct in both hue
@@ -57,10 +138,65 @@ def account_color(index: int) -> QColor:
 
 
 # ---------------- type ----------------
-UI_FONT_FAMILY = "Segoe UI Variable"
+# One typeface (Roboto, in its proportional and monospace forms), bundled
+# and registered from assets/fonts/ rather than relying on whatever the OS
+# happens to have installed -- Segoe UI Variable/Cascadia Mono are Windows
+# names that would silently be a different look (or a different font
+# entirely) on the Linux build this app is headed for. See register_fonts().
+UI_FONT_FAMILY = "Roboto"
 UI_FONT_FALLBACK = "Segoe UI"
-MONO_FONT_FAMILY = "Cascadia Mono"
+MONO_FONT_FAMILY = "Roboto Mono"
 MONO_FONT_FALLBACK = "Consolas"
+
+ASSETS_DIR = Path(__file__).resolve().parents[2] / "assets"
+FONTS_DIR = ASSETS_DIR / "fonts"
+ICONS_DIR = ASSETS_DIR / "icons"
+
+# The five TTFs vendored under assets/fonts/ (Apache-2.0) -- every one of
+# them must register, not just enough to make the family name resolve, so
+# that requesting the Medium/Bold weights doesn't silently synthesise them.
+FONT_FILES = [
+    "Roboto-Regular.ttf",
+    "Roboto-Medium.ttf",
+    "Roboto-Bold.ttf",
+    "RobotoMono-Regular.ttf",
+    "RobotoMono-Medium.ttf",
+]
+
+_registered_font_families: list[str] | None = None
+
+
+def register_fonts() -> list[str]:
+    """Register the bundled Roboto/Roboto Mono fonts with Qt's font
+    database and return the family names Qt resolved each file to.
+
+    Must run after a QApplication/QGuiApplication exists (QFontDatabase
+    needs one). A silent fallback to a system face is the failure mode
+    this guards against -- addApplicationFont() returning a non-negative
+    id only means Qt parsed the file, not that the family name callers
+    expect ("Roboto", "Roboto Mono") is what came back. Idempotent: calling
+    it again (e.g. because apply() ran again for an accent switch) does
+    not re-register the files, it just returns the cached result.
+    """
+    global _registered_font_families
+    if _registered_font_families is not None:
+        return _registered_font_families
+    families: list[str] = []
+    for filename in FONT_FILES:
+        path = FONTS_DIR / filename
+        font_id = QFontDatabase.addApplicationFont(str(path))
+        if font_id == -1:
+            raise RuntimeError(
+                f"failed to register bundled font {filename!r} from {path} "
+                "-- Qt could not parse it")
+        resolved = QFontDatabase.applicationFontFamilies(font_id)
+        if not resolved:
+            raise RuntimeError(
+                f"{filename!r} registered but Qt returned no family name "
+                "for it")
+        families.extend(resolved)
+    _registered_font_families = families
+    return families
 
 
 def mono_font(point_size: int = 9) -> QFont:
@@ -82,7 +218,12 @@ def ui_font(point_size: int = 9) -> QFont:
     return font
 
 
-STYLESHEET = f"""
+def _stylesheet(accent: AccentPalette) -> str:
+    """The whole application stylesheet, parameterised by the active
+    accent. Everything that used to be the literal ACCENT constant now
+    reads from `accent.base`/`accent.hover` so switching accents at
+    runtime is a matter of calling this again with a different palette."""
+    return f"""
 * {{
     color: {TEXT_PRIMARY};
     font-family: "{UI_FONT_FAMILY}", "{UI_FONT_FALLBACK}", sans-serif;
@@ -120,11 +261,11 @@ QPushButton {{
 }}
 
 QPushButton:hover {{
-    border-color: {ACCENT};
+    border-color: {accent.base};
 }}
 
 QPushButton:pressed {{
-    background-color: {ACCENT};
+    background-color: {accent.base};
     color: {BG_SHELL};
 }}
 
@@ -135,22 +276,22 @@ QPushButton:disabled {{
 
 QPushButton:focus, QSpinBox:focus, QComboBox:focus, QLineEdit:focus,
 QListWidget:focus, QTableWidget:focus {{
-    border: 2px solid {ACCENT};
+    border: 2px solid {accent.base};
 }}
 
 #primaryButton {{
-    background-color: {ACCENT};
+    background-color: {accent.base};
     color: {BG_SHELL};
     font-weight: 600;
-    border: 1px solid {ACCENT};
+    border: 1px solid {accent.base};
 }}
 
 #primaryButton:hover {{
-    background-color: #FF8A3D;
+    background-color: {accent.hover};
 }}
 
 #primaryButton:disabled {{
-    background-color: {BORDER};
+    background-color: {accent.disabled};
     color: {TEXT_SECONDARY};
     border-color: {BORDER};
 }}
@@ -160,7 +301,7 @@ QLineEdit, QSpinBox, QComboBox {{
     border: 1px solid {BORDER};
     border-radius: 4px;
     padding: 4px 6px;
-    selection-background-color: {ACCENT};
+    selection-background-color: {accent.base};
 }}
 
 QListWidget::item, QTableWidget::item {{
@@ -188,7 +329,7 @@ QProgressBar {{
 }}
 
 QProgressBar::chunk {{
-    background-color: {ACCENT};
+    background-color: {accent.base};
     border-radius: 3px;
 }}
 
@@ -214,15 +355,80 @@ QMessageBox {{
 """
 
 
-def apply_theme(app: QApplication) -> None:
-    """Apply the one BlendFleet theme to the whole application.
+# Backward-compatible: the default-accent stylesheet, computed eagerly.
+# Nothing in this codebase imports it, but it mirrors ACCENT above so a
+# caller reaching for the pre-Task-1 name still gets a working stylesheet.
+STYLESHEET = _stylesheet(ACCENTS[DEFAULT_ACCENT])
 
-    Call this exactly once, right after constructing QApplication, before
-    any window or dialog is shown -- a stylesheet set at the QApplication
-    level cascades to every widget created afterwards, including dialogs
-    (SetupDialog) opened later. That is the mechanism that guarantees no
+
+def apply(app: QApplication, accent: str = DEFAULT_ACCENT) -> None:
+    """Apply the BlendFleet theme to the whole application for the given
+    accent, registering the bundled fonts on first call.
+
+    Re-appliable at runtime: calling this again with a different accent
+    name (e.g. after the user changes it in settings) re-derives the
+    stylesheet and sets it again -- nothing here accumulates state across
+    calls other than the one-time font registration. An accent name
+    ACCENTS doesn't recognise falls back to the default rather than
+    raising, via resolve_accent().
+
+    Called once, right after constructing QApplication and before any
+    window or dialog is shown, a stylesheet set at the QApplication level
+    cascades to every widget created afterwards, including dialogs
+    (SetupDialog) opened later -- that is the mechanism that guarantees no
     dialog is ever left unstyled.
     """
+    register_fonts()
+    palette = resolve_accent(accent)
     app.setStyle("Fusion")
     app.setFont(ui_font())
-    app.setStyleSheet(STYLESHEET)
+    app.setStyleSheet(_stylesheet(palette))
+
+
+def apply_theme(app: QApplication) -> None:
+    """Backward-compatible entry point: apply() with the default accent."""
+    apply(app, DEFAULT_ACCENT)
+
+
+# ---------------- icons ----------------
+def icon(name: str, color: str, size: int = 24) -> QIcon:
+    """Load `assets/icons/<name>.svg` and recolour its stroke to `color`.
+
+    The bundled SVGs use stroke="currentColor" so they can be tinted to
+    follow whichever accent is active without shipping a copy per colour.
+    Qt's SVG renderer does not resolve CSS `currentColor` on its own, so
+    the substitution happens on the raw markup before rendering.
+
+    Raises FileNotFoundError for an unknown name and ValueError if the
+    file doesn't render to a usable icon -- both cases that would
+    otherwise show up at runtime as a blank square rather than a test
+    failure.
+    """
+    path = ICONS_DIR / f"{name}.svg"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"no bundled icon named {name!r} (looked for {path})")
+    svg_text = path.read_text(encoding="utf-8").replace("currentColor", color)
+    renderer = QSvgRenderer(QByteArray(svg_text.encode("utf-8")))
+    if not renderer.isValid():
+        raise ValueError(f"icon {name!r} did not parse as valid SVG")
+    pixmap = QPixmap(QSize(size, size))
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    try:
+        renderer.render(painter)
+    finally:
+        painter.end()
+    if pixmap.isNull():
+        raise ValueError(f"icon {name!r} rendered a null pixmap")
+    return QIcon(pixmap)
+
+
+# Every icon name the app is documented to reference (see the Task 1
+# brief) -- tested in tests/test_theme.py so a missing file fails a test
+# rather than rendering a blank square at runtime.
+ICON_NAMES = [
+    "check", "x", "circle-check", "circle-alert", "triangle-alert",
+    "loader-circle", "upload", "download", "cpu", "activity", "settings",
+    "plus", "trash-2", "play", "square", "folder-open", "users", "monitor",
+]
