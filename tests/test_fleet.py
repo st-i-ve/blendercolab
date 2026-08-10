@@ -586,6 +586,173 @@ def test_cancel_all_with_no_job_returns_empty(tmp_path):
     assert f.cancel_all() == []
 
 
+# ---------------------------------------------------------------------------
+# Task 3: cancel_worker(label) -- the per-instance counterpart to
+# cancel_all(). Must touch exactly one account's client and leave every
+# other account's cancel() uncalled, not merely "not raise".
+# ---------------------------------------------------------------------------
+
+def test_cancel_worker_cancels_only_that_worker_and_leaves_others_running(
+        blend, tmp_path):
+    clients = {}
+    def factory(tok):
+        clients[tok] = FakeClient(tok); return clients[tok]
+    accts = accounts(3)
+    f = Fleet(accts, factory, tmp_path / "w")
+    f.launch(blend, RenderSettings(1920, 1080, 128), 1, 9)
+    f.poll()  # FakeClient.status() defaults to state="running"
+
+    result = f.cancel_worker("a1")
+
+    assert result is not None
+    assert result.ok is True
+    assert result.label == "a1"
+    assert clients[accts[1].token].cancelled == [result.kernel_slug]
+    # the whole point: the other two accounts' cancel() must never be
+    # called at all, not merely "no exception was raised".
+    assert clients[accts[0].token].cancelled == []
+    assert clients[accts[2].token].cancelled == []
+
+
+def test_cancel_worker_on_an_already_finished_worker_is_a_no_op(blend, tmp_path):
+    clients = {}
+    def factory(tok):
+        clients[tok] = FakeClient(tok, "complete"); return clients[tok]
+    f = Fleet(accounts(2), factory, tmp_path / "w")
+    f.launch(blend, RenderSettings(1920, 1080, 128), 1, 4)
+    f.poll()
+
+    result = f.cancel_worker("a0")
+
+    assert result is None, "an already-finished worker must be a no-op, not an error"
+    assert all(c.cancelled == [] for c in clients.values())
+
+
+def test_cancel_worker_on_a_still_queued_worker_actually_cancels_it(blend, tmp_path):
+    """queued is active (kaggle_client.ACTIVE_STATES), not finished -- a
+    kernel that has not started rendering yet still deserves a real
+    cancel, not a no-op."""
+    clients = {}
+    def factory(tok):
+        clients[tok] = FakeClient(tok, "queued"); return clients[tok]
+    f = Fleet(accounts(1), factory, tmp_path / "w")
+    f.launch(blend, RenderSettings(1920, 1080, 128), 1, 4)
+    f.poll()
+
+    result = f.cancel_worker("a0")
+
+    assert result is not None
+    assert result.ok is True
+    assert list(clients.values())[0].cancelled == [result.kernel_slug]
+
+
+def test_cancel_worker_with_no_job_is_a_no_op(tmp_path):
+    f = Fleet(accounts(1), lambda t: FakeClient(t), tmp_path / "w")
+    assert f.cancel_worker("a0") is None
+
+
+def test_cancel_worker_with_an_unknown_label_is_a_no_op(blend, tmp_path):
+    f = Fleet(accounts(2), lambda t: FakeClient(t), tmp_path / "w")
+    f.launch(blend, RenderSettings(1920, 1080, 128), 1, 4)
+    assert f.cancel_worker("does-not-exist") is None
+
+
+def test_cancel_worker_reports_a_raised_cancel_as_failure(blend, tmp_path):
+    accts = accounts(2)
+    bad = accts[0].token
+
+    def factory(tok):
+        return (RaisingCancelClient if tok == bad else FakeClient)(tok)
+
+    f = Fleet(accts, factory, tmp_path / "w")
+    f.launch(blend, RenderSettings(1920, 1080, 128), 1, 4)
+    f.poll()
+
+    result = f.cancel_worker("a0")
+
+    assert result is not None
+    assert result.ok is False
+    assert "boom" in result.error
+
+
+def test_cancel_worker_reports_a_refused_cancel_as_failure(blend, tmp_path):
+    f = Fleet(accounts(1), lambda t: RefusingCancelClient(t), tmp_path / "w")
+    f.launch(blend, RenderSettings(1920, 1080, 128), 1, 4)
+    f.poll()
+
+    result = f.cancel_worker("a0")
+
+    assert result.ok is False
+    assert result.error
+
+
+def test_cancel_worker_reports_a_removed_account_as_failure(blend, tmp_path):
+    accts = accounts(2)
+    f = Fleet(accts, lambda t: FakeClient(t), tmp_path / "w")
+    f.launch(blend, RenderSettings(1920, 1080, 128), 1, 4)
+    f.poll()
+
+    f2 = Fleet([accts[0]], lambda t: FakeClient(t), tmp_path / "w")
+    result = f2.cancel_worker("a1")
+
+    assert result is not None
+    assert result.ok is False
+    assert "no account" in result.error
+
+
+# ---------------------------------------------------------------------------
+# Task 4: fetch_failure_log(label) -- the tail of the kernel log, fetched
+# only for a worker Kaggle has actually reported as "error". Never a
+# network call for a healthy worker.
+# ---------------------------------------------------------------------------
+
+class LogFetchingClient(FakeClient):
+    def __init__(self, *a, log_text="RuntimeError: CUDA out of memory", **kw):
+        super().__init__(*a, **kw)
+        self._log_text = log_text
+        self.log_fetches = []
+
+    def fetch_log_tail(self, slug, dest, max_lines=200):
+        self.log_fetches.append(slug)
+        return self._log_text
+
+
+def test_fetch_failure_log_returns_the_tail_for_a_failed_worker(blend, tmp_path):
+    f = Fleet(accounts(1), lambda t: LogFetchingClient(t, "error"), tmp_path / "w")
+    f.launch(blend, RenderSettings(1920, 1080, 128), 1, 4)
+    f.poll()
+
+    text = f.fetch_failure_log("a0")
+
+    assert text == "RuntimeError: CUDA out of memory"
+
+
+def test_fetch_failure_log_never_calls_out_for_a_healthy_worker(blend, tmp_path):
+    clients = {}
+    def factory(tok):
+        clients[tok] = LogFetchingClient(tok, "running"); return clients[tok]
+    f = Fleet(accounts(1), factory, tmp_path / "w")
+    f.launch(blend, RenderSettings(1920, 1080, 128), 1, 4)
+    f.poll()
+
+    text = f.fetch_failure_log("a0")
+
+    assert text == ""
+    assert all(c.log_fetches == [] for c in clients.values())
+
+
+def test_fetch_failure_log_with_no_job_returns_empty(tmp_path):
+    f = Fleet(accounts(1), lambda t: LogFetchingClient(t), tmp_path / "w")
+    assert f.fetch_failure_log("a0") == ""
+
+
+def test_fetch_failure_log_with_unknown_label_returns_empty(blend, tmp_path):
+    f = Fleet(accounts(1), lambda t: LogFetchingClient(t, "error"), tmp_path / "w")
+    f.launch(blend, RenderSettings(1920, 1080, 128), 1, 4)
+    f.poll()
+    assert f.fetch_failure_log("does-not-exist") == ""
+
+
 # ------------------------------------------------- dataset slug scrubbing --
 # `stem = blend.stem.lower().replace("_", "-")` was the ONLY transform, so a
 # .blend with spaces in its name -- extremely common -- produced

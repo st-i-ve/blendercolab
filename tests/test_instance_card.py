@@ -477,6 +477,116 @@ def test_switching_accent_actually_repaints_the_status_icon(qapp, name):
         "appear anywhere in the rendered 'rendering' status icon")
 
 
+# ---------------- Task 3: per-instance Cancel control ----------------
+
+def test_cancel_button_hidden_while_idle(qapp):
+    card = InstanceCard(0, make_account())
+    card.set_worker(None)
+    assert card.cancel_btn.isHidden() is True
+
+
+def test_cancel_button_hidden_while_merely_queued(qapp):
+    """Never shown for a worker that is not running -- see the task 3
+    brief and the class docstring: queued is active but not "running"."""
+    card = InstanceCard(0, make_account())
+    card.set_worker(make_worker(state="queued"))
+    assert card.cancel_btn.isHidden() is True
+
+
+def test_cancel_button_visible_only_while_running(qapp):
+    card = InstanceCard(0, make_account())
+    card.set_worker(make_worker(state="running"))
+    assert card.cancel_btn.isHidden() is False
+
+
+@pytest.mark.parametrize("state", ["complete", "error", "cancel_requested",
+                                   "cancel_acknowledged"])
+def test_cancel_button_hidden_once_stopped(qapp, state):
+    card = InstanceCard(0, make_account())
+    card.set_worker(make_worker(state="running"))
+    assert card.cancel_btn.isHidden() is False
+    card.set_worker(make_worker(state=state))
+    assert card.cancel_btn.isHidden() is True
+
+
+def test_clicking_cancel_emits_the_accounts_label(qapp):
+    card = InstanceCard(0, make_account(label="stive"))
+    card.set_worker(make_worker(state="running"))
+    seen = []
+    card.cancel_requested.connect(seen.append)
+    card.cancel_btn.click()
+    assert seen == ["stive"]
+
+
+def test_set_cancel_busy_disables_and_relabels_the_button(qapp):
+    card = InstanceCard(0, make_account())
+    card.set_worker(make_worker(state="running"))
+    assert card.cancel_btn.isEnabled() is True
+    assert card.cancel_btn.text() == "Cancel"
+
+    card.set_cancel_busy(True)
+    assert card.cancel_btn.isEnabled() is False
+    assert card.cancel_btn.text() == "Cancelling…"
+
+    card.set_cancel_busy(False)
+    assert card.cancel_btn.isEnabled() is True
+    assert card.cancel_btn.text() == "Cancel"
+
+
+def test_going_non_running_resets_any_leftover_busy_state(qapp):
+    """A poll landing mid-flight (worker goes from "running" to "error")
+    must not leave the button permanently stuck disabled the next time
+    this account renders and the card is reused."""
+    card = InstanceCard(0, make_account())
+    card.set_worker(make_worker(state="running"))
+    card.set_cancel_busy(True)
+
+    card.set_worker(make_worker(state="error"))
+    assert card.cancel_btn.isEnabled() is True
+    assert card.cancel_btn.text() == "Cancel"
+
+
+# ---------------- Task 4: one-line failure cause + full log -----------
+
+def test_set_failure_shows_a_translated_one_line_cause_not_raw_text(qapp):
+    card = InstanceCard(0, make_account())
+    card.set_failure("CUDA out of memory: tried to allocate 2.00 GiB")
+    assert card.failure_label.isHidden() is False
+    assert "Ran out of memory" in card.failure_label.text()
+    assert "CUDA out of memory" not in card.failure_label.text()
+    assert card.view_log_btn.isHidden() is False
+
+
+def test_set_failure_symbol_and_word_never_colour_alone(qapp):
+    card = InstanceCard(0, make_account())
+    card.set_failure("Segmentation fault")
+    text = card.failure_label.text()
+    assert "⚠" in text or "!" in text  # a symbol, not colour alone
+    assert "Blender crashed" in text
+
+
+def test_view_log_button_shows_the_full_untranslated_explanation(qapp, monkeypatch):
+    shown = []
+    from PySide6.QtWidgets import QMessageBox
+    monkeypatch.setattr(QMessageBox, "information",
+                        lambda *a, **kw: shown.append(a))
+    card = InstanceCard(0, make_account())
+    card.set_failure("CUDA out of memory: tried to allocate 2.00 GiB")
+    card.view_log_btn.click()
+    assert shown
+    title, message = shown[0][1], shown[0][2]
+    assert "memory" in message.lower()
+
+
+def test_set_failure_none_clears_it(qapp):
+    card = InstanceCard(0, make_account())
+    card.set_failure("Segmentation fault")
+    card.set_failure(None)
+    assert card.failure_label.text() == ""
+    assert card.failure_label.isHidden() is True
+    assert card.view_log_btn.isHidden() is True
+
+
 @pytest.mark.parametrize("name", ["orange", "green", "purple", "blue", "red"])
 def test_switching_accent_actually_repaints_an_already_built_card(qapp, name):
     """Not just a freshly-built card -- refresh_accent() (wired to

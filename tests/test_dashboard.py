@@ -136,8 +136,14 @@ def settle(dash, timeout=2000) -> None:
     left running (and possibly garbage-collected mid-flight) once a test
     function returns.
     """
-    for worker in (dash._poll_worker, dash._quota_worker,
-                   dash._cancel_worker, dash._collect_worker):
+    workers = [dash._poll_worker, dash._quota_worker,
+               dash._cancel_worker, dash._collect_worker]
+    # Task 3/4: per-label worker dicts -- more than one can legitimately be
+    # in flight at once (two different cards' cancels, or two different
+    # accounts' failure-log fetches).
+    workers += list(dash._instance_cancel_workers.values())
+    workers += list(dash._log_fetch_workers.values())
+    for worker in workers:
         if worker is None:
             continue
         try:
@@ -196,9 +202,11 @@ class FakeClient:
 
     fail_upload = False
 
-    def __init__(self, token, state="running"):
+    def __init__(self, token, state="running", message=""):
         self.token = token
         self.state = state
+        self.message = message
+        self.cancelled: list[str] = []
         self.sdk = FakeSdk()
         self._sdk_factory = lambda tok: self.sdk
 
@@ -239,9 +247,10 @@ class FakeClient:
         pass
 
     def status(self, slug):
-        return KernelStatus(state=self.state)
+        return KernelStatus(state=self.state, message=self.message)
 
     def cancel(self, slug):
+        self.cancelled.append(slug)
         return True
 
     def quota(self):
@@ -249,6 +258,22 @@ class FakeClient:
 
     def fetch_output(self, slug, dest):
         return []
+
+    def fetch_log_tail(self, slug, dest, max_lines=200):
+        return ""
+
+
+class RefusingCancelClient(FakeClient):
+    """cancel() returns False, exactly as the real client does on error."""
+    def cancel(self, slug):
+        self.cancelled.append(slug)
+        return False
+
+
+class RaisingCancelClient(FakeClient):
+    """cancel() raises, as if the network call or auth blew up."""
+    def cancel(self, slug):
+        raise RuntimeError("boom")
 
 
 def make_store(n=3):
@@ -1002,3 +1027,348 @@ def test_the_filmstrip_tells_the_user_its_completed_cells_are_approximate(qapp, 
     assert "approximate" in header.lower()
     assert "failed frame" in header.lower(), \
         "say WHY it is approximate, not just that it is"
+
+
+# ---------------------------------------------------------------------------
+# Task 3: per-instance cancel, end to end through Dashboard._cancel_instance.
+# A real Fleet.launch() is used (not just dash._last_state) so
+# Fleet.cancel_worker -- built fresh inside the worker closure -- has an
+# actual job on disk to load and cancel.
+# ---------------------------------------------------------------------------
+
+def _seed_job(tmp_path, make_client, n=2):
+    """Launch a real n-account job through a real Fleet and poll it once,
+    so a freshly constructed Dashboard's fleet_factory(...) has real,
+    on-disk state to load/cancel/poll further -- not merely an in-memory
+    dash._last_state.
+
+    `make_client(token, account)` builds each account's fake client, given
+    the ACCOUNT too (not just the token) so a test can assign a fixed
+    state per account deterministically, by label -- never by call order
+    or call count: every action below (launch, poll, and later each
+    cancel_worker/poll call from Dashboard) calls the factory again for
+    its own fresh Fleet/client, so anything order-dependent breaks the
+    moment more than one action runs.
+
+    Returns (store, factory, fleet_state).
+    """
+    store = make_store(n)
+    by_token = {a.token: a for a in store.list()}
+
+    def factory(tok):
+        return make_client(tok, by_token[tok])
+
+    blend = tmp_path / "remember.blend"
+    blend.write_bytes(b"x" * 100)
+    seed = Fleet(store.list(), factory, tmp_path / "w")
+    seed.launch(blend, RenderSettings(1920, 1080, 128), 1, 4)
+    st = seed.poll()  # each client's own .status() decides its worker's state
+    return store, factory, st
+
+
+def test_cancel_button_hidden_for_queued_visible_for_running(qapp, tmp_path):
+    clients = {}
+    def make_client(tok, acct):
+        state = "running" if acct.label == "acct0" else "queued"
+        clients[tok] = FakeClient(tok, state)
+        return clients[tok]
+
+    store, factory, st = _seed_job(tmp_path, make_client)
+
+    def fleet_factory(accounts):
+        return Fleet(accounts, factory, tmp_path / "w")
+
+    dash = Dashboard(store, fleet_factory, verifier=lambda t: "someone")
+    _LIVE_DASHBOARDS.append(dash)
+    settle(dash)
+    dash._last_state = st
+    dash._refresh_views()
+
+    running_worker = next(w for w in st.workers if w.state == "running")
+    queued_worker = next(w for w in st.workers if w.state == "queued")
+    assert dash._instance_cards[running_worker.label].cancel_btn.isHidden() is False
+    assert dash._instance_cards[queued_worker.label].cancel_btn.isHidden() is True
+    dash.close()
+
+
+def test_cancel_instance_confirms_and_cancels_only_that_account(
+        qapp, tmp_path, stub_message_boxes):
+    clients = {}
+    def make_client(tok, acct):
+        clients[tok] = FakeClient(tok)
+        return clients[tok]
+
+    store, factory, st = _seed_job(tmp_path, make_client)
+
+    def fleet_factory(accounts):
+        return Fleet(accounts, factory, tmp_path / "w")
+
+    dash = Dashboard(store, fleet_factory, verifier=lambda t: "someone")
+    _LIVE_DASHBOARDS.append(dash)
+    settle(dash)
+    dash._last_state = st
+    dash._refresh_views()
+
+    target = st.workers[0]
+    other = st.workers[1]
+
+    dash._cancel_instance(target.label)
+    worker = dash._instance_cancel_workers.get(target.label)
+    pump(worker)
+    settle(dash)
+
+    target_token = next(a.token for a in store.list() if a.label == target.label)
+    other_token = next(a.token for a in store.list() if a.label == other.label)
+    assert clients[target_token].cancelled == [target.kernel_slug]
+    # the whole point: the OTHER account's cancel() must never be called.
+    assert clients[other_token].cancelled == []
+    assert stub_message_boxes["information"], "no confirmation dialog was shown"
+    dash.close()
+
+
+def test_cancel_instance_declined_confirmation_cancels_nothing(
+        qapp, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+    monkeypatch.setattr(QMessageBox, "question",
+                        lambda *a, **kw: QMessageBox.StandardButton.No)
+
+    clients = {}
+    def make_client(tok, acct):
+        clients[tok] = FakeClient(tok)
+        return clients[tok]
+
+    store, factory, st = _seed_job(tmp_path, make_client)
+
+    def fleet_factory(accounts):
+        return Fleet(accounts, factory, tmp_path / "w")
+
+    dash = Dashboard(store, fleet_factory, verifier=lambda t: "someone")
+    _LIVE_DASHBOARDS.append(dash)
+    settle(dash)
+    dash._last_state = st
+    dash._refresh_views()
+
+    dash._cancel_instance(st.workers[0].label)
+
+    assert dash._instance_cancel_workers == {}
+    assert all(c.cancelled == [] for c in clients.values())
+    dash.close()
+
+
+def test_cancel_instance_disables_button_while_in_flight_and_reenables_on_success(
+        qapp, tmp_path, stub_message_boxes):
+    clients = {}
+    def make_client(tok, acct):
+        clients[tok] = FakeClient(tok)
+        return clients[tok]
+
+    store, factory, st = _seed_job(tmp_path, make_client, n=1)
+
+    def fleet_factory(accounts):
+        return Fleet(accounts, factory, tmp_path / "w")
+
+    dash = Dashboard(store, fleet_factory, verifier=lambda t: "someone")
+    _LIVE_DASHBOARDS.append(dash)
+    settle(dash)
+    dash._last_state = st
+    dash._refresh_views()
+
+    label = st.workers[0].label
+    card = dash._instance_cards[label]
+
+    dash._cancel_instance(label)
+    # Disabling happens synchronously, before the worker thread is even
+    # scheduled -- must already be true the instant _cancel_instance returns.
+    assert card.cancel_btn.isEnabled() is False
+    assert card.cancel_btn.text() == "Cancelling…"
+
+    pump(dash._instance_cancel_workers[label])
+    settle(dash)
+
+    assert card.cancel_btn.isEnabled() is True
+    assert card.cancel_btn.text() == "Cancel"
+    dash.close()
+
+
+def test_cancel_instance_failure_warns_and_reenables_the_button(
+        qapp, tmp_path, stub_message_boxes):
+    def make_client(tok, acct):
+        return RefusingCancelClient(tok)
+
+    store, factory, st = _seed_job(tmp_path, make_client, n=1)
+
+    def fleet_factory(accounts):
+        return Fleet(accounts, factory, tmp_path / "w")
+
+    dash = Dashboard(store, fleet_factory, verifier=lambda t: "someone")
+    _LIVE_DASHBOARDS.append(dash)
+    settle(dash)
+    dash._last_state = st
+    dash._refresh_views()
+
+    label = st.workers[0].label
+    card = dash._instance_cards[label]
+
+    dash._cancel_instance(label)
+    pump(dash._instance_cancel_workers[label])
+    settle(dash)
+
+    assert card.cancel_btn.isEnabled() is True
+    assert stub_message_boxes["warning"], \
+        "a failed cancel must say so, never look like a silent success"
+    dash.close()
+
+
+def test_cancel_instance_on_an_already_finished_worker_says_nothing_to_cancel(
+        qapp, tmp_path, stub_message_boxes):
+    """Simulates the race the brief describes: the button fired while the
+    card still thought the worker was running, but by the time the actual
+    network call happens the job has already finished."""
+    def make_client(tok, acct):
+        return FakeClient(tok, "complete")
+
+    store, factory, st = _seed_job(tmp_path, make_client, n=1)
+
+    def fleet_factory(accounts):
+        return Fleet(accounts, factory, tmp_path / "w")
+
+    dash = Dashboard(store, fleet_factory, verifier=lambda t: "someone")
+    _LIVE_DASHBOARDS.append(dash)
+    settle(dash)
+
+    dash._cancel_instance(st.workers[0].label)
+    pump(dash._instance_cancel_workers[st.workers[0].label])
+    settle(dash)
+
+    titles = [title for title, _ in stub_message_boxes["information"]]
+    assert any("Nothing to cancel" in t for t in titles)
+    dash.close()
+
+
+# ---------------------------------------------------------------------------
+# Task 4: "it just says error" -- surfacing failure_message, or the fetched
+# log tail when it is empty, and ONLY for a failed worker.
+# ---------------------------------------------------------------------------
+
+def test_poll_shows_failure_message_without_fetching_a_log_when_present(
+        qapp, tmp_path):
+    fetch_calls: list[str] = []
+
+    def make_client(tok, acct):
+        class TrackedClient(FakeClient):
+            def fetch_log_tail(self, slug, dest, max_lines=200):
+                fetch_calls.append(slug)
+                return "should never be requested"
+        return TrackedClient(
+            tok, "error", message="CUDA out of memory: tried to allocate 2GB")
+
+    store, factory, st = _seed_job(tmp_path, make_client, n=1)
+    label = st.workers[0].label
+
+    dash = Dashboard(store, lambda accounts: Fleet(accounts, factory, tmp_path / "w"),
+                     verifier=lambda t: "someone")
+    _LIVE_DASHBOARDS.append(dash)
+    settle(dash)
+
+    dash._poll()
+    pump(dash._poll_worker)
+    settle(dash)
+
+    assert fetch_calls == [], \
+        "failure_message was already present -- the log must never be fetched"
+    assert dash._log_fetch_workers == {}
+    card = dash._instance_cards[label]
+    assert card.failure_label.isHidden() is False
+    assert "memory" in card._failure_detail.lower()
+    dash.close()
+
+
+def test_poll_fetches_the_log_once_for_a_failure_with_no_message(qapp, tmp_path):
+    fetch_calls: list[str] = []
+
+    def make_client(tok, acct):
+        class TrackedClient(FakeClient):
+            def fetch_log_tail(self, slug, dest, max_lines=200):
+                fetch_calls.append(slug)
+                return "Fatal Python error: Segmentation fault"
+        return TrackedClient(tok, "error")
+
+    store, factory, st = _seed_job(tmp_path, make_client, n=1)
+    label = st.workers[0].label
+
+    dash = Dashboard(store, lambda accounts: Fleet(accounts, factory, tmp_path / "w"),
+                     verifier=lambda t: "someone")
+    _LIVE_DASHBOARDS.append(dash)
+    settle(dash)
+
+    dash._poll()
+    pump(dash._poll_worker)
+    settle(dash)   # also waits out the log-fetch worker _maybe_fetch_... started
+
+    assert len(fetch_calls) == 1
+    card = dash._instance_cards[label]
+    assert card.failure_label.isHidden() is False
+    assert "crashed" in card._failure_detail.lower() or \
+        "Blender crashed" in card.failure_label.text()
+
+    # A second poll tick, worker still "error" -- must NOT re-fetch.
+    dash._poll()
+    pump(dash._poll_worker)
+    settle(dash)
+    assert len(fetch_calls) == 1, "once per failure, not once per poll tick"
+    dash.close()
+
+
+def test_poll_never_fetches_a_log_for_a_healthy_worker(qapp, tmp_path):
+    fetch_calls: list[str] = []
+
+    def make_client(tok, acct):
+        class TrackedClient(FakeClient):
+            def fetch_log_tail(self, slug, dest, max_lines=200):
+                fetch_calls.append(slug)
+                return "should never be requested"
+        return TrackedClient(tok, "running")
+
+    store, factory, st = _seed_job(tmp_path, make_client, n=1)
+    label = st.workers[0].label
+
+    dash = Dashboard(store, lambda accounts: Fleet(accounts, factory, tmp_path / "w"),
+                     verifier=lambda t: "someone")
+    _LIVE_DASHBOARDS.append(dash)
+    settle(dash)
+
+    dash._poll()
+    pump(dash._poll_worker)
+    settle(dash)
+
+    assert fetch_calls == []
+    assert dash._log_fetch_workers == {}
+    card = dash._instance_cards[label]
+    assert card.failure_label.isHidden() is True
+    dash.close()
+
+
+def test_failure_cache_is_cleared_when_a_new_render_starts(qapp, tmp_path):
+    def make_client(tok, acct):
+        class TrackedClient(FakeClient):
+            def fetch_log_tail(self, slug, dest, max_lines=200):
+                return "Fatal Python error: Segmentation fault"
+        return TrackedClient(tok, "error")
+
+    store, factory, st = _seed_job(tmp_path, make_client, n=1)
+    label = st.workers[0].label
+
+    dash = Dashboard(store, lambda accounts: Fleet(accounts, factory, tmp_path / "w"),
+                     verifier=lambda t: "someone")
+    _LIVE_DASHBOARDS.append(dash)
+    settle(dash)
+
+    dash._poll()
+    pump(dash._poll_worker)
+    settle(dash)
+    assert dash._failure_logs.get(label)
+
+    dash._start_progress_threads(FleetState("job2", "x.blend", 1, 1, []))
+    assert label not in dash._failure_logs
+    assert dash._instance_cards[label].failure_label.text() == ""
+    dash.close()

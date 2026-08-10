@@ -553,6 +553,37 @@ class KaggleClient:
         return sorted(p for p in dest.rglob("*")
                       if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES)
 
+    def fetch_log_tail(self, slug: str, dest: Path, max_lines: int = 200) -> str:
+        """The last `max_lines` lines of `slug`'s kernel log.
+
+        kernels_status's own failure_message is frequently empty -- the
+        actual cause (a Blender crash, a CUDA/host out-of-memory, a
+        missing file) lives in the kernel's own log instead. `kernels
+        logs`/`kernels output` return nothing until the session has
+        stopped (see log_stream.py's module docstring), which is exactly
+        when this is called: once, for a worker Kaggle has already
+        reported as failed, never on the live/poll path.
+
+        Built on the exact same call fetch_output() already makes:
+        kernels_output() downloads whatever output files exist AND, as a
+        side effect, writes the full log to `<kernel-name>.log` inside
+        `dest` (kaggle_api_extended.py's own kernels_output: `log =
+        response.log; ... out.write(log)`). Returns "" -- not an error --
+        when Kaggle has no log for this kernel at all (never actually
+        started, or output already pruned); callers must not read that as
+        evidence of anything and should say so distinctly rather than
+        showing it as the diagnosed cause.
+        """
+        dest = Path(dest)
+        dest.mkdir(parents=True, exist_ok=True)
+        _, name = slug.split("/", 1)
+        self.api.kernels_output(slug, path=str(dest))
+        log_path = dest / f"{name}.log"
+        if not log_path.exists():
+            return ""
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+        return "\n".join(text.splitlines()[-max_lines:])
+
 
 def verify_token(token: str,
                   client_factory: Callable[[str], "KaggleClient"] | None = None

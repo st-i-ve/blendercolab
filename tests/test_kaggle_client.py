@@ -529,6 +529,55 @@ def test_fetch_output_returns_jpegs_too(tmp_path):
     assert [p.name for p in got] == ["f_0001.jpg", "f_0002.jpeg"]
 
 
+# ---------------------------------------------------------------------------
+# Task 4: kernels_output() writes the full kernel log to
+# "<kernel-name>.log" as a side effect (kaggle_api_extended.py's own
+# kernels_output: `log = response.log; ... out.write(log)`) -- fetch_log_tail
+# reuses that exact call rather than any new API surface.
+# ---------------------------------------------------------------------------
+
+class LoggingApi(FakeApi):
+    """Like FakeApi, but kernels_output also writes the kernel's log file
+    -- exactly what the real kaggle package does as a side effect of that
+    one call."""
+
+    def __init__(self, *a, log_text=None, **kw):
+        super().__init__(*a, **kw)
+        self._log_text = log_text
+
+    def kernels_output(self, slug, path):
+        super().kernels_output(slug, path)
+        if self._log_text is not None:
+            name = slug.split("/", 1)[1]
+            (Path(path) / f"{name}.log").write_text(self._log_text,
+                                                     encoding="utf-8")
+
+
+def test_fetch_log_tail_returns_the_log_files_contents(tmp_path):
+    c, _ = client(api=LoggingApi(log_text="line1\nline2\nline3"))
+    text = c.fetch_log_tail("user/remember-render", tmp_path / "out")
+    assert text == "line1\nline2\nline3"
+
+
+def test_fetch_log_tail_returns_only_the_last_max_lines(tmp_path):
+    """The log for a long render can be huge -- only the tail (the part
+    that actually shows the crash/OOM/traceback) is ever needed."""
+    lines = [f"line{i}" for i in range(500)]
+    c, _ = client(api=LoggingApi(log_text="\n".join(lines)))
+    text = c.fetch_log_tail("user/remember-render", tmp_path / "out",
+                            max_lines=50)
+    assert text.splitlines() == lines[-50:]
+
+
+def test_fetch_log_tail_returns_empty_string_when_no_log_was_captured(tmp_path):
+    """No log file at all (never started, output already pruned) is
+    genuinely different from an empty log -- callers must not confuse this
+    with "the log was fetched and found no cause"."""
+    c, _ = client(api=FakeApi())  # writes no .log file
+    text = c.fetch_log_tail("user/remember-render", tmp_path / "out")
+    assert text == ""
+
+
 def test_sdk_factory_passes_the_token_instead_of_setting_the_environment():
     """CRITICAL C2: kagglesdk.KaggleClient accepts api_token=, so nothing
     here may write the process-global KAGGLE_API_TOKEN."""

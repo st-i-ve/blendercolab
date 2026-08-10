@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (QComboBox, QFileDialog, QFormLayout,
 
 from blendfleet.accounts import AccountStore
 from blendfleet.assignment import estimate
-from blendfleet.fleet import Fleet, FleetState
+from blendfleet.fleet import Fleet, FleetState, WorkerState
 from blendfleet.instance_state import GpuSnapshot, InstanceSnapshot, InstanceStore
 from blendfleet.log_stream import stream_progress
 from blendfleet.notebook_builder import RenderSettings
@@ -160,6 +160,21 @@ class Dashboard(QMainWindow):
         self._quota_worker: _CallWorker | None = None
         self._cancel_worker: _CallWorker | None = None
         self._collect_worker: _CallWorker | None = None
+        # Task 3: per-instance cancel. Keyed by account label rather than a
+        # single attribute like _cancel_worker above, because -- unlike
+        # "Cancel all" -- more than one account's cancel can legitimately
+        # be in flight at once (the user can click Cancel on two different
+        # cards before either returns).
+        self._instance_cancel_workers: dict[str, _CallWorker] = {}
+        # Task 4: "it just says error". Keyed by account label, holding
+        # whatever text (kernels_status's own failure_message, or a
+        # fetched kernel-log tail) explains that account's most recent
+        # failure -- fetched via _maybe_fetch_failure_logs, at most ONCE
+        # per failure, never on the polling path for a healthy worker.
+        # Reset only when a new render starts (_start_progress_threads),
+        # exactly like the other per-run caches below.
+        self._failure_logs: dict[str, str] = {}
+        self._log_fetch_workers: dict[str, _CallWorker] = {}
         self._last_state: FleetState | None = None
         # Keyed by kernel_slug (stable across polls) rather than kept on the
         # WorkerState instance: fleet.poll() rebuilds fresh WorkerState
@@ -637,6 +652,7 @@ class Dashboard(QMainWindow):
         self._instance_cards = {}
         for i, a in enumerate(self.store.list()):
             card = InstanceCard(i, a)
+            card.cancel_requested.connect(self._cancel_instance)
             self._instance_cards[a.label] = card
             self.rail_rows_layout.addWidget(card)
         self._refresh_views()
@@ -811,8 +827,16 @@ class Dashboard(QMainWindow):
         self._instance_hardware.clear()
         self._instance_gpu_models.clear()
         self._instance_preflight.clear()
+        # A previous run's failure has nothing to do with this new one --
+        # cached log text and the card's failure line must not survive
+        # into it. In-flight fetch workers (if a failure from the PREVIOUS
+        # job is still being fetched) are left alone: they pop themselves
+        # from _log_fetch_workers when done rather than being torn down
+        # here, so closeEvent still has them to join.
+        self._failure_logs.clear()
         for card in self._instance_cards.values():
             card.set_preflight(None)
+            card.set_failure(None)
         self._recorded_instance_labels.clear()
         # Drop the threads from the previous job that have already unwound,
         # so a long session's worth of renders does not accumulate dead
@@ -936,6 +960,127 @@ class Dashboard(QMainWindow):
             f"quota:\n\n{detail}\n\n"
             f"Stop them by hand at kaggle.com → the notebook → Stop session.")
 
+    # ---------------- per-instance cancel (Task 3) ----------------
+    def _cancel_instance(self, label: str) -> None:
+        """Stop exactly one account's render, leaving every other card's
+        render running untouched -- the per-instance counterpart to
+        _cancel() above, wired to InstanceCard.cancel_requested.
+
+        Kaggle's own unit of control is a whole session, not an
+        individual GPU within it: there is no way to release one GPU and
+        keep the other, so the confirmation below is honest about
+        cancelling the ACCOUNT's session, never worded as "release this
+        GPU". Same discipline as _cancel(): confirm first, disable the
+        (per-card) button for the duration, re-enable it on both the
+        success and the failure path.
+        """
+        if label in self._instance_cancel_workers:
+            return   # already in flight -- that card's button is disabled too
+        account = next((a for a in self.store.list() if a.label == label), None)
+        who = (account.username or label) if account else label
+        if QMessageBox.question(
+                self, "Cancel this instance",
+                f"Stop the render on {who}? Kaggle's unit of control is "
+                "the session, not the GPU, so this stops that account's "
+                "whole session -- every other account keeps rendering.") \
+                != QMessageBox.StandardButton.Yes:
+            return
+        accounts = self.store.list()
+        card = self._instance_cards.get(label)
+
+        def work():
+            return self.fleet_factory(accounts).cancel_worker(label)
+
+        if card is not None:
+            card.set_cancel_busy(True)
+
+        worker = _CallWorker(work, f"Cancelling {who}'s render", self)
+        self._instance_cancel_workers[label] = worker
+
+        def done_ok(result) -> None:
+            self._instance_cancel_workers.pop(label, None)
+            if card is not None:
+                card.set_cancel_busy(False)
+            self._show_cancel_instance_result(who, result)
+
+        def done_fail(message: str) -> None:
+            self._instance_cancel_workers.pop(label, None)
+            if card is not None:
+                card.set_cancel_busy(False)
+            QMessageBox.warning(self, "Could not cancel", message)
+
+        worker.succeeded.connect(done_ok)
+        worker.failed.connect(done_fail)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def _show_cancel_instance_result(self, who: str, result) -> None:
+        if result is None:
+            QMessageBox.information(
+                self, "Nothing to cancel",
+                f"{who}'s render had already stopped -- there was nothing "
+                "left to cancel.")
+            return
+        if result.ok:
+            QMessageBox.information(
+                self, "Instance cancelled",
+                f"Cancel requested for {who}; Kaggle confirmed the stop. "
+                "Every other account keeps rendering.")
+            return
+        # Exactly _show_cancel_results' own reasoning: a silently-failed
+        # cancel leaves this one account's quota draining for hours.
+        QMessageBox.warning(
+            self, "Render did NOT stop",
+            f"{who} could not be cancelled and may still be running, "
+            f"spending their GPU quota: {result.error}\n\n"
+            f"Stop it by hand at kaggle.com → the notebook → Stop session.")
+
+    # ---------------- failure logs (Task 4: "it just says error") -------
+    def _maybe_fetch_failure_logs(self, st: FleetState | None) -> None:
+        """Kick off a background fetch of the kernel log tail for any
+        worker that just turned up "error" with no failure_message of its
+        own -- and ONLY those. Called once, from _poll()'s own success
+        path, right after a fresh FleetState lands; never from the 30s
+        polling tick's own network call, and never a second time for a
+        failure already fetched (or already being fetched) this run.
+        """
+        if st is None:
+            return
+        for w in st.workers:
+            if w.state != "error" or w.message:
+                continue
+            if w.label in self._failure_logs or w.label in self._log_fetch_workers:
+                continue
+            self._fetch_failure_log(w.label)
+
+    def _fetch_failure_log(self, label: str) -> None:
+        accounts = self.store.list()
+
+        def work():
+            return self.fleet_factory(accounts).fetch_failure_log(label)
+
+        worker = _CallWorker(work, f"Fetching {label}'s failure log", self)
+        self._log_fetch_workers[label] = worker
+
+        def done_ok(text: str) -> None:
+            self._log_fetch_workers.pop(label, None)
+            self._failure_logs[label] = text
+            self._refresh_views()
+
+        def done_fail(message: str) -> None:
+            # Best-effort: the fetch itself failing (network blip, revoked
+            # token) must still surface SOMETHING rather than going back
+            # to silence -- explain() has already turned it into a full
+            # sentence, which reads fine as the card's one-line cause too.
+            self._log_fetch_workers.pop(label, None)
+            self._failure_logs[label] = message
+            self._refresh_views()
+
+        worker.succeeded.connect(done_ok)
+        worker.failed.connect(done_fail)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
     def _collect(self) -> None:
         """Downloading rendered output (`fetch_output`) is real, and
         potentially slow, network I/O -- moved off the UI thread for the
@@ -1024,6 +1169,13 @@ class Dashboard(QMainWindow):
                 self._last_state = st
             self.poll_status_label.setText("")
             self._refresh_views()
+            # Task 4: only ever triggered from here -- this poll's own
+            # network call already happened above; this only ever starts
+            # a SEPARATE fetch, and only for a worker that just turned up
+            # "error" with nothing to show yet. Never runs on the
+            # done_fail path below: a poll that itself failed produced no
+            # fresh state to look for a new failure in.
+            self._maybe_fetch_failure_logs(st)
 
         def done_fail(message: str) -> None:
             self._poll_worker = None
@@ -1175,9 +1327,23 @@ class Dashboard(QMainWindow):
             card = self._instance_cards.get(account.label)
             if card is None:
                 continue
+            worker = workers_by_label.get(account.label)
             card.set_quota(self._quota_cache.get(account.label))
             card.set_snapshot(self.instance_store.get(account.label))
-            card.set_worker(workers_by_label.get(account.label))
+            card.set_worker(worker)
+            card.set_failure(self._failure_text_for(worker))
+
+    def _failure_text_for(self, worker: WorkerState | None) -> str | None:
+        """Whatever text explains `worker`'s failure right now, or None
+        when there is nothing to show -- not in "error" at all, OR in
+        "error" with kernels_status's own failure_message empty and the
+        log tail not fetched (yet, or ever -- see _maybe_fetch_failure_logs)
+        for it. Kaggle's own failure_message always wins when present:
+        it is already the real cause and needs no network round trip.
+        """
+        if worker is None or worker.state != "error":
+            return None
+        return worker.message or self._failure_logs.get(worker.label)
 
     def _render_table(self, st: FleetState) -> None:
         # Quota and frame counts are machine data -- set in monospace with
@@ -1268,7 +1434,9 @@ class Dashboard(QMainWindow):
         # stuck network call cannot hang application shutdown forever.
         for worker in (self._launch_worker, self._poll_worker,
                        self._quota_worker, self._cancel_worker,
-                       self._collect_worker):
+                       self._collect_worker,
+                       *self._instance_cancel_workers.values(),
+                       *self._log_fetch_workers.values()):
             if worker is None:
                 continue
             try:

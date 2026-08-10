@@ -38,13 +38,16 @@ from __future__ import annotations
 
 import time
 
-from PySide6.QtWidgets import QHBoxLayout, QLabel, QVBoxLayout, QWidget
+from PySide6.QtCore import Signal
+from PySide6.QtWidgets import (QHBoxLayout, QLabel, QMessageBox, QPushButton,
+                               QVBoxLayout, QWidget)
 
 from blendfleet.accounts import Account
 from blendfleet.fleet import WorkerState
 from blendfleet.instance_state import InstanceSnapshot
 from blendfleet.ui.charts import Sparkline
 from blendfleet.ui.formatting import format_bytes
+from blendfleet.ui.messages import explain_kernel_failure
 from blendfleet.ui.theme import (TELEMETRY, TEXT_SECONDARY, WARNING,
                                   account_color, current_accent, icon,
                                   mono_font, theme_signal, ui_font)
@@ -251,7 +254,22 @@ class InstanceCard(QWidget):
     actually defers to. `is_live()`/status_for() are used for the status
     WORD, which is honestly whatever Kaggle's poll last reported (allowed
     to lag by design), not for what the body shows.
+
+    Task 3's per-instance Cancel control is deliberately gated on
+    `is_live(worker)` -- the exact "running" check, not the broader
+    ACTIVE_STATES a queued kernel also satisfies -- because that is the
+    UI-facing rule the brief states explicitly: never show it for a
+    worker that is not running. Fleet.cancel_worker() itself is more
+    permissive (it will also cancel a merely queued kernel); this card
+    simply never offers the button for that case.
     """
+
+    # Emitted with this card's account label when the user clicks Cancel
+    # and confirms -- Dashboard owns the confirmation dialog, the
+    # _CallWorker, and disabling/re-enabling this exact button (via
+    # set_cancel_busy below), the same division of responsibility as
+    # every other network-backed action in this app.
+    cancel_requested = Signal(str)
 
     def __init__(self, index: int, account: Account,
                  parent: QWidget | None = None) -> None:
@@ -263,6 +281,7 @@ class InstanceCard(QWidget):
         self._telemetry_active = False
         self._preflight_active = False
         self._gpu_rows: dict[int, GpuLiveRow] = {}
+        self._failure_detail = ""
 
         v = QVBoxLayout(self)
         v.setContentsMargins(10, 8, 10, 8)
@@ -282,6 +301,18 @@ class InstanceCard(QWidget):
         self.status_word = QLabel()
         self.status_word.setFont(ui_font(9))
         header.addWidget(self.status_word)
+        # Per-instance cancel -- the real equivalent of "stop just this
+        # GPU": Kaggle's own unit of control is the session, not a GPU
+        # within it, so this stops this account's whole session while
+        # every other card's render keeps going untouched. Visibility is
+        # driven entirely from set_worker (is_live() only -- see the
+        # class docstring), never toggled directly by a caller.
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setFixedHeight(22)
+        self.cancel_btn.hide()
+        self.cancel_btn.clicked.connect(
+            lambda: self.cancel_requested.emit(self.label))
+        header.addWidget(self.cancel_btn)
         v.addLayout(header)
 
         # ---- quota (always visible: this IS obtainable at rest) ----
@@ -342,6 +373,24 @@ class InstanceCard(QWidget):
         frames_row.addWidget(self.frames_label, 1)
         self._live_v.addLayout(frames_row)
         v.addWidget(self.live_container)
+
+        # ---- failure: one line, plain language, "error" only ----
+        # Independent of the idle/live split above -- an errored worker
+        # shows the CACHED (idle) body for its last-known hardware exactly
+        # like any other stopped worker, plus this one extra line. Never a
+        # raw traceback: set_failure always renders through
+        # messages.explain_kernel_failure. "View full log" is the escape
+        # hatch onto whatever untranslated detail was actually available.
+        self.failure_label = QLabel("")
+        self.failure_label.setWordWrap(True)
+        self.failure_label.setStyleSheet(f"color: {WARNING};")
+        self.failure_label.hide()
+        v.addWidget(self.failure_label)
+        self.view_log_btn = QPushButton("View full log")
+        self.view_log_btn.setFixedHeight(22)
+        self.view_log_btn.hide()
+        self.view_log_btn.clicked.connect(self._show_full_failure)
+        v.addWidget(self.view_log_btn)
 
         self._worker: WorkerState | None = None
         self.set_worker(None)
@@ -467,9 +516,31 @@ class InstanceCard(QWidget):
         self.status_word.setText(word)
         self.status_word.setStyleSheet(f"color: {colour};")
 
+        # Never shown for a worker that is not running -- see the class
+        # docstring. Going non-running (including simply going idle again
+        # once a poll catches up) always resets the busy state: nothing
+        # can legitimately still be "in flight" for a cancel request
+        # against a worker that no longer qualifies for the button at all.
+        running = is_live(worker)
+        self.cancel_btn.setVisible(running)
+        if not running:
+            self.set_cancel_busy(False)
+
         if self._currently_live() and worker is not None:
             self.frames_label.setText(f"{worker.frames_done} / {len(worker.frames)}")
         self._sync_body()
+
+    def set_cancel_busy(self, busy: bool) -> None:
+        """Disable (and re-word) the per-card Cancel control while a
+        cancel_worker() request for this account is in flight.
+
+        Dashboard is the sole caller: it owns the _CallWorker for this
+        specific action and therefore knows exactly when a request starts
+        and ends, on both the success AND the failure path -- this method
+        only ever reflects that, it never decides it.
+        """
+        self.cancel_btn.setEnabled(not busy)
+        self.cancel_btn.setText("Cancelling…" if busy else "Cancel")
 
     def _currently_live(self) -> bool:
         """Whether the LIVE BODY should be showing right now.
@@ -567,3 +638,40 @@ class InstanceCard(QWidget):
         self.preflight_label.setText(format_preflight_summary(record))
         self.preflight_label.show()
         self._sync_body()
+
+    # ---------------- failure (Task 4: "it just says error") ------------
+    def set_failure(self, raw: str | None) -> None:
+        """Show why this account's render failed, in one plain-language
+        line, with "View full log" as the way to see the rest.
+
+        `raw` is whatever text Dashboard has for this worker: Kaggle's own
+        failure_message (WorkerState.message) when it is non-empty, or
+        the tail of the kernel log Dashboard fetched via
+        Fleet.fetch_failure_log when it was not -- or None once this
+        worker is not (or no longer) in "error" at all, which hides the
+        line unconditionally (a card must never go on showing a PREVIOUS
+        run's failure once a new render has started, exactly like
+        set_preflight(None)).
+
+        Always renders through messages.explain_kernel_failure -- never
+        the raw text directly in the one-line label -- so the label is
+        never a bare status word or an unread traceback; the untranslated
+        detail is still reachable, deliberately, via View full log.
+        """
+        if raw is None:
+            self.failure_label.setText("")
+            self.failure_label.hide()
+            self.view_log_btn.hide()
+            self._failure_detail = ""
+            return
+        cause, explanation = explain_kernel_failure(raw)
+        # Symbol AND word, never colour alone -- same discipline as
+        # status_for()'s own icon+word pairing (theme.WARNING's docstring).
+        self.failure_label.setText(f"⚠ {cause}")
+        self.failure_label.show()
+        self._failure_detail = explanation
+        self.view_log_btn.show()
+
+    def _show_full_failure(self) -> None:
+        QMessageBox.information(self, "Why this instance failed",
+                                self._failure_detail)

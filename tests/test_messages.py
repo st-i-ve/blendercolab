@@ -1,6 +1,8 @@
+import pytest
+
 from blendfleet.fleet import FleetBusyError
 from blendfleet.kaggle_client import KaggleError
-from blendfleet.ui.messages import explain
+from blendfleet.ui.messages import explain, explain_kernel_failure
 
 
 def test_self_explanatory_exception_is_prefixed_not_rewrapped():
@@ -35,3 +37,53 @@ def test_never_shows_a_bare_empty_message():
     msg = explain("Collecting frames", RuntimeError(""))
     assert "Collecting frames failed:" in msg
     assert "RuntimeError" in msg
+
+
+# ---------------------------------------------------------------------------
+# Task 4: explain_kernel_failure -- plain-language causes, not a raw
+# traceback or a bare status word.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("raw, expected_cause", [
+    ("CUDA out of memory: tried to allocate 2.00 GiB", "Ran out of memory"),
+    ("RuntimeError: CUDA out of memory", "Ran out of memory"),
+    ("Fatal Python error: Segmentation fault", "Blender crashed"),
+    ("blender: core dumped", "Blender crashed"),
+    ("FileNotFoundError: [Errno 2] No such file or directory: 'scene.blend'",
+     "A file the render needed was missing"),
+    ("the session timed out after 12 hours", "The session timed out"),
+    ("you have exceeded your weekly GPU quota", "This account's GPU quota ran out"),
+])
+def test_explain_kernel_failure_recognises_common_causes(raw, expected_cause):
+    cause, explanation = explain_kernel_failure(raw)
+    assert cause == expected_cause
+    assert explanation  # what/why/next-step, never blank
+    assert len(explanation) > len(cause)
+
+
+def test_explain_kernel_failure_is_case_insensitive():
+    cause, _ = explain_kernel_failure("CUDA Out Of Memory: allocation failed")
+    assert cause == "Ran out of memory"
+
+
+def test_explain_kernel_failure_never_hides_an_unrecognised_raw_detail():
+    """An unrecognised message must still show the raw text somewhere --
+    the rule is "never a bare status", not "only ever the five recognised
+    causes"."""
+    cause, explanation = explain_kernel_failure("Weird custom error 0xDEADBEEF")
+    assert "Weird custom error 0xDEADBEEF" in cause or \
+        "Weird custom error 0xDEADBEEF" in explanation
+
+
+def test_explain_kernel_failure_with_empty_text_says_so_honestly():
+    cause, explanation = explain_kernel_failure("")
+    assert cause == "Failed for an unknown reason"
+    assert "no failure message" in explanation.lower()
+    assert "no kernel log" in explanation.lower()
+
+
+def test_explain_kernel_failure_never_returns_a_bare_status_word():
+    for raw in ("error", "ERROR", ""):
+        cause, explanation = explain_kernel_failure(raw)
+        assert cause.lower() != "error"
+        assert explanation

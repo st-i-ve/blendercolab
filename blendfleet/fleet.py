@@ -25,6 +25,7 @@ from blendfleet import sharing
 from blendfleet.accounts import Account
 from blendfleet.assignment import assign_frames
 from blendfleet.dataset_sync import sync_blend
+from blendfleet.kaggle_client import ACTIVE_STATES
 from blendfleet.notebook_builder import RenderSettings, build
 from blendfleet.platform_paths import state_dir
 
@@ -429,3 +430,82 @@ class Fleet:
                 w.label, w.kernel_slug, bool(ok),
                 "" if ok else "Kaggle rejected the cancel request"))
         return results
+
+    def cancel_worker(self, label: str) -> CancelResult | None:
+        """Cancel exactly the worker labelled `label`, leaving every other
+        worker running untouched -- the per-instance counterpart to
+        cancel_all() above. Kaggle's own unit of control is a whole
+        session, not an individual GPU: there is no way to release one
+        GPU and keep the other within a session, so stopping this one
+        account's session is the actual, closest equivalent to "stop
+        rendering on just this account" -- callers should word it that
+        way, never as "release this GPU".
+
+        Returns None -- NOT a failure -- when there is no job at all, no
+        worker under this label, or that worker is not currently active
+        (kaggle_client.ACTIVE_STATES: "queued"/"running"). A worker that
+        has already finished (complete/error/cancelled) or never started
+        has nothing running to stop, so nothing is attempted and nobody's
+        quota is at risk either way -- cancelling it again is a no-op, not
+        an error.
+
+        A CancelResult -- reusing cancel_all()'s own per-account reporting
+        rather than a second mechanism -- is returned only once an actual
+        cancel request was made, so a FAILED cancel is reported exactly
+        like a failed cancel_all() entry, never silently: the whole point
+        of this method is stopping somebody's GPU quota from draining, and
+        a cancel that quietly does nothing defeats that just as badly here
+        as it would in cancel_all().
+        """
+        st = self.load()
+        if st is None:
+            return None
+        worker = next((w for w in st.workers if w.label == label), None)
+        if worker is None or worker.state not in ACTIVE_STATES:
+            return None
+        acct = next((a for a in self.accounts if a.label == label), None)
+        if acct is None:
+            return CancelResult(
+                label, worker.kernel_slug, False,
+                "no account with this label is configured any more, so "
+                "there is no token to cancel it with")
+        try:
+            ok = self.client_factory(acct.token).cancel(worker.kernel_slug)
+        except Exception as e:
+            # Exactly cancel_all()'s own handling: this account's cancel
+            # failing must be reported, not raised past the caller.
+            return CancelResult(label, worker.kernel_slug, False, str(e))
+        return CancelResult(
+            label, worker.kernel_slug, bool(ok),
+            "" if ok else "Kaggle rejected the cancel request")
+
+    def fetch_failure_log(self, label: str) -> str:
+        """The tail of `label`'s kernel log -- the actual cause of a
+        failure when kernels_status's own failure_message (surfaced as
+        WorkerState.message by poll()) came back empty. See
+        kaggle_client.KaggleClient.fetch_log_tail for what this
+        downloads and why.
+
+        Deliberately restricted to a worker Kaggle has reported as
+        "error": this is a real network call, and the whole reason it is
+        a method of its own -- rather than something poll() does for
+        every worker on every 30s tick -- is that it must fire only for a
+        worker that has actually failed, once, not on the healthy-worker
+        polling path. Returns "" (not an error) for no job, no such
+        worker, or a worker that is not (or no longer) in "error": there
+        is genuinely nothing to fetch.
+        """
+        st = self.load()
+        if st is None:
+            return ""
+        worker = next((w for w in st.workers if w.label == label), None)
+        if worker is None or worker.state != "error":
+            return ""
+        acct = next((a for a in self.accounts if a.label == label), None)
+        if acct is None:
+            raise RuntimeError(
+                f"no account with label {label!r} is configured any more, "
+                "so there is no token to fetch its kernel log with")
+        client = self.client_factory(acct.token)
+        return client.fetch_log_tail(worker.kernel_slug,
+                                     self.work_dir / f"log_{label}")
