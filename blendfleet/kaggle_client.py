@@ -599,6 +599,13 @@ class KaggleClient:
         this is the whole download-side counterpart of KaggleClient's
         injectable `_upload_blob_fn`, used the same way by tests: zero
         network, a fake object with just `.get(url)`.
+
+        Follows `next_page_token` across every page before downloading
+        anything, exactly like kaggle_api_extended.py's own kernels_output()
+        loops for this same RPC -- the archive collapses this to one file
+        in the common case, but the no-archive fallback (many loose
+        frames) can easily exceed one page, and a caller must never
+        silently see only the first page's worth.
         """
         from kagglesdk.kernels.types.kernels_api_service import (
             ApiListKernelSessionOutputRequest)
@@ -607,13 +614,23 @@ class KaggleClient:
         dest.mkdir(parents=True, exist_ok=True)
         owner, name = slug.split("/", 1)
         sdk = self._sdk_factory(self.token)
-        request = ApiListKernelSessionOutputRequest()
-        request.user_name = owner
-        request.kernel_slug = name
-        response = sdk.kernels.kernels_api_client.list_kernel_session_output(
-            request)
 
-        wanted = [f for f in (response.files or [])
+        all_files = []
+        page_token = ""
+        while True:
+            request = ApiListKernelSessionOutputRequest()
+            request.user_name = owner
+            request.kernel_slug = name
+            if page_token:
+                request.page_token = page_token
+            response = sdk.kernels.kernels_api_client.list_kernel_session_output(
+                request)
+            all_files.extend(response.files or [])
+            page_token = getattr(response, "next_page_token", "") or ""
+            if not page_token:
+                break
+
+        wanted = [f for f in all_files
                  if Path(f.file_name).suffix.lower() in _OUTPUT_SUFFIXES]
         files = [(f.url, dest / f.file_name) for f in wanted]
 

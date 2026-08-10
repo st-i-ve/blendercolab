@@ -609,8 +609,9 @@ class FakeOutputFile:
 
 
 class FakeListOutputResponse:
-    def __init__(self, files):
+    def __init__(self, files, next_page_token=""):
         self.files = files
+        self.next_page_token = next_page_token
 
 
 class FakeGetResponse:
@@ -676,6 +677,40 @@ def test_fetch_output_with_progress_reports_bytes_downloaded(tmp_path):
     assert events
     assert events[-1].downloaded == len(body)
     assert events[-1].total == len(body)
+
+
+def test_fetch_output_with_progress_follows_pagination(tmp_path):
+    """The fallback (no archive -> many loose frames) can exceed one
+    page's worth of output files -- list_kernel_session_output paginates
+    exactly like kaggle's own kernels_output() already loops over
+    next_page_token for, and this must too, or files beyond the first
+    page would be silently dropped."""
+    pages = [
+        FakeListOutputResponse([FakeOutputFile("https://x/f1.png", "f1.png")]),
+        FakeListOutputResponse([FakeOutputFile("https://x/f2.png", "f2.png")]),
+    ]
+    pages[0].next_page_token = "page2"
+    pages[1].next_page_token = ""
+    calls = []
+
+    class FakeSdk:
+        class kernels:
+            class kernels_api_client:
+                @staticmethod
+                def list_kernel_session_output(request):
+                    calls.append(request.page_token)
+                    return pages[0] if not request.page_token else pages[1]
+
+    c = KaggleClient(TOKEN, api_factory=lambda t: FakeApi(),
+                     sdk_factory=lambda t: FakeSdk())
+    transport = FakeGetTransport({"https://x/f1.png": b"AAA",
+                                  "https://x/f2.png": b"BBB"})
+
+    got = c.fetch_output_with_progress("x/y", tmp_path / "out",
+                                       transport=transport)
+
+    assert sorted(p.name for p in got) == ["f1.png", "f2.png"]
+    assert calls == ["", "page2"]
 
 
 def test_fetch_output_with_progress_filters_to_images_and_archives_only(tmp_path):
