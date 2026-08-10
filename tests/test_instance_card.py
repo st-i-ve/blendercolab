@@ -13,8 +13,8 @@ from blendfleet.instance_state import (DEFAULT_STALE_AFTER_SECONDS,
 from blendfleet.ui.instance_card import (NEVER_RUN_TEXT, GpuLiveRow,
                                          InstanceCard, format_age,
                                          format_hardware_summary,
-                                         format_preflight_summary, is_live,
-                                         status_for)
+                                         format_preflight_summary, is_active,
+                                         is_live, status_for)
 from blendfleet.ui.theme import ACCENT, ACCENTS, TEXT_SECONDARY, WARNING
 
 
@@ -485,18 +485,35 @@ def test_cancel_button_hidden_while_idle(qapp):
     assert card.cancel_btn.isHidden() is True
 
 
-def test_cancel_button_hidden_while_merely_queued(qapp):
-    """Never shown for a worker that is not running -- see the task 3
-    brief and the class docstring: queued is active but not "running"."""
+def test_cancel_button_visible_while_queued(qapp):
+    """Review fix (Task 3 spec defect): a queued kernel already holds one
+    of the account's 2 GPU session slots and Fleet.cancel_worker() cancels
+    it correctly, so the button must be offered for "queued" too, not
+    only "running" -- see the class docstring and is_active()."""
     card = InstanceCard(0, make_account())
     card.set_worker(make_worker(state="queued"))
-    assert card.cancel_btn.isHidden() is True
+    assert card.cancel_btn.isHidden() is False
 
 
-def test_cancel_button_visible_only_while_running(qapp):
+def test_cancel_button_visible_while_running(qapp):
     card = InstanceCard(0, make_account())
     card.set_worker(make_worker(state="running"))
     assert card.cancel_btn.isHidden() is False
+
+
+@pytest.mark.parametrize("state", ["queued", "running"])
+def test_is_active_true_for_queued_and_running(qapp, state):
+    assert is_active(make_worker(state=state)) is True
+
+
+@pytest.mark.parametrize("state", ["complete", "error", "cancel_requested",
+                                   "cancel_acknowledged"])
+def test_is_active_false_once_stopped(qapp, state):
+    assert is_active(make_worker(state=state)) is False
+
+
+def test_is_active_false_for_no_worker(qapp):
+    assert is_active(None) is False
 
 
 @pytest.mark.parametrize("state", ["complete", "error", "cancel_requested",

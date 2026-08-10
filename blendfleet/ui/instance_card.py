@@ -188,6 +188,23 @@ def is_live(worker: WorkerState | None) -> bool:
     return worker is not None and worker.state == _RUNNING_STATE
 
 
+# The queued+running union kaggle_client.KernelStatus.is_active treats as
+# the meaningful "stoppable" set: fleet.Fleet.cancel_worker() cancels a
+# merely-queued kernel just as correctly as a running one, and a queued
+# kernel already holds one of the account's 2 GPU session slots. Kept
+# separate from is_live() above (which stays "running only" -- it still
+# drives the status WORD and the live-body/telemetry gating, where
+# "queued" genuinely is not yet live) -- see InstanceCard's class
+# docstring for why the Cancel button uses THIS predicate instead.
+_ACTIVE_STATES = {_QUEUED_STATE, _RUNNING_STATE}
+
+
+def is_active(worker: WorkerState | None) -> bool:
+    """True while Kaggle's last poll says this worker is queued OR
+    running -- the set that still has a chance to be cancelled."""
+    return worker is not None and worker.state in _ACTIVE_STATES
+
+
 # ---------------- widgets ----------------
 
 class GpuLiveRow(QWidget):
@@ -256,13 +273,21 @@ class InstanceCard(QWidget):
     WORD, which is honestly whatever Kaggle's poll last reported (allowed
     to lag by design), not for what the body shows.
 
-    Task 3's per-instance Cancel control is deliberately gated on
-    `is_live(worker)` -- the exact "running" check, not the broader
-    ACTIVE_STATES a queued kernel also satisfies -- because that is the
-    UI-facing rule the brief states explicitly: never show it for a
-    worker that is not running. Fleet.cancel_worker() itself is more
-    permissive (it will also cancel a merely queued kernel); this card
-    simply never offers the button for that case.
+    Task 3's per-instance Cancel control is gated on `is_active(worker)`
+    -- queued OR running -- NOT `is_live(worker)` (running only). The
+    original brief said "never show it for a worker that is not
+    running", which undersold the queued case: this is a spec defect,
+    not an implementation one. Fleet.cancel_worker() already cancels a
+    merely-queued kernel correctly (there is a passing test for it), and
+    kaggle_client.KernelStatus.is_active already treats queued+running as
+    the one meaningful "stoppable" set. A queued kernel holds one of the
+    account's 2 GPU session slots from the moment it is queued -- exactly
+    when a user who launched by mistake most wants to stop it -- so
+    gating the button on "running" left it with no way to be cancelled
+    until it started rendering. `is_live()` is unchanged and still used
+    for the status WORD and the live-body/telemetry gating above, where
+    "queued" genuinely is not yet live; only the Cancel button's own gate
+    uses the broader predicate.
     """
 
     # Emitted with this card's account label when the user clicks Cancel
@@ -307,12 +332,12 @@ class InstanceCard(QWidget):
         self.status_word = QLabel()
         self.status_word.setFont(ui_font(9))
         header.addWidget(self.status_word)
-        # Per-instance cancel -- the real equivalent of "stop just this
-        # GPU": Kaggle's own unit of control is the session, not a GPU
-        # within it, so this stops this account's whole session while
-        # every other card's render keeps going untouched. Visibility is
-        # driven entirely from set_worker (is_live() only -- see the
-        # class docstring), never toggled directly by a caller.
+        # Per-instance cancel. Kaggle's own unit of control is the whole
+        # session, not a single GPU within it, so this stops this
+        # account's whole session while every other card's render keeps
+        # going untouched. Visibility is driven entirely from set_worker
+        # (is_active() -- queued or running, see the class docstring),
+        # never toggled directly by a caller.
         self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.setFixedHeight(22)
         self.cancel_btn.hide()
@@ -542,14 +567,15 @@ class InstanceCard(QWidget):
         self.status_word.setText(word)
         self.status_word.setStyleSheet(f"color: {colour};")
 
-        # Never shown for a worker that is not running -- see the class
-        # docstring. Going non-running (including simply going idle again
-        # once a poll catches up) always resets the busy state: nothing
-        # can legitimately still be "in flight" for a cancel request
-        # against a worker that no longer qualifies for the button at all.
-        running = is_live(worker)
-        self.cancel_btn.setVisible(running)
-        if not running:
+        # Shown for queued OR running -- see the class docstring for why
+        # this is is_active(), not is_live(). Going inactive (including
+        # simply going idle again once a poll catches up) always resets
+        # the busy state: nothing can legitimately still be "in flight"
+        # for a cancel request against a worker that no longer qualifies
+        # for the button at all.
+        active = is_active(worker)
+        self.cancel_btn.setVisible(active)
+        if not active:
             self.set_cancel_busy(False)
 
         if self._currently_live() and worker is not None:

@@ -1067,7 +1067,11 @@ def _seed_job(tmp_path, make_client, n=2):
     return store, factory, st
 
 
-def test_cancel_button_hidden_for_queued_visible_for_running(qapp, tmp_path):
+def test_cancel_button_visible_for_both_queued_and_running(qapp, tmp_path):
+    """Review fix (Task 3 spec defect): a queued kernel already holds a
+    GPU session slot and Fleet.cancel_worker() cancels it correctly, so
+    the per-instance Cancel button must be offered for queued workers
+    too, not only running ones."""
     clients = {}
     def make_client(tok, acct):
         state = "running" if acct.label == "acct0" else "queued"
@@ -1088,7 +1092,7 @@ def test_cancel_button_hidden_for_queued_visible_for_running(qapp, tmp_path):
     running_worker = next(w for w in st.workers if w.state == "running")
     queued_worker = next(w for w in st.workers if w.state == "queued")
     assert dash._instance_cards[running_worker.label].cancel_btn.isHidden() is False
-    assert dash._instance_cards[queued_worker.label].cancel_btn.isHidden() is True
+    assert dash._instance_cards[queued_worker.label].cancel_btn.isHidden() is False
     dash.close()
 
 
