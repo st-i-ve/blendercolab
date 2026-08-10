@@ -100,6 +100,38 @@ class _LaunchWorker(QThread):
             self.succeeded.emit(st)
 
 
+class _DownloadWorker(QThread):
+    """Runs `collector.collect()` off the UI thread, threading
+    DownloadProgress ticks back to whichever InstanceCard(s) they belong
+    to -- the download-side counterpart of _LaunchWorker's own `progress`
+    Signal for uploads.
+
+    `fn` takes ONE argument: an `on_progress(label, progress)` callable
+    (exactly collect()'s own `on_progress` parameter) that this worker
+    hands it, wired straight to `self.progress.emit` -- Qt marshals that
+    emit onto the UI thread automatically because emitter and receiver
+    live on different threads, the same mechanism _LaunchWorker.progress
+    already relies on for upload progress.
+    """
+
+    progress = Signal(str, object)   # (label, blendfleet.downloader.DownloadProgress)
+    succeeded = Signal(object)       # blendfleet.collector.CollectReport | None
+    failed = Signal(str)
+
+    def __init__(self, fn: Callable[[Callable], object], action: str, parent=None) -> None:
+        super().__init__(parent)
+        self._fn = fn
+        self._action = action
+
+    def run(self) -> None:
+        try:
+            result = self._fn(lambda label, p: self.progress.emit(label, p))
+        except Exception as e:  # noqa: BLE001 -- turned into a friendly message
+            self.failed.emit(explain(self._action, e))
+        else:
+            self.succeeded.emit(result)
+
+
 class _CallWorker(QThread):
     """Runs one arbitrary no-argument callable off the UI thread.
 
@@ -159,13 +191,24 @@ class Dashboard(QMainWindow):
         self._poll_worker: _CallWorker | None = None
         self._quota_worker: _CallWorker | None = None
         self._cancel_worker: _CallWorker | None = None
-        self._collect_worker: _CallWorker | None = None
+        # Task 6: the fleet-wide "Collect frames..." button now runs
+        # through _DownloadWorker (not _CallWorker) so it can thread live
+        # DownloadProgress ticks back to each account's own InstanceCard --
+        # same attribute name as before Task 6, only the worker type
+        # changed, so closeEvent/tests that reference _collect_worker by
+        # name need no changes beyond that.
+        self._collect_worker: _DownloadWorker | None = None
         # Task 3: per-instance cancel. Keyed by account label rather than a
         # single attribute like _cancel_worker above, because -- unlike
         # "Cancel all" -- more than one account's cancel can legitimately
         # be in flight at once (the user can click Cancel on two different
         # cards before either returns).
         self._instance_cancel_workers: dict[str, _CallWorker] = {}
+        # Task 6: per-instance download ("can I just download instance 1").
+        # Keyed by label for the same reason as _instance_cancel_workers --
+        # more than one card's download can legitimately be in flight at
+        # once.
+        self._instance_download_workers: dict[str, _DownloadWorker] = {}
         # Task 4: "it just says error". Keyed by account label, holding
         # whatever text (kernels_status's own failure_message, or a
         # fetched kernel-log tail) explains that account's most recent
@@ -653,6 +696,7 @@ class Dashboard(QMainWindow):
         for i, a in enumerate(self.store.list()):
             card = InstanceCard(i, a)
             card.cancel_requested.connect(self._cancel_instance)
+            card.download_requested.connect(self._download_instance)
             self._instance_cards[a.label] = card
             self.rail_rows_layout.addWidget(card)
         self._refresh_views()
@@ -1081,10 +1125,52 @@ class Dashboard(QMainWindow):
         worker.finished.connect(worker.deleteLater)
         worker.start()
 
+    def _clear_all_download_progress(self) -> None:
+        """Reset every card's download progress line -- called once a
+        fleet-wide or per-instance download finishes (success or failure),
+        so a card never goes on showing the last tick from a download that
+        is no longer running."""
+        for card in self._instance_cards.values():
+            card.set_download_progress(None)
+
+    def _route_download_progress(self, label: str, progress) -> None:
+        """One DownloadProgress tick, from either the fleet-wide worker or
+        a per-instance one -- routed to whichever InstanceCard shares that
+        label, exactly the same "join by label, never by position" rule
+        _start_progress_threads already documents for telemetry/log
+        streams."""
+        card = self._instance_cards.get(label)
+        if card is not None:
+            card.set_download_progress(progress)
+
+    def _describe_collect_result(self, r, *, who: str, dest: str) -> str:
+        """One friendly message for a CollectReport, shared by the
+        fleet-wide and per-instance download paths so the two do not grow
+        two different tellings of the same report."""
+        msg = f"Copied {r.copied} frame(s) {who} to {dest}."
+        if r.missing_frames:
+            msg += (f"\n\n{len(r.missing_frames)} frame(s) are still "
+                    f"missing (not rendered yet, or the render failed for "
+                    f"that account): {r.missing_frames[:20]}"
+                    f"{'…' if len(r.missing_frames) > 20 else ''}\n\n"
+                    "Collect again once those accounts finish.")
+        if r.archive_errors:
+            msg += ("\n\nRecovered from this account's loose frames "
+                    "instead of its archive (the archive was corrupt) "
+                    f"for: {', '.join(r.archive_errors)}.")
+        if r.worker_errors:
+            detail = "; ".join(f"{label}: {err}"
+                               for label, err in r.worker_errors.items())
+            msg += f"\n\nCould not reach: {detail}"
+        return msg
+
     def _collect(self) -> None:
-        """Downloading rendered output (`fetch_output`) is real, and
-        potentially slow, network I/O -- moved off the UI thread for the
-        same reason as _cancel above (FINDING 1, task 5 fix round 1)."""
+        """Downloading rendered output is real, and potentially slow,
+        network I/O -- moved off the UI thread for the same reason as
+        _cancel above (FINDING 1, task 5 fix round 1). Task 6: runs
+        through _DownloadWorker so live DownloadProgress ticks reach each
+        account's own InstanceCard as they arrive, the fleet-wide
+        counterpart of _download_instance below."""
         d = QFileDialog.getExistingDirectory(self, "Save frames to")
         if not d:
             return
@@ -1093,47 +1179,117 @@ class Dashboard(QMainWindow):
         from blendfleet.collector import collect
         accounts = self.store.list()
 
-        def work():
+        def work(on_progress):
             fleet = self.fleet_factory(accounts)
             st = fleet.load()
             if st is None:
                 return None
-            return collect(st, accounts, fleet.client_factory, Path(d))
+            return collect(st, accounts, fleet.client_factory, Path(d),
+                           on_progress=on_progress)
 
         self.collect_btn.setEnabled(False)
         self.collect_btn.setText("Collecting…")
 
-        worker = _CallWorker(work, "Collecting frames", self)
+        worker = _DownloadWorker(work, "Collecting frames", self)
         self._collect_worker = worker
 
         def done_ok(r) -> None:
             self._collect_worker = None
             self.collect_btn.setEnabled(True)
             self.collect_btn.setText("Collect frames…")
+            self._clear_all_download_progress()
             if r is None:
                 QMessageBox.information(
                     self, "Nothing to collect",
                     "No render job was found -- start a render first.")
                 return
-            msg = f"Copied {r.copied} frame(s) to {d}."
-            if r.missing_frames:
-                msg += (f"\n\n{len(r.missing_frames)} frame(s) are still "
-                        f"missing (not rendered yet, or the render failed "
-                        f"for that account): {r.missing_frames[:20]}"
-                        f"{'…' if len(r.missing_frames) > 20 else ''}\n\n"
-                        "Collect again once those accounts finish.")
-            QMessageBox.information(self, "Frames collected", msg)
+            QMessageBox.information(
+                self, "Frames collected",
+                self._describe_collect_result(r, who="to", dest=d))
 
         def done_fail(message: str) -> None:
             self._collect_worker = None
             self.collect_btn.setEnabled(True)
             self.collect_btn.setText("Collect frames…")
+            self._clear_all_download_progress()
             QMessageBox.critical(self, "Could not collect frames", message)
 
+        worker.progress.connect(self._route_download_progress)
         worker.succeeded.connect(done_ok)
         worker.failed.connect(done_fail)
         worker.finished.connect(worker.deleteLater)
         worker.start()
+
+    # ---------------- per-instance download (Task 6) ---------------------
+    def _download_instance(self, label: str) -> None:
+        """Download exactly one account's frames -- "can I just download
+        instance 1" -- leaving every other card untouched. A failure here
+        is collector.collect()'s own per-worker report (worker_errors),
+        never a raised exception for a SINGLE dead account, but the
+        network call to even reach that point can still fail outright
+        (revoked token, dead client_factory) -- both paths re-enable this
+        card's button exactly like _cancel_instance does for Cancel.
+        """
+        if label in self._instance_download_workers:
+            return   # already in flight -- that card's button is disabled too
+        d = QFileDialog.getExistingDirectory(self, "Save frames to")
+        if not d:
+            return
+        from blendfleet.collector import collect
+        account = next((a for a in self.store.list() if a.label == label), None)
+        who = (account.username or label) if account else label
+        accounts = self.store.list()
+        card = self._instance_cards.get(label)
+
+        def work(on_progress):
+            fleet = self.fleet_factory(accounts)
+            st = fleet.load()
+            if st is None:
+                return None
+            return collect(st, accounts, fleet.client_factory, Path(d),
+                           worker_label=label, on_progress=on_progress)
+
+        if card is not None:
+            card.set_download_busy(True)
+
+        worker = _DownloadWorker(work, f"Downloading {who}'s frames", self)
+        self._instance_download_workers[label] = worker
+
+        def done_ok(r) -> None:
+            self._instance_download_workers.pop(label, None)
+            if card is not None:
+                card.set_download_busy(False)
+                card.set_download_progress(None)
+            self._show_download_instance_result(who, d, r)
+
+        def done_fail(message: str) -> None:
+            self._instance_download_workers.pop(label, None)
+            if card is not None:
+                card.set_download_busy(False)
+                card.set_download_progress(None)
+            QMessageBox.critical(self, "Could not download frames", message)
+
+        worker.progress.connect(self._route_download_progress)
+        worker.succeeded.connect(done_ok)
+        worker.failed.connect(done_fail)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def _show_download_instance_result(self, who: str, dest: str, r) -> None:
+        if r is None:
+            QMessageBox.information(
+                self, "Nothing to collect",
+                "No render job was found -- start a render first.")
+            return
+        if r.worker_errors:
+            detail = "; ".join(r.worker_errors.values())
+            QMessageBox.warning(
+                self, "Could not download frames",
+                f"{who}'s frames could not be downloaded: {detail}")
+            return
+        QMessageBox.information(
+            self, "Frames downloaded",
+            self._describe_collect_result(r, who=f"from {who} to", dest=dest))
 
     # ---------------- polling / live refresh ----------------
     def _poll(self) -> None:
@@ -1436,7 +1592,8 @@ class Dashboard(QMainWindow):
                        self._quota_worker, self._cancel_worker,
                        self._collect_worker,
                        *self._instance_cancel_workers.values(),
-                       *self._log_fetch_workers.values()):
+                       *self._log_fetch_workers.values(),
+                       *self._instance_download_workers.values()):
             if worker is None:
                 continue
             try:

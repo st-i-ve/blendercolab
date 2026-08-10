@@ -16,6 +16,7 @@ from typing import Callable
 import requests
 from requests.exceptions import HTTPError
 
+from blendfleet.downloader import Transport, fetch_files
 from blendfleet.uploader import UploadError, upload_file
 
 # Status strings returned by ApiGetKernelSessionStatusResponse.status
@@ -30,6 +31,13 @@ _METADATA_FILENAMES = {"dataset-metadata.json", "datapackage.json"}
 # (PNG -> .png, JPEG -> .jpg). fetch_output() must look for all of them or a
 # JPEG render silently collects zero frames.
 IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg")
+
+# Task 5: the notebook now also writes one per-worker zip archive alongside
+# the loose frames (blendfleet.notebook_builder's ARCHIVE). fetch_output()
+# must return it too, or collector.py -- which prefers the archive when
+# present -- would never see it at all.
+ARCHIVE_SUFFIX = ".zip"
+_OUTPUT_SUFFIXES = IMAGE_SUFFIXES + (ARCHIVE_SUFFIX,)
 
 ENV_TOKEN = "KAGGLE_API_TOKEN"
 
@@ -112,6 +120,19 @@ class _RequestsPutTransport:
 
     def put(self, url: str, data, headers: dict):
         return requests.put(url, data=data, headers=headers)
+
+
+class _RequestsGetTransport:
+    """Real `blendfleet.downloader.Transport` backed by `requests`.
+
+    `stream=True` is what makes `.iter_content(...)` read incrementally off
+    the wire instead of buffering the whole response first -- exactly the
+    hook kaggle's own kernels_output() opens (it also passes stream=True)
+    and then throws away by reading `.content` in one shot.
+    """
+
+    def get(self, url: str):
+        return requests.get(url, stream=True)
 
 
 def _start_blob_upload(sdk, path: Path, blob_type) -> tuple[str, str]:
@@ -542,16 +563,64 @@ class KaggleClient:
             return False
 
     def fetch_output(self, slug: str, dest: Path) -> list[Path]:
-        """Return every rendered image, whatever format was selected.
+        """Return every rendered image, whatever format was selected, plus
+        the per-worker zip archive (Task 5) when the notebook wrote one.
 
         Globbing *.png only made the dashboard's JPEG option a dead setting:
         Blender wrote .jpg and collect() then reported every frame missing.
+        No download progress here -- see fetch_output_with_progress below
+        for that; this keeps calling kaggle's own kernels_output() exactly
+        as before so every existing caller (and fetch_log_tail, built on
+        this same call's log side effect) is unaffected.
         """
         dest = Path(dest)
         dest.mkdir(parents=True, exist_ok=True)
         self.api.kernels_output(slug, path=str(dest))
         return sorted(p for p in dest.rglob("*")
-                      if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES)
+                      if p.is_file() and p.suffix.lower() in _OUTPUT_SUFFIXES)
+
+    def fetch_output_with_progress(
+            self, slug: str, dest: Path,
+            on_progress: Callable | None = None,
+            transport: Transport | None = None) -> list[Path]:
+        """Like fetch_output, but reports real download progress via an
+        instrumented reader (blendfleet.downloader.fetch_files) instead of
+        kaggle's own kernels_output(), which -- per kaggle_api_extended.py --
+        does `requests.get(url, stream=True)` and then reads the WHOLE body
+        via `.content` in one shot, with nowhere for a progress callback to
+        hook in. This calls the exact same underlying RPC kernels_output()
+        itself uses to get each output file's direct URL
+        (ApiListKernelSessionOutputRequest -> list_kernel_session_output),
+        then streams each file to disk itself through downloader.fetch_files
+        -- one GET per file, no Range-chunked sub-requests (see that
+        module's docstring for why, mirroring uploader.py's own reasoning).
+
+        `transport`, if given, replaces the real `requests`-backed one --
+        this is the whole download-side counterpart of KaggleClient's
+        injectable `_upload_blob_fn`, used the same way by tests: zero
+        network, a fake object with just `.get(url)`.
+        """
+        from kagglesdk.kernels.types.kernels_api_service import (
+            ApiListKernelSessionOutputRequest)
+
+        dest = Path(dest)
+        dest.mkdir(parents=True, exist_ok=True)
+        owner, name = slug.split("/", 1)
+        sdk = self._sdk_factory(self.token)
+        request = ApiListKernelSessionOutputRequest()
+        request.user_name = owner
+        request.kernel_slug = name
+        response = sdk.kernels.kernels_api_client.list_kernel_session_output(
+            request)
+
+        wanted = [f for f in (response.files or [])
+                 if Path(f.file_name).suffix.lower() in _OUTPUT_SUFFIXES]
+        files = [(f.url, dest / f.file_name) for f in wanted]
+
+        transport = transport or _RequestsGetTransport()
+        fetch_files(files, transport, on_progress=on_progress)
+        return sorted(p for p in dest.rglob("*")
+                      if p.is_file() and p.suffix.lower() in _OUTPUT_SUFFIXES)
 
     def fetch_log_tail(self, slug: str, dest: Path, max_lines: int = 200) -> str:
         """The last `max_lines` lines of `slug`'s kernel log.

@@ -207,21 +207,38 @@ _telemetry_thread.start()
 print("[telemetry] background GPU sampler started")
 '''
 
-    c4 = '''
-import os, glob, time, shutil, subprocess
+    # Task 5: the whole point is ONE download instead of hundreds, not
+    # squeezing extra bytes out of already-compressed PNG/JPEG -- hence
+    # ZIP_STORED, never ZIP_DEFLATED. Named from THIS kernel's own slug
+    # (unique per worker/account) so collect() can tell one worker's
+    # archive apart from another's. Written as each frame completes, not
+    # only after the whole FRAMES loop finishes: a session that hits the
+    # wall or is killed mid-render still leaves a PARTIAL archive covering
+    # every frame finished so far -- exactly as honest as the loose files
+    # in OUT it sits alongside, which are written first and never removed
+    # or replaced by this.
+    archive_name = kernel_slug.split("/", 1)[1]
+
+    c4 = f'''
+import os, glob, time, shutil, subprocess, zipfile
 WORK = "/kaggle/tmp/work"
 os.makedirs(WORK, exist_ok=True)
-blend = f"{WORK}/scene.blend"
+blend = f"{{WORK}}/scene.blend"
 shutil.copy(BLEND, blend)          # /kaggle/input is READ-ONLY
 OUT = "/kaggle/working/frames"
 os.makedirs(OUT, exist_ok=True)
+# ONE archive, in ADDITION to the loose files in OUT -- never a
+# replacement for them. If the kernel is killed before this is even
+# opened, the loose files (uploaded to /kaggle/working exactly as
+# before) are still there for collect() to fall back to.
+ARCHIVE = "/kaggle/working/{archive_name}.zip"
 
 env = os.environ.copy()
-env.update({"BR_RES_X": str(RES_X), "BR_RES_Y": str(RES_Y),
+env.update({{"BR_RES_X": str(RES_X), "BR_RES_Y": str(RES_Y),
             "BR_SAMPLES": str(SAMPLES), "BR_FORMAT": FMT,
-            "BR_OUTPUT": f"{OUT}/f_"})
+            "BR_OUTPUT": f"{{OUT}}/f_"}})
 
-done, failed = [], []
+done, failed, _archived = [], [], set()
 for frame in FRAMES:
     t0 = time.time()
     p = subprocess.run([BBIN, blend, "-b", "-noaudio", "-P",
@@ -230,15 +247,25 @@ for frame in FRAMES:
                        stderr=subprocess.STDOUT)
     ok = p.returncode == 0
     (done if ok else failed).append(frame)
+    if ok:
+        # Appended right after THIS frame succeeds, not batched to the
+        # end of the loop -- see the ARCHIVE comment above for why.
+        for f in glob.glob(f"{{OUT}}/*"):
+            name = os.path.basename(f)
+            if name in _archived:
+                continue
+            with zipfile.ZipFile(ARCHIVE, "a", zipfile.ZIP_STORED) as zf:
+                zf.write(f, arcname=name)
+            _archived.add(name)
     # PROGRESS lines are what the desktop app parses out of the log stream.
-    print(f"PROGRESS frame={frame} ok={ok} secs={time.time()-t0:.1f} "
-          f"done={len(done)}/{len(FRAMES)}", flush=True)
+    print(f"PROGRESS frame={{frame}} ok={{ok}} secs={{time.time()-t0:.1f}} "
+          f"done={{len(done)}}/{{len(FRAMES)}}", flush=True)
     if not ok:
         print(p.stdout[-2000:])
 
 print("DONE", sorted(done), "FAILED", sorted(failed))
-for f in sorted(glob.glob(f"{OUT}/*")):
-    print(f"  {os.path.basename(f)} {os.path.getsize(f)//1024} KB")
+for f in sorted(glob.glob(f"{{OUT}}/*")):
+    print(f"  {{os.path.basename(f)}} {{os.path.getsize(f)//1024}} KB")
 _telemetry_stop.set()
 '''
 

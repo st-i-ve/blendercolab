@@ -43,10 +43,11 @@ from PySide6.QtWidgets import (QHBoxLayout, QLabel, QMessageBox, QPushButton,
                                QVBoxLayout, QWidget)
 
 from blendfleet.accounts import Account
+from blendfleet.downloader import DownloadProgress
 from blendfleet.fleet import WorkerState
 from blendfleet.instance_state import InstanceSnapshot
 from blendfleet.ui.charts import Sparkline
-from blendfleet.ui.formatting import format_bytes
+from blendfleet.ui.formatting import format_bytes, format_eta, format_rate
 from blendfleet.ui.messages import explain_kernel_failure
 from blendfleet.ui.theme import (TELEMETRY, TEXT_SECONDARY, WARNING,
                                   account_color, current_accent, icon,
@@ -270,6 +271,11 @@ class InstanceCard(QWidget):
     # set_cancel_busy below), the same division of responsibility as
     # every other network-backed action in this app.
     cancel_requested = Signal(str)
+    # Task 6: "can I just download instance 1" -- emitted with this card's
+    # account label when its own Download button is clicked. Dashboard
+    # owns the destination-folder dialog and the background worker exactly
+    # like cancel_requested above.
+    download_requested = Signal(str)
 
     def __init__(self, index: int, account: Account,
                  parent: QWidget | None = None) -> None:
@@ -313,7 +319,27 @@ class InstanceCard(QWidget):
         self.cancel_btn.clicked.connect(
             lambda: self.cancel_requested.emit(self.label))
         header.addWidget(self.cancel_btn)
+        # Task 6: per-instance download. Unlike Cancel, this is not gated
+        # on "running" -- there is something worth grabbing (partial
+        # frames included) at any point once a job exists on disk, and
+        # collector.collect() itself already reports cleanly ("nothing to
+        # collect") when there is nothing there yet, so this button is
+        # simply always available rather than trying to predict that here.
+        self.download_btn = QPushButton("Download")
+        self.download_btn.setFixedHeight(22)
+        self.download_btn.clicked.connect(
+            lambda: self.download_requested.emit(self.label))
+        header.addWidget(self.download_btn)
         v.addLayout(header)
+
+        # ---- download progress: bytes/rate/ETA, exactly like the upload
+        # view's own stats line, reusing the same formatting helpers. One
+        # line, hidden whenever no download is in flight for this card.
+        self.download_progress_label = QLabel("")
+        self.download_progress_label.setFont(mono_font(9))
+        self.download_progress_label.setProperty("secondary", True)
+        self.download_progress_label.hide()
+        v.addWidget(self.download_progress_label)
 
         # ---- quota (always visible: this IS obtainable at rest) ----
         quota_row = QHBoxLayout()
@@ -541,6 +567,39 @@ class InstanceCard(QWidget):
         """
         self.cancel_btn.setEnabled(not busy)
         self.cancel_btn.setText("Cancelling…" if busy else "Cancel")
+
+    # ---------------- download (Task 6) ----------------
+    def set_download_busy(self, busy: bool) -> None:
+        """Disable (and re-word) the per-card Download control while a
+        collect() request for this account is in flight -- the download
+        counterpart of set_cancel_busy above, same division of
+        responsibility (Dashboard owns the worker and calls this on both
+        the success and the failure path)."""
+        self.download_btn.setEnabled(not busy)
+        self.download_btn.setText("Downloading…" if busy else "Download")
+
+    def set_download_progress(self, progress: DownloadProgress | None) -> None:
+        """Render one DownloadProgress tick, or clear the line entirely
+        when `progress` is None (no download in flight for this card --
+        the initial state, and the state Dashboard restores once a
+        download finishes or fails).
+
+        Deliberately reuses blendfleet.ui.formatting's format_bytes/
+        format_rate/format_eta -- the exact helpers upload_view.py already
+        uses for the upload side -- rather than writing a second copy of
+        "0 B/s reads as stalled, not 0.0 B/s" or any of the other
+        edge-case discipline those already encode.
+        """
+        if progress is None:
+            self.download_progress_label.setText("")
+            self.download_progress_label.hide()
+            return
+        line = (f"{format_bytes(progress.downloaded)}/"
+               f"{format_bytes(progress.total)}"
+               f"  {format_rate(progress.rate_bps):>10}"
+               f"  eta {format_eta(progress.downloaded, progress.total, progress.rate_bps)}")
+        self.download_progress_label.setText(line)
+        self.download_progress_label.show()
 
     def _currently_live(self) -> bool:
         """Whether the LIVE BODY should be showing right now.

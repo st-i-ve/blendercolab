@@ -253,3 +253,80 @@ def test_preflight_cell_is_still_valid_python_with_a_gate_configured(tmp_path):
     p = build([1], settings, "me/x", tmp_path, "me/r")
     for src in cells_src(p):
         ast.parse(src)
+
+
+# --------------------------------------------------------------------------
+# Task 5: zip the rendered frames into a single per-worker archive, without
+# ever losing the loose files a timeout would otherwise still leave behind.
+# --------------------------------------------------------------------------
+
+def test_writes_a_zip_archive_using_stdlib_zipfile(tmp_path, settings):
+    cells = cells_src(build([1], settings, "me/x", tmp_path, "me/r"))
+    render_cell = next(c for c in cells if "PROGRESS frame=" in c)
+    assert "zipfile" in render_cell.splitlines()[0], \
+        "zipfile must be imported (stdlib -- no dependency on either side)"
+    assert "zipfile.ZipFile" in render_cell
+
+
+def test_archive_uses_zip_stored_not_deflate(tmp_path, settings):
+    # PNG/JPEG are already compressed -- deflating them costs render-loop
+    # time for almost nothing. The whole win here is one download instead
+    # of hundreds, not squeezing more bytes out of an already-compressed
+    # format.
+    joined = "\n".join(cells_src(build([1], settings, "me/x", tmp_path, "me/r")))
+    assert "zipfile.ZIP_STORED" in joined
+    assert "ZIP_DEFLATED" not in joined
+
+
+def test_archive_name_is_per_worker_not_a_fixed_shared_name(tmp_path, settings):
+    # Named from kernel_slug (unique per worker/account) rather than a
+    # constant like "frames.zip" -- collect() must be able to tell one
+    # worker's archive from another's if they ever land in the same place.
+    joined = "\n".join(cells_src(
+        build([1], settings, "me/x", tmp_path, "me/render-abc123")))
+    assert "render-abc123" in joined
+
+
+def test_archive_is_written_inside_the_frame_loop_not_only_at_the_end(tmp_path, settings):
+    # THE non-negotiable from the brief: if the archive were written only
+    # once after the whole FRAMES loop finishes, a session that hits the
+    # wall or dies mid-render would lose every frame's inclusion in the
+    # archive -- the archive write must happen as each frame completes, so
+    # a partial render still produces a partial (not empty, not missing)
+    # archive alongside the loose files.
+    cells = cells_src(build([1, 2, 3], settings, "me/x", tmp_path, "me/r"))
+    render_cell = next(c for c in cells if "PROGRESS frame=" in c)
+    zip_idx = render_cell.index("zipfile.ZipFile")
+    loop_idx = render_cell.index("for frame in FRAMES")
+    done_idx = render_cell.index('print("DONE"')
+    assert loop_idx < zip_idx < done_idx, (
+        "the archive write must sit inside the per-frame loop, strictly "
+        "before the final DONE summary")
+
+
+def test_archive_write_does_not_replace_the_loose_frames(tmp_path, settings):
+    # The loose files in OUT must still be written exactly as before --
+    # the archive is written IN ADDITION, never as a replacement, so a
+    # timeout that kills the session before the archive is even opened
+    # still leaves every finished frame recoverable.
+    joined = "\n".join(cells_src(build([1], settings, "me/x", tmp_path, "me/r")))
+    assert 'os.makedirs(OUT, exist_ok=True)' in joined
+    assert "BR_OUTPUT" in joined
+    assert "shutil.rmtree" not in joined
+    assert "os.remove(f\"{OUT}" not in joined
+
+
+def test_archive_only_includes_successfully_rendered_frames(tmp_path, settings):
+    # A failed frame's (nonexistent) output must never be swept into the
+    # archive -- only zip on ok, exactly like `done`/`failed` already track.
+    cells = cells_src(build([1], settings, "me/x", tmp_path, "me/r"))
+    render_cell = next(c for c in cells if "PROGRESS frame=" in c)
+    ok_idx = render_cell.index("if ok:")
+    zip_idx = render_cell.index("zipfile.ZipFile")
+    assert ok_idx < zip_idx
+
+
+def test_every_cell_is_still_valid_python_with_archiving(tmp_path, settings):
+    p = build([1, 2, 3], settings, "me/remember-blend", tmp_path, "me/render-0")
+    for src in cells_src(p):
+        ast.parse(src)

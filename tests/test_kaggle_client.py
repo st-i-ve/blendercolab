@@ -578,6 +578,127 @@ def test_fetch_log_tail_returns_empty_string_when_no_log_was_captured(tmp_path):
     assert text == ""
 
 
+# ---------------------------------------------------------------------------
+# Task 5: fetch_output must also pick up the per-worker archive, alongside
+# the loose images it already returns.
+# ---------------------------------------------------------------------------
+
+def test_fetch_output_returns_the_archive_too(tmp_path):
+    class ZipApi(FakeApi):
+        def kernels_output(self, slug, path):
+            Path(path).mkdir(parents=True, exist_ok=True)
+            (Path(path) / "f_0001.png").write_bytes(b"PNG")
+            (Path(path) / "render-0.zip").write_bytes(b"PK\x03\x04fake zip")
+
+    c, _ = client(api=ZipApi())
+    got = c.fetch_output("x/y", tmp_path / "out")
+    assert sorted(p.name for p in got) == ["f_0001.png", "render-0.zip"]
+
+
+# ---------------------------------------------------------------------------
+# Task 6: fetch_output_with_progress -- real download progress via an
+# instrumented reader (blendfleet.downloader), not kaggle's own
+# kernels_output() (which pulls the whole body into memory with
+# `.content`, nowhere for a progress callback to hook in).
+# ---------------------------------------------------------------------------
+
+class FakeOutputFile:
+    def __init__(self, url, file_name):
+        self.url = url
+        self.file_name = file_name
+
+
+class FakeListOutputResponse:
+    def __init__(self, files):
+        self.files = files
+
+
+class FakeGetResponse:
+    def __init__(self, body: bytes):
+        self.body = body
+        self.headers = {"Content-Length": str(len(body))}
+
+    def iter_content(self, chunk_size=None):
+        yield self.body
+
+
+class FakeGetTransport:
+    def __init__(self, bodies: dict[str, bytes]):
+        self._bodies = bodies
+        self.urls: list[str] = []
+
+    def get(self, url):
+        self.urls.append(url)
+        return FakeGetResponse(self._bodies[url])
+
+
+def test_fetch_output_with_progress_downloads_via_the_listed_urls(tmp_path):
+    class FakeSdk:
+        class kernels:
+            class kernels_api_client:
+                @staticmethod
+                def list_kernel_session_output(request):
+                    assert request.user_name == "x"
+                    assert request.kernel_slug == "y"
+                    return FakeListOutputResponse(
+                        [FakeOutputFile("https://x/f.zip", "f.zip")])
+
+    c = KaggleClient(TOKEN, api_factory=lambda t: FakeApi(),
+                     sdk_factory=lambda t: FakeSdk())
+    transport = FakeGetTransport({"https://x/f.zip": b"PK\x03\x04zipbytes"})
+
+    got = c.fetch_output_with_progress("x/y", tmp_path / "out",
+                                       transport=transport)
+
+    assert [p.name for p in got] == ["f.zip"]
+    assert (tmp_path / "out" / "f.zip").read_bytes() == b"PK\x03\x04zipbytes"
+    assert transport.urls == ["https://x/f.zip"]
+
+
+def test_fetch_output_with_progress_reports_bytes_downloaded(tmp_path):
+    class FakeSdk:
+        class kernels:
+            class kernels_api_client:
+                @staticmethod
+                def list_kernel_session_output(request):
+                    return FakeListOutputResponse(
+                        [FakeOutputFile("https://x/f.zip", "f.zip")])
+
+    c = KaggleClient(TOKEN, api_factory=lambda t: FakeApi(),
+                     sdk_factory=lambda t: FakeSdk())
+    body = b"0" * (2 * 1024 * 1024)
+    transport = FakeGetTransport({"https://x/f.zip": body})
+    events = []
+
+    c.fetch_output_with_progress("x/y", tmp_path / "out",
+                                 on_progress=events.append, transport=transport)
+
+    assert events
+    assert events[-1].downloaded == len(body)
+    assert events[-1].total == len(body)
+
+
+def test_fetch_output_with_progress_filters_to_images_and_archives_only(tmp_path):
+    class FakeSdk:
+        class kernels:
+            class kernels_api_client:
+                @staticmethod
+                def list_kernel_session_output(request):
+                    return FakeListOutputResponse([
+                        FakeOutputFile("https://x/f.zip", "f.zip"),
+                        FakeOutputFile("https://x/notes.txt", "notes.txt"),
+                    ])
+
+    c = KaggleClient(TOKEN, api_factory=lambda t: FakeApi(),
+                     sdk_factory=lambda t: FakeSdk())
+    transport = FakeGetTransport({"https://x/f.zip": b"zip",
+                                  "https://x/notes.txt": b"ignore me"})
+
+    got = c.fetch_output_with_progress("x/y", tmp_path / "out",
+                                       transport=transport)
+    assert [p.name for p in got] == ["f.zip"]
+
+
 def test_sdk_factory_passes_the_token_instead_of_setting_the_environment():
     """CRITICAL C2: kagglesdk.KaggleClient accepts api_token=, so nothing
     here may write the process-global KAGGLE_API_TOKEN."""

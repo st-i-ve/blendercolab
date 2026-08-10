@@ -138,11 +138,12 @@ def settle(dash, timeout=2000) -> None:
     """
     workers = [dash._poll_worker, dash._quota_worker,
                dash._cancel_worker, dash._collect_worker]
-    # Task 3/4: per-label worker dicts -- more than one can legitimately be
-    # in flight at once (two different cards' cancels, or two different
-    # accounts' failure-log fetches).
+    # Task 3/4/6: per-label worker dicts -- more than one can legitimately
+    # be in flight at once (two different cards' cancels, two different
+    # accounts' failure-log fetches, or two different cards' downloads).
     workers += list(dash._instance_cancel_workers.values())
     workers += list(dash._log_fetch_workers.values())
+    workers += list(dash._instance_download_workers.values())
     for worker in workers:
         if worker is None:
             continue
@@ -1242,6 +1243,226 @@ def test_cancel_instance_on_an_already_finished_worker_says_nothing_to_cancel(
 
     titles = [title for title, _ in stub_message_boxes["information"]]
     assert any("Nothing to cancel" in t for t in titles)
+    dash.close()
+
+
+# ---------------------------------------------------------------------------
+# Task 6: per-instance download (with progress), and the fleet-wide
+# "Collect frames..." button rewired onto the same progress-reporting path.
+# ---------------------------------------------------------------------------
+
+class DownloadingClient(FakeClient):
+    """fetch_output writes fake frame files into `dest`; fetch_output_with_
+    progress reports one DownloadProgress tick first -- so Task 6's
+    download-progress wiring can be exercised end to end with zero
+    network."""
+
+    def __init__(self, token, state="complete", frame_names=("f_0001.png",)):
+        super().__init__(token, state)
+        self.frame_names = frame_names
+
+    def fetch_output(self, slug, dest):
+        dest.mkdir(parents=True, exist_ok=True)
+        out = []
+        for name in self.frame_names:
+            p = dest / name
+            p.write_bytes(b"PNG")
+            out.append(p)
+        return out
+
+    def fetch_output_with_progress(self, slug, dest, on_progress=None):
+        if on_progress is not None:
+            from blendfleet.downloader import DownloadProgress
+            on_progress(DownloadProgress(downloaded=3, total=3, rate_bps=1.0))
+        return self.fetch_output(slug, dest)
+
+
+class BoomFetchClient(FakeClient):
+    def fetch_output(self, slug, dest):
+        raise RuntimeError("network died mid-download")
+
+    def fetch_output_with_progress(self, slug, dest, on_progress=None):
+        raise RuntimeError("network died mid-download")
+
+
+def test_download_instance_downloads_only_that_worker(
+        qapp, tmp_path, monkeypatch, stub_message_boxes):
+    clients = {}
+
+    def make_client(tok, acct):
+        clients[tok] = DownloadingClient(
+            tok, frame_names=(f"f_000{acct.label[-1]}.png",))
+        return clients[tok]
+
+    store, factory, st = _seed_job(tmp_path, make_client, n=2)
+    dest = tmp_path / "downloaded"
+    monkeypatch.setattr(dashboard_mod.QFileDialog, "getExistingDirectory",
+                        lambda *a, **kw: str(dest))
+
+    dash = Dashboard(store, lambda accounts: Fleet(accounts, factory, tmp_path / "w"),
+                     verifier=lambda t: "someone")
+    _LIVE_DASHBOARDS.append(dash)
+    settle(dash)
+    dash._last_state = st
+    dash._refresh_views()
+
+    target = st.workers[0]
+    dash._download_instance(target.label)
+    pump(dash._instance_download_workers[target.label])
+    settle(dash)
+
+    assert dest.exists()
+    assert stub_message_boxes["information"], "no result dialog was shown"
+    dash.close()
+
+
+def test_download_instance_shows_progress_on_that_cards_own_line(
+        qapp, tmp_path, monkeypatch, stub_message_boxes):
+    def make_client(tok, acct):
+        return DownloadingClient(tok)
+
+    store, factory, st = _seed_job(tmp_path, make_client, n=1)
+    monkeypatch.setattr(dashboard_mod.QFileDialog, "getExistingDirectory",
+                        lambda *a, **kw: str(tmp_path / "downloaded"))
+
+    dash = Dashboard(store, lambda accounts: Fleet(accounts, factory, tmp_path / "w"),
+                     verifier=lambda t: "someone")
+    _LIVE_DASHBOARDS.append(dash)
+    settle(dash)
+    dash._last_state = st
+    dash._refresh_views()
+
+    label = st.workers[0].label
+    card = dash._instance_cards[label]
+    seen_progress = []
+    card.set_download_progress = (lambda p, orig=card.set_download_progress:
+                                  (seen_progress.append(p), orig(p)))
+
+    dash._download_instance(label)
+    pump(dash._instance_download_workers[label])
+    settle(dash)
+
+    assert any(p is not None for p in seen_progress), \
+        "the card's own progress line was never updated"
+    # cleared again once the download finishes
+    assert card.download_progress_label.isHidden() is True
+    dash.close()
+
+
+def test_download_instance_disables_button_while_in_flight_and_reenables(
+        qapp, tmp_path, monkeypatch, stub_message_boxes):
+    def make_client(tok, acct):
+        return DownloadingClient(tok)
+
+    store, factory, st = _seed_job(tmp_path, make_client, n=1)
+    monkeypatch.setattr(dashboard_mod.QFileDialog, "getExistingDirectory",
+                        lambda *a, **kw: str(tmp_path / "downloaded"))
+
+    dash = Dashboard(store, lambda accounts: Fleet(accounts, factory, tmp_path / "w"),
+                     verifier=lambda t: "someone")
+    _LIVE_DASHBOARDS.append(dash)
+    settle(dash)
+    dash._last_state = st
+    dash._refresh_views()
+
+    label = st.workers[0].label
+    card = dash._instance_cards[label]
+
+    dash._download_instance(label)
+    assert card.download_btn.isEnabled() is False
+    assert card.download_btn.text() == "Downloading…"
+
+    pump(dash._instance_download_workers[label])
+    settle(dash)
+
+    assert card.download_btn.isEnabled() is True
+    assert card.download_btn.text() == "Download"
+    dash.close()
+
+
+def test_download_instance_no_folder_chosen_does_nothing(
+        qapp, tmp_path, monkeypatch):
+    def make_client(tok, acct):
+        return DownloadingClient(tok)
+
+    store, factory, st = _seed_job(tmp_path, make_client, n=1)
+    monkeypatch.setattr(dashboard_mod.QFileDialog, "getExistingDirectory",
+                        lambda *a, **kw: "")   # user cancelled the dialog
+
+    dash = Dashboard(store, lambda accounts: Fleet(accounts, factory, tmp_path / "w"),
+                     verifier=lambda t: "someone")
+    _LIVE_DASHBOARDS.append(dash)
+    settle(dash)
+    dash._last_state = st
+    dash._refresh_views()
+
+    dash._download_instance(st.workers[0].label)
+    assert dash._instance_download_workers == {}
+    dash.close()
+
+
+def test_download_instance_failure_on_one_worker_leaves_the_button_usable_again(
+        qapp, tmp_path, monkeypatch, stub_message_boxes):
+    def make_client(tok, acct):
+        return BoomFetchClient(tok)
+
+    store, factory, st = _seed_job(tmp_path, make_client, n=1)
+    monkeypatch.setattr(dashboard_mod.QFileDialog, "getExistingDirectory",
+                        lambda *a, **kw: str(tmp_path / "downloaded"))
+
+    dash = Dashboard(store, lambda accounts: Fleet(accounts, factory, tmp_path / "w"),
+                     verifier=lambda t: "someone")
+    _LIVE_DASHBOARDS.append(dash)
+    settle(dash)
+    dash._last_state = st
+    dash._refresh_views()
+
+    label = st.workers[0].label
+    card = dash._instance_cards[label]
+
+    dash._download_instance(label)
+    pump(dash._instance_download_workers[label])
+    settle(dash)
+
+    # collect() itself never raises on a fetch failure (Task 6: one
+    # worker's failure must not abort the others) -- it comes back as a
+    # CollectReport whose worker_errors names this account, so the button
+    # must still re-enable exactly as on a clean success.
+    assert card.download_btn.isEnabled() is True
+    assert card.download_btn.text() == "Download"
+    assert stub_message_boxes["warning"] or stub_message_boxes["information"]
+    dash.close()
+
+
+def test_collect_fleet_wide_downloads_every_worker_and_routes_progress_per_card(
+        qapp, tmp_path, monkeypatch, stub_message_boxes):
+    clients = {}
+
+    def make_client(tok, acct):
+        clients[tok] = DownloadingClient(
+            tok, frame_names=(f"f_000{acct.label[-1]}.png",))
+        return clients[tok]
+
+    store, factory, st = _seed_job(tmp_path, make_client, n=2)
+    dest = tmp_path / "downloaded"
+    monkeypatch.setattr(dashboard_mod.QFileDialog, "getExistingDirectory",
+                        lambda *a, **kw: str(dest))
+
+    dash = Dashboard(store, lambda accounts: Fleet(accounts, factory, tmp_path / "w"),
+                     verifier=lambda t: "someone")
+    _LIVE_DASHBOARDS.append(dash)
+    settle(dash)
+    dash._last_state = st
+    dash._refresh_views()
+
+    dash._collect()
+    pump(dash._collect_worker)
+    settle(dash)
+
+    assert dest.exists()
+    for w in st.workers:
+        assert dash._instance_cards[w.label].download_progress_label.isHidden() is True
+    assert stub_message_boxes["information"]
     dash.close()
 
 

@@ -598,3 +598,71 @@ def test_switching_accent_actually_repaints_an_already_built_card(qapp, name):
     card.refresh_accent()
     image = card.status_icon.pixmap().toImage()
     assert _image_has_color(image, ACCENTS[name].base)
+
+
+# ---------------- Task 6: per-instance Download control ----------------
+
+def test_download_button_is_always_available(qapp):
+    """Unlike Cancel (gated on "running"), Download makes sense any time
+    there is a job on disk at all -- idle, queued, running, complete,
+    even error (partial frames are still worth grabbing) -- so it is
+    never hidden by worker state."""
+    card = InstanceCard(0, make_account())
+    for state in (None, "queued", "running", "complete", "error"):
+        card.set_worker(make_worker(state=state) if state else None)
+        assert card.download_btn.isHidden() is False
+
+
+def test_clicking_download_emits_the_accounts_label(qapp):
+    card = InstanceCard(0, make_account(label="stive"))
+    seen = []
+    card.download_requested.connect(seen.append)
+    card.download_btn.click()
+    assert seen == ["stive"]
+
+
+def test_set_download_busy_disables_and_relabels_the_button(qapp):
+    card = InstanceCard(0, make_account())
+    assert card.download_btn.isEnabled() is True
+    assert card.download_btn.text() == "Download"
+
+    card.set_download_busy(True)
+    assert card.download_btn.isEnabled() is False
+    assert card.download_btn.text() == "Downloading…"
+
+    card.set_download_busy(False)
+    assert card.download_btn.isEnabled() is True
+    assert card.download_btn.text() == "Download"
+
+
+def test_set_download_progress_shows_bytes_rate_and_eta(qapp):
+    from blendfleet.downloader import DownloadProgress
+    card = InstanceCard(0, make_account())
+    card.set_download_progress(
+        DownloadProgress(downloaded=2 * 1024 * 1024, total=10 * 1024 * 1024,
+                         rate_bps=1024 * 1024.0))
+    text = card.download_progress_label.text()
+    assert "2.0 MB" in text
+    assert "10.0 MB" in text
+    assert "MB/s" in text
+    assert card.download_progress_label.isHidden() is False
+
+
+def test_set_download_progress_stalled_reads_stalled_not_zero(qapp):
+    """Reusing formatting.format_rate -- never write a second copy of the
+    "stalled" rule."""
+    from blendfleet.downloader import DownloadProgress
+    card = InstanceCard(0, make_account())
+    card.set_download_progress(DownloadProgress(downloaded=0, total=10, rate_bps=0.0))
+    assert "stalled" in card.download_progress_label.text()
+
+
+def test_set_download_progress_none_clears_and_hides_the_line(qapp):
+    from blendfleet.downloader import DownloadProgress
+    card = InstanceCard(0, make_account())
+    card.set_download_progress(DownloadProgress(downloaded=1, total=2, rate_bps=1.0))
+    assert card.download_progress_label.isHidden() is False
+
+    card.set_download_progress(None)
+    assert card.download_progress_label.text() == ""
+    assert card.download_progress_label.isHidden() is True
