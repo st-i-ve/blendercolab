@@ -1,8 +1,8 @@
 import json
 
 from blendfleet.log_stream import (is_end_of_log, parse_hardware_banner,
-                                   parse_progress, parse_telemetry,
-                                   stream_progress)
+                                   parse_preflight, parse_progress,
+                                   parse_telemetry, stream_progress)
 
 
 def test_parses_a_real_sse_line():
@@ -242,6 +242,135 @@ def test_stream_progress_without_on_hardware_ignores_hardware_lines(monkeypatch)
 
     progress_calls = []
     # Default on_hardware=None must not raise on hardware-banner lines.
+    stream_progress(
+        "KGAT_" + "a" * 32, "user0", "user0/kernel",
+        on_progress=lambda done, total: progress_calls.append((done, total)))
+    assert progress_calls == [(1, 2)]
+
+
+# --------------------------------------------------------------------------
+# parse_preflight: notebook_builder.py's first cell prints exactly ONE
+# PREFLIGHT line, before anything else -- before the hardware banner above,
+# and before the next cell downloads Blender:
+#   f"PREFLIGHT gpus={len(gpu_names)} gpu_names={...} cpu={cpu_count} "
+#   f"ram={ram_total:.1f}"
+# --------------------------------------------------------------------------
+
+def test_parses_the_real_preflight_line_with_two_gpus():
+    line = _sse("PREFLIGHT gpus=2 gpu_names=Tesla T4|Tesla T4 cpu=4 ram=31.3\n")
+    assert parse_preflight(line) == {
+        "gpu_count": 2, "gpu_names": ["Tesla T4", "Tesla T4"],
+        "cpu_count": 4, "ram_total": 31.3}
+
+
+def test_parses_a_preflight_line_with_no_gpus():
+    # CPU-only session: the notebook prints the literal "none", never an
+    # empty gpu_names field.
+    line = _sse("PREFLIGHT gpus=0 gpu_names=none cpu=4 ram=31.3\n")
+    assert parse_preflight(line) == {
+        "gpu_count": 0, "gpu_names": [], "cpu_count": 4, "ram_total": 31.3}
+
+
+def test_parses_a_single_gpu_preflight_line():
+    line = _sse("PREFLIGHT gpus=1 gpu_names=Tesla P100-PCIE-16GB cpu=4 ram=31.3\n")
+    assert parse_preflight(line) == {
+        "gpu_count": 1, "gpu_names": ["Tesla P100-PCIE-16GB"],
+        "cpu_count": 4, "ram_total": 31.3}
+
+
+def test_preflight_ignores_stderr_and_noise():
+    assert parse_preflight(
+        'data: {"stream_name":"stderr","data":"PREFLIGHT gpus=1 '
+        'gpu_names=Tesla T4 cpu=4 ram=31.3\\n"}') is None
+    assert parse_preflight("") is None
+    assert parse_preflight("event: ping") is None
+    assert parse_preflight("not json at all") is None
+
+
+def test_preflight_ignores_malformed_json():
+    assert parse_preflight('data: {"stream_name":') is None
+
+
+def test_preflight_parser_ignores_progress_telemetry_and_hardware_lines():
+    progress_line = _sse("PROGRESS frame=1 ok=True secs=1.0 done=1/2\n")
+    telemetry_line = _sse(
+        "TELEMETRY gpu=0 util=87 mem_used=6144 mem_total=15360 "
+        "temp=71 power=58\n")
+    cpu_ram_line = _sse("CPU 4 cores | RAM 31.3 GB\n")
+    gpu_line = _sse("Tesla T4, 15360 MiB\n")
+    assert parse_preflight(progress_line) is None
+    assert parse_preflight(telemetry_line) is None
+    assert parse_preflight(cpu_ram_line) is None
+    assert parse_preflight(gpu_line) is None
+
+
+def test_other_parsers_ignore_preflight_lines():
+    line = _sse("PREFLIGHT gpus=2 gpu_names=Tesla T4|Tesla T4 cpu=4 ram=31.3\n")
+    assert parse_progress(line) is None
+    assert parse_telemetry(line) is None
+    assert parse_hardware_banner(line) is None
+
+
+class _FakePreflightSdkClient:
+    """Same shape as _FakeHardwareSdkClient above, plus the PREFLIGHT line
+    ahead of everything else -- matching the real notebook's cell order
+    (PREFLIGHT prints before the hardware banner, which prints before
+    PROGRESS/TELEMETRY)."""
+
+    def __init__(self, api_token=None, **kw):
+        lines = [
+            _sse("PREFLIGHT gpus=2 gpu_names=Tesla T4|Tesla T4 cpu=4 ram=31.3\n"),
+            _sse("CPU 4 cores | RAM 31.3 GB\n"),
+            _sse("Tesla T4, 15360 MiB\n"),
+            _sse("PROGRESS frame=1 ok=True secs=1.0 done=1/2\n"),
+            _sse("TELEMETRY gpu=0 util=87 mem_used=6144 mem_total=15360 "
+                "temp=71 power=58\n"),
+            "data: END_OF_LOG",
+        ]
+
+        class _ApiClient:
+            @staticmethod
+            def get_kernel_session_logs_stream(req):
+                return _FakeStreamResponse(lines)
+
+        class _Kernels:
+            kernels_api_client = _ApiClient()
+
+        self.kernels = _Kernels()
+
+
+def test_stream_progress_reports_preflight_alongside_everything_else(monkeypatch):
+    import kagglesdk
+    monkeypatch.setattr(kagglesdk, "KaggleClient", _FakePreflightSdkClient)
+
+    progress_calls = []
+    telemetry_calls = []
+    hardware_calls = []
+    preflight_calls = []
+    stream_progress(
+        "KGAT_" + "a" * 32, "user0", "user0/kernel",
+        on_progress=lambda done, total: progress_calls.append((done, total)),
+        on_telemetry=telemetry_calls.append,
+        on_hardware=hardware_calls.append,
+        on_preflight=preflight_calls.append)
+
+    assert preflight_calls == [{
+        "gpu_count": 2, "gpu_names": ["Tesla T4", "Tesla T4"],
+        "cpu_count": 4, "ram_total": 31.3}]
+    assert hardware_calls == [
+        {"kind": "cpu_ram", "cpu_count": 4, "ram_total": 31.3},
+        {"kind": "gpu", "model": "Tesla T4", "mem_total": 15360}]
+    assert progress_calls == [(1, 2)]
+    assert [t["gpu"] for t in telemetry_calls] == [0]
+
+
+def test_stream_progress_without_on_preflight_ignores_preflight_lines(monkeypatch):
+    import kagglesdk
+    monkeypatch.setattr(kagglesdk, "KaggleClient", _FakePreflightSdkClient)
+
+    progress_calls = []
+    # Default on_preflight=None must not raise on a PREFLIGHT line, and
+    # must not swallow the lines that come after it.
     stream_progress(
         "KGAT_" + "a" * 32, "user0", "user0/kernel",
         on_progress=lambda done, total: progress_calls.append((done, total)))

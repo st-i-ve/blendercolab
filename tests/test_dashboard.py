@@ -359,6 +359,58 @@ def test_live_telemetry_flows_into_the_matching_instance_card_only(qapp, tmp_pat
     dash.close()
 
 
+# --------- PREFLIGHT: real hardware within seconds, before TELEMETRY -----
+
+def test_preflight_flows_into_the_matching_instance_card_only(qapp, tmp_path):
+    """PREFLIGHT arrives before Blender is even downloaded -- well before
+    a worker could plausibly be "running" -- so a merely queued worker
+    must already see it, and per-account, never the other account's."""
+    dash = make_dashboard(qapp, tmp_path, n=2)
+    dash._last_state = FleetState(
+        job_id="job", blend_name="x.blend", start_frame=1, end_frame=2,
+        workers=[
+            WorkerState(label="acct0", username="user_0",
+                       kernel_slug="user_0/k0", frames=[1, 2], state="queued"),
+            WorkerState(label="acct1", username="user_1",
+                       kernel_slug="user_1/k1", frames=[1, 2], state="queued"),
+        ])
+    dash._refresh_views()
+
+    dash._preflight_queue.put(("acct0", {
+        "gpu_count": 2, "gpu_names": ["Tesla T4", "Tesla T4"],
+        "cpu_count": 4, "ram_total": 31.3}))
+    dash._live_tick()
+
+    card0 = dash._instance_cards["acct0"]
+    card1 = dash._instance_cards["acct1"]
+    assert "2x Tesla T4" in card0.preflight_label.text()
+    assert card0.live_container.isHidden() is False
+    assert card1.preflight_label.text() == ""
+    assert dash._instance_preflight["acct0"]["gpu_count"] == 2
+    dash.close()
+
+
+def test_preflight_cleared_at_the_start_of_a_new_render(qapp, tmp_path):
+    """A card must never open showing the PREVIOUS run's PREFLIGHT text."""
+    dash = make_dashboard(qapp, tmp_path, n=1)
+    dash._last_state = FleetState(
+        job_id="job", blend_name="x.blend", start_frame=1, end_frame=1,
+        workers=[WorkerState(label="acct0", username="user_0",
+                             kernel_slug="user_0/k0", frames=[1],
+                             state="queued")])
+    dash._refresh_views()
+    dash._preflight_queue.put(("acct0", {
+        "gpu_count": 1, "gpu_names": ["Tesla T4"],
+        "cpu_count": 4, "ram_total": 31.3}))
+    dash._live_tick()
+    assert "Tesla T4" in dash._instance_cards["acct0"].preflight_label.text()
+
+    dash._start_progress_threads(FleetState("job2", "x.blend", 1, 1, []))
+    assert dash._instance_preflight == {}
+    assert dash._instance_cards["acct0"].preflight_label.text() == ""
+    dash.close()
+
+
 def test_launch_success_reflects_in_the_instance_card_status(qapp, tmp_path):
     dash = make_dashboard(qapp, tmp_path, n=1)
     blend = tmp_path / "remember.blend"
@@ -385,7 +437,7 @@ def test_telemetry_arriving_while_still_queued_shows_a_live_card(qapp, tmp_path,
     live body must reflect that immediately, not wait for the next poll."""
     def fake_stream_progress(token, user_name, kernel_slug, on_progress,
                              stop_event=None, on_telemetry=None,
-                             on_hardware=None):
+                             on_hardware=None, on_preflight=None):
         on_progress(1, 4)
         if on_telemetry:
             on_telemetry({"gpu": 0, "util": 50, "mem_used": 100,
@@ -514,7 +566,7 @@ def test_live_tick_drains_queued_telemetry_into_gpu_panel(qapp, tmp_path):
 def test_start_progress_threads_feeds_live_progress_and_telemetry(qapp, tmp_path, monkeypatch):
     def fake_stream_progress(token, user_name, kernel_slug, on_progress,
                              stop_event=None, on_telemetry=None,
-                             on_hardware=None):
+                             on_hardware=None, on_preflight=None):
         on_progress(2, 3)
         if on_telemetry:
             on_telemetry({"gpu": 0, "util": 50, "mem_used": 100,

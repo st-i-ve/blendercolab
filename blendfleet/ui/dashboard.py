@@ -177,6 +177,16 @@ class Dashboard(QMainWindow):
         # UI thread by _live_tick alongside _telemetry_queue -- same
         # widgets-only-from-the-UI-thread reasoning as telemetry above.
         self._hardware_queue: "queue.Queue[tuple[str, dict]]" = queue.Queue()
+        # Filled by the same SSE threads from the notebook's single
+        # PREFLIGHT line (log_stream.parse_preflight) -- printed before
+        # anything else, before even Blender is downloaded. Drained
+        # separately from _hardware_queue/_telemetry_queue below and
+        # pushed straight to the card the moment it arrives, rather than
+        # waiting for the next _refresh_instance_cards tick, so the card
+        # shows real hardware within seconds of launch instead of sitting
+        # on "waiting for GPU telemetry…" for the entire download+setup
+        # window.
+        self._preflight_queue: "queue.Queue[tuple[str, dict]]" = queue.Queue()
         # Last-known hardware per account, cached across app restarts so an
         # idle card (Task 4) can show what an account last ran on -- Kaggle
         # has no idle instances to poll instead. Loaded once here; every
@@ -198,6 +208,11 @@ class Dashboard(QMainWindow):
         # blendfleet/instance_state.py). Matched to telemetry's indexed
         # GPUs by position when a snapshot is built.
         self._instance_gpu_models: dict[str, list[str]] = {}
+        # Per-run cache: label -> the most recent PREFLIGHT record (see
+        # log_stream.parse_preflight). Reset alongside _instance_gpus, so a
+        # new render's card never opens still showing the PREVIOUS run's
+        # PREFLIGHT text before this run's own line has arrived.
+        self._instance_preflight: dict[str, dict] = {}
         # Labels already persisted for the CURRENT run. Recording once per
         # account per run (not once per telemetry sample, which arrives
         # every ~5s for as long as the render runs) is the whole point --
@@ -795,6 +810,9 @@ class Dashboard(QMainWindow):
         self._instance_gpus.clear()
         self._instance_hardware.clear()
         self._instance_gpu_models.clear()
+        self._instance_preflight.clear()
+        for card in self._instance_cards.values():
+            card.set_preflight(None)
         self._recorded_instance_labels.clear()
         # Drop the threads from the previous job that have already unwound,
         # so a long session's worth of renders does not accumulate dead
@@ -827,11 +845,16 @@ class Dashboard(QMainWindow):
                     # never touch self.instance_store from this thread.
                     self._hardware_queue.put((label, record))
 
+                def preflight(record, label=acct.label):
+                    # Same reasoning as telemetry()/hardware() above.
+                    self._preflight_queue.put((label, record))
+
                 try:
                     stream_progress(acct.token, w.username,
                                     w.kernel_slug.split("/", 1)[1], bump,
                                     self._stop, on_telemetry=telemetry,
-                                    on_hardware=hardware)
+                                    on_hardware=hardware,
+                                    on_preflight=preflight)
                 except Exception:
                     pass  # a dead stream must never kill the render or the UI
             thread = threading.Thread(target=run, daemon=True,
@@ -1065,6 +1088,23 @@ class Dashboard(QMainWindow):
                 self._instance_gpu_models.setdefault(label, []).append(
                     record["model"])
             hw_drained += 1
+        # PREFLIGHT arrives before even the hardware banner above (it is
+        # the very first line the notebook prints, before Blender is
+        # downloaded) -- pushed straight to the card here, not only cached
+        # for the next snapshot, so the live body shows real hardware
+        # within seconds of launch instead of "waiting for GPU
+        # telemetry…" for the whole download+setup window.
+        pf_drained = 0
+        while pf_drained < 200:  # same bound, same reason as telemetry above
+            try:
+                label, record = self._preflight_queue.get_nowait()
+            except queue.Empty:
+                break
+            self._instance_preflight[label] = record
+            card = self._instance_cards.get(label)
+            if card is not None:
+                card.set_preflight(record)
+            pf_drained += 1
         for label in newly_seen:
             self._record_instance_snapshot(label)
         self._refresh_views()

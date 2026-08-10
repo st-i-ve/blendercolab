@@ -40,6 +40,20 @@ else:
 '''
 
 
+# Confirmed live (docs/machine-shape-findings.md, 2026-08-10) against the
+# app's own KaggleClient.push_kernel: "NvidiaTeslaT4" is the ONLY string of
+# the three valid `machine_shape` values that yields 2 GPUs (2x Tesla T4,
+# 15360 MiB each) -- "NvidiaTeslaP100" and omitting the field both yield a
+# single P100. kagglesdk ships no enum for this (see the findings doc,
+# section 1); the only source is a docstring, so a typo here has nothing
+# to catch it at import time. Kaggle's own kernels_push accepts an INVALID
+# machine_shape with NO error and silently falls back to a single P100 --
+# indistinguishable from success in the push response -- so this constant
+# is pinned by an exact-string test (test_notebook_builder.py) rather than
+# trusted to eyeball review.
+MACHINE_SHAPE = "NvidiaTeslaT4"
+
+
 @dataclass
 class RenderSettings:
     resolution_x: int
@@ -47,6 +61,13 @@ class RenderSettings:
     samples: int
     file_format: str = "PNG"
     blender_version: str = "5.2.0"
+    # 0 = no minimum-hardware gate (today's behaviour). Kaggle's GPU
+    # allocation is not guaranteed even with a valid machine_shape request
+    # (see docs/machine-shape-findings.md) -- a caller that genuinely needs
+    # >=N GPUs sets this so the generated notebook's PREFLIGHT gate stops
+    # the session before Blender is downloaded, rather than discovering the
+    # shortfall only from a slow render.
+    min_gpus: int = 0
 
 
 def _code(src: str) -> dict:
@@ -64,11 +85,41 @@ FRAMES = {frames!r}
 RES_X, RES_Y = {settings.resolution_x}, {settings.resolution_y}
 SAMPLES, FMT = {settings.samples}, {settings.file_format!r}
 BLENDER_VERSION = {settings.blender_version!r}
+MIN_GPUS = {settings.min_gpus!r}
 
-vm = psutil.virtual_memory()
-print(f"CPU {{psutil.cpu_count(logical=True)}} cores | RAM {{vm.total/2**30:.1f}} GB")
-print(subprocess.run("nvidia-smi --query-gpu=name,memory.total --format=csv,noheader",
-                     shell=True, capture_output=True, text=True).stdout.strip())
+cpu_count = psutil.cpu_count(logical=True)
+ram_total = psutil.virtual_memory().total / 2**30
+gpu_listing = subprocess.run(
+    "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader",
+    shell=True, capture_output=True, text=True).stdout.strip()
+gpu_names = [row.split(",", 1)[0].strip()
+            for row in gpu_listing.splitlines() if row.strip()]
+
+# PREFLIGHT: the kernel is starting regardless, so report the REAL
+# hardware in the first seconds -- before the next cell downloads
+# Blender, let alone before the .blend is touched -- rather than only
+# finding out from a slow render or a wasted whole session. One line,
+# not one-per-GPU like the CPU/RAM + nvidia-smi lines below: this is the
+# single fact the desktop app needs to decide "keep going or stop" the
+# moment the kernel starts. Flushing stdout immediately is mandatory
+# here: without it, nothing reaches the live log stream until the kernel
+# exits (same reason PROGRESS/TELEMETRY flush explicitly further down).
+print(f"PREFLIGHT gpus={{len(gpu_names)}} "
+      f"gpu_names={{'|'.join(gpu_names) if gpu_names else 'none'}} "
+      f"cpu={{cpu_count}} ram={{ram_total:.1f}}", flush=True)
+
+if len(gpu_names) < MIN_GPUS:
+    # Minimum-hardware gate: fail loudly and stop HERE, before Blender is
+    # downloaded or the .blend is even walked for -- a wrong machine costs
+    # seconds, not the whole session's quota.
+    print(f"PREFLIGHT_FAIL requires >={{MIN_GPUS}} GPU(s), got "
+          f"{{len(gpu_names)}}: {{gpu_names}}", flush=True)
+    raise SystemExit(
+        f"minimum hardware not met: requires >={{MIN_GPUS}} GPU(s), got "
+        f"{{len(gpu_names)}} ({{gpu_names}})")
+
+print(f"CPU {{cpu_count}} cores | RAM {{ram_total:.1f}} GB")
+print(gpu_listing)
 
 # Datasets mount at /kaggle/input/datasets/<owner>/<slug>/<file>, NOT
 # /kaggle/input/<slug>/. Walk instead of assuming -- a hardcoded path
@@ -207,6 +258,11 @@ _telemetry_stop.set()
         "kernel_type": "notebook",
         "is_private": True,
         "enable_gpu": True,
+        # DEPRECATED per kagglesdk's own docstring, but kept alongside
+        # machine_shape: a backend that has not adopted machine_shape yet
+        # would otherwise silently fall back to a CPU-only session if this
+        # were dropped (docs/machine-shape-findings.md, section 2).
+        "machine_shape": MACHINE_SHAPE,
         "enable_internet": True,
         "dataset_sources": [dataset_slug],
         "competition_sources": [],

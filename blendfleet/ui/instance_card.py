@@ -105,6 +105,33 @@ def format_hardware_summary(snapshot: InstanceSnapshot) -> str:
     return ", ".join(parts) if parts else "hardware details unavailable"
 
 
+def format_preflight_summary(record: dict) -> str:
+    """"2x Tesla T4, 4 vCPU, 31.3 GB RAM" from one PREFLIGHT record (see
+    log_stream.parse_preflight) -- the real hardware this session actually
+    got, seconds after the kernel started, before Blender is even
+    downloaded. Repeated identical GPU names are counted ("2x Tesla T4"),
+    not listed twice, and a GPU-less session reads as "CPU only" rather
+    than silently dropping the GPU clause."""
+    parts: list[str] = []
+    names = record.get("gpu_names") or []
+    if names:
+        counts: dict[str, int] = {}
+        for name in names:
+            counts[name] = counts.get(name, 0) + 1
+        parts.append(", ".join(
+            f"{n}x {model}" if n > 1 else model
+            for model, n in counts.items()))
+    else:
+        parts.append("CPU only")
+    cpu_count = record.get("cpu_count")
+    if cpu_count is not None:
+        parts.append(f"{cpu_count} vCPU")
+    ram_total = record.get("ram_total")
+    if ram_total is not None:
+        parts.append(f"{ram_total:.1f} GB RAM")
+    return ", ".join(parts)
+
+
 def status_for(worker: WorkerState | None,
                verified: bool = True) -> tuple[str, str, str]:
     """(icon name, colour, word) for the card header's status.
@@ -234,6 +261,7 @@ class InstanceCard(QWidget):
         self.label = account.label
         self._verified = account.verified
         self._telemetry_active = False
+        self._preflight_active = False
         self._gpu_rows: dict[int, GpuLiveRow] = {}
 
         v = QVBoxLayout(self)
@@ -289,6 +317,19 @@ class InstanceCard(QWidget):
         self.live_container = QWidget()
         self._live_v = QVBoxLayout(self.live_container)
         self._live_v.setContentsMargins(0, 0, 0, 0)
+        # PREFLIGHT arrives seconds after the kernel starts, before Blender
+        # is even downloaded -- shown here so the live body reports real
+        # hardware immediately instead of only "waiting for GPU
+        # telemetry…" for the whole download+setup window. Hidden until
+        # set_preflight() has something to show; per-GPU live gauges
+        # (below) are strictly more specific once they exist, but this
+        # line is not replaced by them -- it is the only place total
+        # CPU/RAM ever appears while a render is actually live.
+        self.preflight_label = QLabel("")
+        self.preflight_label.setProperty("secondary", True)
+        self.preflight_label.setWordWrap(True)
+        self.preflight_label.hide()
+        self._live_v.addWidget(self.preflight_label)
         self._gpu_placeholder = QLabel("waiting for GPU telemetry…")
         self._gpu_placeholder.setProperty("secondary", True)
         self._live_v.addWidget(self._gpu_placeholder)
@@ -419,6 +460,7 @@ class InstanceCard(QWidget):
             # "error"/"complete") from re-opening the live body a moment
             # after this call returns "idle".
             self._telemetry_active = False
+            self._preflight_active = False
 
         name, colour, word = status_for(worker, self._verified)
         self.status_icon.setPixmap(icon(name, colour, 14).pixmap(14, 14))
@@ -433,14 +475,19 @@ class InstanceCard(QWidget):
         """Whether the LIVE BODY should be showing right now.
 
         Deliberately not just `is_live(self._worker)` -- see the class
-        docstring's explanation of the poll/telemetry race. Telemetry that
-        has already arrived for the current (non-stopped) worker outranks
-        what the last 30s poll happened to say.
+        docstring's explanation of the poll/telemetry race. Telemetry OR
+        PREFLIGHT that has already arrived for the current (non-stopped)
+        worker outranks what the last 30s poll happened to say -- PREFLIGHT
+        in particular arrives while the poll may still say "queued" (it is
+        printed before Blender is even downloaded, long before a frame's
+        TELEMETRY line could exist), so without this the live body would
+        stay hidden -- and PREFLIGHT invisible with it -- for the entire
+        download+setup window.
         """
         w = self._worker
         if w is None or w.state in _STOPPED_STATES:
             return False
-        return is_live(w) or self._telemetry_active
+        return is_live(w) or self._telemetry_active or self._preflight_active
 
     def _sync_body(self) -> None:
         live = self._currently_live()
@@ -459,6 +506,9 @@ class InstanceCard(QWidget):
             self._gpu_rows.clear()
             self._gpu_placeholder.show()
             self.frames_label.setText("—")
+            self.preflight_label.setText("")
+            self.preflight_label.hide()
+            self._preflight_active = False
 
     # ---------------- live telemetry ----------------
     def ingest_telemetry(self, record: dict) -> None:
@@ -488,3 +538,32 @@ class InstanceCard(QWidget):
             self._gpu_rows[index] = row
             self._live_v.insertWidget(len(self._gpu_rows) - 1, row)
         row.update_sample(record["util"], record["mem_used"], record["mem_total"])
+
+    # ---------------- preflight (real hardware, seconds after launch) ----
+    def set_preflight(self, record: dict | None) -> None:
+        """Show the notebook's PREFLIGHT record (see
+        log_stream.parse_preflight) the moment it arrives -- seconds after
+        the kernel starts, before Blender is even downloaded -- so the
+        live body reports real hardware instead of sitting on "waiting for
+        GPU telemetry…" for the whole download+setup window.
+
+        `record=None` clears the line unconditionally (dashboard.py calls
+        this at the start of every new render, before this run's own
+        PREFLIGHT line can possibly have arrived, so a card must never open
+        still showing the PREVIOUS run's hardware). A real record is
+        subject to the same defense-in-depth as ingest_telemetry: refused
+        once this worker has definitely stopped or there is none at all.
+        """
+        if record is None:
+            self._preflight_active = False
+            self.preflight_label.setText("")
+            self.preflight_label.hide()
+            self._sync_body()
+            return
+        w = self._worker
+        if w is None or w.state in _STOPPED_STATES:
+            return
+        self._preflight_active = True
+        self.preflight_label.setText(format_preflight_summary(record))
+        self.preflight_label.show()
+        self._sync_body()

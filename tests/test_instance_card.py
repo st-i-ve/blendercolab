@@ -12,7 +12,8 @@ from blendfleet.instance_state import (DEFAULT_STALE_AFTER_SECONDS,
                                        GpuSnapshot, InstanceSnapshot)
 from blendfleet.ui.instance_card import (NEVER_RUN_TEXT, GpuLiveRow,
                                          InstanceCard, format_age,
-                                         format_hardware_summary, is_live,
+                                         format_hardware_summary,
+                                         format_preflight_summary, is_live,
                                          status_for)
 from blendfleet.ui.theme import ACCENT, ACCENTS, TEXT_SECONDARY, WARNING
 
@@ -112,6 +113,29 @@ def test_format_hardware_summary_nothing_known():
     snap = InstanceSnapshot(username=None, gpus=[], cpu_count=None,
                             ram_total=None, observed_at=0.0)
     assert format_hardware_summary(snap) == "hardware details unavailable"
+
+
+def test_format_preflight_summary_with_two_identical_gpus():
+    text = format_preflight_summary({
+        "gpu_count": 2, "gpu_names": ["Tesla T4", "Tesla T4"],
+        "cpu_count": 4, "ram_total": 31.3})
+    assert "2x Tesla T4" in text
+    assert "4 vCPU" in text
+    assert "31.3 GB RAM" in text
+
+
+def test_format_preflight_summary_single_gpu_not_counted():
+    text = format_preflight_summary({
+        "gpu_count": 1, "gpu_names": ["Tesla P100-PCIE-16GB"],
+        "cpu_count": 4, "ram_total": 31.3})
+    assert "Tesla P100-PCIE-16GB" in text
+    assert "1x" not in text
+
+
+def test_format_preflight_summary_no_gpus_reads_as_cpu_only():
+    text = format_preflight_summary({
+        "gpu_count": 0, "gpu_names": [], "cpu_count": 4, "ram_total": 31.3})
+    assert "CPU only" in text
 
 
 def test_status_for_idle_is_symbol_and_word():
@@ -301,6 +325,75 @@ def test_a_straggling_sample_after_error_cannot_resurrect_the_live_body(qapp):
                           "temp": 1, "power": None})
     assert card.live_container.isHidden() is True
     assert card._gpu_rows == {}
+
+
+# ---------------- InstanceCard: preflight ----------------
+
+def test_preflight_arrival_makes_the_live_body_visible_while_still_queued(qapp):
+    """PREFLIGHT arrives before Blender is even downloaded -- well before
+    any TELEMETRY line could exist -- so it must outrank a stale "queued"
+    poll exactly like telemetry does, or the card stays stuck looking like
+    it is still "starting…" for the entire download+setup window."""
+    card = InstanceCard(0, make_account())
+    card.set_worker(make_worker(state="queued"))
+    assert card.live_container.isHidden() is True
+
+    card.set_preflight({"gpu_count": 2, "gpu_names": ["Tesla T4", "Tesla T4"],
+                        "cpu_count": 4, "ram_total": 31.3})
+    assert card.live_container.isHidden() is False
+    assert "2x Tesla T4" in card.preflight_label.text()
+    assert card.preflight_label.isHidden() is False
+
+
+def test_preflight_ignored_while_idle(qapp):
+    card = InstanceCard(0, make_account())
+    card.set_worker(None)
+    card.set_preflight({"gpu_count": 1, "gpu_names": ["Tesla T4"],
+                        "cpu_count": 4, "ram_total": 31.3})
+    assert card.live_container.isHidden() is True
+    assert card.preflight_label.text() == ""
+
+
+def test_going_idle_after_preflight_clears_it(qapp):
+    """A completed/errored/cancelled render must not leave the PREVIOUS
+    run's PREFLIGHT text sitting (hidden) in the live body."""
+    card = InstanceCard(0, make_account())
+    card.set_worker(make_worker(state="queued"))
+    card.set_preflight({"gpu_count": 1, "gpu_names": ["Tesla T4"],
+                        "cpu_count": 4, "ram_total": 31.3})
+    assert "Tesla T4" in card.preflight_label.text()
+
+    card.set_worker(make_worker(state="complete"))
+    assert card.preflight_label.text() == ""
+    assert card.preflight_label.isHidden() is True
+
+
+def test_set_preflight_none_clears_it_unconditionally(qapp):
+    """dashboard.py calls set_preflight(None) at the start of every new
+    render, before this run's own line can possibly have arrived -- this
+    must clear even a card whose worker is currently None/stopped, unlike
+    the guarded real-record path."""
+    card = InstanceCard(0, make_account())
+    card.set_worker(make_worker(state="queued"))
+    card.set_preflight({"gpu_count": 1, "gpu_names": ["Tesla T4"],
+                        "cpu_count": 4, "ram_total": 31.3})
+    card.set_worker(None)
+    card.set_preflight(None)
+    assert card.preflight_label.text() == ""
+
+
+def test_telemetry_and_preflight_can_both_be_visible(qapp):
+    """PREFLIGHT reports total CPU/RAM, which no live gauge ever shows
+    (see the module docstring) -- it stays up alongside per-GPU telemetry
+    rows once they start arriving, rather than being replaced by them."""
+    card = InstanceCard(0, make_account())
+    card.set_worker(make_worker(state="running"))
+    card.set_preflight({"gpu_count": 1, "gpu_names": ["Tesla T4"],
+                        "cpu_count": 4, "ram_total": 31.3})
+    card.ingest_telemetry({"gpu": 0, "util": 50, "mem_used": 100,
+                          "mem_total": 15360, "temp": 60, "power": 10.0})
+    assert card.preflight_label.isHidden() is False
+    assert 0 in card._gpu_rows
 
 
 def test_queued_worker_shows_cached_body_not_an_empty_live_one(qapp):

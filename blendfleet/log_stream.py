@@ -40,6 +40,21 @@ TELEMETRY_RE = re.compile(
 HARDWARE_CPU_RAM_RE = re.compile(r"CPU (\d+) cores \| RAM ([\d.]+) GB")
 HARDWARE_GPU_RE = re.compile(r"^(.+?),\s*(\d+)\s*MiB$")
 
+# blendfleet/notebook_builder.py's first cell prints exactly ONE PREFLIGHT
+# line, before anything else in the whole notebook -- before the CPU/RAM +
+# nvidia-smi hardware banner above, and before the next cell even starts
+# downloading Blender:
+#   f"PREFLIGHT gpus={len(gpu_names)} "
+#   f"gpu_names={'|'.join(gpu_names) if gpu_names else 'none'} "
+#   f"cpu={cpu_count} ram={ram_total:.1f}"
+# Unlike TELEMETRY/the hardware banner, this is never one-per-GPU: it is
+# the single fact the desktop app needs, seconds after the kernel starts,
+# to decide whether to keep going or stop -- so gpu_names is a single
+# '|'-joined field ("Tesla T4|Tesla T4"), not separate lines to reassemble.
+PREFLIGHT_RE = re.compile(
+    r"PREFLIGHT gpus=(\d+) gpu_names=(.*?) cpu=(\d+) ram=([\d.]+)"
+)
+
 
 # How long a stream thread may sit inside the network stack with no way to
 # notice stop_event. kagglesdk passes no timeout at all to requests
@@ -202,11 +217,46 @@ def parse_hardware_banner(line: str) -> dict | None:
     return {"kind": "gpu", "model": model, "mem_total": int(m.group(2))}
 
 
+def parse_preflight(line: str) -> dict | None:
+    """Return one record from the notebook's PREFLIGHT line, or None.
+
+    Same gate as parse_progress/parse_telemetry/parse_hardware_banner: only
+    a `data:` SSE line whose payload is valid JSON with
+    stream_name == "stdout" is even considered.
+
+    Returns {"gpu_count": int, "gpu_names": list[str], "cpu_count": int,
+    "ram_total": float}. gpu_names is [] for a CPU-only session (the
+    notebook prints the literal "none" for that case, never an empty
+    string, so a truncated/malformed line can't be mistaken for one).
+    """
+    if not line.startswith("data:"):
+        return None
+    payload = line[len("data:"):].strip()
+    try:
+        obj = json.loads(payload)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if obj.get("stream_name") != "stdout":
+        return None
+    m = PREFLIGHT_RE.search(obj.get("data", ""))
+    if not m:
+        return None
+    names_raw = m.group(2)
+    gpu_names = [] if names_raw == "none" else names_raw.split("|")
+    return {
+        "gpu_count": int(m.group(1)),
+        "gpu_names": gpu_names,
+        "cpu_count": int(m.group(3)),
+        "ram_total": float(m.group(4)),
+    }
+
+
 def stream_progress(token: str, user_name: str, kernel_slug: str,
                     on_progress: Callable[[int, int], None],
                     stop_event: threading.Event | None = None,
                     on_telemetry: Callable[[dict], None] | None = None,
-                    on_hardware: Callable[[dict], None] | None = None) -> None:
+                    on_hardware: Callable[[dict], None] | None = None,
+                    on_preflight: Callable[[dict], None] | None = None) -> None:
     """Block, calling on_progress(done, total) as lines arrive.
 
     `on_telemetry`, if given, is called with the parsed dict (see
@@ -220,6 +270,13 @@ def stream_progress(token: str, user_name: str, kernel_slug: str,
     stream -- the notebook's first cell prints CPU count, total RAM, and
     the nvidia-smi GPU listing exactly once per run, and this is the only
     way to see that text: no new network call, same SSE connection.
+
+    `on_preflight`, if given, is called with the parsed dict (see
+    parse_preflight) for the single PREFLIGHT line the notebook prints
+    before anything else -- before the hardware banner above, and before
+    the next cell even starts downloading Blender. This is how a caller
+    finds out real hardware within seconds of the kernel starting, not
+    only once telemetry/the hardware banner arrive later.
 
     The token is passed to KaggleClient explicitly and NEVER through
     os.environ: the dashboard starts one of these threads per account
@@ -272,6 +329,11 @@ def stream_progress(token: str, user_name: str, kernel_slug: str,
                 record = parse_telemetry(raw)
                 if record:
                     on_telemetry(record)
+                    continue
+            if on_preflight is not None:
+                pf_record = parse_preflight(raw)
+                if pf_record:
+                    on_preflight(pf_record)
                     continue
             if on_hardware is not None:
                 hw_record = parse_hardware_banner(raw)
