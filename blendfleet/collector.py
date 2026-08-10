@@ -7,8 +7,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+from blendfleet.notebook_builder import ARCHIVE_SUFFIX
+
 FRAME_RE = re.compile(r"_(\d+)\.(png|jpg|jpeg)$", re.I)
-ARCHIVE_SUFFIX = ".zip"
 
 
 @dataclass

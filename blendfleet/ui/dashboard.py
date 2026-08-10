@@ -266,11 +266,6 @@ class Dashboard(QMainWindow):
         # blendfleet/instance_state.py). Matched to telemetry's indexed
         # GPUs by position when a snapshot is built.
         self._instance_gpu_models: dict[str, list[str]] = {}
-        # Per-run cache: label -> the most recent PREFLIGHT record (see
-        # log_stream.parse_preflight). Reset alongside _instance_gpus, so a
-        # new render's card never opens still showing the PREVIOUS run's
-        # PREFLIGHT text before this run's own line has arrived.
-        self._instance_preflight: dict[str, dict] = {}
         # Labels already persisted for the CURRENT run. Recording once per
         # account per run (not once per telemetry sample, which arrives
         # every ~5s for as long as the render runs) is the whole point --
@@ -797,7 +792,8 @@ class Dashboard(QMainWindow):
                 f"frame ({self.start.value()}). Fix the range and try again.")
             return
         settings = RenderSettings(self.rx.value(), self.ry.value(),
-                                  self.spp.value(), self.fmt.currentText())
+                                  self.spp.value(), self.fmt.currentText(),
+                                  min_gpus=self.settings.min_gpus)
         owner_label = self.store.list()[0].label
 
         try:
@@ -870,7 +866,6 @@ class Dashboard(QMainWindow):
         self._instance_gpus.clear()
         self._instance_hardware.clear()
         self._instance_gpu_models.clear()
-        self._instance_preflight.clear()
         # A previous run's failure has nothing to do with this new one --
         # cached log text and the card's failure line must not survive
         # into it. In-flight fetch workers (if a failure from the PREVIOUS
@@ -1224,9 +1219,19 @@ class Dashboard(QMainWindow):
                     self, "Nothing to collect",
                     "No render job was found -- start a render first.")
                 return
-            QMessageBox.information(
-                self, "Frames collected",
-                self._describe_collect_result(r, destination_phrase=f"to {d}"))
+            msg = self._describe_collect_result(r, destination_phrase=f"to {d}")
+            if r.worker_errors:
+                # Consistent with _show_download_instance_result's own
+                # per-instance path below: at least one account's fetch
+                # genuinely failed, so this is a warning, not the same
+                # success-toned dialog a clean collect gets (review
+                # finding: this used to show "Frames collected" -- an
+                # information icon -- even when worker_errors was
+                # non-empty, while the per-instance path correctly warned
+                # for the exact same condition).
+                QMessageBox.warning(self, "Frames collected", msg)
+                return
+            QMessageBox.information(self, "Frames collected", msg)
 
         def done_fail(message: str) -> None:
             self._collect_worker = None
@@ -1430,17 +1435,19 @@ class Dashboard(QMainWindow):
             hw_drained += 1
         # PREFLIGHT arrives before even the hardware banner above (it is
         # the very first line the notebook prints, before Blender is
-        # downloaded) -- pushed straight to the card here, not only cached
-        # for the next snapshot, so the live body shows real hardware
-        # within seconds of launch instead of "waiting for GPU
-        # telemetry…" for the whole download+setup window.
+        # downloaded) -- pushed straight to the card here, so the live
+        # body shows real hardware within seconds of launch instead of
+        # "waiting for GPU telemetry…" for the whole download+setup
+        # window. The card's own preflight_label is what visually retains
+        # this until _start_progress_threads clears it for the next run
+        # (InstanceCard.set_preflight(None)) -- nothing here needs its own
+        # copy of the record.
         pf_drained = 0
         while pf_drained < 200:  # same bound, same reason as telemetry above
             try:
                 label, record = self._preflight_queue.get_nowait()
             except queue.Empty:
                 break
-            self._instance_preflight[label] = record
             card = self._instance_cards.get(label)
             if card is not None:
                 card.set_preflight(record)

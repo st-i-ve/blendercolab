@@ -141,3 +141,31 @@ def test_picking_an_already_selected_swatch_is_a_no_op_not_an_error(qapp):
     dlg._on_picked("green")
     assert settings.accent == "green"
     assert dlg._swatches["green"].button.isChecked()
+
+
+# ---------------- minimum-GPU render gate -----------------------------
+
+def test_min_gpus_spinbox_shows_the_current_setting(qapp):
+    dlg = make_view(Settings(min_gpus=2))
+    assert dlg.min_gpus_spin.value() == 2
+
+
+def test_min_gpus_defaults_to_one(qapp):
+    dlg = make_view(Settings())
+    assert dlg.min_gpus_spin.value() == 1
+
+
+def test_changing_min_gpus_updates_settings_and_saves(qapp):
+    settings = Settings()
+    dlg = make_view(settings)
+    dlg.min_gpus_spin.setValue(3)
+    assert settings.min_gpus == 3
+    reloaded = Settings.load()
+    assert reloaded.min_gpus == 3
+
+
+def test_min_gpus_can_be_set_to_zero_to_disable_the_gate(qapp):
+    settings = Settings(min_gpus=2)
+    dlg = make_view(settings)
+    dlg.min_gpus_spin.setValue(0)
+    assert settings.min_gpus == 0

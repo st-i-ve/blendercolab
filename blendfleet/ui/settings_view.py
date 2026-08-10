@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (QDialog, QHBoxLayout, QLabel, QPushButton,
-                               QVBoxLayout, QWidget)
+                               QSpinBox, QVBoxLayout, QWidget)
 
 from blendfleet.settings import Settings
 from blendfleet.ui import theme
@@ -82,9 +82,10 @@ class _AccentSwatch(QWidget):
 
 
 class SettingsView(QDialog):
-    """Modal settings dialog -- currently just the accent picker, but its
-    own module/class so a future setting (e.g. poll interval) has an
-    obvious home instead of getting bolted onto SetupDialog."""
+    """Modal settings dialog: the accent picker, plus the minimum-GPU
+    render gate -- its own module/class so a future setting (e.g. poll
+    interval) has an obvious home instead of getting bolted onto
+    SetupDialog."""
 
     def __init__(self, settings: Settings, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -115,6 +116,25 @@ class SettingsView(QDialog):
             row.addWidget(swatch)
         row.addStretch(1)
         v.addLayout(row)
+
+        gpu_heading = QLabel("<b>Minimum GPUs required</b>")
+        v.addWidget(gpu_heading)
+        gpu_sub = QLabel(
+            "A new render will not start on an account whose Kaggle "
+            "session reports fewer GPUs than this -- Kaggle can silently "
+            "fall back to a single P100 if the requested hardware is not "
+            "available, and this is what stops a long render from "
+            "proceeding on far less GPU than expected. 0 turns the check "
+            "off entirely.")
+        gpu_sub.setWordWrap(True)
+        gpu_sub.setProperty("secondary", True)
+        v.addWidget(gpu_sub)
+
+        self.min_gpus_spin = QSpinBox()
+        self.min_gpus_spin.setRange(0, 8)
+        self.min_gpus_spin.setValue(self.settings.min_gpus)
+        self.min_gpus_spin.valueChanged.connect(self._on_min_gpus_changed)
+        v.addWidget(self.min_gpus_spin)
         v.addStretch(1)
 
         done = QPushButton("Done")
@@ -131,6 +151,10 @@ class SettingsView(QDialog):
         if app is not None:
             theme.apply(app, name)
         self._sync_selection()
+
+    def _on_min_gpus_changed(self, value: int) -> None:
+        self.settings.min_gpus = value
+        self.settings.save()
 
     def _sync_selection(self) -> None:
         for name, swatch in self._swatches.items():

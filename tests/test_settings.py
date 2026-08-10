@@ -3,7 +3,7 @@ import json
 import pytest
 
 import blendfleet.platform_paths as pp
-from blendfleet.settings import Settings
+from blendfleet.settings import DEFAULT_MIN_GPUS, Settings
 from blendfleet.ui.theme import ACCENTS, DEFAULT_ACCENT
 
 
@@ -17,18 +17,27 @@ def test_load_with_no_file_returns_defaults():
     s = Settings.load()
     assert s.accent == DEFAULT_ACCENT
     assert s.fullscreen is False
+    assert s.min_gpus == DEFAULT_MIN_GPUS
 
 
 def test_defaults_accent_is_a_real_accent():
     assert Settings().accent in ACCENTS
 
 
+def test_defaults_min_gpus_requires_at_least_one_gpu():
+    # A render app has no legitimate use for a CPU-only allocation --
+    # min_gpus=0 (no gate at all) must never be the out-of-the-box
+    # behaviour, only something a user opts into explicitly.
+    assert Settings().min_gpus == 1
+
+
 def test_save_then_load_round_trips():
-    s = Settings(accent="blue", fullscreen=True)
+    s = Settings(accent="blue", fullscreen=True, min_gpus=2)
     s.save()
     loaded = Settings.load()
     assert loaded.accent == "blue"
     assert loaded.fullscreen is True
+    assert loaded.min_gpus == 2
 
 
 def test_unknown_accent_falls_back_to_default_rather_than_raising():
@@ -106,3 +115,40 @@ def test_load_with_accent_key_entirely_missing_falls_back():
     s = Settings.load()
     assert s.accent == DEFAULT_ACCENT
     assert s.fullscreen is True
+
+
+# ---------------- malformed min_gpus values -- same principle as accent ----
+
+@pytest.mark.parametrize("bad_min_gpus", [
+    None,
+    3.5,
+    True,       # bool is technically an int but not a real GPU count
+    -1,         # negative has no meaning
+    [1, 2],
+    {"x": 1},
+    "two",
+])
+def test_malformed_min_gpus_falls_back_rather_than_raising(bad_min_gpus):
+    s = Settings(min_gpus=bad_min_gpus)
+    assert s.min_gpus == DEFAULT_MIN_GPUS
+
+
+def test_min_gpus_zero_is_accepted_as_an_explicit_opt_out():
+    # 0 disables the gate entirely -- a deliberate, valid choice, unlike
+    # the malformed values above, so it must NOT be coerced back to 1.
+    s = Settings(min_gpus=0)
+    assert s.min_gpus == 0
+
+
+def test_load_with_malformed_min_gpus_in_file_falls_back():
+    p = pp.config_dir() / "settings.json"
+    p.write_text(json.dumps({"min_gpus": "lots"}), encoding="utf-8")
+    s = Settings.load()
+    assert s.min_gpus == DEFAULT_MIN_GPUS
+
+
+def test_load_with_min_gpus_key_missing_falls_back():
+    p = pp.config_dir() / "settings.json"
+    p.write_text(json.dumps({"accent": "blue"}), encoding="utf-8")
+    s = Settings.load()
+    assert s.min_gpus == DEFAULT_MIN_GPUS

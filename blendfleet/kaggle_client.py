@@ -8,6 +8,7 @@ goes through KaggleApi / kagglesdk instead.
 from __future__ import annotations
 
 import os
+import shutil
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +18,7 @@ import requests
 from requests.exceptions import HTTPError
 
 from blendfleet.downloader import Transport, fetch_files
+from blendfleet.notebook_builder import ARCHIVE_SUFFIX
 from blendfleet.uploader import UploadError, upload_file
 
 # Status strings returned by ApiGetKernelSessionStatusResponse.status
@@ -35,8 +37,10 @@ IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg")
 # Task 5: the notebook now also writes one per-worker zip archive alongside
 # the loose frames (blendfleet.notebook_builder's ARCHIVE). fetch_output()
 # must return it too, or collector.py -- which prefers the archive when
-# present -- would never see it at all.
-ARCHIVE_SUFFIX = ".zip"
+# present -- would never see it at all. ARCHIVE_SUFFIX itself is imported
+# from notebook_builder (which writes the archive and is the one place that
+# gets to define what it's called) rather than redefined here -- it used to
+# be duplicated in both modules.
 _OUTPUT_SUFFIXES = IMAGE_SUFFIXES + (ARCHIVE_SUFFIX,)
 
 ENV_TOKEN = "KAGGLE_API_TOKEN"
@@ -120,6 +124,28 @@ class _RequestsPutTransport:
 
     def put(self, url: str, data, headers: dict):
         return requests.put(url, data=data, headers=headers)
+
+
+def _safe_dest(dest: Path, file_name: str) -> Path | None:
+    """`dest / file_name`, refused if `file_name` would escape `dest`.
+
+    `file_name` comes straight off Kaggle's own
+    ApiKernelSessionOutputFile.file_name -- no more trustworthy than a zip
+    entry name, which collector._safe_zip_members already refuses to
+    extract outside its target directory for exactly this reason (a
+    leading '../', an absolute path, or a backslash). This is the same
+    defence for the same class of Kaggle-supplied filename, applied here
+    because until now nothing had.
+    """
+    resolved_root = dest.resolve()
+    if "\\" in file_name:
+        return None
+    candidate = (dest / file_name).resolve()
+    try:
+        candidate.relative_to(resolved_root)
+    except ValueError:
+        return None
+    return candidate
 
 
 class _RequestsGetTransport:
@@ -632,7 +658,12 @@ class KaggleClient:
 
         wanted = [f for f in all_files
                  if Path(f.file_name).suffix.lower() in _OUTPUT_SUFFIXES]
-        files = [(f.url, dest / f.file_name) for f in wanted]
+        files = []
+        for f in wanted:
+            safe_dest = _safe_dest(dest, f.file_name)
+            if safe_dest is None:
+                continue  # see _safe_dest -- refuses a path-escaping file_name
+            files.append((f.url, safe_dest))
 
         transport = transport or _RequestsGetTransport()
         fetch_files(files, transport, on_progress=on_progress)
@@ -651,24 +682,43 @@ class KaggleClient:
         reported as failed, never on the live/poll path.
 
         Built on the exact same call fetch_output() already makes:
-        kernels_output() downloads whatever output files exist AND, as a
-        side effect, writes the full log to `<kernel-name>.log` inside
-        `dest` (kaggle_api_extended.py's own kernels_output: `log =
-        response.log; ... out.write(log)`). Returns "" -- not an error --
-        when Kaggle has no log for this kernel at all (never actually
-        started, or output already pruned); callers must not read that as
-        evidence of anything and should say so distinctly rather than
-        showing it as the diagnosed cause.
+        kernels_output() writes the full log to `<kernel-name>.log` inside
+        `dest` as a side effect (kaggle_api_extended.py's own
+        kernels_output: `log = response.log; ... out.write(log)`), which
+        happens unconditionally, OUTSIDE the per-file download loop and
+        regardless of `file_pattern` (confirmed against the installed
+        kaggle package, kaggle_api_extended.py lines 6707-6739) -- so
+        passing a `file_pattern` that cannot match any real filename skips
+        every output-file download (every rendered frame, plus the Task 5
+        zip archive, both otherwise re-downloaded whole into RAM purely to
+        show a one-line failure reason) while still writing the log this
+        call actually wants. Returns "" -- not an error -- when Kaggle has
+        no log for this kernel at all (never actually started, or output
+        already pruned); callers must not read that as evidence of
+        anything and should say so distinctly rather than showing it as
+        the diagnosed cause.
+
+        `dest` is scratch space for this one call only: it is removed again
+        before returning (success or failure) so a failed render never
+        leaves anything behind under cache_dir()/work/log_<label> -- before
+        this, kernels_output's real download (loose frames + archive) was
+        left there forever, unbounded across every failed render.
         """
         dest = Path(dest)
         dest.mkdir(parents=True, exist_ok=True)
         _, name = slug.split("/", 1)
-        self.api.kernels_output(slug, path=str(dest))
-        log_path = dest / f"{name}.log"
-        if not log_path.exists():
-            return ""
-        text = log_path.read_text(encoding="utf-8", errors="replace")
-        return "\n".join(text.splitlines()[-max_lines:])
+        try:
+            # "(?!)" is a regex that can never match (an empty negative
+            # lookahead), so no item.file_name in the response is ever
+            # downloaded -- only the log, written unconditionally below.
+            self.api.kernels_output(slug, path=str(dest), file_pattern=r"(?!)")
+            log_path = dest / f"{name}.log"
+            if not log_path.exists():
+                return ""
+            text = log_path.read_text(encoding="utf-8", errors="replace")
+            return "\n".join(text.splitlines()[-max_lines:])
+        finally:
+            shutil.rmtree(dest, ignore_errors=True)
 
 
 def verify_token(token: str,

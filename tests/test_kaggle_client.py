@@ -1,5 +1,6 @@
 import datetime as _dt
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -78,6 +79,15 @@ class FakeApi:
         self.pushed = []
         self.created = []
         self.versioned = []
+        # Every call this fake's kernels_output() received, in order --
+        # lets a test assert on what fetch_log_tail actually ASKED for
+        # (the file_pattern), not merely on the text that came back.
+        self.kernels_output_calls: list[str | None] = []
+        # Filenames this fake actually "downloaded" (subject to
+        # file_pattern, exactly like the real kaggle package -- see
+        # kaggle_api_extended.py's own kernels_output: `if compiled_pattern
+        # and not compiled_pattern.search(item.file_name): continue`).
+        self.kernels_output_written: list[str] = []
 
     def kernels_list(self, mine=False, page_size=1):
         return self._kernels
@@ -92,9 +102,20 @@ class FakeApi:
     def kernels_push(self, folder):
         self.pushed.append(folder)
 
-    def kernels_output(self, slug, path):
+    def kernels_output(self, slug, path, file_pattern=None):
+        self.kernels_output_calls.append(file_pattern)
         Path(path).mkdir(parents=True, exist_ok=True)
-        (Path(path) / "f_0001.png").write_bytes(b"PNG")
+        self._maybe_write(path, "f_0001.png", b"PNG", file_pattern)
+
+    def _maybe_write(self, path, name, content, file_pattern):
+        # Mirrors the real API's own filtering exactly (re.search against
+        # the pattern, kaggle_api_extended.py's kernels_output) so a test
+        # asserting "this file was not downloaded" reflects real behaviour,
+        # not just this stub's own invented shortcut.
+        if file_pattern is not None and not re.search(file_pattern, name):
+            return
+        (Path(path) / name).write_bytes(content)
+        self.kernels_output_written.append(name)
 
     def dataset_status(self, slug):
         if not self._dataset_ok:
@@ -545,9 +566,13 @@ class LoggingApi(FakeApi):
         super().__init__(*a, **kw)
         self._log_text = log_text
 
-    def kernels_output(self, slug, path):
-        super().kernels_output(slug, path)
+    def kernels_output(self, slug, path, file_pattern=None):
+        super().kernels_output(slug, path, file_pattern=file_pattern)
         if self._log_text is not None:
+            # The real kaggle package writes the log UNCONDITIONALLY,
+            # outside the per-file filtering loop entirely (see
+            # kaggle_api_extended.py lines 6707-6739) -- never gated on
+            # file_pattern, which is exactly what fetch_log_tail relies on.
             name = slug.split("/", 1)[1]
             (Path(path) / f"{name}.log").write_text(self._log_text,
                                                      encoding="utf-8")
@@ -576,6 +601,61 @@ def test_fetch_log_tail_returns_empty_string_when_no_log_was_captured(tmp_path):
     c, _ = client(api=FakeApi())  # writes no .log file
     text = c.fetch_log_tail("user/remember-render", tmp_path / "out")
     assert text == ""
+
+
+def test_fetch_log_tail_downloads_no_output_files(tmp_path):
+    """fetch_log_tail must fetch ONLY the log, never every rendered frame
+    (and the Task 5 zip archive) a second time purely to show a one-line
+    failure reason -- IMPORTANT 1 of the final review.
+
+    Asserts on what the stub was actually ASKED for (the file_pattern
+    kernels_output() received) and on what it actually WROTE to disk, not
+    merely that a log string came back: kernels_output's log write is
+    unconditional regardless of file_pattern (confirmed against the
+    installed kaggle package), so a test that only checked the returned
+    text would pass even if fetch_log_tail silently downloaded every
+    output file too.
+    """
+    api = LoggingApi(log_text="boom: out of memory")
+    c, _ = client(api=api)
+
+    text = c.fetch_log_tail("user/remember-render", tmp_path / "out")
+
+    assert text == "boom: out of memory"
+    # The stub was asked for a pattern that cannot match any real filename.
+    assert len(api.kernels_output_calls) == 1
+    file_pattern = api.kernels_output_calls[0]
+    assert file_pattern is not None
+    assert re.search(file_pattern, "f_0001.png") is None
+    assert re.search(file_pattern, "render-0.zip") is None
+    # And, because the fake honours file_pattern exactly like the real
+    # kaggle package does, no output file was actually written -- only the
+    # log (which the fake writes unconditionally, exactly like the real one).
+    assert api.kernels_output_written == []
+
+
+def test_fetch_log_tail_cleans_up_its_scratch_directory(tmp_path):
+    """`dest` (cache_dir()/work/log_<label> in production) is scratch
+    space for this one call only. Before this fix, kernels_output's real
+    download -- loose frames plus the Task 5 archive -- was left there
+    forever, unbounded across every failed render; now nothing is left
+    behind at all, success or failure."""
+    api = LoggingApi(log_text="boom")
+    c, _ = client(api=api)
+    dest = tmp_path / "out"
+
+    c.fetch_log_tail("user/remember-render", dest)
+
+    assert not dest.exists()
+
+
+def test_fetch_log_tail_cleans_up_even_when_there_is_no_log(tmp_path):
+    c, _ = client(api=FakeApi())  # writes no .log file
+    dest = tmp_path / "out"
+
+    c.fetch_log_tail("user/remember-render", dest)
+
+    assert not dest.exists()
 
 
 # ---------------------------------------------------------------------------
@@ -732,6 +812,36 @@ def test_fetch_output_with_progress_filters_to_images_and_archives_only(tmp_path
     got = c.fetch_output_with_progress("x/y", tmp_path / "out",
                                        transport=transport)
     assert [p.name for p in got] == ["f.zip"]
+
+
+def test_fetch_output_with_progress_rejects_path_escaping_file_names(tmp_path):
+    """`file_name` comes straight off Kaggle's own API response -- no more
+    trustworthy than a zip entry name, which collector._safe_zip_members
+    already refuses to extract outside its target directory. Same defence
+    here, for the same reason (Minor from the final review)."""
+    class FakeSdk:
+        class kernels:
+            class kernels_api_client:
+                @staticmethod
+                def list_kernel_session_output(request):
+                    return FakeListOutputResponse([
+                        FakeOutputFile("https://x/good.png", "good.png"),
+                        FakeOutputFile("https://x/evil.png",
+                                      "../../evil.png"),
+                    ])
+
+    c = KaggleClient(TOKEN, api_factory=lambda t: FakeApi(),
+                     sdk_factory=lambda t: FakeSdk())
+    transport = FakeGetTransport({"https://x/good.png": b"GOOD",
+                                  "https://x/evil.png": b"EVIL"})
+
+    out = tmp_path / "out"
+    got = c.fetch_output_with_progress("x/y", out, transport=transport)
+
+    assert [p.name for p in got] == ["good.png"]
+    assert transport.urls == ["https://x/good.png"]
+    assert list(tmp_path.rglob("evil.png")) == [], (
+        "the escaping file_name must never be written anywhere on disk")
 
 
 def test_sdk_factory_passes_the_token_instead_of_setting_the_environment():

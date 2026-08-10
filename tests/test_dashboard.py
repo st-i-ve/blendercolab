@@ -412,7 +412,6 @@ def test_preflight_flows_into_the_matching_instance_card_only(qapp, tmp_path):
     assert "2x Tesla T4" in card0.preflight_label.text()
     assert card0.live_container.isHidden() is False
     assert card1.preflight_label.text() == ""
-    assert dash._instance_preflight["acct0"]["gpu_count"] == 2
     dash.close()
 
 
@@ -432,7 +431,6 @@ def test_preflight_cleared_at_the_start_of_a_new_render(qapp, tmp_path):
     assert "Tesla T4" in dash._instance_cards["acct0"].preflight_label.text()
 
     dash._start_progress_threads(FleetState("job2", "x.blend", 1, 1, []))
-    assert dash._instance_preflight == {}
     assert dash._instance_cards["acct0"].preflight_label.text() == ""
     dash.close()
 
@@ -783,6 +781,44 @@ def test_dashboard_loads_its_own_settings_when_none_given(qapp, tmp_path):
     dash = make_dashboard(qapp, tmp_path, n=1)
     assert dash.settings.accent == "orange"
     assert dash.settings.fullscreen is False
+    assert dash.settings.min_gpus == 1
+    dash.close()
+
+
+def test_launch_wires_settings_min_gpus_into_render_settings(
+        qapp, tmp_path, monkeypatch):
+    """Final review IMPORTANT 2: the desktop app's one production
+    RenderSettings() construction (dashboard.py's _launch) must actually
+    pass the user's configured minimum-GPU gate through, not silently
+    leave every launch at RenderSettings' own default of 0 (no gate at
+    all, which is what made the PREFLIGHT SystemExit gate unreachable)."""
+    from blendfleet.fleet import Fleet
+
+    captured = {}
+    original_launch = Fleet.launch
+
+    def spy_launch(self, blend, settings, *args, **kwargs):
+        captured["settings"] = settings
+        return original_launch(self, blend, settings, *args, **kwargs)
+
+    monkeypatch.setattr(Fleet, "launch", spy_launch)
+
+    settings = Settings(min_gpus=3)
+    dash = Dashboard(make_store(1), lambda accounts: Fleet(
+        accounts, lambda tok: FakeClient(tok), tmp_path / "w"),
+        verifier=lambda t: "someone", settings=settings)
+    _LIVE_DASHBOARDS.append(dash)
+    settle(dash)
+
+    blend = tmp_path / "remember.blend"
+    blend.write_bytes(b"x" * 100)
+    dash.blend = blend
+    dash.start.setValue(1)
+    dash.end.setValue(4)
+    dash._launch()
+    pump(dash._launch_worker)
+
+    assert captured["settings"].min_gpus == 3
     dash.close()
 
 
@@ -1467,6 +1503,40 @@ def test_collect_fleet_wide_downloads_every_worker_and_routes_progress_per_card(
     for w in st.workers:
         assert dash._instance_cards[w.label].download_progress_label.isHidden() is True
     assert stub_message_boxes["information"]
+    dash.close()
+
+
+def test_collect_fleet_wide_with_a_worker_error_warns_not_informs(
+        qapp, tmp_path, monkeypatch, stub_message_boxes):
+    """Final review Minor: a CollectReport.worker_errors used to surface
+    under the same success-toned "Frames collected" information dialog on
+    the fleet-wide path, while the per-instance path
+    (_show_download_instance_result) correctly warns for the identical
+    condition. The two must agree -- errors warn, on both paths."""
+    def make_client(tok, acct):
+        if acct.label == "acct0":
+            return BoomFetchClient(tok)
+        return DownloadingClient(tok)
+
+    store, factory, st = _seed_job(tmp_path, make_client, n=2)
+    monkeypatch.setattr(dashboard_mod.QFileDialog, "getExistingDirectory",
+                        lambda *a, **kw: str(tmp_path / "downloaded"))
+
+    dash = Dashboard(store, lambda accounts: Fleet(accounts, factory, tmp_path / "w"),
+                     verifier=lambda t: "someone")
+    _LIVE_DASHBOARDS.append(dash)
+    settle(dash)
+    dash._last_state = st
+    dash._refresh_views()
+
+    dash._collect()
+    pump(dash._collect_worker)
+    settle(dash)
+
+    assert stub_message_boxes["warning"], \
+        "a worker_errors report must warn, never look like a clean collect"
+    titles = [title for title, _ in stub_message_boxes["information"]]
+    assert "Frames collected" not in titles
     dash.close()
 
 

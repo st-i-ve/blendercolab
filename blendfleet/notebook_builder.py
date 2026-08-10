@@ -53,6 +53,15 @@ else:
 # trusted to eyeball review.
 MACHINE_SHAPE = "NvidiaTeslaT4"
 
+# Extension of the Task 5 per-worker output archive -- single source of
+# truth for both where it's written (below, into the generated notebook's
+# ARCHIVE literal) and where it's later recognised (collector.py's
+# _resolve_frame_sources, kaggle_client.py's _OUTPUT_SUFFIXES). Used to be
+# defined separately in each of those three places; a future format change
+# updated in only one or two of them would have silently stopped the third
+# from seeing the archive at all.
+ARCHIVE_SUFFIX = ".zip"
+
 
 @dataclass
 class RenderSettings:
@@ -209,15 +218,16 @@ print("[telemetry] background GPU sampler started")
 
     # Task 5: the whole point is ONE download instead of hundreds, not
     # squeezing extra bytes out of already-compressed PNG/JPEG -- hence
-    # ZIP_STORED, never ZIP_DEFLATED. Named from THIS kernel's own slug
-    # (unique per worker/account) so collect() can tell one worker's
-    # archive apart from another's. Written as each frame completes, not
-    # only after the whole FRAMES loop finishes: a session that hits the
-    # wall or is killed mid-render still leaves a PARTIAL archive covering
-    # every frame finished so far -- exactly as honest as the loose files
-    # in OUT it sits alongside, which are written first and never removed
-    # or replaced by this.
-    archive_name = kernel_slug.split("/", 1)[1]
+    # ZIP_STORED, never ZIP_DEFLATED. Named from THIS kernel's own slug so
+    # collect() can tell one worker's archive apart from another's --
+    # which needs the WHOLE slug, owner included: kernel_slug is
+    # "<username>/<stem>-render-<job_id>", and username is the only part
+    # that differs between workers in the same job (stem and job_id are
+    # fleet-wide). Slicing that off with .split("/", 1)[1], as this used
+    # to, left every worker's archive_name identical despite the comment
+    # here claiming otherwise. "/" cannot appear in a filename, so it is
+    # replaced rather than kept literally.
+    archive_name = kernel_slug.replace("/", "-")
 
     c4 = f'''
 import os, glob, time, shutil, subprocess, zipfile
@@ -231,7 +241,7 @@ os.makedirs(OUT, exist_ok=True)
 # replacement for them. If the kernel is killed before this is even
 # opened, the loose files (uploaded to /kaggle/working exactly as
 # before) are still there for collect() to fall back to.
-ARCHIVE = "/kaggle/working/{archive_name}.zip"
+ARCHIVE = "/kaggle/working/{archive_name}{ARCHIVE_SUFFIX}"
 
 env = os.environ.copy()
 env.update({{"BR_RES_X": str(RES_X), "BR_RES_Y": str(RES_Y),

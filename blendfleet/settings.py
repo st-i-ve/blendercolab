@@ -20,10 +20,26 @@ from blendfleet.ui.theme import ACCENTS, DEFAULT_ACCENT
 FILENAME = "settings.json"
 
 
+DEFAULT_MIN_GPUS = 1
+
+
 @dataclass
 class Settings:
     accent: str = DEFAULT_ACCENT
     fullscreen: bool = False
+    # Minimum GPUs a launched kernel must report before the generated
+    # notebook's PREFLIGHT gate (notebook_builder.py) lets a render
+    # proceed -- see notebook_builder.RenderSettings.min_gpus, which this
+    # is wired into at the one production call site (ui/dashboard.py's
+    # _launch). Kaggle accepts an invalid machine_shape with no error and
+    # silently falls back to a single P100; this gate is what stops a long
+    # render from proceeding on far less hardware than requested when that
+    # happens. Defaults to 1 rather than 0 (no gate): a render app has no
+    # legitimate use for a CPU-only allocation, so requiring at least one
+    # GPU -- and failing fast instead of rendering at unusable speed -- is
+    # the right default, not something the user has to discover and turn
+    # on themselves.
+    min_gpus: int = DEFAULT_MIN_GPUS
 
     def __post_init__(self) -> None:
         # Total, not just "wrong value": a hand-edited or forward-dated
@@ -35,6 +51,13 @@ class Settings:
         # value, not only the ones that happen to be hashable.
         if not isinstance(self.accent, str) or self.accent not in ACCENTS:
             self.accent = DEFAULT_ACCENT
+        # Same principle as accent above: a hand-edited or forward-dated
+        # config must never brick the app. bool is technically an int
+        # subclass in Python, so it is excluded explicitly rather than
+        # accepted as 0/1.
+        if (not isinstance(self.min_gpus, int) or isinstance(self.min_gpus, bool)
+                or self.min_gpus < 0):
+            self.min_gpus = DEFAULT_MIN_GPUS
 
     def _path(self) -> Path:
         return config_dir() / FILENAME
@@ -58,4 +81,5 @@ class Settings:
         return cls(
             accent=data.get("accent", DEFAULT_ACCENT),
             fullscreen=bool(data.get("fullscreen", False)),
+            min_gpus=data.get("min_gpus", DEFAULT_MIN_GPUS),
         )

@@ -287,6 +287,25 @@ def test_archive_name_is_per_worker_not_a_fixed_shared_name(tmp_path, settings):
     assert "render-abc123" in joined
 
 
+def test_archive_name_actually_differs_between_workers_in_the_same_job(tmp_path, settings):
+    # Final review Minor: kernel_slug is "<username>/<stem>-render-<job_id>"
+    # -- username is the only part that differs between two workers in the
+    # SAME job (stem and job_id are fleet-wide). Slicing the owner off with
+    # kernel_slug.split("/", 1)[1] left every worker's archive_name
+    # identical despite a comment here claiming otherwise; this locks in
+    # that two different accounts rendering the same job get two different
+    # archive names.
+    joined_a = "\n".join(cells_src(
+        build([1], settings, "me/x", tmp_path / "a", "alice/render-job1")))
+    joined_b = "\n".join(cells_src(
+        build([1], settings, "me/x", tmp_path / "b", "bob/render-job1")))
+    archive_line_a = next(l for l in joined_a.splitlines() if l.startswith("ARCHIVE ="))
+    archive_line_b = next(l for l in joined_b.splitlines() if l.startswith("ARCHIVE ="))
+    assert archive_line_a != archive_line_b
+    assert "alice" in archive_line_a
+    assert "bob" in archive_line_b
+
+
 def test_archive_is_written_inside_the_frame_loop_not_only_at_the_end(tmp_path, settings):
     # THE non-negotiable from the brief: if the archive were written only
     # once after the whole FRAMES loop finishes, a session that hits the
