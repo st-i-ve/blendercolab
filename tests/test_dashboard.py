@@ -1467,6 +1467,87 @@ def test_collect_fleet_wide_downloads_every_worker_and_routes_progress_per_card(
 
 
 # ---------------------------------------------------------------------------
+# Review findings on the Task 6 download wiring above.
+# ---------------------------------------------------------------------------
+
+def test_collect_result_message_never_doubles_the_word_to(
+        qapp, tmp_path, monkeypatch, stub_message_boxes):
+    """Review finding: _describe_collect_result's own template already
+    ends "... {who} to {dest}.", but the fleet-wide call site passed
+    who="to" and the per-instance one passed who=f"from {who} to" --
+    both produced a doubled "to to" in the user-facing dialog."""
+    def make_client(tok, acct):
+        return DownloadingClient(tok)
+
+    store, factory, st = _seed_job(tmp_path, make_client, n=1)
+    monkeypatch.setattr(dashboard_mod.QFileDialog, "getExistingDirectory",
+                        lambda *a, **kw: str(tmp_path / "downloaded"))
+
+    dash = Dashboard(store, lambda accounts: Fleet(accounts, factory, tmp_path / "w"),
+                     verifier=lambda t: "someone")
+    _LIVE_DASHBOARDS.append(dash)
+    settle(dash)
+    dash._last_state = st
+    dash._refresh_views()
+
+    dash._collect()
+    pump(dash._collect_worker)
+    settle(dash)
+    fleet_message = stub_message_boxes["information"][-1][1]
+    assert "to to" not in fleet_message, fleet_message
+
+    stub_message_boxes["information"].clear()
+    dash._download_instance(st.workers[0].label)
+    pump(dash._instance_download_workers[st.workers[0].label])
+    settle(dash)
+    instance_message = stub_message_boxes["information"][-1][1]
+    assert "to to" not in instance_message, instance_message
+    dash.close()
+
+
+def test_fleet_wide_collect_finishing_does_not_clobber_a_concurrent_instance_download(
+        qapp, tmp_path, monkeypatch, stub_message_boxes):
+    """Review finding: the fleet-wide "Collect frames..." button and a
+    per-card "Download" are not mutually exclusive. When the fleet-wide
+    one finishes, it used to blank EVERY card's progress line -- including
+    one whose own, unrelated per-instance download was still running."""
+    from blendfleet.downloader import DownloadProgress
+
+    def make_client(tok, acct):
+        return DownloadingClient(tok)
+
+    store, factory, st = _seed_job(tmp_path, make_client, n=2)
+    monkeypatch.setattr(dashboard_mod.QFileDialog, "getExistingDirectory",
+                        lambda *a, **kw: str(tmp_path / "downloaded"))
+
+    dash = Dashboard(store, lambda accounts: Fleet(accounts, factory, tmp_path / "w"),
+                     verifier=lambda t: "someone")
+    _LIVE_DASHBOARDS.append(dash)
+    settle(dash)
+    dash._last_state = st
+    dash._refresh_views()
+
+    other_label = st.workers[1].label
+    other_card = dash._instance_cards[other_label]
+    other_card.set_download_progress(DownloadProgress(downloaded=1, total=2, rate_bps=1.0))
+    # Simulate other_label's own per-instance download still being in
+    # flight -- a plain marker is enough since _clear_all_download_progress
+    # only needs to consult the KEYS of this dict, never call into it.
+    dash._instance_download_workers[other_label] = object()
+
+    dash._collect()
+    pump(dash._collect_worker)
+
+    assert other_card.download_progress_label.isHidden() is False, (
+        "the fleet-wide collect finishing must not blank a card whose OWN "
+        "per-instance download is still running")
+    # Drop the placeholder before settle()/close() try to .wait() it as if
+    # it were a real _DownloadWorker.
+    dash._instance_download_workers.pop(other_label, None)
+    dash.close()
+
+
+# ---------------------------------------------------------------------------
 # Task 4: "it just says error" -- surfacing failure_message, or the fetched
 # log tail when it is empty, and ONLY for a failed worker.
 # ---------------------------------------------------------------------------

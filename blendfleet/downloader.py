@@ -112,26 +112,42 @@ def fetch_files(files: list[tuple[str, Path]], transport: Transport,
     bytes actually written to disk, with a running total across every file
     in `files` -- see the module docstring for why that is cumulative
     rather than per file.
+
+    Opens `transport.get(url)` for the NEXT file only once the previous
+    file's response has been fully read and closed -- never more than one
+    connection open at a time (review finding: this used to open every
+    file's GET up front before reading any of them, which for the
+    no-archive fallback -- potentially hundreds of loose frames -- meant
+    hundreds of simultaneous open connections before a single byte
+    reached disk). `total` therefore grows additively as each new file's
+    Content-Length becomes known, rather than being fixed from the start;
+    it never decreases.
     """
-    responses = [(transport.get(url), path) for url, path in files]
-    total = sum(_content_length(response) for response, _ in responses)
     reporter = _ProgressReporter(on_progress)
     downloaded = 0
+    total = 0
     since_tick = 0
     start = time.monotonic()
 
-    for response, dest in responses:
-        dest = Path(dest)
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        with dest.open("wb") as f:
-            for chunk in response.iter_content(_READ_CHUNK):
-                if not chunk:
-                    continue
-                f.write(chunk)
-                n = len(chunk)
-                downloaded += n
-                since_tick += n
-                if since_tick >= progress_interval or downloaded >= total:
-                    elapsed = max(time.monotonic() - start, 1e-9)
-                    reporter.report(downloaded, total, downloaded / elapsed)
-                    since_tick = 0
+    for url, dest in files:
+        response = transport.get(url)
+        try:
+            total += _content_length(response)
+            dest = Path(dest)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with dest.open("wb") as f:
+                for chunk in response.iter_content(_READ_CHUNK):
+                    if not chunk:
+                        continue
+                    f.write(chunk)
+                    n = len(chunk)
+                    downloaded += n
+                    since_tick += n
+                    if since_tick >= progress_interval or downloaded >= total:
+                        elapsed = max(time.monotonic() - start, 1e-9)
+                        reporter.report(downloaded, total, downloaded / elapsed)
+                        since_tick = 0
+        finally:
+            close = getattr(response, "close", None)
+            if close is not None:
+                close()

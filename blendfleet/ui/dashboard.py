@@ -1125,12 +1125,25 @@ class Dashboard(QMainWindow):
         worker.finished.connect(worker.deleteLater)
         worker.start()
 
-    def _clear_all_download_progress(self) -> None:
-        """Reset every card's download progress line -- called once a
-        fleet-wide or per-instance download finishes (success or failure),
-        so a card never goes on showing the last tick from a download that
-        is no longer running."""
-        for card in self._instance_cards.values():
+    def _clear_all_download_progress(self, *, except_labels=()) -> None:
+        """Reset every card's download progress line -- called once the
+        FLEET-WIDE download finishes (success or failure), so a card never
+        goes on showing the last tick from that worker's own download.
+
+        `except_labels` skips whichever cards have their OWN, separate
+        per-instance download still in flight (review finding: the
+        fleet-wide "Collect frames..." button and a per-card "Download"
+        are not mutually exclusive -- clearing every card unconditionally
+        used to blank a concurrently-running per-instance download's
+        progress line the instant the UNRELATED fleet-wide one finished).
+        Callers pass `set(self._instance_download_workers)` -- exactly the
+        labels whose own worker is still tracked as in flight; a
+        per-instance download itself always clears its own card directly
+        once IT finishes, never through this method.
+        """
+        for label, card in self._instance_cards.items():
+            if label in except_labels:
+                continue
             card.set_download_progress(None)
 
     def _route_download_progress(self, label: str, progress) -> None:
@@ -1143,11 +1156,18 @@ class Dashboard(QMainWindow):
         if card is not None:
             card.set_download_progress(progress)
 
-    def _describe_collect_result(self, r, *, who: str, dest: str) -> str:
+    def _describe_collect_result(self, r, *, destination_phrase: str) -> str:
         """One friendly message for a CollectReport, shared by the
         fleet-wide and per-instance download paths so the two do not grow
-        two different tellings of the same report."""
-        msg = f"Copied {r.copied} frame(s) {who} to {dest}."
+        two different tellings of the same report.
+
+        `destination_phrase` is the WHOLE "to <where>" clause, fully
+        formed by the caller (review finding: this used to take `who` +
+        `dest` separately and glue them together with its own literal
+        " to " -- but both call sites' `who` already ended in "to",
+        producing a doubled "... to to <path>." in the actual dialog).
+        """
+        msg = f"Copied {r.copied} frame(s) {destination_phrase}."
         if r.missing_frames:
             msg += (f"\n\n{len(r.missing_frames)} frame(s) are still "
                     f"missing (not rendered yet, or the render failed for "
@@ -1197,7 +1217,8 @@ class Dashboard(QMainWindow):
             self._collect_worker = None
             self.collect_btn.setEnabled(True)
             self.collect_btn.setText("Collect frames…")
-            self._clear_all_download_progress()
+            self._clear_all_download_progress(
+                except_labels=set(self._instance_download_workers))
             if r is None:
                 QMessageBox.information(
                     self, "Nothing to collect",
@@ -1205,13 +1226,14 @@ class Dashboard(QMainWindow):
                 return
             QMessageBox.information(
                 self, "Frames collected",
-                self._describe_collect_result(r, who="to", dest=d))
+                self._describe_collect_result(r, destination_phrase=f"to {d}"))
 
         def done_fail(message: str) -> None:
             self._collect_worker = None
             self.collect_btn.setEnabled(True)
             self.collect_btn.setText("Collect frames…")
-            self._clear_all_download_progress()
+            self._clear_all_download_progress(
+                except_labels=set(self._instance_download_workers))
             QMessageBox.critical(self, "Could not collect frames", message)
 
         worker.progress.connect(self._route_download_progress)
@@ -1276,20 +1298,30 @@ class Dashboard(QMainWindow):
         worker.start()
 
     def _show_download_instance_result(self, who: str, dest: str, r) -> None:
+        """Report one account's collect() outcome.
+
+        Routes through _describe_collect_result for the message body in
+        every case -- including worker_errors -- rather than formatting
+        that branch a second time here. That branch used to be built
+        inline and returned on early, which meant _describe_collect_result's
+        OWN worker_errors branch could never actually fire for this
+        (per-instance) path despite the method's docstring claiming it
+        was shared by both download paths -- a dead, misleading branch.
+        A worker_errors report still gets a warning dialog, not the
+        success-toned "Frames downloaded" one, since for a single-account
+        download a fetch failure IS the whole story.
+        """
         if r is None:
             QMessageBox.information(
                 self, "Nothing to collect",
                 "No render job was found -- start a render first.")
             return
+        msg = self._describe_collect_result(
+            r, destination_phrase=f"from {who} to {dest}")
         if r.worker_errors:
-            detail = "; ".join(r.worker_errors.values())
-            QMessageBox.warning(
-                self, "Could not download frames",
-                f"{who}'s frames could not be downloaded: {detail}")
+            QMessageBox.warning(self, "Could not download frames", msg)
             return
-        QMessageBox.information(
-            self, "Frames downloaded",
-            self._describe_collect_result(r, who=f"from {who} to", dest=dest))
+        QMessageBox.information(self, "Frames downloaded", msg)
 
     # ---------------- polling / live refresh ----------------
     def _poll(self) -> None:

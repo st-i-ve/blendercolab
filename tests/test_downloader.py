@@ -121,6 +121,57 @@ def test_missing_content_length_does_not_crash_and_reports_zero_total(tmp_path):
     assert events[-1].downloaded == 3
 
 
+# ---------------------------------------------------------------- review --
+# Code review finding: fetch_files used to open EVERY file's GET up front
+# (`[(transport.get(url), path) for url, path in files]`) before reading or
+# writing any of them -- for the no-archive fallback (hundreds of loose
+# frames) that opens hundreds of simultaneous connections before a single
+# byte reaches disk, and contradicts this module's own stated one-request-
+# at-a-time design (mirroring uploader.py). Fixed to open the NEXT file's
+# connection only once the previous one's response has been fully read and
+# closed.
+
+class _OpenTracker:
+    def __init__(self):
+        self.open_count = 0
+        self.max_open = 0
+
+
+class _TrackedResponse(FakeResponse):
+    def __init__(self, body: bytes, tracker: _OpenTracker):
+        super().__init__(body)
+        self._tracker = tracker
+
+    def close(self) -> None:
+        self._tracker.open_count -= 1
+
+
+class TrackingTransport:
+    def __init__(self, bodies: dict[str, bytes], tracker: _OpenTracker):
+        self._bodies = bodies
+        self._tracker = tracker
+
+    def get(self, url: str):
+        self._tracker.open_count += 1
+        self._tracker.max_open = max(self._tracker.max_open, self._tracker.open_count)
+        return _TrackedResponse(self._bodies[url], self._tracker)
+
+
+def test_fetches_one_file_at_a_time_never_more_than_one_open_connection(tmp_path):
+    tracker = _OpenTracker()
+    transport = TrackingTransport(
+        {"https://x/a": _bytes(1024), "https://x/b": _bytes(1024),
+         "https://x/c": _bytes(1024)}, tracker)
+
+    fetch_files([("https://x/a", tmp_path / "a.bin"),
+                ("https://x/b", tmp_path / "b.bin"),
+                ("https://x/c", tmp_path / "c.bin")], transport)
+
+    assert tracker.max_open == 1, (
+        "at most one connection should ever be open at once -- one GET at "
+        "a time, exactly like uploader.py's one-PUT-at-a-time design")
+
+
 def test_progress_never_regresses_even_with_a_defensive_high_water_clamp(tmp_path):
     """Same discipline as uploader._ProgressReporter: on_progress is fed
     through a high-water-mark clamp so nothing this module ever does

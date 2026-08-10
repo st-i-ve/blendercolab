@@ -39,6 +39,33 @@ def _frame_number(name: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
+def _safe_zip_members(zf: zipfile.ZipFile, extract_dir: Path) -> list[str]:
+    """Entry names from `zf` that are safe to extract under `extract_dir`.
+
+    Defence against zip-slip: an entry name containing '../' segments, an
+    absolute path, or a backslash could otherwise make `extractall` write
+    outside `extract_dir` entirely. This app's own notebook only ever
+    writes flat, basename-only entries (`arcname=os.path.basename(f)`), so
+    an entry that fails this check is itself evidence the archive is
+    corrupt or tampered with -- it is skipped exactly like a frame this
+    worker never rendered, never trusted onto disk.
+    """
+    resolved_root = extract_dir.resolve()
+    safe = []
+    for name in zf.namelist():
+        if name.endswith("/"):
+            continue  # directory entry -- nothing to extract
+        if "\\" in name:
+            continue
+        candidate = (extract_dir / name).resolve()
+        try:
+            candidate.relative_to(resolved_root)
+        except ValueError:
+            continue
+        safe.append(name)
+    return safe
+
+
 def _resolve_frame_sources(files: list[Path], staging: Path,
                            label: str, report: CollectReport) -> dict[int, Path]:
     """Map frame number -> the file to copy for it, from whatever
@@ -55,9 +82,17 @@ def _resolve_frame_sources(files: list[Path], staging: Path,
     wins on any frame number both sources agree on; the loose files only
     ever fill a genuine gap.
 
-    A corrupt archive (BadZipFile) is reported on `report.archive_errors`
-    and treated as if no archive had been returned at all -- the loose
-    files are still used, never a crash.
+    A corrupt archive is reported on `report.archive_errors` and treated
+    as if no archive had been returned at all -- the loose files are
+    still used, never a crash. Caught broadly (not just BadZipFile):
+    a truncated/interrupted write (the exact failure mode Task 5's
+    incremental append can leave behind if a session is killed mid-write)
+    can just as easily surface as a plain OSError/EOFError from
+    `extractall` depending on exactly where the corruption falls, and
+    every one of those must fall back to loose frames identically --
+    letting any of them escape uncaught would mark this worker as failed
+    (report.worker_errors) instead, discarding perfectly good loose files
+    sitting right next to the archive.
     """
     frame_paths: dict[int, Path] = {}
     archive = next((f for f in files if f.suffix.lower() == ARCHIVE_SUFFIX), None)
@@ -65,14 +100,14 @@ def _resolve_frame_sources(files: list[Path], staging: Path,
         try:
             extract_dir = staging / "_extracted"
             with zipfile.ZipFile(archive) as zf:
-                zf.extractall(extract_dir)
+                zf.extractall(extract_dir, members=_safe_zip_members(zf, extract_dir))
             for p in sorted(extract_dir.rglob("*")):
                 if not p.is_file():
                     continue
                 frame = _frame_number(p.name)
                 if frame is not None:
                     frame_paths[frame] = p
-        except zipfile.BadZipFile as e:
+        except Exception as e:
             report.archive_errors[label] = (
                 f"{label}'s archive ({archive.name}) is corrupt ({e}) -- "
                 "falling back to this worker's loose frames.")

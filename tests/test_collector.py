@@ -317,6 +317,60 @@ def test_archive_lagging_one_frame_behind_loose_files_still_finds_it(tmp_path):
     assert (out / "r_0003.png").exists()   # recovered from the loose file
 
 
+def test_archive_corruption_that_raises_something_other_than_badzipfile_still_falls_back(
+        tmp_path, monkeypatch):
+    """Review finding: a truncated/interrupted archive write is not
+    guaranteed to always surface as zipfile.BadZipFile -- e.g. a disk-full
+    or permission error during extractall raises a plain OSError. That
+    must fall back to loose frames exactly like BadZipFile does, never
+    escape and mark the whole worker as failed (which would throw away
+    perfectly good loose files sitting right next to the archive)."""
+    import blendfleet.collector as collector_mod
+
+    def boom_extractall(self, path=None, members=None, pwd=None):
+        raise OSError(22, "Invalid argument")
+
+    monkeypatch.setattr(collector_mod.zipfile.ZipFile, "extractall", boom_extractall)
+
+    def factory(tok):
+        return FakeClient(tok, ["f_0001.png", "f_0003.png"] if tok.endswith("0"*32)
+                          else ["f_0002.png", "f_0004.png"],
+                          archive={"f_0001.png": b"AAA"} if tok.endswith("0"*32)
+                          else {"f_0002.png": b"CCC"})
+
+    r = collect(state(), accts(), factory, tmp_path / "out")
+    assert r.copied == 4
+    assert r.missing_frames == []
+    assert r.archive_errors["a0"]
+    assert r.archive_errors["a1"]
+    assert not r.worker_errors
+
+
+def test_archive_zip_slip_entries_are_rejected_not_extracted_outside_staging(tmp_path):
+    """A malicious or corrupted archive entry name must never be allowed
+    to write outside the staging directory (zip-slip)."""
+    def factory(tok):
+        class SlipClient(FakeClient):
+            def fetch_output(self, slug, dest):
+                dest.mkdir(parents=True, exist_ok=True)
+                zpath = dest / "frames.zip"
+                with zipfile.ZipFile(zpath, "w", zipfile.ZIP_STORED) as zf:
+                    zf.writestr("f_0001.png", b"AAA")
+                    zf.writestr("../../evil_0002.png", b"EVIL")
+                return [zpath]
+        return SlipClient(tok)
+
+    st = FleetState(job_id="j1", blend_name="r.blend", start_frame=1, end_frame=1,
+                    workers=[WorkerState("a0", "u0", "u0/k0", [1])])
+    out = tmp_path / "out"
+    r = collect(st, [Account("a0", "KGAT_" + "0"*32)], factory, out)
+
+    assert r.copied == 1
+    assert (out / "r_0001.png").read_bytes() == b"AAA"
+    assert list(tmp_path.rglob("evil_0002.png")) == [], (
+        "the escaping entry must never be extracted anywhere on disk")
+
+
 def test_archive_and_matching_loose_files_do_not_double_count(tmp_path):
     def factory(tok):
         return FakeClient(tok, produce=["f_0001.png"],
