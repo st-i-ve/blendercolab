@@ -114,7 +114,7 @@
 
         <div class="dash-grid" style="margin-top:22px">
           <div>
-            <h2 class="sec">Running processes <span class="meta">one file · divided frames</span></h2>
+            <h2 class="sec">Running processes <span class="meta" id="job-meta">no scene chosen</span></h2>
             <div class="instances" id="instances"></div>
           </div>
           <div>
@@ -219,6 +219,12 @@
               <button class="btn" id="btn-start-all">Start all warm</button>
               <button class="btn danger" id="btn-stop-all">Stop all</button>
               <button class="btn ghost-accent" id="btn-send-job">Send job to warm machines</button>
+              <!-- The way out of a genuine deadlock: Kaggle sometimes
+                   reports a kernel as active but refuses to cancel it, and
+                   then no new render can start. This does NOT stop
+                   anything -- the wording says so, and so does the
+                   confirmation. -->
+              <button class="btn danger" id="btn-forget">Stop tracking job</button>
               <span class="dz-sub" id="warm-note"></span>
             </div>
             <div class="panel">

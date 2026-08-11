@@ -5,8 +5,9 @@ import blendfleet.platform_paths as pp
 from blendfleet.accounts import Account
 from blendfleet.kaggle_client import KernelStatus, Quota
 from blendfleet.notebook_builder import RenderSettings
-from blendfleet.fleet import (Fleet, FleetBusyError, StaleDatasetError,
-                              UnreachableAccountsError, WorkerState)
+from blendfleet.fleet import (Fleet, FleetBusyError, FleetState,
+                              StaleDatasetError, UnreachableAccountsError,
+                              WorkerState)
 
 
 class FakeDatasetApiClient:
@@ -846,3 +847,60 @@ def test_an_unusable_filename_is_rejected_before_anything_is_uploaded(tmp_path):
     assert uploads == 0, "the user must not wait out an upload to be told the name is bad"
     assert all(c.pushed == 0 for c in clients.values())
     assert f.load() is None, "nothing was started, so no state may be written"
+
+
+# ---------------------------------------------------------------------------
+# The deadlock escape hatch. Kaggle has been observed to report a kernel as
+# active while refusing the cancel request: cancel_all() then cannot clear
+# it and launch() keeps refusing because a job is "still running", which
+# leaves the app wedged with no way out but editing state by hand.
+# ---------------------------------------------------------------------------
+
+def test_forget_job_clears_the_state_so_a_new_render_can_start(tmp_path):
+    fleet = Fleet([Account(label="a", token="KGAT_" + "0" * 32,
+                           username="user_a")],
+                  lambda t: object(), tmp_path / "w")
+    fleet._save(FleetState(job_id="j", blend_name="s.blend", start_frame=1,
+                           end_frame=4,
+                           workers=[WorkerState(label="a", username="user_a",
+                                                kernel_slug="user_a/k",
+                                                frames=[1, 2], state="running")]))
+    assert fleet.load() is not None
+
+    forgotten = fleet.forget_job()
+
+    assert [w.label for w in forgotten] == ["a"]
+    assert fleet.load() is None, "the job is still tracked, so launch stays blocked"
+
+
+def test_forget_job_does_not_cancel_anything(tmp_path):
+    """It must not touch Kaggle at all. A button that quietly abandoned a
+    running session while sounding like a cancel would be the worst lie
+    this app could tell -- the caller is what has to say so."""
+    calls = []
+
+    class LoudClient:
+        def __init__(self, token):
+            self.token = token
+
+        def __getattr__(self, name):
+            calls.append(name)
+            raise AssertionError(f"forget_job called client.{name}")
+
+    fleet = Fleet([Account(label="a", token="KGAT_" + "0" * 32,
+                           username="user_a")],
+                  LoudClient, tmp_path / "w")
+    fleet._save(FleetState(job_id="j", blend_name="s.blend", start_frame=1,
+                           end_frame=2,
+                           workers=[WorkerState(label="a", username="user_a",
+                                                kernel_slug="user_a/k",
+                                                frames=[1], state="running")]))
+    fleet.forget_job()
+    assert calls == []
+
+
+def test_forget_job_with_no_job_is_a_no_op(tmp_path):
+    fleet = Fleet([Account(label="a", token="KGAT_" + "0" * 32,
+                           username="user_a")],
+                  lambda t: object(), tmp_path / "w")
+    assert fleet.forget_job() == []

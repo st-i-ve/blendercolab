@@ -226,6 +226,31 @@ class Fleet:
         d["workers"] = [WorkerState(**w) for w in d["workers"]]
         return FleetState(**d)
 
+    def forget_job(self) -> list[WorkerState]:
+        """Drop the tracked job WITHOUT stopping anything on Kaggle.
+
+        The escape hatch for a genuine deadlock: Kaggle reports a kernel as
+        still active but refuses the cancel request, so cancel_all() cannot
+        clear it and launch() keeps refusing because a job is "still
+        running". Without this the app is wedged with no way out but
+        editing state by hand.
+
+        This is deliberately NOT a cancel and must never be worded as one.
+        Whatever is running on Kaggle keeps running, and keeps spending
+        quota; all that changes is that this app stops tracking it -- which
+        also means it can no longer cancel or collect from those kernels.
+        The caller is responsible for saying so plainly and pointing at
+        kaggle.com, and the returned workers are exactly what it has
+        stopped being able to reach.
+        """
+        st = self.load()
+        if st is None:
+            return []
+        path = self._state_path()
+        if path.exists():
+            path.unlink()
+        return list(st.workers)
+
     def active_workers(self) -> list[WorkerState]:
         """Workers whose kernel Kaggle currently reports as queued/running.
 

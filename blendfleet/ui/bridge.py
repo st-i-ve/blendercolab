@@ -30,21 +30,26 @@ Honesty rules carried over from the Qt UI, which this must not lose:
 from __future__ import annotations
 
 import json
+import queue
+import threading
 import time
 import uuid
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QObject, QThread, Signal, Slot
+from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
 
 from blendfleet.accounts import AccountStore
 from blendfleet.assignment import estimate
 from blendfleet.instance_state import InstanceStore
+from blendfleet.log_stream import stream_progress
 from blendfleet.notebook_builder import RenderSettings
 from blendfleet.settings import Settings
 from blendfleet.ui.messages import explain
 
 SECONDS_PER_FRAME_DEFAULT = 57.1     # measured: 1920x1080, 128spp, P100
+POLL_INTERVAL_MS = 30_000            # real network calls: kernel status
+LIVE_INTERVAL_MS = 2_000             # cheap: drain the in-memory queues
 
 
 class _Worker(QThread):
@@ -113,6 +118,35 @@ class Backend(QObject):
         self._last_poll_ms: int | None = None
         self._last_poll_at: str | None = None
         self._online = True
+
+        # ---- live telemetry --------------------------------------------
+        # `kernels logs`/`kernels output` return NOTHING until a kernel is
+        # COMPLETE, so a 30-second status poll can only ever say "queued"
+        # or "running" -- it cannot say "installing Blender" or "frame 7 of
+        # 15". The SSE log stream is the only source of live progress, live
+        # per-GPU telemetry and the hardware a session actually got.
+        #
+        # One daemon thread per worker fills these queues; _live_tick
+        # drains them on the UI thread. Nothing touches the payload from a
+        # stream thread.
+        self._stop = threading.Event()
+        self._stream_threads: list[threading.Thread] = []
+        self._progress_q: "queue.Queue[tuple[str, int, int]]" = queue.Queue()
+        self._telemetry_q: "queue.Queue[tuple[str, dict]]" = queue.Queue()
+        self._hardware_q: "queue.Queue[tuple[str, dict]]" = queue.Queue()
+        self._preflight_q: "queue.Queue[tuple[str, dict]]" = queue.Queue()
+        # label -> what we have seen live this run. Cleared per launch.
+        self._live: dict[str, dict] = {}
+
+        # A status poll is infrequent and costs a network call per account;
+        # the live drain is cheap and purely in-memory. Two timers, two
+        # rates -- the Qt UI's own split, for the same reasons.
+        self._poll_timer = QTimer(self)
+        self._poll_timer.timeout.connect(self.poll)
+        self._poll_timer.start(POLL_INTERVAL_MS)
+        self._live_timer = QTimer(self)
+        self._live_timer.timeout.connect(self._live_tick)
+        self._live_timer.start(LIVE_INTERVAL_MS)
 
     # ---- helpers ------------------------------------------------------
     def _start(self, key: str, fn, action: str, on_ok, on_fail=None) -> bool:
@@ -190,6 +224,11 @@ class Backend(QObject):
                 # Last-KNOWN, always carrying its age.
                 "hardware": _snapshot_payload(
                     self.instance_store.get(account.label)),
+                # What the log stream has seen THIS run: the phase, live
+                # per-GPU utilisation and memory, and the hardware the
+                # session actually got. None until a stream reports --
+                # never a cached value dressed up as live.
+                "live": self._live_payload(account.label),
             })
         return {
             "job": {
@@ -202,6 +241,26 @@ class Backend(QObject):
             "blend": {"path": str(self.blend), "name": self.blend.name}
                      if self.blend else None,
             "approximate": True,
+        }
+
+    def _live_payload(self, label: str) -> dict | None:
+        """What the SSE stream has reported for `label` this run.
+
+        None when nothing has arrived. That is the honest answer between
+        renders: there is no idle session to poll, so "no live data" is a
+        state, not a gap to paper over with the last run's numbers.
+        """
+        slot = self._live.get(label)
+        if not slot:
+            return None
+        return {
+            "phase": slot["phase"],
+            "framesDone": slot["framesDone"],
+            "framesTotal": slot["framesTotal"],
+            "gpus": [slot["gpus"][k] for k in sorted(slot["gpus"])],
+            "cpuCount": slot["cpuCount"],
+            "ramTotal": slot["ramTotal"],
+            "preflight": slot["preflight"],
         }
 
     def _emit_state(self) -> None:
@@ -472,6 +531,7 @@ class Backend(QObject):
 
         def ok(state) -> None:
             self._last_state = state
+            self._start_streams(state)
             self.logLine.emit(
                 f"render started on {len(accounts)} account(s)", "active")
             self.notification.emit("Render started", "active")
@@ -518,6 +578,7 @@ class Backend(QObject):
 
         def ok(state) -> None:
             self._last_state = state
+            self._start_streams(state)
             self.logLine.emit(
                 f"started {len(labels)} machine(s) warm — they are spending "
                 "quota while they wait", "warn")
@@ -616,6 +677,47 @@ class Backend(QObject):
             self.poll()
 
         self._start("cancel", work, "Cancelling the render", ok)
+
+    @Slot()
+    def forgetJob(self) -> None:
+        """Stop tracking a job this app can no longer control.
+
+        For the deadlock where Kaggle reports a kernel as active but
+        refuses to cancel it: cancel cannot clear it, and launch keeps
+        refusing because a job is still running. This unwedges the app.
+
+        It does NOT stop anything. Whatever is running on Kaggle keeps
+        running and keeps spending quota -- and this app will no longer be
+        able to cancel it or collect its frames. The message says exactly
+        that, because a button that quietly abandons somebody else's
+        running GPU session while sounding like a cancel would be the worst
+        kind of lie this app could tell.
+        """
+        accounts = self.store.list()
+
+        def work():
+            return self.fleet_factory(accounts).forget_job()
+
+        def ok(workers) -> None:
+            self._last_state = None
+            self._live = {}
+            if not workers:
+                self.notification.emit("There was no tracked job.", "idle")
+            else:
+                names = ", ".join(
+                    f"{w.label} ({w.kernel_slug})" for w in workers)
+                self.notification.emit(
+                    f"Stopped tracking {len(workers)} kernel(s). They are "
+                    f"NOT cancelled — if still running they keep spending "
+                    f"quota, and this app can no longer stop or collect "
+                    f"them: {names}. Stop them by hand at kaggle.com.",
+                    "offline")
+                self.logLine.emit(
+                    f"stopped tracking {len(workers)} kernel(s) — not "
+                    "cancelled", "warn")
+            self._emit_state()
+
+        self._start("forget", work, "Forgetting the job", ok)
 
     @Slot(str)
     def cancelInstance(self, label: str) -> None:
@@ -731,10 +833,117 @@ class Backend(QObject):
         self.logLine.emit(f"removed account {label}", "warn")
         self._emit_state()
 
+    # ---- live streaming ------------------------------------------------
+    def _start_streams(self, state) -> None:
+        """One SSE log stream per worker, for as long as it runs.
+
+        Workers are matched to accounts by LABEL, never by position:
+        zip(accounts, workers) mispairs the moment the two lists stop
+        lining up, and streaming a kernel with the wrong person's token is
+        both a privacy leak and a stream that simply 403s.
+        """
+        self._live = {}
+        self._stream_threads = [t for t in self._stream_threads if t.is_alive()]
+        by_label = {a.label: a for a in self.store.list()}
+        for worker in (state.workers if state else []):
+            account = by_label.get(worker.label)
+            if account is None:
+                continue        # removed mid-launch: no token, so no stream
+
+            def run(account=account, worker=worker):
+                label = account.label
+
+                def progress(done, total):
+                    self._progress_q.put((label, done, total))
+
+                try:
+                    stream_progress(
+                        account.token, worker.username,
+                        worker.kernel_slug.split("/", 1)[1], progress,
+                        self._stop,
+                        on_telemetry=lambda r: self._telemetry_q.put((label, r)),
+                        on_hardware=lambda r: self._hardware_q.put((label, r)),
+                        on_preflight=lambda r: self._preflight_q.put((label, r)))
+                except Exception:
+                    pass        # a dead stream must never kill the render
+
+            thread = threading.Thread(target=run, daemon=True,
+                                      name=f"blendfleet-stream-{worker.label}")
+            self._stream_threads.append(thread)
+            thread.start()
+
+    def _slot(self, label: str) -> dict:
+        return self._live.setdefault(label, {
+            "phase": "", "framesDone": 0, "framesTotal": 0,
+            "gpus": {}, "cpuCount": None, "ramTotal": None, "preflight": None,
+        })
+
+    def _live_tick(self) -> None:
+        """Drain what the stream threads collected, on the UI thread.
+
+        Bounded per tick so a flood of telemetry cannot starve the loop.
+        """
+        changed = False
+        for _ in range(200):
+            try:
+                label, done, total = self._progress_q.get_nowait()
+            except queue.Empty:
+                break
+            slot = self._slot(label)
+            slot["framesDone"], slot["framesTotal"] = done, total
+            slot["phase"] = f"rendering · {done}/{total} frames"
+            changed = True
+        for _ in range(200):
+            try:
+                label, record = self._telemetry_q.get_nowait()
+            except queue.Empty:
+                break
+            slot = self._slot(label)
+            slot["gpus"][record["gpu"]] = {
+                "index": record["gpu"],
+                "util": record.get("util"),
+                "memUsed": record.get("mem_used"),
+                "memTotal": record.get("mem_total"),
+            }
+            # Telemetry only exists while Blender is running, so its
+            # arrival is itself evidence the setup finished.
+            if not slot["phase"]:
+                slot["phase"] = "rendering"
+            changed = True
+        for _ in range(200):
+            try:
+                label, record = self._hardware_q.get_nowait()
+            except queue.Empty:
+                break
+            slot = self._slot(label)
+            if record.get("kind") == "cpu_ram":
+                slot["cpuCount"] = record.get("cpu_count")
+                slot["ramTotal"] = record.get("ram_total")
+            # The hardware banner is cell 1; Blender is downloaded in cell
+            # 2. Seeing the banner but no telemetry yet means setup.
+            if not slot["phase"]:
+                slot["phase"] = "installing Blender"
+            changed = True
+        for _ in range(200):
+            try:
+                label, record = self._preflight_q.get_nowait()
+            except queue.Empty:
+                break
+            slot = self._slot(label)
+            slot["preflight"] = record
+            if not slot["phase"]:
+                slot["phase"] = "checking hardware"
+            changed = True
+        if changed:
+            self._emit_state()
+
     def stop(self) -> None:
-        """Wait for whatever is in flight. Called from the host window's
+        """Wait for whatever is in flight, streams included. Called from the host window's
         closeEvent: a QThread still running when Qt destroys its QObject
         is the same class of bug the Qt UI documents at length."""
+        self._poll_timer.stop()
+        self._live_timer.stop()
+        self._stop.set()        # tells the SSE threads to unwind
         for worker in list(self._workers.values()):
             try:
                 if worker.isRunning():
@@ -742,6 +951,12 @@ class Backend(QObject):
             except RuntimeError:
                 pass            # already finished and deleted
         self._workers.clear()
+        # A daemon thread still inside SSL when the process tears down is
+        # what produces "Fatal Python error: Aborted" -- daemon=True hides
+        # that, it does not prevent it.
+        for thread in self._stream_threads:
+            thread.join(timeout=3.0)
+        self._stream_threads = [t for t in self._stream_threads if t.is_alive()]
 
 
 def _snapshot_payload(snapshot) -> dict | None:

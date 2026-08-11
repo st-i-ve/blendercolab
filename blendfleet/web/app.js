@@ -189,16 +189,27 @@ function renderState(json) {
 
   const online = state.instances.length;
   const running = state.instances.filter(i => i.worker && i.worker.state === 'running').length;
+  /* GPUs ACTIVE means GPUs actually reporting telemetry right now -- not
+     "how many this account had last time", which is what counting cached
+     hardware would give and would read as activity that is not happening. */
   const gpus = state.instances.reduce(
-    (n, i) => n + (i.worker && i.hardware ? i.hardware.gpus.length : 0), 0);
+    (n, i) => n + (i.live ? i.live.gpus.length : 0), 0);
   const frames = state.instances.reduce(
-    (n, i) => n + (i.worker ? i.worker.framesDone : 0), 0);
+    (n, i) => n + (i.live && i.live.framesTotal
+                   ? i.live.framesDone
+                   : (i.worker ? i.worker.framesDone : 0)), 0);
 
   setStat('inst', online);
   setStat('run', running);
   setStat('gpus', gpus);
   setStat('frames', frames);
 
+  const jobMeta = document.getElementById('job-meta');
+  if (jobMeta) {
+    jobMeta.textContent = state.job
+      ? `${state.job.blend} · frames ${state.job.startFrame}-${state.job.endFrame}`
+      : (state.blend ? `${state.blend.name} · not started` : 'no scene chosen');
+  }
   document.getElementById('nav-running').textContent = running;
   document.getElementById('nav-inst').textContent = online;
   document.getElementById('nav-files').textContent = state.job ? 1 : 0;
@@ -236,8 +247,52 @@ function instanceCard(inst) {
       + ` <b>${fmtAge(inst.hardware.ageSeconds)}</b>`
     : 'never run — launch to see specs';
 
-  const progress = worker && worker.frames.length
-    ? Math.round(100 * worker.framesDone / worker.frames.length) : 0;
+  /* Live beats polled. The 30s status poll can only say queued/running --
+     it cannot say "installing Blender" or "frame 7 of 15", because Kaggle
+     returns no logs until a kernel COMPLETES. The SSE stream can, so when
+     it has reported, its numbers are the ones shown. */
+  const live = inst.live;
+  const done = live && live.framesTotal ? live.framesDone
+             : (worker ? worker.framesDone : 0);
+  const total = live && live.framesTotal ? live.framesTotal
+              : (worker ? worker.frames.length : 0);
+  const progress = total ? Math.round(100 * done / total) : 0;
+
+  /* The hardware this session ACTUALLY got, reported seconds after start
+     -- distinct from the cached "last known" line above it, which may be
+     from a different allocation entirely. */
+  const preflight = live && live.preflight;
+  const liveHw = preflight
+    ? `<div class="hw-row"><span class="hw-chip live">This session <b>${
+        esc((preflight.gpu_names || []).join(', ') || 'CPU only')}</b>${
+        preflight.cpu_count ? ` · ${preflight.cpu_count} vCPU` : ''}${
+        preflight.ram_total ? ` · ${preflight.ram_total.toFixed(1)} GB RAM` : ''
+      }</span></div>`
+    : '';
+
+  /* One row per physical GPU, never combined -- an average across two
+     cards hides one of them sitting idle. */
+  const gpuRows = live && live.gpus.length
+    ? live.gpus.map(g => `<div class="gpu-line">
+        <span class="tag on">GPU ${g.index}</span>
+        <div class="track rendering"><i style="width:${g.util || 0}%"></i></div>
+        <span class="pct">${g.util == null ? '—' : g.util + '%'}</span>
+      </div>
+      <div class="gpu-line">
+        <span class="tag">VRAM</span>
+        <div class="track"><i style="width:${
+          g.memTotal ? Math.round(100 * g.memUsed / g.memTotal) : 0}%"></i></div>
+        <span class="pct">${g.memTotal
+          ? Math.round(g.memUsed / 1024) + '/' + Math.round(g.memTotal / 1024) + 'G'
+          : '—'}</span>
+      </div>`).join('')
+    : '';
+
+  const phase = live && live.phase
+    ? `<div class="inst-foot"><b>${esc(live.phase)}</b></div>`
+    : (worker && worker.state === 'queued'
+       ? '<div class="inst-foot">queued — waiting for Kaggle to allocate a machine</div>'
+       : '');
 
   return `<div class="inst">
     <div class="inst-head">
@@ -254,14 +309,17 @@ function instanceCard(inst) {
         <span class="hw-chip">Quota (API) <b>${esc(inst.quota || '—')}</b></span>
       </div>
       <div class="hw-row"><span class="hw-chip">${hw}</span></div>
+      ${liveHw}
       ${worker ? `
       <div class="assign">
         <div class="wrapc">
           <div class="l1"><span class="flab">Frames</span>
-            <span class="frange">${worker.framesDone} / ${worker.frames.length}</span></div>
+            <span class="frange">${done} / ${total}</span></div>
           <div class="assign-progress"><i style="width:${progress}%"></i></div>
         </div>
       </div>` : ''}
+      ${gpuRows}
+      ${phase}
       ${worker && worker.message ? `<div class="inst-foot"><b>${esc(worker.message)}</b></div>` : ''}
     </div>
   </div>`;
@@ -434,7 +492,9 @@ function renderFrameGrid(state) {
   const done = new Set();
   state.instances.forEach(i => {
     if (!i.worker) return;
-    i.worker.frames.slice(0, i.worker.framesDone).forEach(f => done.add(f));
+    const n = i.live && i.live.framesTotal ? i.live.framesDone
+            : i.worker.framesDone;
+    i.worker.frames.slice(0, n).forEach(f => done.add(f));
   });
   const cells = [];
   for (let f = state.job.startFrame; f <= state.job.endFrame; f++) {
@@ -497,6 +557,23 @@ document.getElementById('btn-stop-all').onclick = () =>
   backend && backend.cancelAll();
 document.getElementById('btn-send-job').onclick = () =>
   backend && backend.sendJob(JSON.stringify(renderOptions()));
+document.getElementById('btn-forget').onclick = () => {
+  /* Confirmed, and worded as what it actually is. Abandoning a running
+     session while sounding like a cancel would be the worst lie this app
+     could tell -- somebody else's quota keeps draining either way. */
+  const ok = window.confirm(
+    'Stop tracking this job?
+
+'
+    + 'This does NOT cancel anything. Any kernels still running on Kaggle '
+    + 'keep running and keep spending quota, and this app will no longer '
+    + 'be able to stop them or collect their frames.
+
+'
+    + 'Use this only when Kaggle refuses to cancel and you are stuck. '
+    + 'Then stop them by hand at kaggle.com.');
+  if (ok && backend) backend.forgetJob();
+};
 
 document.getElementById('btn-add').onclick = () => {
   const label = document.getElementById('ni-label').value.trim();
