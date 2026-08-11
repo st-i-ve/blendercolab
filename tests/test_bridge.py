@@ -297,3 +297,95 @@ def test_sync_refuses_without_a_scene_rather_than_guessing(qapp, tmp_path):
     backend.syncDataset()
     assert messages and messages[0][1] == "offline"
     assert "dataset" not in backend._workers
+
+
+# ---------------------------------------------------------------------------
+# Live GPU / RAM. These assert against the ACTUAL keys log_stream's parsers
+# emit, because the payload is hand-written against them and a renamed key
+# would show up as an empty card rather than as an error anywhere.
+# ---------------------------------------------------------------------------
+
+def test_telemetry_reaches_the_payload_as_one_row_per_gpu(qapp, tmp_path):
+    """Never aggregated: an average across two cards hides one of them
+    sitting idle, which is exactly what you need to see."""
+    backend = make_backend(tmp_path, n=1)
+    for gpu, util in ((0, 91), (1, 12)):
+        backend._telemetry_q.put(("acct0", {
+            "gpu": gpu, "util": util, "mem_used": 4096, "mem_total": 15360,
+            "temp": 61, "power": 70.0}))
+    backend._live_tick()
+
+    live = json.loads(backend.state())["instances"][0]["live"]
+    assert [g["index"] for g in live["gpus"]] == [0, 1]
+    assert [g["util"] for g in live["gpus"]] == [91, 12]
+    assert live["gpus"][0]["memUsed"] == 4096
+    assert live["gpus"][0]["memTotal"] == 15360
+
+
+def test_the_keys_match_what_log_stream_actually_parses(qapp, tmp_path):
+    """Parses a real TELEMETRY line rather than a hand-built dict, so a
+    rename in log_stream.parse_telemetry fails HERE instead of silently
+    emptying the card."""
+    from blendfleet.log_stream import parse_telemetry
+
+    line = ('data: {"stream_name": "stdout", "data": '
+            '"TELEMETRY gpu=0 util=77 mem_used=5000 mem_total=15360'
+            ' temp=63 power=71.5"}')
+    record = parse_telemetry(line)
+    assert record is not None, "the sample line no longer parses"
+
+    backend = make_backend(tmp_path, n=1)
+    backend._telemetry_q.put(("acct0", record))
+    backend._live_tick()
+
+    gpu = json.loads(backend.state())["instances"][0]["live"]["gpus"][0]
+    assert gpu["util"] == 77
+    assert gpu["memTotal"] == 15360
+
+
+def test_cpu_and_ram_from_the_hardware_banner_reach_the_payload(qapp, tmp_path):
+    backend = make_backend(tmp_path, n=1)
+    backend._hardware_q.put(("acct0", {
+        "kind": "cpu_ram", "cpu_count": 4, "ram_total": 31.3}))
+    backend._live_tick()
+
+    live = json.loads(backend.state())["instances"][0]["live"]
+    assert live["cpuCount"] == 4
+    assert live["ramTotal"] == 31.3
+
+
+def test_preflight_reports_the_hardware_this_session_actually_got(qapp, tmp_path):
+    """Distinct from the cached "last known" line: Kaggle reallocates, so
+    the two can legitimately disagree and both are shown."""
+    backend = make_backend(tmp_path, n=1)
+    backend._preflight_q.put(("acct0", {
+        "gpu_count": 2, "gpu_names": ["Tesla T4", "Tesla T4"],
+        "cpu_count": 4, "ram_total": 31.3}))
+    backend._live_tick()
+
+    live = json.loads(backend.state())["instances"][0]["live"]
+    assert live["preflight"]["gpu_names"] == ["Tesla T4", "Tesla T4"]
+
+
+def test_phase_advances_with_what_has_actually_arrived(qapp, tmp_path):
+    """The 30s poll can only say queued/running -- Kaggle returns no logs
+    until a kernel completes. Phase is the only thing that can say
+    "installing Blender", so it must track the evidence."""
+    backend = make_backend(tmp_path, n=1)
+
+    backend._preflight_q.put(("acct0", {"gpu_count": 1, "gpu_names": ["P100"],
+                                        "cpu_count": 4, "ram_total": 31.3}))
+    backend._live_tick()
+    assert json.loads(backend.state())["instances"][0]["live"]["phase"] == \
+        "checking hardware"
+
+    backend._progress_q.put(("acct0", 7, 15))
+    backend._live_tick()
+    assert "7/15" in json.loads(backend.state())["instances"][0]["live"]["phase"]
+
+
+def test_no_live_block_at_all_before_anything_streams(qapp, tmp_path):
+    """Between renders there is no session to poll. "No live data" is the
+    honest answer -- not last run's numbers presented as current."""
+    backend = make_backend(tmp_path, n=1)
+    assert json.loads(backend.state())["instances"][0]["live"] is None

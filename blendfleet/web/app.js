@@ -261,12 +261,23 @@ function instanceCard(inst) {
   /* The hardware this session ACTUALLY got, reported seconds after start
      -- distinct from the cached "last known" line above it, which may be
      from a different allocation entirely. */
+  /* PREFLIGHT arrives first (seconds after the kernel starts); the
+     hardware banner follows in the same cell. Either can be the source,
+     so both are used -- reading only preflight meant a session that
+     reported its CPU/RAM but not its preflight line showed neither.
+
+     RAM is TOTAL, never "in use": the notebook queries nvidia-smi only,
+     so no live RAM-used sample exists anywhere in this app. Labelling it
+     as usage would be inventing a reading. */
   const preflight = live && live.preflight;
-  const liveHw = preflight
+  const gpuNames = preflight ? (preflight.gpu_names || []) : null;
+  const cpuCount = (preflight && preflight.cpu_count) || (live && live.cpuCount);
+  const ramTotal = (preflight && preflight.ram_total) || (live && live.ramTotal);
+  const liveHw = (gpuNames || cpuCount || ramTotal)
     ? `<div class="hw-row"><span class="hw-chip live">This session <b>${
-        esc((preflight.gpu_names || []).join(', ') || 'CPU only')}</b>${
-        preflight.cpu_count ? ` · ${preflight.cpu_count} vCPU` : ''}${
-        preflight.ram_total ? ` · ${preflight.ram_total.toFixed(1)} GB RAM` : ''
+        gpuNames ? esc(gpuNames.join(', ') || 'CPU only') : 'running'}</b>${
+        cpuCount ? ` · ${cpuCount} vCPU` : ''}${
+        ramTotal ? ` · ${ramTotal.toFixed(1)} GB RAM` : ''
       }</span></div>`
     : '';
 
