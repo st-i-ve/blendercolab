@@ -127,10 +127,145 @@
         </div>
       </div>
 
-      <div class="page" id="page-files"><h2 class="sec">Files</h2><div class="empty">Coming next in the port.</div></div>
-      <div class="page" id="page-instances"><h2 class="sec">Instances</h2><div class="empty">Coming next in the port.</div></div>
-      <div class="page" id="page-logs"><h2 class="sec">Logs</h2><div class="empty">Coming next in the port.</div></div>
-      <div class="page" id="page-settings"><h2 class="sec">Settings</h2><div class="empty">Coming next in the port.</div></div>
+      <!-- ============ FILES ============ -->
+      <div class="page" id="page-files">
+        <div class="two-col">
+          <div>
+            <h2 class="sec">Project <span class="meta">.blend scene</span></h2>
+            <!-- A native file chooser, not an <input type=file>: the page
+                 has no filesystem access, and the upload needs a real path
+                 rather than a sandboxed File object. -->
+            <div class="dropzone" id="dropzone" tabindex="0" role="button">
+              <svg width="30" height="30" viewBox="0 0 30 30" fill="none" style="margin:auto"><path d="M15 20V8M15 8l-4.5 4.5M15 8l4.5 4.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><path d="M5 20.5v2A2.5 2.5 0 007.5 25h15a2.5 2.5 0 002.5-2.5v-2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+              <div class="dz-title" id="dz-title">Choose a .blend file</div>
+              <div class="dz-sub" id="dz-sub">uploaded to the first account, then shared with the rest</div>
+            </div>
+
+            <h2 class="sec" style="margin-top:26px">Upload <span class="meta">owner account</span></h2>
+            <div class="panel" style="padding:14px 17px">
+              <div class="up-item" style="border:none;padding:0">
+                <div class="l"><b id="up-name">no upload in progress</b><span id="up-pct"></span></div>
+                <div class="track"><i id="up-bar"></i></div>
+              </div>
+            </div>
+
+            <h2 class="sec" style="margin-top:26px">Frames <span class="meta" id="fg-meta">no job yet</span></h2>
+            <div class="fgrid-wrap show">
+              <div class="fgrid" id="fgrid"></div>
+              <!-- The caveat is not a footnote. The notebook reports how
+                   many frames succeeded, not which, so a failed frame
+                   shifts every later cell for that account. -->
+              <div class="fgrid-legend">
+                <span><i style="background:var(--accent)"></i>done <b>(approximate)</b></span>
+                <span><i style="background:var(--fill)"></i>not yet</span>
+              </div>
+              <div class="dz-sub" style="margin-top:8px">The render reports a COUNT of successful frames, not a list — a failed frame shifts every later cell for that account. Collect frames is the authoritative list of what exists.</div>
+            </div>
+          </div>
+
+          <div>
+            <h2 class="sec">Render settings</h2>
+            <div class="panel form">
+              <div class="f-row"><label>Start frame</label><input id="f-start" type="number" min="1" value="1"></div>
+              <div class="f-row"><label>End frame</label><input id="f-end" type="number" min="1" value="250"></div>
+              <div class="f-row"><label>Width</label><input id="f-rx" type="number" min="64" value="1920"></div>
+              <div class="f-row"><label>Height</label><input id="f-ry" type="number" min="64" value="1080"></div>
+              <div class="f-row"><label>Samples</label><input id="f-spp" type="number" min="1" value="128"></div>
+              <div class="f-row"><label>Format</label><select id="f-fmt"><option>PNG</option><option>JPEG</option></select></div>
+              <div class="dz-sub" id="eta" style="margin:6px 0 12px"></div>
+              <div class="fr-actions">
+                <button class="btn primary" id="btn-render">Render across fleet</button>
+                <button class="btn" id="btn-cancel">Cancel all</button>
+                <button class="btn" id="btn-collect">Collect frames…</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ============ INSTANCES ============ -->
+      <div class="page" id="page-instances">
+        <div class="setup-grid">
+          <div>
+            <h2 class="sec">Add account</h2>
+            <div class="panel form">
+              <div class="f-row"><label>Name</label><input id="ni-label" placeholder="stive"></div>
+              <div class="f-row"><label>API token</label><input id="ni-token" placeholder="KGAT_…" autocomplete="off"></div>
+              <div class="f-err" id="add-err"></div>
+              <div class="dz-sub" style="margin-bottom:12px">Generate one at kaggle.com → Settings → API. The account is verified before it is added: one that cannot render is worse than absent, because it would sit in the fleet looking merely idle.</div>
+              <button class="btn primary" id="btn-add" style="width:100%">Verify &amp; add</button>
+            </div>
+          </div>
+          <div>
+            <h2 class="sec">Fleet <span class="meta" id="inst-meta">—</span></h2>
+            <div class="panel">
+              <table class="inst-table">
+                <thead><tr><th>Account</th><th>Kaggle user</th><th>Quota (API)</th><th>Last known hardware</th><th>State</th><th></th></tr></thead>
+                <tbody id="inst-tbody"></tbody>
+              </table>
+            </div>
+            <div class="dz-sub" style="margin-top:10px">Quota is what the Kaggle API reports right now, not a guarantee — it has been observed to disagree with the settings page. Hardware is the last seen, with its age: Kaggle reallocates between runs.</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ============ LOGS ============ -->
+      <div class="page" id="page-logs">
+        <div class="logs-grid">
+          <div>
+            <h2 class="sec">Instance failures <span class="meta" id="err-meta">0 entries</span></h2>
+            <div class="panel" id="err-panel">
+              <div class="empty" id="err-empty">No failures this session.</div>
+              <div id="err-list"></div>
+            </div>
+          </div>
+          <div>
+            <h2 class="sec">Fleet log <span class="meta">this session</span></h2>
+            <div class="panel log-card"><div class="log" id="log-full"></div></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ============ SETTINGS ============ -->
+      <div class="page" id="page-settings">
+        <h2 class="sec">Appearance</h2>
+        <div class="panel set-card">
+          <div class="set-row">
+            <div class="st"><h4>Theme</h4><p>Light for daylight suites, dark for night shifts.</p></div>
+            <div class="seg" id="seg-theme"><button data-v="light">Light</button><button data-v="dark">Dark</button></div>
+          </div>
+          <div class="set-row">
+            <div class="st"><h4>Accent colour</h4><p>Rendering activity, progress and highlights.</p></div>
+            <div class="swatches" id="swatches">
+              <button class="swatch" data-v="orange" style="background:#E8935A" title="Orange"></button>
+              <button class="swatch" data-v="blue" style="background:#5A9BD8" title="Blue"></button>
+              <button class="swatch" data-v="green" style="background:#4DB690" title="Green"></button>
+              <button class="swatch" data-v="purple" style="background:#9B7FD4" title="Purple"></button>
+              <button class="swatch" data-v="red" style="background:#D4708F" title="Red"></button>
+            </div>
+          </div>
+          <div class="set-row">
+            <div class="st"><h4>Translucent surfaces</h4><p>Let the desktop show through the app shell. Panels and cards stay solid so text never lands on your wallpaper. Needs Windows 11.</p></div>
+            <div class="toggle" id="tgl-glass" role="switch" tabindex="0"></div>
+          </div>
+        </div>
+
+        <h2 class="sec">Notifications</h2>
+        <div class="panel set-card">
+          <div class="set-row">
+            <div class="st"><h4>Sound effects</h4><p>Soft chimes for results, failures and reconnects.</p></div>
+            <div class="toggle" id="tgl-sound" role="switch" tabindex="0"></div>
+          </div>
+        </div>
+
+        <h2 class="sec">Rendering</h2>
+        <div class="panel set-card">
+          <div class="set-row">
+            <div class="st"><h4>Minimum GPUs required</h4><p>Kaggle can silently fall back to a single P100 when the requested hardware is unavailable. A render will not start on an account reporting fewer GPUs than this. 0 turns the check off.</p></div>
+            <input id="min-gpus" type="number" min="0" max="8" style="width:90px">
+          </div>
+        </div>
+      </div>
 
     </div>
   </div>

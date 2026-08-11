@@ -194,6 +194,13 @@ function renderState(json) {
   document.getElementById('nav-running').textContent = running;
   document.getElementById('nav-inst').textContent = online;
   document.getElementById('nav-files').textContent = state.job ? 1 : 0;
+
+  /* Every page is driven from the SAME payload on the same tick. A count
+     in the sidebar that updates on a different schedule from the page it
+     points at is worse than no count. */
+  renderFleetTable(state);
+  renderFrameGrid(state);
+  renderFailures(state);
 }
 
 function instanceCard(inst) {
@@ -326,12 +333,214 @@ setInterval(() => {
   document.getElementById('side-clock').textContent = now;
 }, 1000);
 
+/* ---------------- files page -------------------------------------------- */
+function renderOptions() {
+  return {
+    startFrame: +document.getElementById('f-start').value,
+    endFrame: +document.getElementById('f-end').value,
+    resX: +document.getElementById('f-rx').value,
+    resY: +document.getElementById('f-ry').value,
+    samples: +document.getElementById('f-spp').value,
+    format: document.getElementById('f-fmt').value,
+  };
+}
+
+function refreshEta() {
+  if (!backend) return;
+  const o = renderOptions();
+  backend.estimateRender(o.startFrame, o.endFrame, json => {
+    const e = JSON.parse(json);
+    /* The basis travels with the number, always: this is an extrapolation
+       from one measured scene, not a prediction about yours. */
+    document.getElementById('eta').innerHTML =
+      `${e.frames} frames across ${e.accounts} account(s) ≈ <b>${e.hours.toFixed(1)} h</b> each `
+      + `<span style="opacity:.8">(${esc(e.basis)})</span>`;
+  });
+}
+['f-start', 'f-end'].forEach(id =>
+  document.getElementById(id).addEventListener('input', refreshEta));
+
+document.getElementById('dropzone').addEventListener('click', () => {
+  if (!backend) return;
+  backend.pickBlend(json => {
+    const picked = JSON.parse(json);
+    if (!picked.name) return;
+    document.getElementById('dz-title').textContent = picked.name;
+    document.getElementById('dz-sub').textContent = picked.path;
+    document.getElementById('nav-files').textContent = '1';
+  });
+});
+
+document.getElementById('btn-render').onclick = () =>
+  backend && backend.launch(JSON.stringify(renderOptions()));
+document.getElementById('btn-cancel').onclick = () => backend && backend.cancelAll();
+document.getElementById('btn-collect').onclick = () => backend && backend.collect('');
+
+function renderFrameGrid(state) {
+  const grid = document.getElementById('fgrid');
+  const meta = document.getElementById('fg-meta');
+  if (!state.job) {
+    grid.innerHTML = '';
+    meta.textContent = 'no job yet';
+    return;
+  }
+  /* Which frames are done is INFERRED, not reported: each account is
+     assumed to have finished the first N of its own stride. That holds
+     until a frame fails, which is why the legend says approximate. */
+  const done = new Set();
+  state.instances.forEach(i => {
+    if (!i.worker) return;
+    i.worker.frames.slice(0, i.worker.framesDone).forEach(f => done.add(f));
+  });
+  const cells = [];
+  for (let f = state.job.startFrame; f <= state.job.endFrame; f++) {
+    cells.push(`<div class="fcell${done.has(f) ? ' d' : ''}" title="frame ${f}"></div>`);
+  }
+  grid.innerHTML = cells.join('');
+  const total = state.job.endFrame - state.job.startFrame + 1;
+  meta.textContent = `${done.size}/${total} frames · ${esc(state.job.blend)}`;
+}
+
+/* ---------------- instances page ---------------------------------------- */
+function renderFleetTable(state) {
+  const body = document.getElementById('inst-tbody');
+  document.getElementById('inst-meta').textContent =
+    `${state.instances.length} account(s)`;
+  body.innerHTML = state.instances.map(i => {
+    const hw = i.hardware
+      ? `${esc(i.hardware.gpus.map(g => g.model || 'GPU').join(', ') || 'no GPU seen')} <span class="dim">${fmtAge(i.hardware.ageSeconds)}</span>`
+      : '<span class="dim">never run</span>';
+    const state_ = i.worker ? i.worker.state : 'idle';
+    const stoppable = i.worker && ['running', 'queued'].includes(i.worker.state);
+    return `<tr>
+      <td>${esc(i.label)}${i.verified ? '' : ' <span class="badge warn"><i></i>unverified</span>'}</td>
+      <td>${esc(i.username || '—')}</td>
+      <td>${esc(i.quota || '—')}</td>
+      <td>${hw}</td>
+      <td>${esc(state_)}</td>
+      <td style="text-align:right;white-space:nowrap">
+        ${stoppable ? `<button class="btn sm" data-cancel="${esc(i.label)}">Cancel</button>` : ''}
+        <button class="btn sm" data-download="${esc(i.label)}">Download</button>
+        <button class="btn sm danger" data-remove="${esc(i.label)}">Remove</button>
+      </td></tr>`;
+  }).join('');
+}
+
+document.getElementById('inst-tbody').addEventListener('click', e => {
+  const button = e.target.closest('button');
+  if (!button || !backend) return;
+  if (button.dataset.cancel) backend.cancelInstance(button.dataset.cancel);
+  if (button.dataset.download) backend.collect(button.dataset.download);
+  if (button.dataset.remove) backend.removeAccount(button.dataset.remove);
+});
+
+document.getElementById('btn-add').onclick = () => {
+  const label = document.getElementById('ni-label').value.trim();
+  const token = document.getElementById('ni-token').value.trim();
+  const err = document.getElementById('add-err');
+  if (!label || !token) {
+    err.textContent = 'Both a name and a token are needed.';
+    return;
+  }
+  err.textContent = '';
+  backend.addAccount(label, token);
+  document.getElementById('ni-token').value = '';
+};
+
+/* ---------------- logs page --------------------------------------------- */
+function renderFailures(state) {
+  const list = document.getElementById('err-list');
+  const failures = state.instances.filter(i => i.worker && i.worker.message);
+  document.getElementById('err-empty').style.display =
+    failures.length ? 'none' : '';
+  document.getElementById('err-meta').textContent =
+    `${failures.length} ${failures.length === 1 ? 'entry' : 'entries'}`;
+  document.getElementById('nav-errs').textContent = failures.length;
+  list.innerHTML = failures.map(i => `<div class="err-row">
+      <span class="ed"></span>
+      <div><div class="em"><b>${esc(i.label)}</b></div>
+        <div class="es">${esc(i.worker.message)}</div></div>
+    </div>`).join('');
+}
+
+/* ---------------- settings page ----------------------------------------- */
+function bindToggle(id, key) {
+  const el = document.getElementById(id);
+  const flip = () => {
+    const next = !el.classList.contains('on');
+    el.classList.toggle('on', next);
+    el.setAttribute('aria-checked', String(next));
+    if (backend) backend.setPreference(key, JSON.stringify(next));
+    if (key === 'sound') prefs.sound = next;
+    if (key === 'translucent') document.body.classList.toggle('glass', next);
+  };
+  el.addEventListener('click', flip);
+  el.addEventListener('keydown', e => {
+    if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); flip(); }
+  });
+}
+bindToggle('tgl-glass', 'translucent');
+bindToggle('tgl-sound', 'sound');
+
+document.getElementById('seg-theme').addEventListener('click', e => {
+  const value = e.target.dataset.v;
+  if (!value) return;
+  applyPrefs({ theme: value });
+  backend && backend.setPreference('theme', JSON.stringify(value));
+  syncSettingsControls();
+});
+document.getElementById('swatches').addEventListener('click', e => {
+  const value = e.target.dataset.v;
+  if (!value) return;
+  applyPrefs({ accent: value });
+  backend && backend.setPreference('accent', JSON.stringify(value));
+  syncSettingsControls();
+});
+document.getElementById('min-gpus').addEventListener('change', e => {
+  backend && backend.setPreference('minGpus', JSON.stringify(+e.target.value));
+});
+
+function syncSettingsControls() {
+  document.querySelectorAll('#seg-theme button').forEach(b =>
+    b.classList.toggle('on', b.dataset.v === prefs.theme));
+  document.querySelectorAll('#swatches .swatch').forEach(b =>
+    b.classList.toggle('on', b.dataset.v === prefs.accent));
+  document.getElementById('tgl-glass').classList.toggle('on', !!prefs.translucent);
+  document.getElementById('tgl-sound').classList.toggle('on', prefs.sound !== false);
+  if (prefs.minGpus !== undefined) {
+    document.getElementById('min-gpus').value = prefs.minGpus;
+  }
+}
+
 /* ---------------- bridge ------------------------------------------------ */
 new QWebChannel(qt.webChannelTransport, channel => {
   backend = channel.objects.backend;
 
-  backend.preferences(json => applyPrefs(JSON.parse(json)));
-  backend.settingsChanged.connect(json => applyPrefs(JSON.parse(json)));
+  backend.preferences(json => { applyPrefs(JSON.parse(json)); syncSettingsControls(); });
+  backend.settingsChanged.connect(json => { applyPrefs(JSON.parse(json)); syncSettingsControls(); });
+
+  /* Upload and download report as bytes, not as a spinner: a 400 MB
+     .blend on a slow line is the one moment the app looks frozen, and a
+     percentage is the difference between waiting and worrying. */
+  backend.uploadProgress.connect(json => {
+    const p = JSON.parse(json);
+    const pct = p.totalBytes ? Math.round(100 * p.sentBytes / p.totalBytes) : 0;
+    document.getElementById('up-name').textContent = `uploading · ${p.label}`;
+    document.getElementById('up-pct').textContent = `${pct}%`;
+    document.getElementById('up-bar').style.width = pct + '%';
+  });
+  backend.downloadProgress.connect(json => {
+    const p = JSON.parse(json);
+    const pct = p.totalBytes ? Math.round(100 * p.receivedBytes / p.totalBytes) : 0;
+    logLine(`${p.label}: downloading ${pct}%`, '');
+  });
+
+  backend.busyChanged.connect((key, busy) => {
+    const map = { launch: 'btn-render', cancel: 'btn-cancel', 'collect:': 'btn-collect' };
+    const id = map[key];
+    if (id) document.getElementById(id).disabled = busy;
+    if (key.indexOf('verify:') === 0) document.getElementById('btn-add').disabled = busy;
+  });
 
   backend.state(renderState);
   backend.stateChanged.connect(renderState);
