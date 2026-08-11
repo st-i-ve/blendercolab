@@ -141,11 +141,24 @@
               <div class="dz-sub" id="dz-sub">uploaded to the first account, then shared with the rest</div>
             </div>
 
-            <h2 class="sec" style="margin-top:26px">Upload <span class="meta">owner account</span></h2>
+            <h2 class="sec" style="margin-top:26px">Dataset on Kaggle <span class="meta">uploaded once · shared with every account</span></h2>
             <div class="panel" style="padding:14px 17px">
-              <div class="up-item" style="border:none;padding:0">
+              <!-- Separate from rendering on purpose: the upload is the
+                   slowest and most failure-prone step, it costs no GPU
+                   quota, and the same scene does not need re-uploading for
+                   every render. -->
+              <div class="fr-stats">
+                <span>Scene <b id="ds-blend">—</b></span>
+                <span>Dataset <b id="ds-slug">not uploaded this session</b></span>
+                <span>Size <b id="ds-size">—</b></span>
+              </div>
+              <div class="up-item" style="border:none;padding:8px 0 0">
                 <div class="l"><b id="up-name">no upload in progress</b><span id="up-pct"></span></div>
                 <div class="track"><i id="up-bar"></i></div>
+              </div>
+              <div class="fr-actions" style="margin-top:12px">
+                <button class="btn" id="btn-upload">Upload to Kaggle</button>
+                <span class="dz-sub" id="ds-note">Rendering reuses this if it matches the scene you have chosen.</span>
               </div>
             </div>
 

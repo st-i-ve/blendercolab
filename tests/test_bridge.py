@@ -35,6 +35,42 @@ class FakeClient:
         return Quota(7200, 108000, "soon", "api")
 
 
+# Every Backend a test builds, kept alive until that test ends.
+#
+# A Backend parents its worker QThreads to itself. If Python collects the
+# Backend while one of those threads still has a deleteLater queued, the
+# NEXT processEvents() -- in a later test entirely -- walks freed memory
+# and Qt aborts the process rather than raising. Holding a reference and
+# tearing down deterministically is the same fix tests/test_dashboard.py
+# uses for Dashboards.
+_LIVE_BACKENDS = []
+
+
+def _settle(backend):
+    """Join the worker threads and flush what their completion queued.
+
+    wait() alone is not enough: the succeeded/failed connections are
+    queued across threads, so without pumping the loop _workers never
+    empties and stop() has nothing to wait on. Pumped again AFTER stop()
+    so every deleteLater lands while the Backend that owns those objects
+    is still alive.
+    """
+    for worker in list(backend._workers.values()):
+        worker.wait(5000)
+    for _ in range(30):
+        QApplication.processEvents()
+    backend.stop()
+    for _ in range(30):
+        QApplication.processEvents()
+
+
+@pytest.fixture(autouse=True)
+def _close_backends(qapp):
+    yield
+    while _LIVE_BACKENDS:
+        _settle(_LIVE_BACKENDS.pop())
+
+
 def make_backend(tmp_path, n=2, settings=None):
     store = AccountStore([
         Account(label=f"acct{i}", token=f"KGAT_{i:032x}",
@@ -42,8 +78,10 @@ def make_backend(tmp_path, n=2, settings=None):
         for i in range(n)])
     factory = lambda accounts: Fleet(  # noqa: E731
         accounts, lambda t: FakeClient(t), tmp_path / "w")
-    return Backend(store, factory, lambda t: "someone",
-                   settings or Settings())
+    backend = Backend(store, factory, lambda t: "someone",
+                      settings or Settings())
+    _LIVE_BACKENDS.append(backend)
+    return backend
 
 
 # ---------------- the payload is ACCOUNT-first ----------------
@@ -185,3 +223,77 @@ def test_estimate_carries_the_measurement_it_came_from(qapp, tmp_path):
     assert result["accounts"] == 2
     assert result["hours"] > 0
     assert "P100" in result["basis"]
+
+
+# ---------------- the dataset is a step of its own ----------------------
+
+def test_state_says_nothing_is_uploaded_before_a_sync(qapp, tmp_path):
+    """"Not uploaded this session" is a different claim from "not on
+    Kaggle": the app only knows what it put there itself."""
+    payload = json.loads(make_backend(tmp_path).state())
+    assert payload["dataset"] is None
+    assert payload["blend"] is None
+
+
+def test_a_synced_dataset_is_reused_when_the_scene_matches(qapp, tmp_path):
+    """Re-uploading a scene already on Kaggle is the most expensive thing
+    this app can do for no reason."""
+    seen = {}
+
+    class RecordingFleet(Fleet):
+        def launch(self, blend, settings, start_frame, end_frame,
+                   on_progress=None, dataset_slug=None):
+            seen["slug"] = dataset_slug
+            return FleetState(job_id="j", blend_name=blend.name,
+                              start_frame=start_frame, end_frame=end_frame,
+                              workers=[])
+
+    backend = make_backend(tmp_path)
+    backend.fleet_factory = lambda accounts: RecordingFleet(
+        accounts, lambda t: FakeClient(t), tmp_path / "w")
+    blend = tmp_path / "scene.blend"
+    blend.write_bytes(b"x" * 32)
+    backend.blend = blend
+    backend._dataset = {"slug": "owner/scene-blend", "blendName": "scene.blend",
+                        "sizeBytes": 32, "at": "10:00:00"}
+
+    backend.launch(json.dumps({"startFrame": 1, "endFrame": 4}))
+    _settle(backend)
+    assert seen["slug"] == "owner/scene-blend"
+
+
+def test_a_dataset_for_a_different_scene_is_not_reused(qapp, tmp_path):
+    """A slug left over from another .blend would render the WRONG SCENE
+    on somebody else's quota. The name has to match before the upload is
+    skipped."""
+    seen = {}
+
+    class RecordingFleet(Fleet):
+        def launch(self, blend, settings, start_frame, end_frame,
+                   on_progress=None, dataset_slug=None):
+            seen["slug"] = dataset_slug
+            return FleetState(job_id="j", blend_name=blend.name,
+                              start_frame=start_frame, end_frame=end_frame,
+                              workers=[])
+
+    backend = make_backend(tmp_path)
+    backend.fleet_factory = lambda accounts: RecordingFleet(
+        accounts, lambda t: FakeClient(t), tmp_path / "w")
+    blend = tmp_path / "other.blend"
+    blend.write_bytes(b"x" * 32)
+    backend.blend = blend
+    backend._dataset = {"slug": "owner/scene-blend", "blendName": "scene.blend",
+                        "sizeBytes": 32, "at": "10:00:00"}
+
+    backend.launch(json.dumps({"startFrame": 1, "endFrame": 4}))
+    _settle(backend)
+    assert seen["slug"] is None, "reused a dataset built from a different scene"
+
+
+def test_sync_refuses_without_a_scene_rather_than_guessing(qapp, tmp_path):
+    backend = make_backend(tmp_path)
+    messages = []
+    backend.notification.connect(lambda m, t: messages.append((m, t)))
+    backend.syncDataset()
+    assert messages and messages[0][1] == "offline"
+    assert "dataset" not in backend._workers

@@ -104,6 +104,11 @@ class Backend(QObject):
         self._quota: dict[str, str] = {}
         self._failures: dict[str, str] = {}
         self._workers: dict[str, _Worker] = {}
+        # What is on Kaggle right now, as far as this session knows:
+        # {slug, blendName, sizeBytes, at}. Set only by syncDataset(), so
+        # it is never a guess -- an empty value means we have not put this
+        # scene up during this session, not that Kaggle has nothing.
+        self._dataset: dict | None = None
         self._last_poll_ms: int | None = None
         self._last_poll_at: str | None = None
         self._online = True
@@ -192,6 +197,9 @@ class Backend(QObject):
                 "endFrame": state.end_frame,
             } if state else None,
             "instances": instances,
+            "dataset": self._dataset,
+            "blend": {"path": str(self.blend), "name": self.blend.name}
+                     if self.blend else None,
             "approximate": True,
         }
 
@@ -368,6 +376,50 @@ class Backend(QObject):
         return json.dumps({"path": str(self.blend) if self.blend else "",
                            "name": self.blend.name if self.blend else ""})
 
+    @Slot()
+    def syncDataset(self) -> None:
+        """Upload the chosen .blend to Kaggle as a dataset, on its own.
+
+        Costs no GPU quota -- a dataset upload is not a session -- so this
+        is safe to run whenever, and separating it means the slowest and
+        most failure-prone step is no longer able to take a whole render
+        attempt down with it. Once it has run, launch() reuses the result
+        instead of uploading the same scene again.
+        """
+        if self.blend is None:
+            self.notification.emit("Choose a .blend file first.", "offline")
+            return
+        if not self.store.list():
+            self.notification.emit(
+                "Add at least one Kaggle account first.", "offline")
+            return
+        accounts = self.store.list()
+        blend = self.blend
+        owner = accounts[0].label
+
+        def work():
+            fleet = self.fleet_factory(accounts)
+            return fleet.prepare_dataset(
+                blend,
+                on_progress=lambda p: self.uploadProgress.emit(json.dumps({
+                    "label": owner,
+                    "sentBytes": getattr(p, "sent_bytes", 0),
+                    "totalBytes": getattr(p, "total_bytes", 0),
+                })))
+
+        def ok(slug) -> None:
+            self._dataset = {
+                "slug": slug,
+                "blendName": blend.name,
+                "sizeBytes": blend.stat().st_size,
+                "at": time.strftime("%H:%M:%S"),
+            }
+            self.logLine.emit(f"dataset ready: {slug}", "active")
+            self.notification.emit(f"Uploaded {blend.name} to {slug}", "active")
+            self._emit_state()
+
+        self._start("dataset", work, "Uploading the scene", ok)
+
     @Slot(str)
     def launch(self, options_json: str) -> None:
         """Start a render across every account.
@@ -400,9 +452,17 @@ class Backend(QObject):
         blend = self.blend
         owner = accounts[0].label
 
+        # Reuse the dataset only when it is THIS scene. A slug left over
+        # from a different .blend would render the wrong thing on somebody
+        # else's quota, so the name has to match before we skip the
+        # upload; fleet.launch verifies the content besides.
+        prepared = (self._dataset["slug"]
+                    if self._dataset
+                    and self._dataset["blendName"] == blend.name else None)
+
         def work():
             return self.fleet_factory(accounts).launch(
-                blend, settings, start, end,
+                blend, settings, start, end, dataset_slug=prepared,
                 on_progress=lambda p: self.uploadProgress.emit(json.dumps({
                     "label": owner,
                     "sentBytes": getattr(p, "sent_bytes", 0),

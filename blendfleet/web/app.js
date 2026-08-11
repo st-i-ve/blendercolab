@@ -209,6 +209,7 @@ function renderState(json) {
   renderFleetTable(state);
   renderFrameGrid(state);
   renderFailures(state);
+  renderDataset(state);
 }
 
 function instanceCard(inst) {
@@ -376,8 +377,43 @@ document.getElementById('dropzone').addEventListener('click', () => {
     document.getElementById('dz-title').textContent = picked.name;
     document.getElementById('dz-sub').textContent = picked.path;
     document.getElementById('nav-files').textContent = '1';
+    backend.state(renderState);
   });
 });
+
+document.getElementById('btn-upload').onclick = () =>
+  backend && backend.syncDataset();
+
+function renderDataset(state) {
+  const ds = state.dataset;
+  document.getElementById('ds-blend').textContent =
+    state.blend ? state.blend.name : '—';
+  document.getElementById('ds-slug').textContent =
+    ds ? ds.slug : 'not uploaded this session';
+  document.getElementById('ds-size').textContent =
+    ds ? fmtBytes(ds.sizeBytes) : '—';
+  /* Says plainly whether the next render will reuse this or re-upload.
+     "Not uploaded this session" is not the same claim as "not on Kaggle" --
+     we only know what we put there ourselves. */
+  const note = document.getElementById('ds-note');
+  if (!state.blend) {
+    note.textContent = 'Choose a scene first.';
+  } else if (ds && ds.blendName === state.blend.name) {
+    note.textContent = `Ready — rendering will reuse this (uploaded ${ds.at}).`;
+  } else if (ds) {
+    note.textContent = `This dataset holds ${ds.blendName}, not the scene you have chosen — rendering would upload again.`;
+  } else {
+    note.textContent = 'Rendering will upload it first. Uploading here instead keeps a failed upload from taking a render attempt with it.';
+  }
+}
+
+function fmtBytes(bytes) {
+  if (!bytes) return '—';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let n = bytes, i = 0;
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+  return `${n.toFixed(n < 10 && i ? 1 : 0)} ${units[i]}`;
+}
 
 document.getElementById('btn-render').onclick = () =>
   backend && backend.launch(JSON.stringify(renderOptions()));
@@ -544,7 +580,8 @@ new QWebChannel(qt.webChannelTransport, channel => {
   });
 
   backend.busyChanged.connect((key, busy) => {
-    const map = { launch: 'btn-render', cancel: 'btn-cancel', 'collect:': 'btn-collect' };
+    const map = { launch: 'btn-render', cancel: 'btn-cancel',
+                  'collect:': 'btn-collect', dataset: 'btn-upload' };
     const id = map[key];
     if (id) document.getElementById(id).disabled = busy;
     if (key.indexOf('verify:') === 0) document.getElementById('btn-add').disabled = busy;

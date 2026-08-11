@@ -249,9 +249,111 @@ class Fleet:
                 continue
         return live
 
+    def _resolve_clients(self) -> tuple[dict, dict]:
+        """A client and a Kaggle username for every account.
+
+        One network call per account (whoami), so callers that need both a
+        dataset step and a push step resolve once and hand the result down
+        rather than paying for it twice.
+        """
+        clients: dict[str, object] = {}
+        usernames: dict[str, str] = {}
+        for account in self.accounts:
+            client = self.client_factory(account.token)
+            clients[account.label] = client
+            usernames[account.label] = account.username or client.whoami()
+        return clients, usernames
+
+    def dataset_slug_for(self, blend: Path, owner_username: str) -> str:
+        """Where `blend` lives on Kaggle once uploaded. Pure -- no network,
+        so the UI can show the destination before anything is sent."""
+        return f"{owner_username}/{slug_stem(blend)}-blend"
+
+    def prepare_dataset(self, blend: Path, on_progress: Callable | None = None,
+                        *, clients: dict | None = None,
+                        usernames: dict | None = None) -> str:
+        """Upload the .blend as a Kaggle dataset, share it, and verify it.
+
+        Split out of launch() so the upload can be driven on its own: it is
+        the slowest step by far, it is the one most likely to fail, and it
+        does not need to be repeated for every render of the same scene.
+        Doing it separately also means a failed upload is a failed upload,
+        rather than something that takes a whole render attempt down with
+        it.
+
+        Costs no GPU quota: a dataset upload is not a session. Nothing here
+        starts a kernel, so a caller may run this as often as it likes.
+
+        Returns the dataset slug every worker's notebook will reference.
+        """
+        if not self.accounts:
+            raise ValueError("add at least one account before uploading")
+        # Validate the name FIRST -- before the upload, before anything
+        # that costs time. An unusable filename used to surface as a Kaggle
+        # 400 from dataset_create, i.e. only after the entire .blend had
+        # finished uploading.
+        stem = slug_stem(blend)
+        dataset_name = f"{stem}-blend"
+
+        if clients is None or usernames is None:
+            clients, usernames = self._resolve_clients()
+        owner = self.accounts[0]
+        owner_client = clients[owner.label]
+        owner_username = usernames[owner.label]
+        dataset_slug = f"{owner_username}/{dataset_name}"
+
+        # One upload, shared by every account -- dataset sharing is
+        # automatable, so N accounts does not mean N uploads.
+        sync_blend(owner_client, blend, dataset_slug,
+                   self.work_dir / "ds_owner", on_progress=on_progress)
+
+        # Confirm the upload that just happened actually landed as the
+        # right content -- the remote-side counterpart of dataset_sync.py's
+        # own local staging-size check. dataset_reachable()/dataset_exists()
+        # only prove the dataset is THERE; they say nothing about whether
+        # it's the file just uploaded versus a stale one from an earlier
+        # job with the same slug.
+        expected_size = blend.stat().st_size
+        _require_matching_dataset(owner_client, owner_username, dataset_slug,
+                                  blend.name, expected_size)
+
+        friends = self.accounts[1:]
+        friend_usernames = [usernames[a.label] for a in friends]
+        if friend_usernames:
+            sdk = owner_client._sdk_factory(owner_client.token)
+            current = sharing.get_settings(sdk, owner_username, dataset_name)
+            sharing.grant_readers(sdk, owner_username, dataset_name,
+                                  friend_usernames, current)
+
+            # Verify access actually landed, not just that the write
+            # returned cleanly -- see UnreachableAccountsError. Deliberately
+            # dataset_reachable(), NOT dataset_exists(): the latter is built
+            # on dataset_status(), measured live to 404 for a non-owner
+            # account even with a genuine READER grant, so it would refuse
+            # every shared launch here.
+            unreachable = [usernames[a.label] for a in friends
+                          if not clients[a.label].dataset_reachable(dataset_slug)]
+            if unreachable:
+                raise UnreachableAccountsError(
+                    "granted READER access but the dataset is still not "
+                    f"reachable for: {', '.join(unreachable)}. Nothing has "
+                    "been started -- retry once Kaggle's grant has "
+                    "propagated.")
+
+            # Reachable proves a friend can see A copy -- not that it is
+            # the SAME copy just verified above for the owner. Each
+            # friend's OWN client is asked, in case Kaggle's read-side
+            # replication genuinely disagrees between accounts.
+            for account in friends:
+                _require_matching_dataset(
+                    clients[account.label], usernames[account.label],
+                    dataset_slug, blend.name, expected_size)
+        return dataset_slug
+
     def launch(self, blend: Path, settings: RenderSettings,
                start_frame: int, end_frame: int,
-               on_progress: Callable | None = None) -> FleetState:
+               on_progress: Callable | None = None,
+               dataset_slug: str | None = None) -> FleetState:
         """Launch a render across every configured account.
 
         `on_progress`, if given, is threaded straight through to
@@ -269,7 +371,6 @@ class Fleet:
         # filename used to surface as a Kaggle 400 from dataset_create,
         # i.e. only after the entire .blend had finished uploading.
         stem = slug_stem(blend)
-        dataset_name = f"{stem}-blend"
 
         # Single-slot state file: launching over a live job would overwrite
         # the only record of the running kernels, leaving them uncancellable
@@ -286,69 +387,23 @@ class Fleet:
         buckets = assign_frames(start_frame, end_frame, len(self.accounts))
 
         # Resolve a client + username for every account up front: needed
-        # for the push loop below regardless, and for the grant/verify
-        # step that has to happen before it.
-        clients: dict[str, object] = {}
-        usernames: dict[str, str] = {}
-        for account in self.accounts:
-            client = self.client_factory(account.token)
-            clients[account.label] = client
-            usernames[account.label] = account.username or client.whoami()
+        # for the push loop below regardless, and for the dataset step
+        # that has to happen before it.
+        clients, usernames = self._resolve_clients()
 
-        owner = self.accounts[0]
-        owner_client = clients[owner.label]
-        owner_username = usernames[owner.label]
-        dataset_slug = f"{owner_username}/{dataset_name}"
-
-        # One upload, shared by every account (Task 3) -- dataset sharing is
-        # automatable, so N accounts no longer means N uploads.
-        sync_blend(owner_client, blend, dataset_slug,
-                   self.work_dir / "ds_owner", on_progress=on_progress)
-
-        # Confirm the upload that just happened actually landed as the
-        # right content -- the remote-side counterpart of dataset_sync.py's
-        # own local staging-size check. dataset_reachable()/dataset_exists()
-        # only prove the dataset is THERE; they say nothing about whether
-        # it's the file that was just uploaded versus a stale one from an
-        # earlier job with the same slug. Runs before a single friend is
-        # granted access or a single kernel is pushed -- in the no-friends
-        # ("per-account") case this is the ENTIRE verification, since there
-        # is nobody else to share with. See StaleDatasetError.
-        expected_size = blend.stat().st_size
-        _require_matching_dataset(owner_client, owner_username, dataset_slug,
-                                  blend.name, expected_size)
-
-        friends = self.accounts[1:]
-        friend_usernames = [usernames[a.label] for a in friends]
-        if friend_usernames:
-            sdk = owner_client._sdk_factory(owner_client.token)
-            current = sharing.get_settings(sdk, owner_username, dataset_name)
-            sharing.grant_readers(sdk, owner_username, dataset_name,
-                                  friend_usernames, current)
-
-            # Verify access actually landed, not just that the write
-            # returned cleanly -- see UnreachableAccountsError. Deliberately
-            # dataset_reachable(), NOT dataset_exists(): dataset_exists()
-            # is built on dataset_status(), which was measured live to 404
-            # for a non-owner account even with a genuine READER grant (see
-            # task-3-report.md) -- it only reflects datasets an account
-            # owns, so it would refuse every shared launch here.
-            unreachable = [usernames[a.label] for a in friends
-                          if not clients[a.label].dataset_reachable(dataset_slug)]
-            if unreachable:
-                raise UnreachableAccountsError(
-                    "granted READER access but the dataset is still not "
-                    f"reachable for: {', '.join(unreachable)}. Nothing has "
-                    "been started -- retry once Kaggle's grant has "
-                    "propagated.")
-
-            # Reachable proves a friend can see A copy -- not that it is
-            # the SAME copy just verified above for the owner. Each
-            # friend's OWN client is asked, in case Kaggle's read-side
-            # replication genuinely disagrees between accounts (the same
-            # kind of propagation lag dataset_reachable already accounts
-            # for). Still strictly before push_kernel: nothing started.
-            for account in friends:
+        # The dataset step. Skipped entirely when the caller has already
+        # run prepare_dataset() and hands the slug back -- re-uploading a
+        # scene that is already on Kaggle is the single most expensive
+        # thing this app can do for no reason. It is still VERIFIED below
+        # before a kernel is pushed: "the caller says it is there" is not
+        # evidence, and a stale or half-replaced dataset would otherwise
+        # render the wrong scene on somebody else's quota.
+        if dataset_slug is None:
+            dataset_slug = self.prepare_dataset(
+                blend, on_progress, clients=clients, usernames=usernames)
+        else:
+            expected_size = blend.stat().st_size
+            for account in self.accounts:
                 _require_matching_dataset(
                     clients[account.label], usernames[account.label],
                     dataset_slug, blend.name, expected_size)
