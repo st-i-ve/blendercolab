@@ -1033,3 +1033,82 @@ def test_verify_token_refuses_an_account_that_authenticated_as_someone_else(monk
 
     with pytest.raises(KaggleError, match="was not accepted by Kaggle"):
         verify_token(TOKEN)
+
+
+# ---------------------------------------------------------------------------
+# whoami's second source. Kaggle exposes no "who am I" endpoint, so the
+# handle is read off the owner prefix of something the account owns. An
+# account that has only ever uploaded a DATASET used to be rejected for
+# having no notebooks -- and that is exactly the account this app is most
+# likely to be handed, since a friend lending quota may never have written
+# a notebook.
+# ---------------------------------------------------------------------------
+
+class _Ref:
+    def __init__(self, ref):
+        self.ref = ref
+
+
+class _AuthenticatingApi(GoodApi):
+    """A session that authenticates cleanly -- so whoami's answer is about
+    what the account OWNS, not about whether the token works."""
+
+    def __init__(self):
+        super().__init__(TOKEN)
+
+
+class NoKernelsButOneDatasetApi(_AuthenticatingApi):
+    def kernels_list(self, **kwargs):
+        return []
+
+    def dataset_list(self, **kwargs):
+        return [_Ref("friendly/some-dataset")]
+
+
+class OwnsNothingApi(_AuthenticatingApi):
+    def kernels_list(self, **kwargs):
+        return []
+
+    def dataset_list(self, **kwargs):
+        return []
+
+
+class NoKernelsAndNoDatasetCallApi(_AuthenticatingApi):
+    def kernels_list(self, **kwargs):
+        return []
+    # dataset_list deliberately absent: older/newer SDKs differ.
+
+
+def test_whoami_falls_back_to_datasets_when_there_are_no_notebooks(monkeypatch):
+    _install_fake_kaggle_package(monkeypatch, NoKernelsButOneDatasetApi())
+    assert KaggleClient(TOKEN).whoami() == "friendly"
+
+
+def test_whoami_survives_an_sdk_without_dataset_list(monkeypatch):
+    """The guard around the second source is for API-surface differences
+    only -- it must not turn a missing method into a crash."""
+    _install_fake_kaggle_package(monkeypatch, NoKernelsAndNoDatasetCallApi())
+    with pytest.raises(KaggleError, match="no notebooks or datasets"):
+        KaggleClient(TOKEN).whoami()
+
+
+def test_whoami_explains_what_to_do_when_the_account_owns_nothing(monkeypatch):
+    """This is a perfectly ordinary account, not a broken one, so the
+    message has to name both ways out rather than just refusing."""
+    _install_fake_kaggle_package(monkeypatch, OwnsNothingApi())
+    with pytest.raises(KaggleError) as excinfo:
+        KaggleClient(TOKEN).whoami()
+    message = str(excinfo.value)
+    assert "username by hand" in message
+    assert "Instances" in message
+
+
+def test_a_bad_token_still_reports_ITS_error_not_the_owns_nothing_one(monkeypatch):
+    """The regression this nearly shipped: guarding both sources swallowed
+    a genuine auth failure and reported it as "this account owns nothing",
+    which sends the user to fix entirely the wrong thing."""
+    _install_fake_kaggle_package(monkeypatch, LegacyApiKeyFallthroughApi())
+    with pytest.raises(KaggleError) as excinfo:
+        KaggleClient(TOKEN, label="james").whoami()
+    assert "owns nothing" not in str(excinfo.value)
+    assert "no notebooks or datasets" not in str(excinfo.value)

@@ -301,6 +301,7 @@ function instanceCard(inst) {
       <span class="sub">${esc(inst.username || '')}</span>
       <span class="right">
         ${inst.verified ? '' : '<span class="badge warn"><i></i>not verified</span>'}
+        ${inst.username ? '' : '<span class="badge warn"><i></i>needs username</span>'}
         <span class="badge ${badge[0]}"><i></i>${badge[1]}</span>
       </span>
     </div>
@@ -528,7 +529,9 @@ function renderFleetTable(state) {
                && !i.worker.frames.length;
   return `<tr>
       <td>${esc(i.label)}${i.verified ? '' : ' <span class="badge warn"><i></i>unverified</span>'}${warm ? ' <span class="badge accent"><i></i>warm</span>' : ''}</td>
-      <td>${esc(i.username || '—')}</td>
+      <td>${i.username
+        ? esc(i.username)
+        : `<button class="btn sm danger" data-username="${esc(i.label)}">Set username</button>`}</td>
       <td>${esc(i.quota || '—')}</td>
       <td>${hw}</td>
       <td>${esc(state_)}</td>
@@ -545,6 +548,20 @@ function renderFleetTable(state) {
 document.getElementById('inst-tbody').addEventListener('click', e => {
   const button = e.target.closest('button');
   if (!button || !backend) return;
+  if (button.dataset.username) {
+    /* Kaggle exposes no "who am I": the handle is read off something the
+       account owns, and an account that has never made a notebook or a
+       dataset has nothing to read. Asking is the only way. */
+    const name = window.prompt(
+      `Kaggle username for ${button.dataset.username}?
+
+`
+      + 'Kaggle only reveals a handle through something the account owns, '
+      + 'and this one owns no notebook or dataset yet. It is the name in '
+      + 'your profile URL: kaggle.com/<username>.');
+    if (name) backend.setUsername(button.dataset.username, name);
+    return;
+  }
   if (button.dataset.start) backend.startInstances(JSON.stringify([button.dataset.start]));
   if (button.dataset.cancel) backend.cancelInstance(button.dataset.cancel);
   if (button.dataset.download) backend.collect(button.dataset.download);

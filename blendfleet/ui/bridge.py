@@ -819,12 +819,51 @@ class Backend(QObject):
             self.store.add(account)
             self.store.save()
             self.logLine.emit(f"added account {account.label}", "active")
-            self.notification.emit(
-                f"Added {account.label} ({username})", "active")
+            if username:
+                self.notification.emit(
+                    f"Added {account.label} ({username})", "active")
+            else:
+                # The token is valid -- verification passed -- but Kaggle
+                # had nothing owned by this account to read the handle
+                # from. Said HERE, where it is fixable in one field,
+                # rather than discovered later as a failed render.
+                self.notification.emit(
+                    f"Added {account.label}, but Kaggle did not reveal its "
+                    "username -- the account owns no notebook or dataset to "
+                    "read it from. Enter it on the Instances page, or this "
+                    "account cannot render.", "warn")
             self._emit_state()
             self.refreshQuota()
 
         self._start(f"verify:{label}", work, f"Verifying {label}", ok)
+
+    @Slot(str, str)
+    def setUsername(self, label: str, username: str) -> None:
+        """Set an account's Kaggle handle by hand.
+
+        Kaggle exposes no "who am I" endpoint: the handle is recovered
+        from the owner prefix of something the account owns. An account
+        that has never created a notebook OR a dataset has nothing to read
+        it from -- and that is a perfectly ordinary account, especially for
+        a friend lending quota who has never written a notebook. Without
+        this, such an account is added successfully and then fails every
+        render with "could not determine username", which is a dead end.
+        """
+        username = username.strip().lstrip("@")
+        if not username:
+            self.notification.emit("Enter a Kaggle username.", "offline")
+            return
+        for account in self.store.list():
+            if account.label == label:
+                account.username = username
+                self.store.save()
+                self.logLine.emit(
+                    f"{label}: username set to {username}", "active")
+                self.notification.emit(
+                    f"{label} is {username}", "active")
+                self._emit_state()
+                return
+        self.notification.emit(f"No account labelled {label}.", "offline")
 
     @Slot(str)
     def removeAccount(self, label: str) -> None:

@@ -411,14 +411,43 @@ class KaggleClient:
 
     # ---------------- identity ----------------
     def whoami(self) -> str:
-        kernels = self.api.kernels_list(mine=True, page_size=1)
-        for k in kernels:
-            ref = getattr(k, "ref", "")
+        """The account's Kaggle handle, read off something it owns.
+
+        Kaggle's API exposes no "who am I" endpoint, so the handle has to
+        be recovered from the owner prefix of a ref the account owns. Two
+        sources are tried, because a brand-new account that has only ever
+        uploaded a dataset would otherwise be rejected for having no
+        notebooks -- which is exactly the account this app is most likely
+        to be handed, since a friend lending quota may never have written
+        a notebook in their life.
+        """
+        # Notebooks first, and NOT guarded: a revoked token, or one that
+        # authenticates as somebody else, must surface its real error here.
+        # Swallowing that would report a genuine auth failure as "this
+        # account owns nothing", sending the user to fix the wrong thing.
+        for item in self.api.kernels_list(mine=True, page_size=1) or []:
+            ref = str(getattr(item, "ref", ""))
             if "/" in ref:
                 return ref.split("/", 1)[0]
+
+        # Datasets second, and guarded only against this SDK version not
+        # having the call at all -- by the time we are here the token has
+        # already proved itself above, so the only question left is whether
+        # this account owns anything a handle can be read from.
+        try:
+            datasets = self.api.dataset_list(mine=True, page_size=1) or []
+        except (AttributeError, TypeError):
+            datasets = []
+        for item in datasets:
+            ref = str(getattr(item, "ref", ""))
+            if "/" in ref:
+                return ref.split("/", 1)[0]
+
         raise KaggleError(
-            "could not determine username: this account has no notebooks. "
-            "Create one on kaggle.com first, or set the username manually.")
+            "could not determine username: this account has no notebooks or "
+            "datasets for Kaggle to read the handle from. Enter the Kaggle "
+            "username by hand on the Instances page, or create anything at "
+            "all on kaggle.com once and re-verify.")
 
     # ---------------- quota ----------------
     def quota(self) -> Quota:
