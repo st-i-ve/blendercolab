@@ -37,6 +37,11 @@ class Settings:
     # land on anything. Off by default; only the Windows 11 Mica path can
     # honour it at all (see ui/mica.py).
     translucent: bool = False
+    # The reference design ships sound effects ON. Kept that way rather
+    # than defaulting to silence: this app runs long jobs that people walk
+    # away from, so "the render finished" is exactly the kind of thing a
+    # chime is for. One toggle in Settings turns it off.
+    sound: bool = True
     fullscreen: bool = False
     # Minimum GPUs a launched kernel must report before the generated
     # notebook's PREFLIGHT gate (notebook_builder.py) lets a render
@@ -68,6 +73,8 @@ class Settings:
             self.theme = DEFAULT_THEME
         if not isinstance(self.translucent, bool):
             self.translucent = False
+        if not isinstance(self.sound, bool):
+            self.sound = True
         # Same principle as accent above: a hand-edited or forward-dated
         # config must never brick the app. bool is technically an int
         # subclass in Python, so it is excluded explicitly rather than
@@ -99,6 +106,7 @@ class Settings:
             accent=data.get("accent", DEFAULT_ACCENT),
             theme=data.get("theme", DEFAULT_THEME),
             translucent=data.get("translucent", False),
+            sound=data.get("sound", True),
             fullscreen=bool(data.get("fullscreen", False)),
             min_gpus=data.get("min_gpus", DEFAULT_MIN_GPUS),
         )

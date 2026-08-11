@@ -19,7 +19,11 @@
 
 let backend = null;
 let unread = 0;
-let prefs = { theme: 'light', accent: 'orange', translucent: false };
+/* `sound` defaults TRUE here as well as in Settings: the guard in
+   tone() reads prefs.sound, and an undefined key is falsy -- which
+   silently disabled every sound in the app until this was set. */
+let prefs = { theme: 'light', accent: 'orange', translucent: false,
+              sound: true };
 const history = { inst: [], run: [], gpus: [], frames: [] };
 
 /* ---------------- sounds -------------------------------------------------

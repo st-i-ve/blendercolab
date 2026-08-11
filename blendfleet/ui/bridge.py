@@ -213,6 +213,7 @@ class Backend(QObject):
             "accent": self.settings.accent,
             "theme": self.settings.theme,
             "translucent": self.settings.translucent,
+            "sound": self.settings.sound,
             "minGpus": self.settings.min_gpus,
             "fullscreen": self.settings.fullscreen,
         })
@@ -263,13 +264,28 @@ class Backend(QObject):
         except json.JSONDecodeError:
             decoded = value
         mapping = {"accent": "accent", "theme": "theme",
-                   "translucent": "translucent", "minGpus": "min_gpus"}
+                   "translucent": "translucent", "sound": "sound",
+                   "minGpus": "min_gpus"}
         field = mapping.get(key)
         if field is None:
             return
         setattr(self.settings, field, decoded)
         self.settings.__post_init__()       # re-validate, never trust the page
         self.settings.save()
+        # The page restyles itself from its own CSS variables, but the
+        # WINDOW around it is Qt -- the title bar, the shell background
+        # behind the view, the Mica/dark-chrome flags, and any dialog
+        # (SetupDialog, QFileDialog) opened later. Saving the preference
+        # without applying it leaves all of that on the old theme, which
+        # is exactly the "background does not change" bug. theme.apply()
+        # also fires theme_signal, which is what WebHost listens to.
+        if field in ("theme", "accent"):
+            from PySide6.QtWidgets import QApplication
+            from blendfleet.ui import theme as theme_module
+            app = QApplication.instance()
+            if app is not None:
+                theme_module.apply(app, self.settings.accent,
+                                   self.settings.theme)
         self.settingsChanged.emit(self.preferences())
 
     @Slot()
@@ -334,6 +350,216 @@ class Backend(QObject):
             self.healthChanged.emit(self.health())
 
         self._start("quota", work, "Refreshing quota", ok, lambda _m: None)
+
+    # ---- JS -> Python: actions ----------------------------------------
+    @Slot(result=str)
+    def pickBlend(self) -> str:
+        """Open the OS file chooser and remember the choice.
+
+        A native dialog rather than an <input type=file>: the page is not
+        given filesystem access, and the app needs a real path to upload,
+        not a sandboxed File object.
+        """
+        from PySide6.QtWidgets import QFileDialog
+        path, _ = QFileDialog.getOpenFileName(
+            None, "Select .blend", "", "Blender (*.blend)")
+        if path:
+            self.blend = Path(path)
+        return json.dumps({"path": str(self.blend) if self.blend else "",
+                           "name": self.blend.name if self.blend else ""})
+
+    @Slot(str)
+    def launch(self, options_json: str) -> None:
+        """Start a render across every account.
+
+        Refuses rather than guesses when the request cannot be honoured --
+        no accounts, no file, or a backwards frame range. The page shows
+        the reason; it does not get to proceed with a default.
+        """
+        options = json.loads(options_json)
+        start = int(options.get("startFrame", 1))
+        end = int(options.get("endFrame", 1))
+        if not self.store.list():
+            self.notification.emit(
+                "Add at least one Kaggle account before rendering.", "offline")
+            return
+        if self.blend is None:
+            self.notification.emit("Choose a .blend file first.", "offline")
+            return
+        if end < start:
+            self.notification.emit(
+                f"End frame ({end}) is before the start frame ({start}).",
+                "offline")
+            return
+
+        settings = RenderSettings(
+            int(options.get("resX", 1920)), int(options.get("resY", 1080)),
+            int(options.get("samples", 128)), options.get("format", "PNG"),
+            min_gpus=self.settings.min_gpus)
+        accounts = self.store.list()
+        blend = self.blend
+        owner = accounts[0].label
+
+        def work():
+            return self.fleet_factory(accounts).launch(
+                blend, settings, start, end,
+                on_progress=lambda p: self.uploadProgress.emit(json.dumps({
+                    "label": owner,
+                    "sentBytes": getattr(p, "sent_bytes", 0),
+                    "totalBytes": getattr(p, "total_bytes", 0),
+                })))
+
+        def ok(state) -> None:
+            self._last_state = state
+            self.logLine.emit(
+                f"render started on {len(accounts)} account(s)", "active")
+            self.notification.emit("Render started", "active")
+            self._emit_state()
+            self.refreshQuota()
+
+        self._start("launch", work, "Starting the render", ok)
+
+    @Slot()
+    def cancelAll(self) -> None:
+        accounts = self.store.list()
+
+        def work():
+            return self.fleet_factory(accounts).cancel_all()
+
+        def ok(results) -> None:
+            results = list(results or [])
+            failed = [r for r in results if not r.ok]
+            if not results:
+                self.notification.emit("Nothing to cancel.", "idle")
+            elif failed:
+                # A silently-failed cancel is the worst outcome in this
+                # app: the user believes the render stopped while it keeps
+                # draining a friend's weekly GPU quota. Name them.
+                detail = "; ".join(f"{r.label}: {r.error}" for r in failed)
+                self.notification.emit(
+                    f"{len(failed)} of {len(results)} did NOT stop and may "
+                    f"still be spending quota — {detail}. Stop them by hand "
+                    f"at kaggle.com.", "offline")
+            else:
+                self.notification.emit(
+                    f"Cancelled {len(results)} account(s)", "idle")
+            self.poll()
+
+        self._start("cancel", work, "Cancelling the render", ok)
+
+    @Slot(str)
+    def cancelInstance(self, label: str) -> None:
+        """Stop ONE account's session.
+
+        Kaggle's unit of control is the session, not a GPU within it, so
+        this stops that account's whole session -- the wording the page
+        shows says exactly that rather than implying a GPU can be released.
+        """
+        accounts = self.store.list()
+
+        def work():
+            return self.fleet_factory(accounts).cancel_worker(label)
+
+        def ok(result) -> None:
+            if result is None:
+                self.notification.emit(f"{label} had already stopped.", "idle")
+            elif result.ok:
+                self.notification.emit(f"Cancelled {label}", "idle")
+            else:
+                self.notification.emit(
+                    f"{label} did NOT stop and may still be spending quota: "
+                    f"{result.error}", "offline")
+            self.poll()
+
+        self._start(f"cancel:{label}", work, f"Cancelling {label}", ok)
+
+    @Slot(str)
+    def collect(self, label: str = "") -> None:
+        """Download rendered frames -- the whole fleet, or one account."""
+        from PySide6.QtWidgets import QFileDialog
+        from blendfleet.collector import collect as collect_frames
+
+        destination = QFileDialog.getExistingDirectory(None, "Save frames to")
+        if not destination:
+            return
+        accounts = self.store.list()
+        who = label or "the fleet"
+
+        def work():
+            fleet = self.fleet_factory(accounts)
+            state = fleet.load()
+            if state is None:
+                return None
+            return collect_frames(
+                state, accounts, fleet.client_factory, Path(destination),
+                worker_label=label or None,
+                on_progress=lambda lbl, p: self.downloadProgress.emit(
+                    json.dumps({
+                        "label": lbl,
+                        "receivedBytes": getattr(p, "received_bytes", 0),
+                        "totalBytes": getattr(p, "total_bytes", 0),
+                    })))
+
+        def ok(report) -> None:
+            if report is None:
+                self.notification.emit(
+                    "No render job found — start a render first.", "idle")
+                return
+            message = f"Collected {report.copied} frame(s) from {who}"
+            if report.missing_frames:
+                # Never presented as a complete set when it is not one.
+                message += (f" — {len(report.missing_frames)} still missing "
+                            "(not rendered yet, or that account failed)")
+            tone = "offline" if report.worker_errors else "active"
+            if report.worker_errors:
+                detail = "; ".join(f"{k}: {v}"
+                                   for k, v in report.worker_errors.items())
+                message += f". Could not reach: {detail}"
+            self.notification.emit(message, tone)
+
+        self._start(f"collect:{label}", work,
+                    f"Collecting frames from {who}", ok)
+
+    @Slot(str, str)
+    def addAccount(self, label: str, token: str) -> None:
+        """Add and VERIFY an account.
+
+        Verification is a real network call, so it runs off-thread like
+        everything else -- and an account that fails to verify is not
+        added, because one that cannot render is worse than absent: it
+        would sit in the fleet looking merely idle.
+        """
+        from blendfleet.accounts import Account
+
+        account = Account(label=label.strip(), token=token.strip())
+        try:
+            self.store.validate(account)
+        except Exception as e:      # noqa: BLE001 -- shown to the user
+            self.notification.emit(str(e), "offline")
+            return
+
+        def work():
+            return self.verifier(account.token)
+
+        def ok(username) -> None:
+            account.username = username
+            account.verified = True
+            self.store.add(account)
+            self.store.save()
+            self.logLine.emit(f"added account {account.label}", "active")
+            self.notification.emit(
+                f"Added {account.label} ({username})", "active")
+            self._emit_state()
+            self.refreshQuota()
+
+        self._start(f"verify:{label}", work, f"Verifying {label}", ok)
+
+    @Slot(str)
+    def removeAccount(self, label: str) -> None:
+        self.store.remove(label)
+        self.store.save()
+        self.logLine.emit(f"removed account {label}", "warn")
+        self._emit_state()
 
     def stop(self) -> None:
         """Wait for whatever is in flight. Called from the host window's

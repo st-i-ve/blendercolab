@@ -85,3 +85,49 @@ def _assert_declared(path: Path) -> None:
     assert path.resolve() in declared_sources, (
         f"{path} is resolvable at runtime but not declared in "
         "packaging/blendfleet.spec's datas")
+
+
+# ---------------------------------------------------------------------------
+# The web-UI build. Its page is loaded from disk at runtime
+# (web_host.WEB_DIR), so every file under blendfleet/web/ is exactly as
+# runtime-resolvable as an icon or a font -- and exactly as invisible in a
+# source-tree test if the spec forgets it.
+# ---------------------------------------------------------------------------
+
+WEB_SPEC_PATH = REPO_ROOT / "packaging" / "blendfleetweb.spec"
+
+
+def _web_spec_datas() -> list[tuple[str, str]]:
+    text = WEB_SPEC_PATH.read_text(encoding="utf-8")
+    prelude, marker, _ = text.partition("\na = Analysis(")
+    assert marker, (
+        "packaging/blendfleetweb.spec no longer has an 'a = Analysis(' "
+        "line -- update this test's split point")
+    namespace = {"__file__": str(WEB_SPEC_PATH),
+                 "SPECPATH": str(WEB_SPEC_PATH.parent)}
+    exec(compile(prelude, str(WEB_SPEC_PATH), "exec"), namespace)
+    return namespace["datas"]
+
+
+def test_web_spec_ships_every_file_the_page_loads():
+    """index.html, app.css and app.js, plus anything added beside them."""
+    from blendfleet.ui.web_host import WEB_DIR
+
+    shipped = {Path(source).resolve() for source, _dest in _web_spec_datas()}
+    on_disk = {p.resolve() for p in WEB_DIR.glob("*.*")}
+    assert on_disk, "blendfleet/web/ is empty -- the page has to live somewhere"
+    missing = on_disk - shipped
+    assert not missing, (
+        "packaging/blendfleetweb.spec does not ship: "
+        f"{sorted(p.name for p in missing)}")
+
+
+def test_web_assets_land_where_the_stylesheet_expects_them():
+    """app.css reaches the vendored fonts and the brand mark with
+    ../../assets/..., which only resolves if the web files are bundled at
+    blendfleet/web/ -- not at the bundle root."""
+    destinations = {dest for source, dest in _web_spec_datas()
+                    if Path(source).parent.name == "web"}
+    assert destinations == {"blendfleet/web"}, (
+        f"web files are bundled to {destinations!r}; app.css's relative "
+        "paths to assets/ would not resolve")
