@@ -350,6 +350,115 @@ class Fleet:
                     dataset_slug, blend.name, expected_size)
         return dataset_slug
 
+    # ---- warm workers -------------------------------------------------
+    CONTROL_DATASET_NAME = "blendfleet-control"
+
+    def control_slug(self, owner_username: str) -> str:
+        """The tiny dataset a warm worker polls for jobs.
+
+        Owned by the parent account and shared with the others exactly like
+        the scene, so a friend's worker can read it. It carries a job
+        descriptor only -- frame lists and render settings -- never scene
+        data, so sharing it discloses nothing beyond what a collaborator
+        already knows.
+        """
+        return f"{owner_username}/{self.CONTROL_DATASET_NAME}"
+
+    def publish_job(self, job: dict, *, clients: dict | None = None,
+                    usernames: dict | None = None) -> str:
+        """Put a job descriptor where the warm workers will find it.
+
+        A new VERSION of the control dataset -- which is what the workers
+        poll for. Returns the control slug.
+
+        The job carries its own id. A worker records the last id it acted
+        on, so republishing the same job (a retry, a duplicate click) does
+        not make a machine render it twice.
+        """
+        if clients is None or usernames is None:
+            clients, usernames = self._resolve_clients()
+        owner = self.accounts[0]
+        owner_client = clients[owner.label]
+        owner_username = usernames[owner.label]
+        slug = self.control_slug(owner_username)
+
+        staging = self.work_dir / "ctl"
+        staging.mkdir(parents=True, exist_ok=True)
+        job_file = staging / "job.json"
+        job_file.write_text(json.dumps(job, indent=2), encoding="utf-8")
+        sync_blend(owner_client, job_file, slug, self.work_dir / "ds_ctl")
+
+        friends = self.accounts[1:]
+        if friends:
+            sdk = owner_client._sdk_factory(owner_client.token)
+            current = sharing.get_settings(sdk, owner_username,
+                                           self.CONTROL_DATASET_NAME)
+            sharing.grant_readers(sdk, owner_username,
+                                  self.CONTROL_DATASET_NAME,
+                                  [usernames[a.label] for a in friends],
+                                  current)
+        return slug
+
+    def start_workers(self, labels: list[str], settings: RenderSettings,
+                      dataset_slug: str) -> FleetState:
+        """Bring machines up WITHOUT giving them work yet.
+
+        Each pushed kernel reports the hardware it actually got, sets up
+        Blender, then waits. That ordering is the point: Kaggle decides
+        what hardware a session gets, and until now the only way to find
+        out was to commit to a render and read it from the logs. A warm
+        worker lets the answer arrive first, so the decision to spend
+        somebody's quota on a P100 instead of two T4s is one you make.
+
+        Every started machine is spending quota from this moment -- warm is
+        not free -- which is why the worker carries its own idle timeout
+        (notebook_builder.IDLE_TIMEOUT_S) rather than trusting this app to
+        still be running later.
+        """
+        if not labels:
+            raise ValueError("name at least one account to start")
+        busy = self.active_workers()
+        if busy:
+            raise FleetBusyError(
+                "already running on: "
+                + ", ".join(f"{w.label} ({w.kernel_slug})" for w in busy)
+                + ". Stop those before starting more, or the state file "
+                  "would lose track of them.")
+
+        clients, usernames = self._resolve_clients()
+        owner_username = usernames[self.accounts[0].label]
+        control = self.control_slug(owner_username)
+        # Publish an empty job FIRST: a worker that polls before anything
+        # exists logs "unavailable" every tick, which reads like a fault
+        # rather than like an idle machine.
+        self.publish_job({"id": "idle", "workers": [], "frames": []},
+                         clients=clients, usernames=usernames)
+
+        job_id = uuid.uuid4().hex[:8]
+        st = FleetState(job_id=job_id, blend_name="", start_frame=0,
+                        end_frame=0, workers=[])
+        wanted = [a for a in self.accounts if a.label in labels]
+        try:
+            for account in wanted:
+                client = clients[account.label]
+                username = usernames[account.label]
+                kernel_slug = f"{username}/blendfleet-worker-{job_id}"
+                kern_dir = self.work_dir / f"warm_{account.label}"
+                build([], settings, dataset_slug, kern_dir, kernel_slug,
+                      mode="worker", control_slug=control,
+                      token=account.token, worker_label=account.label)
+                client.push_kernel(kern_dir)
+                st.workers.append(WorkerState(
+                    label=account.label, username=username,
+                    kernel_slug=kernel_slug, frames=[], state="queued"))
+                self._save(st)
+        finally:
+            # Same contract as launch(): a kernel that has been pushed is
+            # already spending quota, so whatever got started is on disk
+            # and cancellable even if a later push failed.
+            self._save(st)
+        return st
+
     def launch(self, blend: Path, settings: RenderSettings,
                start_frame: int, end_frame: int,
                on_progress: Callable | None = None,

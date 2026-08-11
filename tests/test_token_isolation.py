@@ -200,6 +200,50 @@ def test_no_module_writes_the_token_into_the_process_environment():
                  for path in sorted(root.rglob("*.py"))
                  for line in path.read_text(encoding="utf-8").splitlines()
                  if assign.search(line)]
-    # Only the set + restore pair inside kaggle_client._with_env_token.
-    assert all(name == "kaggle_client.py" for name, _ in offenders), offenders
-    assert len(offenders) == 2, offenders
+    # Two files may legitimately contain this text, for different reasons:
+    #
+    #   kaggle_client.py -- the set + restore pair inside _with_env_token,
+    #     the single lock-guarded helper this whole guard exists to keep as
+    #     the only one.
+    #   notebook_builder.py -- ONE occurrence, inside the string template
+    #     for a warm worker's notebook. That line never executes in this
+    #     process: it is source code shipped to a Kaggle kernel, which runs
+    #     on Kaggle, in its own interpreter, with only that same account's
+    #     own token. The race this guard prevents is between threads HERE
+    #     sharing one process environment; a Kaggle session has no such
+    #     neighbours.
+    #
+    # The runtime half of that claim is asserted separately below, because
+    # a comment is not evidence.
+    by_file: dict[str, int] = {}
+    for name, _line in offenders:
+        by_file[name] = by_file.get(name, 0) + 1
+    assert by_file == {"kaggle_client.py": 2, "notebook_builder.py": 1}, \
+        offenders
+
+
+def test_building_a_worker_notebook_does_not_touch_this_process_environment():
+    """The runtime counterpart of the exception allowed above.
+
+    notebook_builder writes `os.environ[...] = <token>` into the notebook
+    it generates. This proves that writing it is all it does -- the app's
+    own environment is never assigned, so the cross-thread token race
+    cannot come back through this door.
+    """
+    import os
+    import tempfile
+    from pathlib import Path
+
+    from blendfleet.notebook_builder import RenderSettings, build
+
+    before = os.environ.get("KAGGLE_API_TOKEN")
+    token = "KGAT_" + "b" * 32
+    out = Path(tempfile.mkdtemp())
+    path = build([], RenderSettings(1920, 1080, 128), "me/scene-blend",
+                 out, "me/scene-worker-1", mode="worker",
+                 control_slug="me/ctl", token=token, worker_label="acct0")
+
+    assert os.environ.get("KAGGLE_API_TOKEN") == before
+    # And the token really did reach the generated notebook -- otherwise
+    # this test would pass for the wrong reason.
+    assert token in path.read_text(encoding="utf-8")

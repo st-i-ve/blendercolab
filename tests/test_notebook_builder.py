@@ -1,6 +1,7 @@
 import ast, json
 from pathlib import Path
 import pytest
+import blendfleet.notebook_builder as nb
 from blendfleet.notebook_builder import RenderSettings, build
 
 
@@ -349,3 +350,116 @@ def test_every_cell_is_still_valid_python_with_archiving(tmp_path, settings):
     p = build([1, 2, 3], settings, "me/remember-blend", tmp_path, "me/render-0")
     for src in cells_src(p):
         ast.parse(src)
+
+
+# ---------------------------------------------------------------------------
+# Warm workers. A machine that comes up and waits is only useful if it can
+# (a) hear about a job, and (b) stop itself when there is none -- the
+# second matters more, because a session bills GPU quota by wall-clock and
+# an app that crashes must not strand one waiting forever.
+# ---------------------------------------------------------------------------
+
+def _worker_source(tmp_path, **kwargs):
+    options = dict(mode="worker", control_slug="me/blendfleet-control",
+                   token="KGAT_" + "0" * 32, worker_label="acct0")
+    options.update(kwargs)
+    path = nb.build([], nb.RenderSettings(1920, 1080, 128), "me/scene-blend",
+                    tmp_path / "w", "me/scene-worker-1", **options)
+    cells = json.loads(path.read_text(encoding="utf-8"))["cells"]
+    return "".join(cells[-1]["source"]), path
+
+
+def test_worker_mode_refuses_without_a_way_to_hear_about_a_job(tmp_path):
+    """Anything missing here produces a machine that starts, spends quota
+    and waits forever. Refusing costs nothing; the notebook does not."""
+    for missing in ("control_slug", "token", "worker_label"):
+        with pytest.raises(ValueError):
+            _worker_source(tmp_path, **{missing: None})
+
+
+def test_worker_shuts_itself_down_when_idle(tmp_path):
+    """The app is not what stops it. A laptop that sleeps or an app that
+    crashes must not leave a session quietly eating a friend's quota."""
+    source, _ = _worker_source(tmp_path)
+    assert f"IDLE_TIMEOUT_S = {nb.IDLE_TIMEOUT_S}" in source
+    assert "idle_for > IDLE_TIMEOUT_S" in source
+    assert "break" in source
+
+
+def test_worker_has_a_maximum_lifetime_as_well_as_an_idle_timeout(tmp_path):
+    """A worker kept busy by a trickle of jobs would never hit the idle
+    path. Eleven hours warm is a leak, not a warm machine."""
+    source, _ = _worker_source(tmp_path)
+    assert f"MAX_LIFETIME_S = {nb.MAX_WORKER_LIFETIME_S}" in source
+    assert "time.time() - started > MAX_LIFETIME_S" in source
+
+
+def test_the_idle_clock_restarts_after_work_not_before(tmp_path):
+    """A job that took an hour must not count as an hour of idling and
+    shut the machine down the moment it finishes."""
+    source, _ = _worker_source(tmp_path)
+    tail = source[source.index("DONE"):]
+    assert "last_activity = time.time()" in tail
+
+
+def test_a_control_dataset_that_is_unreachable_does_not_kill_the_worker(tmp_path):
+    """A blip in the control channel means "no news", not "die"."""
+    source, _ = _worker_source(tmp_path)
+    assert "except Exception" in source
+    assert "return None" in source
+
+
+def test_the_control_dataset_is_never_attached(tmp_path):
+    """An attached dataset is PINNED at session start, so a worker would
+    never see a new version of it -- which is the entire mechanism. It has
+    to be fetched over the API instead."""
+    _, path = _worker_source(tmp_path)
+    metadata = json.loads(
+        (path.parent / "kernel-metadata.json").read_text(encoding="utf-8"))
+    assert metadata["dataset_sources"] == ["me/scene-blend"]
+    assert "me/blendfleet-control" not in metadata["dataset_sources"]
+
+
+def test_a_worker_kernel_is_private(tmp_path):
+    """It carries that account's own token. A public kernel would expose
+    it, which is the whole risk this mode is opt-in for."""
+    _, path = _worker_source(tmp_path)
+    metadata = json.loads(
+        (path.parent / "kernel-metadata.json").read_text(encoding="utf-8"))
+    assert metadata["is_private"] is True
+
+
+def test_the_token_is_never_printed(tmp_path):
+    """It appears exactly once, being put into the environment."""
+    token = "KGAT_" + "a" * 32
+    source, _ = _worker_source(tmp_path, token=token)
+    assert source.count(token) == 1
+    assert 'KAGGLE_API_TOKEN"] = ' in source
+    for line in source.splitlines():
+        if token in line:
+            assert "print" not in line
+
+
+def test_worker_only_takes_a_job_addressed_to_it_or_to_everyone(tmp_path):
+    source, _ = _worker_source(tmp_path)
+    assert "WORKER_LABEL in (job.get(\"workers\") or [WORKER_LABEL])" in source
+
+
+def test_setup_is_identical_between_render_and_worker_modes(tmp_path):
+    """The thing that renders frames is the same render_setup.py either
+    way -- a warm worker must not be able to drift into rendering
+    differently from a one-shot job."""
+    settings = nb.RenderSettings(1920, 1080, 128)
+    render = nb.build([1, 2], settings, "me/scene-blend", tmp_path / "r",
+                      "me/scene-render-1")
+    worker = nb.build([], settings, "me/scene-blend", tmp_path / "w2",
+                      "me/scene-worker-2", mode="worker",
+                      control_slug="me/ctl", token="KGAT_" + "0" * 32,
+                      worker_label="acct0")
+    render_cells = json.loads(render.read_text(encoding="utf-8"))["cells"]
+    worker_cells = json.loads(worker.read_text(encoding="utf-8"))["cells"]
+    # Cells 1-3 (preflight, Blender, render_setup.py) and the telemetry
+    # thread are shared; only the last cell differs.
+    assert [c["source"] for c in render_cells[1:4]] == \
+        [c["source"] for c in worker_cells[1:4]]
+    assert render_cells[-1]["source"] != worker_cells[-1]["source"]

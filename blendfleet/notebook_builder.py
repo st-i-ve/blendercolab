@@ -84,8 +84,68 @@ def _code(src: str) -> dict:
             "outputs": [], "source": src.strip("\n").splitlines(keepends=True)}
 
 
+# ---------------------------------------------------------------------------
+# WARM WORKERS, AND THE ONE THING THAT MAKES THEM AWKWARD.
+#
+# A pushed Kaggle kernel is a BATCH job: it runs every cell top to bottom
+# and the session ends when the last one does. Nothing can talk to a
+# running kernel -- there is no API for "send this session a command". So a
+# machine that comes up, waits, and renders when told has to find out about
+# the job by ASKING, not by being told: it polls.
+#
+# What it polls is a "job file" the app publishes as a new version of a
+# small control dataset. Reading that from inside the kernel needs the
+# Kaggle API, which needs a token -- and that is the awkward part, so it is
+# stated plainly rather than buried:
+#
+#   The token embedded in a worker notebook is THAT SAME ACCOUNT'S OWN
+#   token. Nobody's credentials travel to anybody else's machine: the
+#   kernel pushed to a friend's account carries only the friend's token,
+#   running on the friend's own session. The kernel is private
+#   (is_private=True below), and the token is read from a variable that is
+#   never printed or written to /kaggle/working.
+#
+# It is still a token sitting in a notebook, and a kernel accidentally made
+# public would expose it. Warm mode is therefore opt-in per launch, never
+# the default, and the app tells the user what it is doing.
+#
+# THE OTHER COST, which is not technical: a session bills GPU quota by
+# wall-clock, not by compute. A machine waiting for work spends a friend's
+# 30h/week at exactly the same rate as one rendering. IDLE_TIMEOUT_S is
+# what bounds that, and the worker shuts ITSELF down -- not the app -- so
+# an app that crashes or a laptop that sleeps cannot strand a session
+# quietly eating quota.
+# ---------------------------------------------------------------------------
+IDLE_TIMEOUT_S = 600            # 10 minutes, the user's own figure
+JOB_POLL_SECONDS = 10
+# Kaggle caps a session well before this, but a worker that has been up for
+# eleven hours has stopped being "warm" and started being a leak.
+MAX_WORKER_LIFETIME_S = 10 * 3600
+
+
 def build(frames: list[int], settings: RenderSettings, dataset_slug: str,
-          out_dir: Path, kernel_slug: str) -> Path:
+          out_dir: Path, kernel_slug: str, *, mode: str = "render",
+          control_slug: str | None = None, token: str | None = None,
+          worker_label: str | None = None) -> Path:
+    """Write the notebook and its kernel-metadata.json.
+
+    `mode="render"` is the one-shot job: render `frames`, then the session
+    ends. `mode="worker"` is a warm machine: identical setup, then a wait
+    loop that polls `control_slug` for work and shuts itself down after
+    IDLE_TIMEOUT_S with nothing to do.
+
+    Warm mode needs `token` (that account's OWN token -- see the note
+    above), `control_slug` and `worker_label`; it refuses rather than
+    producing a notebook that would come up and wait forever for a job it
+    has no way to hear about.
+    """
+    if mode not in ("render", "worker"):
+        raise ValueError(f"unknown notebook mode {mode!r}")
+    if mode == "worker" and not (control_slug and token and worker_label):
+        raise ValueError(
+            "worker mode needs control_slug, token and worker_label -- "
+            "without all three the machine would start, spend quota and "
+            "never be able to learn about a job")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     c1 = f'''
@@ -279,7 +339,105 @@ for f in sorted(glob.glob(f"{{OUT}}/*")):
 _telemetry_stop.set()
 '''
 
-    nb = {"cells": [_code(c1), _code(c2), _code(c3), _code(c_telemetry), _code(c4)],
+    # Warm mode swaps the render cell for a wait loop. Everything before it
+    # -- preflight, Blender, render_setup.py, telemetry -- is IDENTICAL, so
+    # a warm worker and a one-shot render cannot drift apart in setup: the
+    # thing that renders the frames is the same render_setup.py either way.
+    c_worker = f'''
+import os, json, glob, shutil, subprocess, time, zipfile
+IDLE_TIMEOUT_S = {IDLE_TIMEOUT_S}
+POLL_S = {JOB_POLL_SECONDS}
+MAX_LIFETIME_S = {MAX_WORKER_LIFETIME_S}
+CONTROL = {control_slug!r}
+WORKER_LABEL = {worker_label!r}
+# This account's OWN token, for reading the control dataset only. Never
+# printed, never written to /kaggle/working. See the note in
+# blendfleet/notebook_builder.py.
+os.environ["KAGGLE_API_TOKEN"] = {token!r}
+
+WORK = "/kaggle/tmp/work"
+CTL = "/kaggle/tmp/ctl"
+os.makedirs(WORK, exist_ok=True)
+os.makedirs(CTL, exist_ok=True)
+OUT = "/kaggle/working/frames"
+os.makedirs(OUT, exist_ok=True)
+
+print("WORKER ready, waiting for a job", flush=True)
+
+def fetch_job():
+    """The newest job descriptor, or None. Never raises: a control dataset
+    that is briefly unreachable must not kill a warm machine -- it just
+    means there is no news this tick."""
+    try:
+        subprocess.run(
+            ["kaggle", "datasets", "download", "-d", CONTROL,
+             "-p", CTL, "--force", "--unzip"],
+            check=True, capture_output=True, timeout=120)
+        with open(os.path.join(CTL, "job.json")) as fh:
+            return json.load(fh)
+    except Exception as e:
+        print("JOBPOLL unavailable:", type(e).__name__, flush=True)
+        return None
+
+started = time.time()
+last_activity = time.time()
+seen_job = None
+
+while True:
+    if time.time() - started > MAX_LIFETIME_S:
+        print("WORKER max lifetime reached, shutting down", flush=True)
+        break
+    idle_for = time.time() - last_activity
+    if idle_for > IDLE_TIMEOUT_S:
+        print(f"WORKER idle {{int(idle_for)}}s, shutting down", flush=True)
+        break
+
+    job = fetch_job()
+    # A job is ours if it names us, or names nobody (a fleet-wide job).
+    mine = (job and job.get("id") != seen_job
+            and WORKER_LABEL in (job.get("workers") or [WORKER_LABEL]))
+    if not mine:
+        print(f"WORKER idle {{int(idle_for)}}s", flush=True)
+        time.sleep(POLL_S)
+        continue
+
+    seen_job = job["id"]
+    frames = job.get("frames") or []
+    print(f"JOB {{seen_job}} frames={{len(frames)}}", flush=True)
+    blend = f"{{WORK}}/scene.blend"
+    shutil.copy(BLEND, blend)          # /kaggle/input is READ-ONLY
+    env = os.environ.copy()
+    env.update({{"BR_RES_X": str(job.get("resX", RES_X)),
+                "BR_RES_Y": str(job.get("resY", RES_Y)),
+                "BR_SAMPLES": str(job.get("samples", SAMPLES)),
+                "BR_FORMAT": job.get("format", FMT),
+                "BR_OUTPUT": f"{{OUT}}/f_"}})
+    done, failed = [], []
+    for frame in frames:
+        t0 = time.time()
+        p = subprocess.run([BBIN, blend, "-b", "-noaudio", "-P",
+                            "/kaggle/working/render_setup.py", "-f", str(frame)],
+                           env=env, text=True, stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT)
+        ok = p.returncode == 0
+        (done if ok else failed).append(frame)
+        print(f"FRAME {{frame}} {{'ok' if ok else 'FAILED'}} "
+              f"{{time.time() - t0:.1f}}s", flush=True)
+        if not ok:
+            print(p.stdout[-1500:], flush=True)
+        print(f"PROGRESS {{len(done)}}/{{len(frames)}}", flush=True)
+    print("DONE", sorted(done), "FAILED", sorted(failed), flush=True)
+    # The clock restarts from the END of the work, not its start: a job
+    # that took an hour must not count as an hour of idling.
+    last_activity = time.time()
+
+_telemetry_stop.set()
+print("WORKER stopped", flush=True)
+'''
+
+    render_cell = c_worker if mode == "worker" else c4
+    nb = {"cells": [_code(c1), _code(c2), _code(c3), _code(c_telemetry),
+                    _code(render_cell)],
           "metadata": {"kernelspec": {"display_name": "Python 3",
                                       "language": "python", "name": "python3"},
                        "language_info": {"name": "python"}},
@@ -301,6 +459,10 @@ _telemetry_stop.set()
         # were dropped (docs/machine-shape-findings.md, section 2).
         "machine_shape": MACHINE_SHAPE,
         "enable_internet": True,
+        # Only the scene. The control dataset is deliberately NOT attached:
+        # an attached dataset is pinned at session start, so a worker would
+        # never see a new version of it -- which is the entire mechanism.
+        # It is fetched over the API inside the loop instead.
         "dataset_sources": [dataset_slug],
         "competition_sources": [],
         "kernel_sources": [],
