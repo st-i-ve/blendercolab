@@ -41,7 +41,7 @@ def main() -> int:
     # install with no accounts yet) is never at risk of drifting from
     # whatever Dashboard's own settings-driven window state later reads.
     settings = Settings.load()
-    apply(app, settings.accent)
+    apply(app, settings.accent, settings.theme)
     icon = _icon_path()
     if icon is not None:
         app.setWindowIcon(QIcon(str(icon)))

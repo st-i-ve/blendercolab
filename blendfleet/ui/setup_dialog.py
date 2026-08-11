@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLineEdit,
 
 from blendfleet.accounts import Account, AccountStore
 from blendfleet.ui.messages import explain
-from blendfleet.ui.theme import TEXT_SECONDARY, WARNING, current_accent
+from blendfleet.ui.theme import current_accent, current_theme
 
 # Verification state colours, pulled from the one app-wide palette
 # (blendfleet.ui.theme) so this dialog is never a separate look from the
@@ -116,9 +116,9 @@ class SetupDialog(QDialog):
 
     # ---------------- rendering ----------------
     def _refresh(self) -> None:
-        color_checking = _wash(TEXT_SECONDARY)
+        color_checking = _wash(current_theme().ink_3)
         color_verified = _verified_color()
-        color_unverified = _wash(WARNING)
+        color_unverified = _wash(current_theme().warn)
         self.list.clear()
         for a in self.store.list():
             item = QListWidgetItem()

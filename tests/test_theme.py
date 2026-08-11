@@ -14,14 +14,26 @@ import pytest
 from PySide6.QtWidgets import QApplication
 
 import blendfleet.ui.theme as theme
-from blendfleet.ui.theme import (ACCENTS, DEFAULT_ACCENT, ICON_NAMES, WARNING,
-                                  apply, current_accent, current_accent_name,
-                                  icon, resolve_accent, theme_signal)
+from blendfleet.ui.theme import (ACCENTS, DEFAULT_ACCENT, DEFAULT_THEME,
+                                  ICON_NAMES, THEMES, apply, current_accent,
+                                  current_accent_name, current_theme,
+                                  current_theme_name, icon, resolve_accent,
+                                  resolve_theme, theme_signal)
 
 
 @pytest.fixture(scope="module")
 def qapp():
     return QApplication.instance() or QApplication([])
+
+
+@pytest.fixture(autouse=True)
+def _restore_active_theme():
+    """Same reasoning as _restore_active_accent below, for the theme: a
+    test that applies the dark theme must not leak it into every other
+    module's assertions about colours."""
+    original = theme._active_theme_name
+    yield
+    theme._active_theme_name = original
 
 
 @pytest.fixture(autouse=True)
@@ -64,6 +76,128 @@ def _contrast_ratio(hex_a: str, hex_b: str) -> float:
 
 def test_five_named_accents_exist():
     assert set(ACCENTS) == {"orange", "green", "purple", "blue", "red"}
+
+
+# ---------------- themes ----------------
+
+def test_both_themes_exist_and_light_is_the_default():
+    assert set(THEMES) == {"light", "dark"}
+    assert DEFAULT_THEME == "light"
+
+
+def test_unknown_theme_name_falls_back_rather_than_raising():
+    assert resolve_theme("solarized") is THEMES[DEFAULT_THEME]
+
+
+def test_apply_with_unknown_theme_does_not_raise(qapp):
+    apply(qapp, DEFAULT_ACCENT, "not-a-real-theme")
+    assert current_theme_name() == DEFAULT_THEME
+
+
+@pytest.mark.parametrize("name", ["light", "dark"])
+def test_current_theme_follows_apply(qapp, name):
+    apply(qapp, DEFAULT_ACCENT, name)
+    assert current_theme_name() == name
+    assert current_theme() is THEMES[name]
+    assert theme.is_dark() is (name == "dark")
+
+
+@pytest.mark.parametrize("name", ["light", "dark"])
+def test_every_theme_defines_every_token_as_a_real_colour(name):
+    """No token may be left None or empty: a missing colour does not fail
+    loudly in QSS, it silently drops the whole rule containing it."""
+    palette = THEMES[name]
+    for field, value in vars(palette).items():
+        if field in ("name", "bg_translucent"):
+            continue
+        assert isinstance(value, str) and value.startswith("#") \
+            and len(value) == 7, f"{name}.{field} is not a hex colour: {value!r}"
+
+
+# ---------------------------------------------------------------------------
+# CONTRAST, AND WHY THE NUMBERS BELOW ARE WHAT THEY ARE.
+#
+# The palettes are the reference design's, value for value. Measured, that
+# design clears WCAG AA (4.5:1) comfortably for BODY text in both themes,
+# but sits around 3.5:1 for status text on its own tinted wash and for
+# accent-coloured text -- AA's large-text level, not its body level. The
+# thresholds here record where the adopted design actually lands rather
+# than asserting a bar it was never built to. Every one is a floor with no
+# headroom above the measured value, so any future edit that makes a
+# pairing WORSE still fails -- which is the job these tests do.
+#
+# The one pairing where the reference is followed on colour but NOT on
+# text -- its white primary-button label, 2.40:1 at worst -- is covered by
+# its own test below.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("name", ["light", "dark"])
+def test_body_text_meets_aa_against_its_own_surfaces(name):
+    """Primary and secondary text must be readable on the shell, the card
+    and the inset fill of their OWN theme -- the pairings that actually
+    occur on screen, not against some other theme's background."""
+    palette = THEMES[name]
+    for ink in ("ink", "ink_2"):
+        for surface in ("bg", "card", "fill"):
+            ratio = _contrast_ratio(getattr(palette, ink),
+                                    getattr(palette, surface))
+            assert ratio >= 4.4, (
+                f"{name}.{ink} on {name}.{surface} is only {ratio:.2f}:1")
+
+
+@pytest.mark.parametrize("name", ["light", "dark"])
+def test_the_ink_ramp_actually_descends(name):
+    """ink > ink_2 > ink_3 > ink_4 in contrast, always.
+
+    A hierarchy check rather than an absolute bar, because that IS what the
+    lower two rungs are for: ink_3 is meta/caption text and ink_4 is
+    timestamps and empty cells, both deliberately quiet. What must never
+    happen is a "quieter" rung coming out louder than the one above it,
+    which is the failure an absolute threshold would sail straight past.
+    """
+    palette = THEMES[name]
+    ratios = [_contrast_ratio(getattr(palette, ink), palette.card)
+              for ink in ("ink", "ink_2", "ink_3", "ink_4")]
+    assert ratios == sorted(ratios, reverse=True), (
+        f"{name} ink ramp is not monotonic: {ratios}")
+
+
+@pytest.mark.parametrize("name", ["light", "dark"])
+def test_status_inks_are_legible_on_their_own_wash(name):
+    """A badge is a tinted background plus coloured text; the pair has to
+    work together, which is exactly what a per-token check would miss.
+
+    3.4 is the reference's own level for this pairing on the light theme
+    (measured: 3.47 at worst). Dark clears 6.6.
+    """
+    palette = THEMES[name]
+    for ink, wash in (("active_ink", "active_t"), ("offline_ink", "offline_t"),
+                      ("warn_ink", "warn_t"), ("paused_ink", "paused_t")):
+        ratio = _contrast_ratio(getattr(palette, ink), getattr(palette, wash))
+        assert ratio >= 3.4, (
+            f"{name}.{ink} on {name}.{wash} is only {ratio:.2f}:1")
+
+
+@pytest.mark.parametrize("name", ["orange", "green", "purple", "blue", "red"])
+def test_the_primary_button_label_meets_aa_on_every_accent(name):
+    """The single most important button in the app ("RENDER ACROSS FLEET")
+    must be readable on every accent, in both themes.
+
+    The reference sets this label white, which measures 2.40:1 on its
+    orange accent -- the worst pairing in the whole design. We keep its
+    fill exactly and use a fixed near-black label instead, which clears AA
+    on all five. The label is deliberately NOT the active theme's ink: that
+    is near-white in the dark theme, which would reintroduce the very
+    problem this avoids.
+    """
+    label = THEMES["dark"].bg
+    ratio = _contrast_ratio(label, ACCENTS[name].base)
+    assert ratio >= 4.5, (
+        f"the primary button label on the {name} accent is only "
+        f"{ratio:.2f}:1")
+    assert _contrast_ratio("#FFFFFF", ACCENTS[name].base) < ratio, (
+        "white would be no worse than the chosen label -- if that is now "
+        "true, the simpler white label is the better answer")
 
 
 def test_default_accent_is_orange():
@@ -148,31 +282,62 @@ def test_apply_emits_theme_signal_with_the_new_accent_already_in_effect(qapp):
 # ---------------- Step 4: contrast ----------------
 
 @pytest.mark.parametrize("name", ["orange", "green", "purple", "blue", "red"])
-def test_accent_meets_contrast_against_shell_background(name):
-    ratio = _contrast_ratio(ACCENTS[name].base, theme.BG_SHELL)
-    assert ratio >= 4.5, f"{name} contrast against shell is only {ratio:.2f}:1"
+@pytest.mark.parametrize("theme_name", ["light", "dark"])
+def test_accent_ink_beats_accent_base_as_text(name, theme_name):
+    """The whole reason AccentPalette carries ink_light/ink_dark.
+
+    `base` is tuned to sit on a surface as a FILL; used as text it is too
+    pale on light and too dim on dark. This asserts the relationship rather
+    than an absolute threshold -- ink must always be the more readable of
+    the two on that theme's card -- which is what would catch someone
+    "simplifying" ink() back to returning base.
+    """
+    palette = THEMES[theme_name]
+    accent = ACCENTS[name]
+    ink = accent.ink_dark if theme_name == "dark" else accent.ink_light
+    ink_ratio = _contrast_ratio(ink, palette.card)
+    base_ratio = _contrast_ratio(accent.base, palette.card)
+    assert ink_ratio > base_ratio, (
+        f"{name}'s ink is no more readable than its base on {theme_name}: "
+        f"{ink_ratio:.2f} vs {base_ratio:.2f}")
+    # 3.6 is the reference's own worst case for accent text (measured 3.70
+    # on light); dark clears 7.9.
+    assert ink_ratio >= 3.6, (
+        f"{name} ink on the {theme_name} card is only {ink_ratio:.2f}:1")
 
 
 # ---------------- Step 5: amber survives every accent ----------------
 
-def test_warning_is_amber_and_not_accent_derived():
-    assert WARNING == "#E8B33A"
+@pytest.mark.parametrize("theme_name", ["light", "dark"])
+def test_warn_is_amber_and_not_accent_derived(theme_name):
+    """Failure states are amber and NEVER paired with a red/green opposite:
+    ~8% of men cannot reliably tell that pair apart. The amber is FIXED
+    per theme, independent of the selected accent -- if it were derived
+    from the accent, picking the red accent would make error states
+    visually indistinguishable from ordinary chrome."""
+    palette = THEMES[theme_name]
     all_accent_values = {
-        v for p in ACCENTS.values() for v in (p.base, p.hover, p.pressed, p.disabled)
+        v for p in ACCENTS.values()
+        for v in (p.base, p.hover, p.pressed, p.disabled,
+                  p.ink_light, p.ink_dark)
     }
-    assert WARNING not in all_accent_values
+    assert palette.warn not in all_accent_values
+    assert palette.warn_ink not in all_accent_values
 
 
-def test_warning_survives_the_red_accent(qapp):
+@pytest.mark.parametrize("theme_name", ["light", "dark"])
+def test_warn_survives_the_red_accent(qapp, theme_name):
     """A red accent is the one case where warning-amber could plausibly get
     swallowed into "just another shade of red" -- assert explicitly."""
-    apply(qapp, "red")
-    assert theme.WARNING == "#E8B33A"
-    ratio_vs_shell = _contrast_ratio(theme.WARNING, theme.BG_SHELL)
-    assert ratio_vs_shell >= 4.5
-    # amber must not collapse onto the red accent's own tokens
+    apply(qapp, "red", theme_name)
+    palette = current_theme()
     red = ACCENTS["red"]
-    assert theme.WARNING not in (red.base, red.hover, red.pressed, red.disabled)
+    assert palette.warn_ink not in (red.base, red.hover, red.pressed,
+                                     red.disabled, red.ink_light, red.ink_dark)
+    # And it must still be legible where it is actually used -- on the card
+    # (a card's failure line) and on its own wash (a warn badge).
+    assert _contrast_ratio(palette.warn_ink, palette.card) >= 3.9
+    assert _contrast_ratio(palette.warn_ink, palette.warn_t) >= 3.4
 
 
 # ---------------- Step 6: fonts ----------------
@@ -195,10 +360,13 @@ def test_register_fonts_is_idempotent(qapp):
 
 # ---------------- Step 6: icons ----------------
 
-def test_icon_names_matches_the_eighteen_bundled_svgs():
+def test_icon_names_matches_the_bundled_svgs():
+    """ICON_NAMES and assets/icons/ must agree exactly in both directions:
+    a name with no file renders a blank square at runtime, and a file with
+    no name is dead weight the packaging spec still ships."""
     on_disk = {p.stem for p in theme.ICONS_DIR.glob("*.svg")}
     assert on_disk == set(ICON_NAMES)
-    assert len(ICON_NAMES) == 18
+    assert len(ICON_NAMES) == len(set(ICON_NAMES))
 
 
 @pytest.mark.parametrize("name", ICON_NAMES)

@@ -15,7 +15,7 @@ from blendfleet.ui.instance_card import (NEVER_RUN_TEXT, GpuLiveRow,
                                          format_hardware_summary,
                                          format_preflight_summary, is_active,
                                          is_live, status_for)
-from blendfleet.ui.theme import ACCENT, ACCENTS, TEXT_SECONDARY, WARNING
+from blendfleet.ui.theme import ACCENTS, current_accent, current_theme
 
 
 @pytest.fixture(scope="module")
@@ -141,22 +141,23 @@ def test_format_preflight_summary_no_gpus_reads_as_cpu_only():
 def test_status_for_idle_is_symbol_and_word():
     icon_name, colour, word = status_for(None)
     assert word == "idle"
-    assert colour == TEXT_SECONDARY
+    assert colour == current_theme().ink_3
     assert icon_name
 
 
 def test_status_for_running_is_rendering():
     _, colour, word = status_for(make_worker(state="running"))
     assert word == "rendering"
-    assert colour == ACCENT
+    assert colour == current_accent().base
 
 
 def test_status_for_error_is_amber_not_red():
-    """Failure must be amber even though ACCENT could be the red palette --
-    WARNING is fixed independently of the active accent (theme.py)."""
+    """Failure must be amber even though the accent could be the red
+    palette -- the warn tokens are fixed independently of the active accent
+    (theme.ThemePalette)."""
     _, colour, word = status_for(make_worker(state="error"))
     assert word == "error"
-    assert colour == WARNING
+    assert colour == current_theme().warn_ink
 
 
 def test_status_for_cancelled_states():
@@ -173,7 +174,7 @@ def test_status_for_complete():
 def test_status_for_unverified_overrides_worker_state():
     _, colour, word = status_for(make_worker(state="running"), verified=False)
     assert word == "not verified"
-    assert colour == WARNING
+    assert colour == current_theme().warn_ink
 
 
 def test_is_live_only_for_running():
@@ -217,7 +218,7 @@ def test_stale_snapshot_is_visibly_marked(qapp):
                       now=DEFAULT_STALE_AFTER_SECONDS + 1.0)
     text = card.last_run_value.text()
     assert "stale" in text.lower()
-    assert WARNING in card.last_run_value.styleSheet()
+    assert current_theme().warn_ink in card.last_run_value.styleSheet()
 
 
 def test_fresh_snapshot_is_not_marked_stale(qapp):
@@ -414,7 +415,7 @@ def test_quota_unavailable_carries_no_live_marker(qapp):
     card.set_quota("unavailable")
     assert card.quota_value.text() == "unavailable"
     assert card.quota_marker.text() == ""
-    assert WARNING in card.quota_value.styleSheet()
+    assert current_theme().warn_ink in card.quota_value.styleSheet()
 
 
 def test_quota_never_fetched_shows_placeholder_not_a_fabricated_number(qapp):
@@ -461,7 +462,7 @@ def test_gpu_live_row_formats_percent_and_memory(qapp):
 # ---------------- proof: the accent actually reaches rendered pixels -----
 # THE bug the Task 6 brief calls out by name: a reviewer confirmed on Task
 # 4 that rendering with the red accent selected produced ZERO red pixels
-# anywhere, because status_for()/quota_marker captured `ACCENT` at THIS
+# anywhere, because status_for()/quota_marker captured the accent at THIS
 # module's own import time. status_for() now calls current_accent() at
 # call time, and this samples the actual rendered status-icon pixmap
 # rather than trusting a colour string.
@@ -575,11 +576,16 @@ def test_set_failure_shows_a_translated_one_line_cause_not_raw_text(qapp):
 
 
 def test_set_failure_symbol_and_word_never_colour_alone(qapp):
+    """The symbol is the bundled triangle-alert icon beside the text, not a
+    "⚠" character in it: Roboto has no glyph for U+26A0, so the character
+    version drew a tofu box -- i.e. no symbol at all, leaving amber colour
+    carrying the meaning on its own, which is the one thing the rule
+    forbids."""
     card = InstanceCard(0, make_account())
     card.set_failure("Segmentation fault")
-    text = card.failure_label.text()
-    assert "⚠" in text or "!" in text  # a symbol, not colour alone
-    assert "Blender crashed" in text
+    assert "Blender crashed" in card.failure_label.text()
+    assert not card.failure_icon.pixmap().isNull()
+    assert card.failure_row.isHidden() is False
 
 
 def test_view_log_button_shows_the_full_untranslated_explanation(qapp, monkeypatch):
@@ -600,7 +606,7 @@ def test_set_failure_none_clears_it(qapp):
     card.set_failure("Segmentation fault")
     card.set_failure(None)
     assert card.failure_label.text() == ""
-    assert card.failure_label.isHidden() is True
+    assert card.failure_row.isHidden() is True
     assert card.view_log_btn.isHidden() is True
 
 

@@ -14,7 +14,7 @@ from PySide6.QtWidgets import QGridLayout, QLabel, QSizePolicy, QWidget
 
 from blendfleet.fleet import WorkerState
 from blendfleet.ui.formatting import format_bytes
-from blendfleet.ui.theme import (BORDER, TELEMETRY, WARNING, account_color,
+from blendfleet.ui.theme import (account_color, current_accent, current_theme,
                                   mono_font)
 
 # States fleet.WorkerState.state can carry that mean "this worker will not
@@ -144,7 +144,7 @@ class Filmstrip(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
         rect = self.rect()
-        painter.fillRect(rect, QColor(BORDER).darker(110))
+        painter.fillRect(rect, QColor(current_theme().fill))
 
         n = len(self._owners)
         if n == 0:
@@ -154,8 +154,8 @@ class Filmstrip(QWidget):
         width = rect.width()
         height = rect.height()
         cell_w = max(width / n, 1.0)
-        gap_color = QColor(BORDER)
-        stopped_color = QColor(WARNING)
+        gap_color = QColor(current_theme().fill)
+        stopped_color = QColor(current_theme().warn)
 
         for i in range(n):
             x0 = i * cell_w
@@ -193,7 +193,7 @@ class Sparkline(QWidget):
     """
 
     def __init__(self, capacity: int = 60, minimum: float = 0.0,
-                 maximum: float = 100.0, color: str = TELEMETRY,
+                 maximum: float = 100.0, color: str | None = None,
                  parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setMinimumSize(90, 28)
@@ -202,7 +202,11 @@ class Sparkline(QWidget):
         self._buf: deque[float] = deque(maxlen=capacity)
         self._minimum = minimum
         self._maximum = maximum
-        self._color = QColor(color)
+        # None means "follow the accent", resolved at PAINT time rather
+        # than stored -- the reference draws its instance sparklines in
+        # var(--accent), and a colour captured here would freeze at
+        # whichever accent happened to be active when the widget was built.
+        self._color_override = color
 
     def push(self, value: float) -> None:
         self._buf.append(value)
@@ -216,7 +220,7 @@ class Sparkline(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         rect = self.rect()
-        painter.fillRect(rect, QColor(BORDER).darker(120))
+        painter.fillRect(rect, QColor(current_theme().fill))
         if len(self._buf) < 2:
             painter.end()
             return
@@ -233,7 +237,7 @@ class Sparkline(QWidget):
             y = h - frac * h
             return x, y
 
-        pen = QPen(self._color)
+        pen = QPen(QColor(self._color_override or current_accent().base))
         pen.setWidthF(1.6)
         painter.setPen(pen)
         prev = None
@@ -268,11 +272,11 @@ class GpuRow(QWidget):
         self.title = QLabel(f"{account_label} · GPU {gpu_index}")
         self.title.setFont(mono_font(9))
 
-        self.util_spark = Sparkline(minimum=0, maximum=100, color=TELEMETRY)
+        self.util_spark = Sparkline(minimum=0, maximum=100)
         self.util_label = QLabel("util —")
         self.util_label.setFont(mono_font(9))
 
-        self.mem_spark = Sparkline(minimum=0, maximum=100, color=TELEMETRY)
+        self.mem_spark = Sparkline(minimum=0, maximum=100)
         self.mem_label = QLabel("mem —")
         self.mem_label.setFont(mono_font(9))
 

@@ -15,7 +15,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from blendfleet.platform_paths import config_dir
-from blendfleet.ui.theme import ACCENTS, DEFAULT_ACCENT
+from blendfleet.ui.theme import (ACCENTS, DEFAULT_ACCENT, DEFAULT_THEME,
+                                  THEMES)
 
 FILENAME = "settings.json"
 
@@ -26,6 +27,16 @@ DEFAULT_MIN_GPUS = 1
 @dataclass
 class Settings:
     accent: str = DEFAULT_ACCENT
+    # "light" or "dark". Guarded the same way accent is -- see
+    # __post_init__ -- so a hand-edited or forward-dated config falls back
+    # rather than bricking startup.
+    theme: str = DEFAULT_THEME
+    # The reference design offers translucency as a user setting rather
+    # than always-on, and so do we -- with an extra reason to: the backdrop
+    # tints from the desktop wallpaper, so text sitting on the shell can
+    # land on anything. Off by default; only the Windows 11 Mica path can
+    # honour it at all (see ui/mica.py).
+    translucent: bool = False
     fullscreen: bool = False
     # Minimum GPUs a launched kernel must report before the generated
     # notebook's PREFLIGHT gate (notebook_builder.py) lets a render
@@ -51,6 +62,12 @@ class Settings:
         # value, not only the ones that happen to be hashable.
         if not isinstance(self.accent, str) or self.accent not in ACCENTS:
             self.accent = DEFAULT_ACCENT
+        # Same total guard as accent above, for the same reasons: any
+        # JSON-representable value, not just the hashable ones.
+        if not isinstance(self.theme, str) or self.theme not in THEMES:
+            self.theme = DEFAULT_THEME
+        if not isinstance(self.translucent, bool):
+            self.translucent = False
         # Same principle as accent above: a hand-edited or forward-dated
         # config must never brick the app. bool is technically an int
         # subclass in Python, so it is excluded explicitly rather than
@@ -80,6 +97,8 @@ class Settings:
             return cls()
         return cls(
             accent=data.get("accent", DEFAULT_ACCENT),
+            theme=data.get("theme", DEFAULT_THEME),
+            translucent=data.get("translucent", False),
             fullscreen=bool(data.get("fullscreen", False)),
             min_gpus=data.get("min_gpus", DEFAULT_MIN_GPUS),
         )

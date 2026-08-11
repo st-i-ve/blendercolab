@@ -8,11 +8,12 @@ from typing import Callable
 
 from PySide6.QtCore import QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QKeySequence, QShortcut
-from PySide6.QtWidgets import (QComboBox, QFileDialog, QFormLayout,
+from PySide6.QtWidgets import (QComboBox, QFileDialog, QFormLayout, QFrame,
                                QHBoxLayout, QHeaderView, QLabel, QMainWindow,
                                QMessageBox, QProgressBar, QPushButton,
-                               QSizePolicy, QSpinBox, QTableWidget,
-                               QTableWidgetItem, QVBoxLayout, QWidget)
+                               QSizePolicy, QSpinBox, QStackedWidget,
+                               QTableWidget, QTableWidgetItem, QVBoxLayout,
+                               QWidget)
 
 from blendfleet.accounts import AccountStore
 from blendfleet.assignment import estimate
@@ -22,16 +23,33 @@ from blendfleet.log_stream import stream_progress
 from blendfleet.notebook_builder import RenderSettings
 from blendfleet.settings import Settings
 from blendfleet.ui.charts import Filmstrip, GpuPanel
+from blendfleet.ui.components import (EventLog, HealthPanel, IconButton,
+                                      NotificationPanel, OfflineBanner,
+                                      StatTile, ToastStack)
+from blendfleet.ui.flow_layout import FlowLayout
 from blendfleet.ui.instance_card import InstanceCard
 from blendfleet.ui.messages import explain
-from blendfleet.ui.settings_view import SettingsView
+from blendfleet.ui.settings_view import SettingsPanel, SettingsView
 from blendfleet.ui.setup_dialog import SetupDialog
-from blendfleet.ui.theme import (TEXT_SECONDARY, WARNING, brand_icon,
-                                  current_accent, icon, mono_font,
-                                  theme_signal)
+from blendfleet.ui import mica
+from blendfleet.ui.sidebar import Sidebar
+from blendfleet.ui.title_bar import TitleBar, FramelessMixin
+from blendfleet.ui.theme import (current_accent, current_theme, icon,
+                                  is_dark, mono_font, theme_signal,
+                                  tracked_font)
 from blendfleet.ui.upload_view import UploadView
 
 SETTINGS_URL = "https://www.kaggle.com/settings"
+# The header title per page. Keyed by the same page keys Sidebar.PAGES
+# uses -- one dict, so a page can never be navigable under one name and
+# titled with another.
+PAGE_TITLES = {
+    "dashboard": "Dashboard",
+    "files": "Files",
+    "instances": "Instances",
+    "logs": "Logs",
+    "settings": "Settings",
+}
 SECONDS_PER_FRAME_DEFAULT = 57.1     # measured: 1920x1080, 128spp, Tesla P100
 POLL_INTERVAL_MS = 30_000            # real network calls: kernel status, quota
 LIVE_INTERVAL_MS = 2_000             # cheap: drain in-memory progress/telemetry
@@ -62,6 +80,10 @@ MAX_CONTENT_WIDTH = 1600
 # number entry field is not more usable at 1600px than at 300px.
 MAX_CONTROLS_WIDTH = 640
 CONTROL_WIDTH = 160
+# The reference's instance grid is repeat(auto-fill, minmax(320px, 1fr)) --
+# this is that 320. Cards below this width start wrapping their quota and
+# hardware lines into unreadable ribbons.
+INSTANCE_CARD_MIN_WIDTH = 320
 
 
 class _LaunchWorker(QThread):
@@ -163,7 +185,7 @@ class _CallWorker(QThread):
             self.succeeded.emit(result)
 
 
-class Dashboard(QMainWindow):
+class Dashboard(FramelessMixin, QMainWindow):
     def __init__(self, store: AccountStore, fleet_factory, verifier,
                  settings: Settings | None = None) -> None:
         super().__init__()
@@ -219,6 +241,14 @@ class Dashboard(QMainWindow):
         self._failure_logs: dict[str, str] = {}
         self._log_fetch_workers: dict[str, _CallWorker] = {}
         self._last_state: FleetState | None = None
+        # label -> the worker state already written to the fleet log, so a
+        # transition is logged once rather than on every refresh tick.
+        self._logged_states: dict[str, str] = {}
+        # Header state: unread notification count, and what the health
+        # panel reports about the last poll.
+        self._unread = 0
+        self._last_poll_ms: int | None = None
+        self._last_poll_at: str | None = None
         # Keyed by kernel_slug (stable across polls) rather than kept on the
         # WorkerState instance: fleet.poll() rebuilds fresh WorkerState
         # objects from disk every timer tick, which would otherwise orphan
@@ -287,14 +317,44 @@ class Dashboard(QMainWindow):
         self.resize(1180, 760)   # only matters until show_at_startup() runs;
                                  # see its docstring for why that is not show()
 
+        # Which page the stack is showing. Set properly by _show_page below;
+        # seeded here so _refresh_* can run before the shell finishes
+        # building.
+        self.current_page = "dashboard"
+
+        # The window draws its own chrome (ui/title_bar.py): the OS bar is
+        # hidden, so the app is styled edge to edge instead of sitting under
+        # a grey Windows strip. Called before the central widget is built so
+        # the flag is set once, not toggled on a realised window.
+        self._init_frameless()
+
         root = QWidget()
-        outer = QHBoxLayout(root)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
+        root.setObjectName("shell")
+        shell = QVBoxLayout(root)
+        shell.setContentsMargins(0, 0, 0, 0)
+        shell.setSpacing(0)
         self.setCentralWidget(root)
 
-        outer.addWidget(self._build_rail())
+        # Floated over the shell, bottom-right, rather than laid out in it
+        # -- a toast must not reflow the page it appears over.
+        self.toasts = ToastStack(root)
+        self.toasts.setFixedWidth(360)
+
+        self.title_bar = TitleBar("BlendFleet")
+        self.title_bar.close_requested.connect(self.close)
+        shell.addWidget(self.title_bar)
+
+        body = QWidget()
+        body.setObjectName("shellBody")
+        outer = QHBoxLayout(body)
+        # The sidebar floats inset from the window edge (it has its own
+        # rounded corners) rather than sitting flush against it, so the
+        # shell -- not the sidebar -- owns this margin.
+        outer.setContentsMargins(GAP, 0, 0, GAP)
+        outer.setSpacing(GAP)
+        outer.addWidget(self._build_sidebar())
         outer.addWidget(self._build_main(), 1)
+        shell.addWidget(body, 1)
 
         # F11 toggles real (borderless, chrome-free) full screen. A real
         # toggle needs a real way back out that does not depend on the user
@@ -332,62 +392,55 @@ class Dashboard(QMainWindow):
         self._refresh_views()
 
     # ---------------- layout ----------------
-    def _build_rail(self) -> QWidget:
-        rail = QWidget()
-        rail.setObjectName("rail")
-        # Wide enough for a card's quota/hardware line, not just a name --
-        # the old fixed-width rail (230px) was sized for _AccountRow's
-        # single line of text; InstanceCard needs room for a GPU row's
-        # sparkline + numbers without wrapping every value.
-        rail.setFixedWidth(320)
-        v = QVBoxLayout(rail)
-        v.setContentsMargins(0, GAP, 0, GAP)
-        v.setSpacing(GAP)
+    def _build_sidebar(self) -> QWidget:
+        """The sidebar is NAVIGATION now, not content.
 
-        # The brand mark, tinted to the active accent (see theme.brand_icon)
-        # rather than shipped as a fixed-colour logo -- so it belongs to the
-        # app's own chrome and follows whichever accent the user picked,
-        # instead of reading as a sticker pasted over it. Kept on self (not
-        # a local var) because _on_accent_changed has to re-tint it after a
-        # live accent switch -- this pixmap was painted once, at this
-        # moment, and never repaints itself on its own.
-        brand = QHBoxLayout()
-        brand.setContentsMargins(8, 0, 8, 8)
-        brand.setSpacing(8)
-        self.brand_mark = QLabel()
-        self.brand_mark.setPixmap(brand_icon(current_accent().base, 28).pixmap(28, 28))
-        brand.addWidget(self.brand_mark)
-        brand.addWidget(QLabel("<b>BlendFleet</b>"), 1)
-        self.settings_btn = QPushButton()
-        self.settings_btn.setIcon(icon("settings", TEXT_SECONDARY, 16))
-        self.settings_btn.setToolTip("Settings — accent colour")
-        self.settings_btn.setFixedSize(30, 30)
-        self.settings_btn.clicked.connect(self._open_settings)
-        brand.addWidget(self.settings_btn)
-        v.addLayout(brand)
+        It used to be a 320px rail holding one InstanceCard per account --
+        i.e. the app's main content parked in the place a sidebar normally
+        puts its navigation, which is why the app had no navigation at all
+        and everything else had to share one scrolling column. The cards
+        moved to the Dashboard page (_build_dashboard_page); this holds the
+        five destinations.
 
-        title = QLabel("<b>instances</b>")
-        title.setContentsMargins(8, 0, 8, 4)
-        v.addWidget(title)
+        Sidebar emits page_selected and nothing more -- it never touches the
+        QStackedWidget itself, so the two can be tested apart.
+        """
+        sidebar = Sidebar()
+        sidebar.page_selected.connect(self._show_page)
+        self.sidebar = sidebar
+        # Kept under its historical name: this is still "the control that
+        # takes you to settings", and both the tests and _open_settings
+        # refer to it by that name. It is now a nav item that switches to
+        # the Settings PAGE rather than a gear that opens a modal.
+        self.settings_btn = sidebar.buttons["settings"]
+        return sidebar
 
-        # One InstanceCard per account (see blendfleet/ui/instance_card.py):
-        # quota (live) plus EITHER last-known hardware OR (only while that
-        # account is actually rendering) live per-GPU gauges. Rebuilt only
-        # by _refresh_accounts -- i.e. when the account list itself
-        # changes -- never on a poll/telemetry tick, so a card's Sparkline
-        # history survives every tick in between.
-        self.rail_rows_holder = QWidget()
-        self.rail_rows_layout = QVBoxLayout(self.rail_rows_holder)
-        self.rail_rows_layout.setContentsMargins(4, 0, 4, 0)
-        self.rail_rows_layout.setSpacing(GAP)
-        v.addWidget(self.rail_rows_holder)
-        v.addStretch(1)
+    def _section(self, title: str, meta: str = "") -> QWidget:
+        """A section header: tracked caps, an optional mono sub-note, and a
+        hairline rule filling the rest of the row.
 
-        add_btn = QPushButton("+ add account")
-        add_btn.clicked.connect(self._manage)
-        v.addWidget(add_btn)
-        self.rail = rail
-        return rail
+        The rule is a real QFrame because QSS has no ::after pseudo-element
+        to generate one with -- see docs/design-gap-analysis.md.
+        """
+        row = QWidget()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(2, 0, 2, 0)
+        h.setSpacing(10)
+        label = QLabel(title)
+        label.setFont(tracked_font(8, tracking=22.0))
+        label.setProperty("secondary", True)
+        h.addWidget(label)
+        if meta:
+            meta_label = QLabel(meta)
+            meta_label.setFont(mono_font(8))
+            meta_label.setProperty("secondary", True)
+            h.addWidget(meta_label)
+        rule = QFrame()
+        rule.setObjectName("sectionRule")
+        rule.setFrameShape(QFrame.Shape.HLine)
+        rule.setFixedHeight(1)
+        h.addWidget(rule, 1)
+        return row
 
     def _build_main(self) -> QWidget:
         # At 2560px the rail (fixed, 320px) leaves ~2240px for "main" --
@@ -410,6 +463,7 @@ class Dashboard(QMainWindow):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.addStretch(1)
         content = QWidget()
+        content.setObjectName("contentColumn")
         content.setMaximumWidth(MAX_CONTENT_WIDTH)
         # Stretch factor 0 (the pre-fix value) means QHBoxLayout hands 100%
         # of surplus width to the flanking addStretch(1) spacers regardless
@@ -450,19 +504,196 @@ class Dashboard(QMainWindow):
         v.setContentsMargins(MARGIN, MARGIN, MARGIN, MARGIN)
         v.setSpacing(GAP)
 
+        v.addLayout(self._build_header())
+
+        # A visible degraded-state marker for the periodic status poll --
+        # see FINDING 3, task 5 fix round 1: a poll failure used to be
+        # swallowed completely silently, with nothing like quota's
+        # "unavailable" fallback. Hidden (empty) whenever the last poll
+        # succeeded.
+        #
+        # Deliberately OUTSIDE the page stack, directly under the header:
+        # "the app has lost contact with Kaggle" is true on every page, so
+        # it must be visible from every page. This is the same role the
+        # reference design gives its offline banner.
+        self.offline_banner = OfflineBanner()
+        self.offline_banner.retry_requested.connect(self._poll)
+        v.addWidget(self.offline_banner)
+        # The banner's own detail line, kept under the name the rest of the
+        # app (and its tests) already use for "what the last poll failure
+        # said". One string, one place: setting it and showing the banner
+        # cannot drift apart because they are the same widget.
+        self.poll_status_label = self.offline_banner.detail
+
+        self.pages = QStackedWidget()
+        self._pages: dict[str, QWidget] = {}
+        for key, build in (("dashboard", self._build_dashboard_page),
+                            ("files", self._build_files_page),
+                            ("instances", self._build_instances_page),
+                            ("logs", self._build_logs_page),
+                            ("settings", self._build_settings_page)):
+            page = build()
+            page.setObjectName("page")
+            self._pages[key] = page
+            self.pages.addWidget(page)
+        v.addWidget(self.pages, 1)
+        return main
+
+    def _build_header(self) -> QHBoxLayout:
+        """Page title on the left, full-screen escape hatch on the right."""
+        row = QHBoxLayout()
+        row.setContentsMargins(2, 0, 2, 6)
+        self.page_title = QLabel(PAGE_TITLES["dashboard"])
+        self.page_title.setObjectName("pageTitle")
+        self.page_title.setFont(tracked_font(17, tracking=10.0))
+        row.addWidget(self.page_title)
+        row.addStretch(1)
         # The one visible way back out of real full screen (F11) -- see
         # _toggle_fullscreen. Hidden whenever the window is NOT full screen,
-        # which is the common case, so it never competes with the controls
-        # below for a sighted user who never touches F11 at all.
-        exit_row = QHBoxLayout()
-        exit_row.addStretch(1)
+        # which is the common case, so it never competes with the page's own
+        # controls for a sighted user who never touches F11 at all.
         self.exit_fullscreen_btn = QPushButton(" Exit full screen (F11)")
-        self.exit_fullscreen_btn.setIcon(icon("x", TEXT_SECONDARY, 14))
+        self.exit_fullscreen_btn.setIcon(icon("x", current_theme().ink_2, 14))
         self.exit_fullscreen_btn.clicked.connect(self._toggle_fullscreen)
         self.exit_fullscreen_btn.setVisible(False)
-        exit_row.addWidget(self.exit_fullscreen_btn)
-        v.addLayout(exit_row)
+        row.addWidget(self.exit_fullscreen_btn)
 
+        self.health_btn = IconButton("activity", "Connection health")
+        self.health_panel = HealthPanel(self)
+        self.health_panel.rerun_requested.connect(self._poll)
+        self.health_btn.clicked.connect(
+            lambda: self.health_panel.popup_under(self.health_btn))
+        row.addWidget(self.health_btn)
+
+        self.notif_btn = IconButton("circle-alert", "Notifications")
+        self.notif_panel = NotificationPanel(self)
+        self.notif_btn.clicked.connect(self._open_notifications)
+        row.addWidget(self.notif_btn)
+        return row
+
+    def _open_notifications(self) -> None:
+        self.notif_panel.popup_under(self.notif_btn)
+        # Opening the panel IS reading them -- the bubble counts unread, so
+        # it clears here rather than on some separate "mark read" action
+        # nobody would ever click.
+        self.notif_btn.set_count(0)
+        self._unread = 0
+
+    def notify(self, message: str, tone: str = "idle") -> None:
+        """One place that reports an outcome three ways: a toast now, a
+        line in the fleet log, and an entry in the notification panel for
+        anyone who was not looking when it happened."""
+        self.toast(message, tone)
+        self.event_log.append(message, tone)
+        self.notif_panel.add(message, tone)
+        self._unread += 1
+        self.notif_btn.set_count(self._unread)
+
+    def _refresh_health(self) -> None:
+        """Fill the health panel from the polling this app already does --
+        no synthetic ping. Every row is something actually measured here."""
+        ok = not self.offline_banner.isVisible()
+        self.health_panel.set_verdict(
+            "connected" if ok else "cannot reach Kaggle",
+            "active" if ok else "offline")
+        self.health_panel.set_row(
+            "net", "reachable" if ok else "unreachable")
+        self.health_panel.set_row(
+            "latency", f"{self._last_poll_ms} ms" if self._last_poll_ms
+            else "—")
+        self.health_panel.set_row(
+            "sync", self._last_poll_at or "never")
+        reachable = sum(1 for label in self._quota_cache
+                        if self._quota_cache[label] != "unavailable")
+        self.health_panel.set_row(
+            "accounts", f"{reachable}/{len(self.store.list())}")
+
+    # ---------------- pages ----------------
+    def _build_dashboard_page(self) -> QWidget:
+        """At a glance: who is in the fleet, what each machine is doing, and
+        how far the current job has got."""
+        page = QWidget()
+        v = QVBoxLayout(page)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(GAP)
+
+        # The reference's four KPI tiles. Every figure here is one this app
+        # can actually know: there is no "fleet disk free" tile, because
+        # the notebook reports no disk telemetry -- a tile showing a number
+        # we cannot source is worse than no tile.
+        summary = QHBoxLayout()
+        summary.setSpacing(GAP)
+        self.stat_instances = StatTile("Instances online")
+        self.stat_rendering = StatTile("Rendering now")
+        self.stat_gpus = StatTile("GPUs active")
+        self.stat_frames = StatTile("Frames done")
+        for tile in (self.stat_instances, self.stat_rendering,
+                     self.stat_gpus, self.stat_frames):
+            summary.addWidget(tile, 1)
+        v.addLayout(summary)
+
+        v.addWidget(self._section("Running processes", "one file · divided frames"))
+        # One InstanceCard per account (see blendfleet/ui/instance_card.py):
+        # quota (live) plus EITHER last-known hardware OR (only while that
+        # account is actually rendering) live per-GPU gauges. Rebuilt only
+        # by _refresh_accounts -- i.e. when the account list itself
+        # changes -- never on a poll/telemetry tick, so a card's Sparkline
+        # history survives every tick in between.
+        #
+        # FlowLayout, not a column: cards reflow to as many per row as fit,
+        # which is what makes them usable now that they are on a full-width
+        # page instead of in a 320px rail.
+        # The reference's .dash-grid: content on the left, the fleet log in
+        # a fixed-width column on the right.
+        grid = QHBoxLayout()
+        grid.setSpacing(GAP + 6)
+        left = QVBoxLayout()
+        left.setSpacing(GAP)
+        grid.addLayout(left, 1)
+
+        self.instances_holder = QWidget()
+        self.instances_layout = FlowLayout(
+            self.instances_holder, spacing=GAP,
+            min_item_width=INSTANCE_CARD_MIN_WIDTH)
+        left.addWidget(self.instances_holder)
+
+        # The "approximate" wording is not hedging -- it is the honest
+        # description of what this widget can know. See charts.frame_done:
+        # the notebook reports a COUNT of successful frames, not which ones,
+        # so the strip assumes the first N of each account's stride are the
+        # finished ones. That holds exactly until a frame fails, after which
+        # every later cell for that account is shifted by one. Saying so
+        # here is the fix the review asked for: the user must not read a
+        # green cell as proof that that specific frame exists.
+        left.addWidget(self._section("GPU", "one row per physical GPU, never combined"))
+        self.gpu_panel = GpuPanel()
+        left.addWidget(self.gpu_panel)
+        left.addStretch(1)
+
+        right = QVBoxLayout()
+        right.setSpacing(GAP)
+        right.addWidget(self._section("Fleet log"))
+        self.event_log = EventLog()
+        right.addWidget(self.event_log)
+        right.addStretch(1)
+        log_column = QWidget()
+        log_column.setLayout(right)
+        log_column.setFixedWidth(336)
+        grid.addWidget(log_column, 0, Qt.AlignmentFlag.AlignTop)
+
+        v.addLayout(grid)
+        v.addStretch(1)
+        return page
+
+    def _build_files_page(self) -> QWidget:
+        """The .blend being rendered, the settings it is rendered with, and
+        the upload that gets it onto Kaggle."""
+        page = QWidget()
+        v = QVBoxLayout(page)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(GAP)
+
+        v.addWidget(self._section("Project", ".blend scene"))
         top = QHBoxLayout()
         self.project_label = QLabel("<b>no project selected</b>")
         browse = QPushButton("Browse for .blend…")
@@ -471,10 +702,11 @@ class Dashboard(QMainWindow):
         top.addWidget(browse)
         v.addLayout(top)
 
+        v.addWidget(self._section("Render settings"))
         # The controls block: frame range, resolution, samples, format, and
         # the three launch/cancel/collect buttons. Fixed-width and
-        # left-aligned within `content` (not stretched to fill it) -- see
-        # this method's own docstring comment above.
+        # left-aligned within the page (not stretched to fill it) -- a
+        # number entry field is not more usable at 1600px than at 300px.
         controls = QWidget()
         controls.setMaximumWidth(MAX_CONTROLS_WIDTH)
         controls_v = QVBoxLayout(controls)
@@ -516,22 +748,16 @@ class Dashboard(QMainWindow):
             btns.addWidget(b)
         controls_v.addLayout(btns)
 
-        # The "approximate" wording is not hedging -- it is the honest
-        # description of what this widget can know. See charts.frame_done:
-        # the notebook reports a COUNT of successful frames, not which ones,
-        # so the strip assumes the first N of each account's stride are the
-        # finished ones. That holds exactly until a frame fails, after which
-        # every later cell for that account is shifted by one. Saying so
-        # here is the fix the review asked for: the user must not read a
-        # green cell as proof that that specific frame exists.
+        v.addWidget(self._section("Filmstrip", "one cell per frame"))
         filmstrip_header = QLabel(
-            "<b>Filmstrip</b> — one cell per frame, tinted by which account "
-            "rendered it. Completed cells are <b>approximate</b>: the render "
-            "reports how many frames succeeded, not which, so a failed frame "
-            "shifts every later cell for that account. Collect frames… is the "
-            "authoritative list of what actually exists.")
+            "Cells are tinted by which account rendered them. Completed cells "
+            "are <b>approximate</b>: the render reports how many frames "
+            "succeeded, not which, so a failed frame shifts every later cell "
+            "for that account. Collect frames… is the authoritative list of "
+            "what actually exists.")
         filmstrip_header.setWordWrap(True)
         filmstrip_header.setMaximumWidth(MAX_PROSE_WIDTH)
+        filmstrip_header.setProperty("secondary", True)
         v.addWidget(filmstrip_header)
         self.filmstrip = Filmstrip()
         v.addWidget(self.filmstrip)
@@ -540,13 +766,28 @@ class Dashboard(QMainWindow):
         self.filmstrip_caption.setProperty("secondary", True)
         v.addWidget(self.filmstrip_caption)
 
-        v.addWidget(QLabel("<b>Upload</b>"))
+
+        v.addWidget(self._section("Upload", "owner account"))
         self.upload_view = UploadView()
         v.addWidget(self.upload_view)
+        v.addStretch(1)
+        return page
 
-        v.addWidget(QLabel("<b>GPU</b> — one row per physical GPU, never combined"))
-        self.gpu_panel = GpuPanel()
-        v.addWidget(self.gpu_panel)
+    def _build_instances_page(self) -> QWidget:
+        """The fleet itself: who is in it, and what each account's render is
+        doing right now."""
+        page = QWidget()
+        v = QVBoxLayout(page)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(GAP)
+
+        v.addWidget(self._section("Fleet setup"))
+        add_row = QHBoxLayout()
+        add_btn = QPushButton("+ add account")
+        add_btn.clicked.connect(self._manage)
+        add_row.addWidget(add_btn)
+        add_row.addStretch(1)
+        v.addLayout(add_row)
 
         self.table = QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels(
@@ -554,17 +795,6 @@ class Dashboard(QMainWindow):
         self.table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.Stretch)
         v.addWidget(self.table)
-
-        # A visible degraded-state marker for the periodic status poll --
-        # see FINDING 3, task 5 fix round 1: a poll failure used to be
-        # swallowed completely silently, with nothing like quota's
-        # "unavailable" fallback. Hidden (empty) whenever the last poll
-        # succeeded.
-        self.poll_status_label = QLabel("")
-        self.poll_status_label.setWordWrap(True)
-        self.poll_status_label.setMaximumWidth(MAX_PROSE_WIDTH)
-        self.poll_status_label.setStyleSheet(f"color: {WARNING};")
-        v.addWidget(self.poll_status_label)
 
         note = QLabel(
             f'The <b>Quota (API)</b> column above is exactly that: the figure '
@@ -574,18 +804,134 @@ class Dashboard(QMainWindow):
         note.setOpenExternalLinks(True)
         note.setWordWrap(True)
         note.setMaximumWidth(MAX_PROSE_WIDTH)
+        note.setProperty("secondary", True)
         v.addWidget(note)
-        # Capping the table's height (see _sync_table_height) means it no
-        # longer soaks up every pixel of leftover vertical space itself --
-        # without a trailing stretch here, Qt's box layout instead spreads
-        # that surplus as extra gaps between EVERY widget above (any
-        # non-Fixed vertical size policy can grow even at stretch factor 0
-        # if nothing else claims the space), which is a worse look than
-        # the one blank margin below the note that this produces instead.
         v.addStretch(1)
-        return main
+        return page
+
+    def _build_logs_page(self) -> QWidget:
+        """Failures, kept where they can be read after the dialog that
+        announced them has been dismissed.
+
+        Until now a failure existed in exactly two places, both transient: a
+        one-line summary on the account's card, and a modal the user clicks
+        away. Nothing accumulated.
+        """
+        page = QWidget()
+        v = QVBoxLayout(page)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(GAP)
+
+        v.addWidget(self._section("Instance failures", "grouped per account"))
+        self.logs_empty = QLabel("No failures recorded this session.")
+        self.logs_empty.setProperty("secondary", True)
+        v.addWidget(self.logs_empty)
+        self.logs_holder = QWidget()
+        self.logs_layout = QVBoxLayout(self.logs_holder)
+        self.logs_layout.setContentsMargins(0, 0, 0, 0)
+        self.logs_layout.setSpacing(GAP)
+        v.addWidget(self.logs_holder)
+        v.addStretch(1)
+        return page
+
+    def _build_settings_page(self) -> QWidget:
+        """The same controls SettingsView shows in its modal -- one
+        SettingsPanel, embedded here instead of in a QDialog, so the two can
+        never drift apart into two different settings screens."""
+        page = QWidget()
+        v = QVBoxLayout(page)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(GAP)
+        self.settings_panel = SettingsPanel(self.settings)
+        v.addWidget(self.settings_panel)
+        v.addStretch(1)
+        return page
+
+    # ---------------- navigation ----------------
+    def _show_page(self, key: str) -> None:
+        page = self._pages.get(key)
+        if page is None:
+            return
+        self.pages.setCurrentWidget(page)
+        self.page_title.setText(PAGE_TITLES.get(key, key.title()))
+        self.sidebar.set_active(key)
+        self.current_page = key
+
+    def _refresh_stats(self) -> None:
+        """Push the four KPI tiles. Every figure is one this app can
+        actually source: accounts known, workers Kaggle says are running,
+        GPUs telemetry has actually reported, frames counted done."""
+        state = self._last_state
+        workers = state.workers if state else []
+        accounts = len(self.store.list())
+        rendering = sum(1 for w in workers if w.state == "running")
+        gpus = self.gpu_panel.gpu_count
+        frames = sum(w.frames_done for w in workers)
+        self.stat_instances.set_value(accounts, str(accounts))
+        self.stat_rendering.set_value(rendering, str(rendering))
+        self.stat_gpus.set_value(gpus, str(gpus))
+        self.stat_frames.set_value(frames, str(frames))
+
+    def _log_state_changes(self) -> None:
+        """Append a fleet-log line whenever a worker CHANGES state.
+
+        Diffed against the last seen state rather than logged every tick:
+        _refresh_views runs twice a second at times, and a log that repeats
+        "acct0 running" 120 times a minute is not a log.
+        """
+        state = self._last_state
+        for worker in (state.workers if state else []):
+            previous = self._logged_states.get(worker.label)
+            if previous == worker.state:
+                continue
+            self._logged_states[worker.label] = worker.state
+            if previous is None:
+                continue      # first sighting is not a change
+            tone = {"error": "offline", "complete": "active",
+                    "running": "idle"}.get(worker.state, "idle")
+            self.event_log.append(
+                f"{worker.label} -> {worker.state}", tone)
+
+    def _refresh_nav_counts(self) -> None:
+        """Nav pills carry the counts you would otherwise have to change
+        page to discover. Settings gets None -- a permanent 0 there would be
+        meaningless chrome."""
+        state = self._last_state
+        running = sum(1 for w in (state.workers if state else [])
+                      if w.state in ("running", "queued"))
+        self.sidebar.set_count("dashboard", running)
+        self.sidebar.set_count("files", 1 if self.blend is not None else 0)
+        self.sidebar.set_count("instances", len(self.store.list()))
+        self.sidebar.set_count("logs", len(self._failure_logs))
+        self.sidebar.set_count("settings", None)
 
     # ---------------- window state: maximised/full-screen ----------------
+    def _apply_window_effects(self) -> None:
+        """Ask Windows for the Mica backdrop and dark window chrome.
+
+        Best-effort and silent: off Windows 11 this no-ops and the shell
+        stays opaque, which is the same app minus one flourish (see
+        ui/mica.py). Re-run after a theme switch, because the immersive
+        dark-mode flag has to follow the theme.
+
+        Requires a native window handle, so it can only run once the window
+        has been shown -- winId() on an unrealised window forces creation
+        at a point where Qt has not finished setting the window up.
+        """
+        translucent = getattr(self.settings, "translucent", False)
+        self._backdrop_active = mica.apply_backdrop(
+            self, enabled=translucent, dark=is_dark())
+        # The backdrop is only visible where the app does not paint over
+        # it, so the shell surfaces go transparent when it is on and
+        # opaque when it is off. Cards, panels and the sidebar stay opaque
+        # either way -- content has to stay readable over a wallpaper.
+        transparent = self._backdrop_active
+        for name in ("shell", "shellBody"):
+            widget = self.findChild(QWidget, name)
+            if widget is not None:
+                widget.setStyleSheet(
+                    "background: transparent;" if transparent else "")
+
     def show_at_startup(self) -> None:
         """Show the window for the first time, in whichever state
         self.settings remembers -- full screen if the user last left it
@@ -603,6 +949,7 @@ class Dashboard(QMainWindow):
             self.showFullScreen()
         else:
             self.showMaximized()
+        self._apply_window_effects()
         # Driven by self.settings.fullscreen -- the state just REQUESTED --
         # not by re-reading self.isFullScreen() immediately afterwards. See
         # _toggle_fullscreen's own comment: querying window state back
@@ -636,6 +983,31 @@ class Dashboard(QMainWindow):
         self.settings.save()
         self.exit_fullscreen_btn.setVisible(entering_fullscreen)
 
+    def resizeEvent(self, event) -> None:      # noqa: N802 -- Qt override
+        super().resizeEvent(event)
+        self._place_toasts()
+
+    def _place_toasts(self) -> None:
+        """Pin the toast stack to the bottom-right of the shell."""
+        margin = MARGIN
+        height = max(self.toasts.sizeHint().height(), 1)
+        self.toasts.setGeometry(
+            self.width() - self.toasts.width() - margin,
+            self.height() - height - margin,
+            self.toasts.width(), height)
+        self.toasts.raise_()
+
+    def toast(self, message: str, tone: str = "idle") -> None:
+        """Report an outcome without stopping the user.
+
+        Every outcome in this app used to be a modal QMessageBox, including
+        the ones nobody needs to acknowledge -- "frames collected" was a
+        dialog you had to dismiss to carry on watching the render it
+        finished. Decisions and failures stay modal; results come here.
+        """
+        self.toasts.post(message, tone)
+        self._place_toasts()
+
     def keyPressEvent(self, event) -> None:  # noqa: N802 -- Qt override
         # Esc is the other conventional way out of full screen, alongside
         # the visible exit_fullscreen_btn and F11 itself -- three ways
@@ -648,18 +1020,31 @@ class Dashboard(QMainWindow):
 
     # ---------------- settings (accent) ----------------
     def _open_settings(self) -> None:
-        SettingsView(self.settings, self).exec()
+        """Show the Settings page.
+
+        This used to open SettingsView as a modal. It is a page now -- the
+        controls are identical (both are a SettingsPanel), but settings that
+        live behind a modal cannot be left open while you watch what they
+        change, which for an accent picker is most of the point.
+        """
+        self._show_page("settings")
 
     def _on_accent_changed(self) -> None:
         """theme.theme_signal fired -- re-paint every widget that captured
         an accent colour explicitly (not through the QApplication
         stylesheet cascade, which repaints itself) at the moment it was
         built. See theme.theme_signal's docstring for the full mechanism.
+
+        The sidebar connects to theme_signal itself and repaints its own
+        brand mark and nav icons; this only has to cover the cards and the
+        title bar, which are owned here -- plus the window-level effects,
+        since Windows' own dark-chrome flag has to follow the theme.
         """
-        accent = current_accent().base
-        self.brand_mark.setPixmap(brand_icon(accent, 28).pixmap(28, 28))
         for card in self._instance_cards.values():
             card.refresh_accent()
+        self.title_bar.refresh_icons()
+        if self.isVisible():
+            self._apply_window_effects()
 
     # --- helpers ---
     def _refresh_accounts(self) -> None:
@@ -681,8 +1066,8 @@ class Dashboard(QMainWindow):
         # for a card already disconnected here is a safe no-op.
         for card in self._instance_cards.values():
             card.disconnect_theme_signal()
-        while self.rail_rows_layout.count():
-            item = self.rail_rows_layout.takeAt(0)
+        while self.instances_layout.count():
+            item = self.instances_layout.takeAt(0)
             w = item.widget()
             if w is not None:
                 w.setParent(None)
@@ -693,7 +1078,7 @@ class Dashboard(QMainWindow):
             card.cancel_requested.connect(self._cancel_instance)
             card.download_requested.connect(self._download_instance)
             self._instance_cards[a.label] = card
-            self.rail_rows_layout.addWidget(card)
+            self.instances_layout.addWidget(card)
         self._refresh_views()
 
     def _update_eta(self) -> None:
@@ -982,10 +1367,7 @@ class Dashboard(QMainWindow):
             return
         failed = [r for r in results if not r.ok]
         if not failed:
-            QMessageBox.information(
-                self, "Render cancelled",
-                f"Cancel requested for {len(results)} account(s); Kaggle "
-                "confirmed the stop.")
+            self.notify(f"Cancelled {len(results)} account(s)", "idle")
             return
         # A silent cancel failure is the worst outcome in the app: the user
         # believes the render stopped while it keeps draining a friend's
@@ -1231,7 +1613,10 @@ class Dashboard(QMainWindow):
                 # for the exact same condition).
                 QMessageBox.warning(self, "Frames collected", msg)
                 return
-            QMessageBox.information(self, "Frames collected", msg)
+            # A result, not a decision -- see Dashboard.toast. The detail
+            # still goes to the fleet log so nothing is lost by not being
+            # acknowledged.
+            self.notify(f"Collected {r.copied} frame(s)", "active")
 
         def done_fail(message: str) -> None:
             self._collect_worker = None
@@ -1326,7 +1711,7 @@ class Dashboard(QMainWindow):
         if r.worker_errors:
             QMessageBox.warning(self, "Could not download frames", msg)
             return
-        QMessageBox.information(self, "Frames downloaded", msg)
+        self.notify(f"Downloaded {r.copied} frame(s) from {who}", "active")
 
     # ---------------- polling / live refresh ----------------
     def _poll(self) -> None:
@@ -1350,6 +1735,8 @@ class Dashboard(QMainWindow):
             return
         accounts = self.store.list()
 
+        started = time.monotonic()
+
         def work():
             return self.fleet_factory(accounts).poll()
 
@@ -1358,9 +1745,14 @@ class Dashboard(QMainWindow):
 
         def done_ok(st) -> None:
             self._poll_worker = None
+            self._last_poll_ms = int((time.monotonic() - started) * 1000)
+            self._last_poll_at = time.strftime("%H:%M:%S")
             if st:
                 self._last_state = st
             self.poll_status_label.setText("")
+            if self.offline_banner.isVisible():
+                self.offline_banner.hide()
+                self.event_log.append("reconnected to Kaggle", "active")
             self._refresh_views()
             # Task 4: only ever triggered from here -- this poll's own
             # network call already happened above; this only ever starts
@@ -1372,8 +1764,12 @@ class Dashboard(QMainWindow):
 
         def done_fail(message: str) -> None:
             self._poll_worker = None
-            self.poll_status_label.setText(
-                f"⚠ {message} Showing the last known render status.")
+            self._last_poll_ms = int((time.monotonic() - started) * 1000)
+            was_visible = self.offline_banner.isVisible()
+            self.offline_banner.show_reason(
+                f"{message} Showing the last known render status.")
+            if not was_visible:
+                self.event_log.append("lost contact with Kaggle", "offline")
             self._refresh_views()
 
         worker.succeeded.connect(done_ok)
@@ -1490,6 +1886,15 @@ class Dashboard(QMainWindow):
 
     def _refresh_views(self) -> None:
         st = self._last_state
+        # The nav pills and the Logs page are driven from the same state as
+        # every other view, on the same tick -- a count in the sidebar that
+        # updates on a different schedule from the page it points at is
+        # worse than no count.
+        self._refresh_nav_counts()
+        self._refresh_logs_page()
+        self._refresh_stats()
+        self._log_state_changes()
+        self._refresh_health()
         if st is None:
             self._refresh_instance_cards(None)
             self.filmstrip.set_empty()
@@ -1527,6 +1932,41 @@ class Dashboard(QMainWindow):
             card.set_snapshot(self.instance_store.get(account.label))
             card.set_worker(worker)
             card.set_failure(self._failure_text_for(worker))
+
+    def _refresh_logs_page(self) -> None:
+        """Rebuild the Logs page from _failure_logs.
+
+        Rebuilt wholesale rather than diffed: there is at most one entry per
+        account and it only changes when a failure actually arrives, so the
+        simplest correct thing is also the cheapest one. The body is
+        selectable because the useful thing to do with a Kaggle traceback is
+        copy it somewhere else.
+        """
+        while self.logs_layout.count():
+            item = self.logs_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+        self.logs_empty.setVisible(not self._failure_logs)
+        for label, text in sorted(self._failure_logs.items()):
+            entry = QWidget()
+            entry.setObjectName("card")
+            ev = QVBoxLayout(entry)
+            ev.setContentsMargins(14, 12, 14, 12)
+            ev.setSpacing(6)
+            heading = QLabel(label)
+            heading.setFont(tracked_font(8, tracking=14.0))
+            heading.setStyleSheet(f"color: {current_theme().warn_ink};")
+            ev.addWidget(heading)
+            body = QLabel(text)
+            body.setFont(mono_font(8))
+            body.setWordWrap(True)
+            body.setProperty("secondary", True)
+            body.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextSelectableByMouse)
+            ev.addWidget(body)
+            self.logs_layout.addWidget(entry)
 
     def _failure_text_for(self, worker: WorkerState | None) -> str | None:
         """Whatever text explains `worker`'s failure right now, or None
@@ -1583,6 +2023,7 @@ class Dashboard(QMainWindow):
         self._stop.set()          # tells the daemon SSE threads to unwind
         self.timer.stop()
         self.live_timer.stop()
+        self.event_log.stop()
         # theme_signal is a process-global QObject that outlives any one
         # Dashboard -- deleteLater() + processEvents() (close_dashboards, in
         # the test harness) schedules this window's own destruction, which
@@ -1620,6 +2061,10 @@ class Dashboard(QMainWindow):
         if self._accent_connection is not None:
             theme_signal.changed.disconnect(self._accent_connection)
             self._accent_connection = None
+        # The sidebar holds its own theme_signal connection (it repaints its
+        # brand mark and nav icons itself), so it has to be released here
+        # too -- same reasoning, same idempotence contract as the cards'.
+        self.sidebar.disconnect_theme_signal()
         for card in self._instance_cards.values():
             card.disconnect_theme_signal()
         # Threads must not outlive the window (FINDING 1, task 5 fix

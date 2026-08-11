@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (QLabel, QProgressBar, QSizePolicy, QVBoxLayout,
                                QWidget)
 
 from blendfleet.ui.formatting import format_bytes, format_eta, format_rate
-from blendfleet.ui.theme import WARNING, mono_font
+from blendfleet.ui.theme import current_theme, mono_font
 from blendfleet.uploader import UploadProgress
 
 STATE_IDLE = "idle"
@@ -82,7 +82,7 @@ class UploadRow(QWidget):
     def set_failed(self, message: str) -> None:
         self.state = STATE_FAILED
         self.stats_label.setText(message)
-        self.stats_label.setStyleSheet(f"color: {WARNING};")
+        self.stats_label.setStyleSheet(f"color: {current_theme().warn_ink};")
 
 
 class UploadView(QWidget):

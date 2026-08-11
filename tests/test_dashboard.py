@@ -17,6 +17,7 @@ from blendfleet.kaggle_client import KaggleError, KernelStatus, Quota
 from blendfleet.notebook_builder import RenderSettings
 from blendfleet.settings import Settings
 from blendfleet.ui.dashboard import Dashboard
+from blendfleet.ui.sidebar import Sidebar
 from blendfleet.ui.theme import ACCENTS
 
 
@@ -310,20 +311,20 @@ def test_empty_state_shows_no_frames_and_placeholders(qapp, tmp_path):
     assert dash.filmstrip_caption.text() == "no frames yet"
     assert not dash.upload_view._rows
     assert dash.gpu_panel.gpu_count == 0
-    assert dash.rail_rows_layout.count() == 3
+    assert dash.instances_layout.count() == 3
     assert dash.poll_status_label.text() == ""
     dash.close()
 
 
-def test_rail_shows_one_row_per_account(qapp, tmp_path):
+def test_dashboard_page_shows_one_card_slot_per_account(qapp, tmp_path):
     dash = make_dashboard(qapp, tmp_path, n=3)
-    assert dash.rail_rows_layout.count() == 3
+    assert dash.instances_layout.count() == 3
     dash.close()
 
 
 # ---------------- InstanceCard wiring (Task 4) ----------------
 
-def test_rail_shows_one_instance_card_per_account_starting_idle(qapp, tmp_path):
+def test_dashboard_page_shows_one_instance_card_per_account_starting_idle(qapp, tmp_path):
     dash = make_dashboard(qapp, tmp_path, n=3)
     assert set(dash._instance_cards) == {"acct0", "acct1", "acct2"}
     for card in dash._instance_cards.values():
@@ -933,32 +934,85 @@ def test_content_column_grows_with_window_but_never_exceeds_the_cap(
         f"{widths[2560]}px")
 
 
-# ---------------- settings dialog (opened from the rail) -----------------
+# ---------------- navigation shell ----------------
 
-def test_open_settings_shows_a_settings_view_for_the_dashboards_settings(
-        qapp, tmp_path, monkeypatch):
-    """Nothing before this exercised Dashboard._open_settings or a click on
-    settings_btn -- only SettingsView in isolation (see test_settings_view.py).
-    SettingsView.exec() drives its own modal event loop that only returns on
-    a click nothing under QT_QPA_PLATFORM=offscreen will ever deliver, so
-    exec itself is stubbed here (recording the instance instead of blocking)
-    rather than actually shown -- the same reasoning as
-    tests/conftest.py's no_unstubbed_dialogs guard, just for a QDialog
-    instead of a QMessageBox."""
-    opened = []
+def test_every_sidebar_destination_has_a_page(qapp, tmp_path):
+    """Sidebar.PAGES and Dashboard._pages must agree exactly: a nav item
+    with no page behind it is a dead button, and a page with no nav item is
+    unreachable."""
+    dash = make_dashboard(qapp, tmp_path, n=1)
+    assert set(dash._pages) == {key for key, _, _ in Sidebar.PAGES}
+    assert set(dash.sidebar.buttons) == set(dash._pages)
+    assert set(dashboard_mod.PAGE_TITLES) == set(dash._pages)
+    dash.close()
 
-    def fake_exec(self):
-        opened.append(self)
-        return dashboard_mod.SettingsView.DialogCode.Accepted
 
-    monkeypatch.setattr(dashboard_mod.SettingsView, "exec", fake_exec)
+@pytest.mark.parametrize("page", ["files", "instances", "logs", "settings",
+                                  "dashboard"])
+def test_clicking_a_nav_item_switches_page_and_title(qapp, tmp_path, page):
+    dash = make_dashboard(qapp, tmp_path, n=1)
+    dash.sidebar.buttons[page].click()
+    assert dash.current_page == page
+    assert dash.pages.currentWidget() is dash._pages[page]
+    assert dash.page_title.text() == dashboard_mod.PAGE_TITLES[page]
+    # Exactly one nav item is ever marked active.
+    active = [k for k, b in dash.sidebar.buttons.items() if b.isChecked()]
+    assert active == [page]
+    dash.close()
 
+
+def test_dashboard_opens_on_the_dashboard_page(qapp, tmp_path):
+    dash = make_dashboard(qapp, tmp_path, n=1)
+    assert dash.current_page == "dashboard"
+    assert dash.pages.currentWidget() is dash._pages["dashboard"]
+    dash.close()
+
+
+def test_nav_counts_report_accounts_and_project(qapp, tmp_path):
+    """The pills exist so you do not have to change page to find out
+    whether anything is there. Settings has nothing countable and must show
+    no pill at all rather than a permanent 0."""
+    dash = make_dashboard(qapp, tmp_path, n=3)
+    assert dash.sidebar.buttons["instances"].pill.text() == "3"
+    assert dash.sidebar.buttons["files"].pill.text() == "0"
+    dash.blend = tmp_path / "scene.blend"
+    dash._refresh_views()
+    assert dash.sidebar.buttons["files"].pill.text() == "1"
+    assert dash.sidebar.buttons["settings"].pill.text() == ""
+    dash.close()
+
+
+def test_poll_status_banner_lives_outside_the_page_stack(qapp, tmp_path):
+    """"Kaggle is unreachable" is true on every page, so it must not be
+    parented into any single one of them."""
+    dash = make_dashboard(qapp, tmp_path, n=1)
+    ancestors = set()
+    w = dash.poll_status_label.parentWidget()
+    while w is not None:
+        ancestors.add(w)
+        w = w.parentWidget()
+    assert not (ancestors & set(dash._pages.values()))
+    dash.close()
+
+
+# ---------------- settings, now a page rather than a modal ----------------
+
+def test_settings_nav_item_switches_to_the_settings_page(qapp, tmp_path):
+    """Settings used to be a modal opened from a gear in the rail. It is a
+    page now, showing the same SettingsPanel -- an accent picker that covers
+    up the thing whose colour it changes is the wrong shape for the job."""
     dash = make_dashboard(qapp, tmp_path, n=1)
     dash.settings_btn.click()
+    assert dash.current_page == "settings"
+    assert dash.pages.currentWidget() is dash._pages["settings"]
+    assert dash.settings_panel.settings is dash.settings
+    dash.close()
 
-    assert len(opened) == 1
-    assert isinstance(opened[0], dashboard_mod.SettingsView)
-    assert opened[0].settings is dash.settings
+
+def test_open_settings_shows_the_settings_page(qapp, tmp_path):
+    dash = make_dashboard(qapp, tmp_path, n=1)
+    dash._open_settings()
+    assert dash.current_page == "settings"
     dash.close()
 
 
@@ -985,11 +1039,14 @@ def _image_has_color(image, hex_color: str) -> bool:
 def test_switching_accent_live_repaints_the_brand_mark_without_restart(
         qapp, tmp_path, name):
     dash = make_dashboard(qapp, tmp_path, n=1)
-    theme.apply(qapp, name)   # e.g. what SettingsView's swatch click does
-    image = dash.brand_mark.pixmap().toImage()
+    theme.apply(qapp, name)   # e.g. what a settings swatch click does
+    # The brand mark moved into the navigation sidebar, which now owns its
+    # own theme_signal connection and repaints itself -- the requirement is
+    # unchanged, only its address is.
+    image = dash.sidebar.brand_mark.pixmap().toImage()
     assert _image_has_color(image, ACCENTS[name].base), (
         f"the {name!r} accent does not appear in the brand mark after a "
-        "live switch -- Dashboard must repaint chrome it painted with an "
+        "live switch -- the sidebar must repaint chrome it painted with an "
         "explicit accent colour, not just leave it as it was at __init__")
     dash.close()
 
@@ -1058,12 +1115,15 @@ def test_the_filmstrip_tells_the_user_its_completed_cells_are_approximate(qapp, 
     person reading a green cell as proof the frame exists."""
     dash = make_dashboard(qapp, tmp_path)
     labels = [w.text() for w in dash.findChildren(dashboard_mod.QLabel)]
-    filmstrip_headers = [t for t in labels if "Filmstrip" in t]
-    assert filmstrip_headers, "the filmstrip header label went missing"
-    header = filmstrip_headers[0]
-    assert "approximate" in header.lower()
-    assert "failed frame" in header.lower(), \
+    # The caveat is its own label under the "Filmstrip" section header, so
+    # match on the caveat itself rather than on the section title.
+    caveats = [t for t in labels if "approximate" in t.lower()]
+    assert caveats, "the filmstrip's approximate-cells caveat went missing"
+    caveat = caveats[0].lower()
+    assert "failed frame" in caveat, \
         "say WHY it is approximate, not just that it is"
+    assert "collect frames" in caveat, \
+        "point at the authoritative list, not just at the problem"
 
 
 # ---------------------------------------------------------------------------
@@ -1281,7 +1341,7 @@ def test_cancel_instance_on_an_already_finished_worker_says_nothing_to_cancel(
     pump(dash._instance_cancel_workers[st.workers[0].label])
     settle(dash)
 
-    titles = [title for title, _ in stub_message_boxes["information"]]
+    titles = [title for title, _ in stub_message_boxes["information"]] or         [e.text() for e in dash.event_log._entries]
     assert any("Nothing to cancel" in t for t in titles)
     dash.close()
 
@@ -1352,7 +1412,7 @@ def test_download_instance_downloads_only_that_worker(
     settle(dash)
 
     assert dest.exists()
-    assert stub_message_boxes["information"], "no result dialog was shown"
+    assert dash.event_log._entries, "the collect result was never reported"
     dash.close()
 
 
@@ -1502,7 +1562,15 @@ def test_collect_fleet_wide_downloads_every_worker_and_routes_progress_per_card(
     assert dest.exists()
     for w in st.workers:
         assert dash._instance_cards[w.label].download_progress_label.isHidden() is True
-    assert stub_message_boxes["information"]
+    # A clean collect reports through a toast and the fleet log rather than
+    # a modal the user has to dismiss to carry on watching the render it
+    # just finished. It must still REPORT -- silence would be worse than a
+    # dialog.
+    # Reported three ways by Dashboard.notify: a toast now, a fleet-log
+    # line, and a notification-panel entry for anyone who was not looking.
+    assert any("Collected" in e.text() for e in dash.event_log._entries), \
+        "the collect result never reached the fleet log"
+    assert dash.notif_panel.unread == 1
     dash.close()
 
 
@@ -1535,7 +1603,7 @@ def test_collect_fleet_wide_with_a_worker_error_warns_not_informs(
 
     assert stub_message_boxes["warning"], \
         "a worker_errors report must warn, never look like a clean collect"
-    titles = [title for title, _ in stub_message_boxes["information"]]
+    titles = [title for title, _ in stub_message_boxes["information"]] or         [e.text() for e in dash.event_log._entries]
     assert "Frames collected" not in titles
     dash.close()
 
@@ -1543,6 +1611,17 @@ def test_collect_fleet_wide_with_a_worker_error_warns_not_informs(
 # ---------------------------------------------------------------------------
 # Review findings on the Task 6 download wiring above.
 # ---------------------------------------------------------------------------
+
+class _CollectReportStub:
+    """The three fields _describe_collect_result reads."""
+
+    def __init__(self, copied=0, missing_frames=(), archive_errors=(),
+                 worker_errors=None):
+        self.copied = copied
+        self.missing_frames = list(missing_frames)
+        self.archive_errors = list(archive_errors)
+        self.worker_errors = worker_errors or {}
+
 
 def test_collect_result_message_never_doubles_the_word_to(
         qapp, tmp_path, monkeypatch, stub_message_boxes):
@@ -1564,18 +1643,20 @@ def test_collect_result_message_never_doubles_the_word_to(
     dash._last_state = st
     dash._refresh_views()
 
+    # A successful collect reports through a toast and the fleet log now,
+    # not a modal -- so the wording is asserted on the builder both paths
+    # share, which is where the doubled "to to" actually came from.
+    report = _CollectReportStub(copied=2)
+    fleet_message = dash._describe_collect_result(
+        report, destination_phrase=f"to {tmp_path}")
+    assert "to to" not in fleet_message, fleet_message
+    instance_message = dash._describe_collect_result(
+        report, destination_phrase=f"from acct0 to {tmp_path}")
+    assert "to to" not in instance_message, instance_message
+
     dash._collect()
     pump(dash._collect_worker)
     settle(dash)
-    fleet_message = stub_message_boxes["information"][-1][1]
-    assert "to to" not in fleet_message, fleet_message
-
-    stub_message_boxes["information"].clear()
-    dash._download_instance(st.workers[0].label)
-    pump(dash._instance_download_workers[st.workers[0].label])
-    settle(dash)
-    instance_message = stub_message_boxes["information"][-1][1]
-    assert "to to" not in instance_message, instance_message
     dash.close()
 
 
@@ -1720,7 +1801,9 @@ def test_poll_never_fetches_a_log_for_a_healthy_worker(qapp, tmp_path):
     assert fetch_calls == []
     assert dash._log_fetch_workers == {}
     card = dash._instance_cards[label]
-    assert card.failure_label.isHidden() is True
+    # failure_row, not failure_label: the row carries the alert icon
+    # alongside the text and is what set_failure shows and hides.
+    assert card.failure_row.isHidden() is True
     dash.close()
 
 

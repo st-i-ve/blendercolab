@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import time
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (QHBoxLayout, QLabel, QMessageBox, QPushButton,
                                QVBoxLayout, QWidget)
 
@@ -49,9 +49,9 @@ from blendfleet.instance_state import InstanceSnapshot
 from blendfleet.ui.charts import Sparkline
 from blendfleet.ui.formatting import format_bytes, format_eta, format_rate
 from blendfleet.ui.messages import explain_kernel_failure
-from blendfleet.ui.theme import (TELEMETRY, TEXT_SECONDARY, WARNING,
-                                  account_color, current_accent, icon,
-                                  mono_font, theme_signal, ui_font)
+from blendfleet.ui.theme import (account_color, current_accent,
+                                  current_theme, icon, mono_font,
+                                  theme_signal, ui_font)
 
 # States fleet.WorkerState.state can carry -- kaggle_client.ACTIVE_STATES
 # duplicated as a literal set here (not imported) would tie this UI module
@@ -72,6 +72,44 @@ _CANCELLED_STATES = {"cancel_requested", "cancel_acknowledged"}
 _STOPPED_STATES = {_ERROR_STATE, _COMPLETE_STATE} | _CANCELLED_STATES
 
 NEVER_RUN_TEXT = "never run — launch to see specs"
+
+# The account-tint dot in each card header. Even, so the border-radius that
+# makes it a circle is exactly half of it.
+DOT_SIZE = 8
+# Small in-card buttons (Cancel, Download, View full log). 22px was too
+# short for the app's 10pt button text and clipped every descender -- the
+# "g" in "View full log" was visibly cut in half.
+CARD_BUTTON_HEIGHT = 26
+
+
+def height_for_width(widget: QWidget) -> QWidget:
+    """Let `widget` report a height that depends on its width.
+
+    Qt does NOT infer this. A widget's size policy carries an explicit
+    height-for-width flag, it is off by default, and -- the part that bites
+    -- it does not propagate up through container widgets: a wrapped label
+    inside a plain QWidget inside the card leaves the CARD still reporting a
+    single-line height, because the container in the middle never claimed
+    the property. So every link in the chain has to be marked, not just the
+    label at the bottom of it.
+
+    Inside a QVBoxLayout with room to spare, getting this wrong shows up as
+    nothing at all -- the card is simply handed the extra height. Inside a
+    layout that gives each child exactly the height it asked for
+    (ui/flow_layout.py's card grid), the same shortfall clips the card: in
+    practice the wrapped hardware line, the failure text, and the "View full
+    log" button under them -- i.e. exactly the card with the most to say.
+    """
+    policy = widget.sizePolicy()
+    policy.setHeightForWidth(True)
+    widget.setSizePolicy(policy)
+    return widget
+
+
+def wrap(label: QLabel) -> QLabel:
+    """Word-wrap `label` and let it report the height that wrapping needs."""
+    label.setWordWrap(True)
+    return height_for_width(label)
 
 
 # ---------------- pure logic (unit-testable without a QPainter) ----------
@@ -152,9 +190,9 @@ def status_for(worker: WorkerState | None,
     rather than showing "idle" as if it were merely waiting its turn.
     """
     if not verified:
-        return "x", WARNING, "not verified"
+        return "x", current_theme().warn_ink, "not verified"
     if worker is None:
-        return "monitor", TEXT_SECONDARY, "idle"
+        return "monitor", current_theme().ink_3, "idle"
     accent = current_accent().base
     state = worker.state
     if state == _RUNNING_STATE:
@@ -162,12 +200,12 @@ def status_for(worker: WorkerState | None,
     if state == _QUEUED_STATE:
         return "loader-circle", accent, "queued"
     if state == _ERROR_STATE:
-        return "triangle-alert", WARNING, "error"
+        return "triangle-alert", current_theme().warn_ink, "error"
     if state in _CANCELLED_STATES:
-        return "square", TEXT_SECONDARY, "cancelled"
+        return "square", current_theme().ink_3, "cancelled"
     if state == _COMPLETE_STATE:
         return "circle-check", accent, "complete"
-    return "circle-alert", TEXT_SECONDARY, state or "unknown"
+    return "circle-alert", current_theme().ink_3, state or "unknown"
 
 
 def is_live(worker: WorkerState | None) -> bool:
@@ -227,7 +265,7 @@ class GpuLiveRow(QWidget):
         h.addWidget(util_word)
 
         self.spark = Sparkline(capacity=30, minimum=0, maximum=100,
-                               color=TELEMETRY)
+                               )
         h.addWidget(self.spark, 1)
 
         self.util_value = QLabel("—")
@@ -240,7 +278,7 @@ class GpuLiveRow(QWidget):
 
         self.live_marker = QLabel("live")
         self.live_marker.setFont(mono_font(9))
-        self.live_marker.setStyleSheet(f"color: {TELEMETRY};")
+        self.live_marker.setStyleSheet(f"color: {current_accent().ink()};")
         h.addWidget(self.live_marker)
 
     def update_sample(self, util: int, mem_used: int, mem_total: int) -> None:
@@ -306,6 +344,12 @@ class InstanceCard(QWidget):
                  parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("card")
+        # Without this, the #card rule's background, border and radius do
+        # not paint AT ALL: a QWidget subclass ignores stylesheet
+        # backgrounds unless it is told to honour them, so the cards
+        # rendered as bare text on the page rather than as the reference's
+        # bordered .inst panels.
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.index = index
         self.label = account.label
         self._verified = account.verified
@@ -320,8 +364,13 @@ class InstanceCard(QWidget):
 
         # ---- header: dot + "INSTANCE N" + username + status symbol/word ----
         header = QHBoxLayout()
-        dot = QLabel("●")
-        dot.setStyleSheet(f"color: {account_color(index).name()}; font-size: 12pt;")
+        # A painted dot, not a "●" character: Roboto has no glyph for
+        # U+25CF, so the text version drew a tofu box in every card header.
+        dot = QLabel()
+        dot.setFixedSize(DOT_SIZE, DOT_SIZE)
+        dot.setStyleSheet(
+            f"background-color: {account_color(index).name()};"
+            f" border-radius: {DOT_SIZE // 2}px;")
         header.addWidget(dot)
         title = QLabel(f"<b>INSTANCE {index + 1}</b>")
         header.addWidget(title)
@@ -339,7 +388,8 @@ class InstanceCard(QWidget):
         # (is_active() -- queued or running, see the class docstring),
         # never toggled directly by a caller.
         self.cancel_btn = QPushButton("Cancel")
-        self.cancel_btn.setFixedHeight(22)
+        self.cancel_btn.setObjectName("cardButton")
+        self.cancel_btn.setFixedHeight(CARD_BUTTON_HEIGHT)
         self.cancel_btn.hide()
         self.cancel_btn.clicked.connect(
             lambda: self.cancel_requested.emit(self.label))
@@ -351,7 +401,8 @@ class InstanceCard(QWidget):
         # collect") when there is nothing there yet, so this button is
         # simply always available rather than trying to predict that here.
         self.download_btn = QPushButton("Download")
-        self.download_btn.setFixedHeight(22)
+        self.download_btn.setObjectName("cardButton")
+        self.download_btn.setFixedHeight(CARD_BUTTON_HEIGHT)
         self.download_btn.clicked.connect(
             lambda: self.download_requested.emit(self.label))
         header.addWidget(self.download_btn)
@@ -381,7 +432,7 @@ class InstanceCard(QWidget):
         v.addLayout(quota_row)
 
         # ---- idle body: last-known hardware, honestly aged ----
-        self.idle_container = QWidget()
+        self.idle_container = height_for_width(QWidget())
         idle_v = QVBoxLayout(self.idle_container)
         idle_v.setContentsMargins(0, 0, 0, 0)
         last_run_row = QHBoxLayout()
@@ -390,13 +441,13 @@ class InstanceCard(QWidget):
         last_run_row.addWidget(last_run_label)
         self.last_run_value = QLabel(NEVER_RUN_TEXT)
         self.last_run_value.setFont(mono_font(9))
-        self.last_run_value.setWordWrap(True)
+        wrap(self.last_run_value)
         last_run_row.addWidget(self.last_run_value, 1)
         idle_v.addLayout(last_run_row)
         v.addWidget(self.idle_container)
 
         # ---- live body: per-GPU rows + frame count, "running" only ----
-        self.live_container = QWidget()
+        self.live_container = height_for_width(QWidget())
         self._live_v = QVBoxLayout(self.live_container)
         self._live_v.setContentsMargins(0, 0, 0, 0)
         # PREFLIGHT arrives seconds after the kernel starts, before Blender
@@ -409,7 +460,7 @@ class InstanceCard(QWidget):
         # CPU/RAM ever appears while a render is actually live.
         self.preflight_label = QLabel("")
         self.preflight_label.setProperty("secondary", True)
-        self.preflight_label.setWordWrap(True)
+        wrap(self.preflight_label)
         self.preflight_label.hide()
         self._live_v.addWidget(self.preflight_label)
         self._gpu_placeholder = QLabel("waiting for GPU telemetry…")
@@ -432,13 +483,29 @@ class InstanceCard(QWidget):
         # raw traceback: set_failure always renders through
         # messages.explain_kernel_failure. "View full log" is the escape
         # hatch onto whatever untranslated detail was actually available.
+        # The symbol half of "symbol AND word, never colour alone" is the
+        # bundled triangle-alert SVG, not a "⚠" character: Roboto has no
+        # glyph for U+26A0, so the text version rendered as a tofu box --
+        # a missing symbol, which is precisely the thing the rule forbids
+        # relying on colour instead of.
+        self.failure_row = height_for_width(QWidget())
+        failure_h = QHBoxLayout(self.failure_row)
+        failure_h.setContentsMargins(0, 0, 0, 0)
+        failure_h.setSpacing(6)
+        self.failure_icon = QLabel()
+        self.failure_icon.setFixedSize(13, 13)
+        self.failure_icon.setPixmap(
+            icon("triangle-alert", current_theme().warn_ink, 13).pixmap(13, 13))
+        failure_h.addWidget(self.failure_icon, 0, Qt.AlignmentFlag.AlignTop)
         self.failure_label = QLabel("")
-        self.failure_label.setWordWrap(True)
-        self.failure_label.setStyleSheet(f"color: {WARNING};")
-        self.failure_label.hide()
-        v.addWidget(self.failure_label)
+        wrap(self.failure_label)
+        self.failure_label.setStyleSheet(f"color: {current_theme().warn_ink};")
+        failure_h.addWidget(self.failure_label, 1)
+        self.failure_row.hide()
+        v.addWidget(self.failure_row)
         self.view_log_btn = QPushButton("View full log")
-        self.view_log_btn.setFixedHeight(22)
+        self.view_log_btn.setObjectName("cardButton")
+        self.view_log_btn.setFixedHeight(CARD_BUTTON_HEIGHT)
         self.view_log_btn.hide()
         self.view_log_btn.clicked.connect(self._show_full_failure)
         v.addWidget(self.view_log_btn)
@@ -510,7 +577,7 @@ class InstanceCard(QWidget):
             return
         if raw == "unavailable":
             self.quota_value.setText("unavailable")
-            self.quota_value.setStyleSheet(f"color: {WARNING};")
+            self.quota_value.setStyleSheet(f"color: {current_theme().warn_ink};")
             self.quota_marker.setText("")
             return
         self.quota_value.setText(raw)
@@ -537,7 +604,7 @@ class InstanceCard(QWidget):
             # about, and here there is no green counterpart to confuse it
             # with anyway, but the discipline is the same everywhere.
             text += " (stale)"
-            self.last_run_value.setStyleSheet(f"color: {WARNING};")
+            self.last_run_value.setStyleSheet(f"color: {current_theme().warn_ink};")
         self.last_run_value.setText(text)
 
     # ---------------- verification (SetupDialog's own status, echoed here) ----------------
@@ -745,15 +812,16 @@ class InstanceCard(QWidget):
         """
         if raw is None:
             self.failure_label.setText("")
-            self.failure_label.hide()
+            self.failure_row.hide()
             self.view_log_btn.hide()
             self._failure_detail = ""
             return
         cause, explanation = explain_kernel_failure(raw)
         # Symbol AND word, never colour alone -- same discipline as
         # status_for()'s own icon+word pairing (theme.WARNING's docstring).
-        self.failure_label.setText(f"⚠ {cause}")
-        self.failure_label.show()
+        # The symbol is failure_icon, alongside this text.
+        self.failure_label.setText(cause)
+        self.failure_row.show()
         self._failure_detail = explanation
         self.view_log_btn.show()
 

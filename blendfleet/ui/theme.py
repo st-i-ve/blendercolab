@@ -1,18 +1,27 @@
-"""One theme, applied at QApplication level.
+"""The whole design system: themes, accents, radii, type, icons.
 
-BlendFleet renders frames borrowed across a handful of friends' Kaggle
-accounts -- the subject is a render farm assembled out of people, not a
-generic SaaS dashboard. The palette is warm-dark (Blender-orange accent on
-a charcoal-brown shell) rather than the near-black-plus-acid-accent look
-most dark UIs default to, and every numeric/machine value (bytes, rates,
-frame numbers, GPU stats, quota) is set in a monospace face with tabular
-figures so it reads as an instrument panel: numbers hold their width tick
-to tick instead of reflowing.
+Applied ONCE, in __main__.py, at the QApplication level -- see apply() --
+so no dialog (SetupDialog included) is left unstyled. Never write a raw
+colour literal for UI chrome anywhere else; add a token here instead, so
+the whole app can only ever have one look.
 
-Applied ONCE, in __main__.py, at the QApplication level -- see
-apply_theme() -- so no dialog (SetupDialog included) is left unstyled.
-Never import a raw QColor literal for UI chrome anywhere else; add it
-here instead, so the whole app can only ever have one look.
+TWO THEMES, NOT ONE. Every colour lives on a ThemePalette (light and dark),
+resolved at PAINT time through current_theme(). Nothing may capture a
+colour at import time -- see the note on ACCENT below for the bug class
+that rule exists to prevent, which a theme switch would otherwise reproduce
+in monochrome.
+
+The palettes are taken value-for-value from the reference design in
+ref/render-farm (7).html, which is the app's visual specification. Two
+things are deliberately NOT taken from it, at the user's direction: the
+brand mark stays BlendFleet's own (see brand_icon), and the type is the
+bundled Roboto family rather than the reference's Roboto Condensed --
+tracked_font() reproduces the condensed-caps character from what we ship.
+
+Every numeric/machine value (bytes, rates, frame numbers, GPU stats, quota)
+is set in a monospace face with tabular figures so it reads as an
+instrument panel: numbers hold their width tick to tick instead of
+reflowing.
 """
 from __future__ import annotations
 
@@ -24,26 +33,117 @@ from PySide6.QtGui import QColor, QFont, QFontDatabase, QIcon, QPainter, QPixmap
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import QApplication
 
-# ---------------- palette ----------------
-# Named, not inlined at call sites: a hex literal scattered through the UI
-# code is how apps end up half-restyled. Everything here traces back to
-# this one dict.
-BG_SHELL = "#16181D"        # window / shell background
-BG_SURFACE = "#1E212A"      # raised surfaces: rail, cards, table
-BORDER = "#2A2F3A"          # dividers, borders, unfilled/gap cells
-WARNING = "#E8B33A"         # unverified / retrying / failed -- amber, NEVER
-                             # paired with a red/green opposite: ~8% of men
-                             # cannot reliably tell that pair apart. This is
-                             # a FIXED colour, independent of the selected
-                             # accent -- see AccentPalette below. If it were
-                             # derived from the accent, picking the red
-                             # accent would make error states visually
-                             # indistinguishable from ordinary chrome.
-TELEMETRY = "#4FD1C5"       # GPU utilisation/memory sparklines -- a cool
-                             # teal so telemetry never competes visually
-                             # with the accent used for actions/state.
-TEXT_PRIMARY = "#C9CEDB"
-TEXT_SECONDARY = "#7C859B"
+
+# ---------------- themes ----------------
+@dataclass(frozen=True)
+class ThemePalette:
+    """Every non-accent colour, for one theme.
+
+    Field names follow the reference's own token names (bg/card/ink/fill/
+    border) rather than being renamed to something more Qt-ish, so a rule
+    here can be checked against the stylesheet it came from without a
+    translation step in between.
+    """
+    name: str
+    bg: str             # window / shell background
+    card: str           # raised surfaces: sidebar, cards, panels, table
+    fill: str           # inset fills: hover, count pills, chips, tracks
+    border: str
+    border_2: str       # the stronger of the two: control outlines
+    ink: str            # primary text
+    ink_2: str          # secondary text
+    ink_3: str          # tertiary: meta, captions, placeholders
+    ink_4: str          # quaternary: timestamps, disabled, empty cells
+    bar: str            # neutral progress fill
+    active: str         # "healthy / online" marker
+    active_t: str       # the same, as a soft background wash
+    active_ink: str     # the same, as legible text
+    idle: str
+    offline: str
+    offline_t: str
+    offline_ink: str
+    paused_t: str
+    paused_ink: str
+    warn: str           # amber marker
+    warn_t: str
+    warn_ink: str
+    # The shell colour with alpha, for the Windows 11 Mica backdrop: the
+    # window has to be genuinely see-through for DWM's composite to show
+    # at all. See mica.py.
+    bg_translucent: str
+
+
+# Both palettes are the reference's, unchanged. Light is its default.
+THEMES: dict[str, ThemePalette] = {
+    "light": ThemePalette(
+        name="light",
+        bg="#F3F3F0", card="#FDFDFC", fill="#EFEFEB",
+        border="#E7E7E2", border_2="#DCDCD6",
+        ink="#3A3A36", ink_2="#6E6E68", ink_3="#9A9A93", ink_4="#C6C6C0",
+        bar="#8A8A83",
+        active="#4CAF7D", active_t="#E4F3EB", active_ink="#3E8A64",
+        idle="#B9B9B2",
+        offline="#D8807F", offline_t="#F7E9E8", offline_ink="#B05F5E",
+        paused_t="#E8E8E5", paused_ink="#7A7A74",
+        warn="#DEA85A", warn_t="#F8EEDF", warn_ink="#A9752E",
+        bg_translucent="rgba(243, 243, 240, 0.72)"),
+    "dark": ThemePalette(
+        name="dark",
+        bg="#101210", card="#191B19", fill="#222422",
+        border="#262926", border_2="#313431",
+        ink="#E4E5E2", ink_2="#A5A79F", ink_3="#767871", ink_4="#4A4C47",
+        bar="#6E706A",
+        active="#57BE8B", active_t="#1B2A22", active_ink="#7FD3A9",
+        idle="#5A5C57",
+        offline="#D8807F", offline_t="#2C1F1E", offline_ink="#E5A2A1",
+        paused_t="#232522", paused_ink="#A9ABA3",
+        warn="#DEA85A", warn_t="#2A2419", warn_ink="#E5BE84",
+        bg_translucent="rgba(16, 18, 16, 0.70)"),
+}
+DEFAULT_THEME = "light"
+
+# The theme in effect app-wide right now -- one writer (apply()), any
+# number of readers, exactly like _active_accent_name below.
+_active_theme_name: str = DEFAULT_THEME
+
+
+def resolve_theme(name: str) -> ThemePalette:
+    """The named palette, or the default's. Falls back rather than raising
+    for the same reason resolve_accent does: a hand-edited or forward-dated
+    settings.json must not brick the app with no UI left to fix it from."""
+    return THEMES.get(name, THEMES[DEFAULT_THEME])
+
+
+def current_theme() -> ThemePalette:
+    """The palette for whichever theme is active RIGHT NOW.
+
+    Call this at paint/use time, inside a method -- never at module import.
+    A colour captured at import is frozen at whatever the theme was then,
+    which is precisely the bug documented on ACCENT below, and a theme
+    switch reproduces it across every neutral in the app at once.
+    """
+    return THEMES[_active_theme_name]
+
+
+def current_theme_name() -> str:
+    return _active_theme_name
+
+
+def is_dark() -> bool:
+    """For the places that must know -- e.g. asking Windows for a dark
+    title bar, or picking the dark variant of an accent's ink."""
+    return _active_theme_name == "dark"
+
+
+# ---------------- corner radii ----------------
+# Three steps, not a radius per widget: floating panels (the sidebar, cards)
+# are the roundest, inset controls a step tighter, small chrome tighter
+# again. Named because "how round is a card" is a design decision that has
+# to stay the same in every module that draws one. Values are the
+# reference's --r-lg / --r-md / --r-sm.
+RADIUS_LG = 22
+RADIUS_MD = 14
+RADIUS_SM = 10
 
 
 # ---------------- accents ----------------
@@ -55,11 +155,22 @@ class AccentPalette:
     rather than hand-listed per colour, so adding a new accent to ACCENTS
     is one line, and every accent is guaranteed to define the full set --
     no KeyError at paint time for a colour that forgot a shade.
+
+    ink_light/ink_dark are NOT computed, they are the reference's own
+    per-theme values. `base` is tuned to sit ON a surface as a fill; used
+    as TEXT it is too pale on a light theme and too dim on a dark one, so
+    each theme names its own legible variant. Read them through ink().
     """
     base: str
     hover: str
     pressed: str
     disabled: str
+    ink_light: str
+    ink_dark: str
+
+    def ink(self) -> str:
+        """The accent as legible TEXT in the active theme."""
+        return self.ink_dark if is_dark() else self.ink_light
 
 
 def _mix(a: QColor, b: QColor, t: float) -> str:
@@ -70,30 +181,37 @@ def _mix(a: QColor, b: QColor, t: float) -> str:
     return QColor(r, g, bch).name()
 
 
-def _accent(base: str) -> AccentPalette:
+def _accent(base: str, ink_light: str, ink_dark: str) -> AccentPalette:
     c = QColor(base)
     return AccentPalette(
         base=base,
         hover=c.lighter(115).name(),
         pressed=c.darker(115).name(),
-        # Muted toward the border colour, not black -- a disabled accent
-        # chip should read as "this surface", not "this surface plus a
-        # shadow".
-        disabled=_mix(c, QColor(BORDER), 0.6),
+        # Muted toward mid-grey, not black -- a disabled accent chip should
+        # read as "this surface", not "this surface plus a shadow". Mixed
+        # against a fixed neutral rather than a theme token because
+        # ACCENTS is built at import time, before any theme is active.
+        disabled=_mix(c, QColor("#8A8A83"), 0.6),
+        ink_light=ink_light,
+        ink_dark=ink_dark,
     )
 
 
-# Every base value below is checked against BG_SHELL for >= 4.5:1 contrast
-# in tests/test_theme.py using the WCAG relative-luminance formula -- not
-# eyeballed. Red is the accent most likely to run short of that margin
-# against a dark shell, so its base sits comfortably above the threshold
-# (~4.9:1) rather than right at it.
+# The reference's five swatches, value for value. Its own names for them
+# are blender/sky/mint/violet/rose; the keys stay the colour words this app
+# has always used, so a settings.json written by an older build still
+# resolves and nobody's saved choice silently resets.
+#
+# Every base is checked for >= 3:1 contrast against BOTH theme backgrounds,
+# and every ink for >= 4.5:1 against its own theme's surfaces, in
+# tests/test_theme.py -- using the WCAG relative-luminance formula, not
+# eyeballed.
 ACCENTS: dict[str, AccentPalette] = {
-    "orange": _accent("#F5792A"),   # Blender orange -- the original accent
-    "green": _accent("#4CAF6D"),
-    "purple": _accent("#9B7EDE"),
-    "blue": _accent("#5FB0F0"),
-    "red": _accent("#E85454"),
+    "orange": _accent("#E8935A", "#C06F38", "#F0AC7C"),   # blender
+    "blue":   _accent("#5A9BD8", "#3D7BB8", "#8CBCE8"),   # sky
+    "green":  _accent("#4DB690", "#33936F", "#7DD0B0"),   # mint
+    "purple": _accent("#9B7FD4", "#7A5CB8", "#BCA5E8"),   # violet
+    "red":    _accent("#D4708F", "#B34E6F", "#E89AB4"),   # rose
 }
 DEFAULT_ACCENT = "orange"
 
@@ -166,18 +284,19 @@ class _ThemeSignal(QObject):
 
 theme_signal = _ThemeSignal()
 
-# A small, fixed set of account tint colours for the filmstrip and rail
-# status dots. Cycled by account index. Deliberately distinct in both hue
-# AND lightness from each other and from WARNING/ACCENT, so an account's
-# tint is never confusable with a status colour.
+# A small, fixed set of account tint colours for the filmstrip and the card
+# header dots -- the reference's own INST_COLORS, in its order. Cycled by
+# account index. Deliberately distinct in both hue AND lightness from each
+# other, so an account's tint is never confusable with a status colour.
 ACCOUNT_COLORS = [
-    "#F5792A",  # account 0 -- accent orange doubles as "you"
-    "#4FD1C5",  # account 1 -- teal
-    "#9B7EDE",  # account 2 -- violet
-    "#5FB0F0",  # account 3 -- sky blue
-    "#E85D9E",  # account 4 -- pink
-    "#8BC34A",  # account 5 -- muted green (paired with word/symbol, never
-                # relied on alone, so it is safe alongside WARNING amber)
+    "#E8935A",  # account 0 -- the accent hue doubles as "you"
+    "#5A9BD8",
+    "#4DB690",
+    "#9B7FD4",
+    "#D4708F",
+    "#D8B44C",
+    "#5FB8C4",
+    "#B07A5A",
 ]
 
 
@@ -268,24 +387,113 @@ def ui_font(point_size: int = 9) -> QFont:
     return font
 
 
-def _stylesheet(accent: AccentPalette) -> str:
-    """The whole application stylesheet, parameterised by the active
-    accent. Everything that used to be the literal ACCENT constant now
-    reads from `accent.base`/`accent.hover` so switching accents at
-    runtime is a matter of calling this again with a different palette."""
+def tracked_font(point_size: int = 8, *,
+                 weight: QFont.Weight = QFont.Weight.Bold,
+                 tracking: float = 12.0) -> QFont:
+    """Uppercase, letter-spaced Roboto -- navigation items, section headers,
+    the page title, button labels.
+
+    This is how the app gets the reference design's condensed-caps character
+    WITHOUT vendoring a second typeface: bold Roboto, set uppercase and
+    opened up with tracking, reads as deliberate label chrome rather than as
+    body text, which is the whole job those labels do.
+
+    It has to be a QFont rather than a stylesheet rule because Qt Style
+    Sheets implement neither `letter-spacing` nor `text-transform` -- there
+    is no QSS property for either, so both live here or nowhere.
+    Capitalization is applied at PAINT time (AllUppercase), not by upper()ing
+    the string, so a widget's text() still returns what was set: screen
+    readers, tests and tooltips see the real words, not shouted ones.
+
+    `tracking` is in percent ADDED to normal spacing (12.0 -> 112% of
+    normal), matching the .12em the reference uses on nav items.
+    """
+    font = QFont(UI_FONT_FAMILY)
+    font.setFamilies([UI_FONT_FAMILY, UI_FONT_FALLBACK, "sans-serif"])
+    font.setPointSize(point_size)
+    font.setWeight(weight)
+    font.setCapitalization(QFont.Capitalization.AllUppercase)
+    font.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 100.0 + tracking)
+    return font
+
+
+def soft(color: str, *, on: str, amount: float = 0.14) -> str:
+    """`color` at `amount` opacity over `on`, as an OPAQUE hex colour.
+
+    The reference expresses these washes as rgba(...,.14). Precomputing the
+    blend instead of emitting a translucent colour is deliberate: a
+    semi-transparent QSS background composites against whatever Qt happens
+    to have painted underneath, which for a widget inside a styled parent
+    is not reliably the surface we think it is -- so the same rule can
+    render differently depending on stacking. A solid colour cannot.
+    """
+    return _mix(QColor(color), QColor(on), 1.0 - amount)
+
+
+def accent_soft(accent: AccentPalette | None = None,
+                theme: ThemePalette | None = None) -> str:
+    """The active accent as a soft wash over the active theme's card."""
+    accent = accent or current_accent()
+    theme = theme or current_theme()
+    return soft(accent.base, on=theme.card)
+
+
+def accent_ink(accent: AccentPalette | None = None) -> str:
+    """The active accent as legible text -- see AccentPalette.ink()."""
+    return (accent or current_accent()).ink()
+
+
+def _stylesheet(accent: AccentPalette, t: ThemePalette) -> str:
+    """The whole application stylesheet, for one (accent, theme) pair.
+
+    Every rule below traces to the reference design in ref/. Where QSS has
+    no equivalent for a CSS property the reference uses, the difference is
+    noted at the rule rather than silently dropped:
+
+      - `transition` does not exist in QSS. State changes are instant; the
+        few that must animate (the sidebar collapse) use QPropertyAnimation.
+      - `letter-spacing` and `text-transform` do not exist in QSS. Both live
+        on the QFont instead -- see tracked_font().
+      - `box-shadow` does not exist in QSS. Elevation is carried by a real
+        lightness step between bg/card/fill, which holds up better on a
+        dark palette anyway.
+      - `::after` does not exist in QSS. The rule that fills the rest of a
+        section header row is a real QFrame -- see Dashboard._section.
+    """
     return f"""
 * {{
-    color: {TEXT_PRIMARY};
+    color: {t.ink};
     font-family: "{UI_FONT_FAMILY}", "{UI_FONT_FALLBACK}", sans-serif;
     font-size: 10pt;
 }}
 
+/* Plain containers paint NOTHING. Only the window itself and the named
+surfaces below (#card, #panel, #sidebar, ...) have a background.
+
+This is the opposite of the obvious rule, and it is the important one: a
+generic `QWidget {{ background-color: <shell> }}` means every layout
+container INSIDE a card repaints the shell colour on top of the card,
+which showed up as grey blocks across the instance cards and as a fleet-log
+panel with no panel behind it. Transparent by default, painted by name,
+makes that impossible. */
 QWidget {{
-    background-color: {BG_SHELL};
+    background-color: transparent;
 }}
 
-QMainWindow, QDialog {{
-    background-color: {BG_SHELL};
+QMainWindow, QDialog, QMenu {{
+    background-color: {t.bg};
+}}
+
+QMenu {{
+    border: 1px solid {t.border};
+    border-radius: {RADIUS_SM}px;
+    padding: 4px;
+}}
+
+QMenu::item:selected {{
+    background-color: {accent_soft(accent, t)};
+    color: {accent.ink()};
+    border-radius: 6px;
 }}
 
 QLabel {{
@@ -293,55 +501,90 @@ QLabel {{
 }}
 
 QLabel[secondary="true"] {{
-    color: {TEXT_SECONDARY};
+    color: {t.ink_2};
+}}
+
+QLabel[tertiary="true"] {{
+    color: {t.ink_3};
+}}
+
+/* Qt's default link blue is the one colour in the app that belongs to
+nobody -- links take the accent's text variant like every other emphasis. */
+QLabel {{
+    qproperty-linkColor: {accent.ink()};
+}}
+
+/* ---------------- surfaces ---------------- */
+#card, #panel {{
+    background-color: {t.card};
+    border: 1px solid {t.border};
+    border-radius: {RADIUS_LG}px;
+}}
+
+#page {{
+    background-color: {t.bg};
+}}
+
+#pageTitle {{
+    color: {t.ink};
+}}
+
+#sectionRule {{
+    background-color: {t.border};
+    border: none;
 }}
 
 QListWidget, QTableWidget {{
-    background-color: {BG_SURFACE};
-    border: 1px solid {BORDER};
-    border-radius: 6px;
+    background-color: {t.card};
+    border: 1px solid {t.border};
+    border-radius: {RADIUS_LG}px;
+    gridline-color: {t.border};
 }}
 
-/* The rail recedes to the SHELL colour rather than the SURFACE colour
-every other panel uses, so the InstanceCards sitting inside it (below)
-read as a level above their container -- elevation by a genuine lightness
-step, not a decorative drop shadow, which is what still holds up on a
-warm-dark palette this close in contrast already. */
-#rail {{
-    background-color: {BG_SHELL};
-    border-right: 1px solid {BORDER};
+QListWidget::item, QTableWidget::item {{
+    padding: 6px;
+    border: none;
 }}
 
-/* Cards sit INSIDE the rail (see dashboard.py's InstanceCard, one per
-account) -- lighter than the rail behind them (elevation), with a touch
-more corner rounding than the squarer panels around them so they read as
-distinct, liftable units rather than another strip of the sidebar. */
-#card {{
-    background-color: {BG_SURFACE};
-    border: 1px solid {BORDER};
-    border-radius: 8px;
+QListWidget::item:selected, QTableWidget::item:selected {{
+    background-color: {accent_soft(accent, t)};
+    color: {accent.ink()};
 }}
 
+QHeaderView::section {{
+    background-color: {t.card};
+    color: {t.ink_3};
+    border: none;
+    border-bottom: 1px solid {t.border};
+    padding: 8px 6px;
+}}
+
+QTableCornerButton::section {{
+    background-color: {t.card};
+    border: none;
+}}
+
+/* ---------------- buttons ---------------- */
 QPushButton {{
-    background-color: {BG_SURFACE};
-    border: 1px solid {BORDER};
-    border-radius: 4px;
-    padding: 6px 14px;
-    color: {TEXT_PRIMARY};
+    background-color: {t.card};
+    border: 1px solid {t.border_2};
+    border-radius: 12px;
+    padding: 9px 15px;
+    color: {t.ink_2};
 }}
 
 QPushButton:hover {{
-    border-color: {accent.base};
+    border-color: {t.ink_3};
+    color: {t.ink};
 }}
 
 QPushButton:pressed {{
-    background-color: {accent.base};
-    color: {BG_SHELL};
+    background-color: {t.fill};
 }}
 
 QPushButton:disabled {{
-    color: {TEXT_SECONDARY};
-    border-color: {BORDER};
+    color: {t.ink_4};
+    border-color: {t.border};
 }}
 
 QPushButton:focus, QSpinBox:focus, QComboBox:focus, QLineEdit:focus,
@@ -349,10 +592,18 @@ QListWidget:focus, QTableWidget:focus {{
     border: 2px solid {accent.base};
 }}
 
+/* The label is a fixed near-black, NOT white and NOT the active theme's
+ink. The reference sets white here, which measures 2.40:1 on the orange
+accent -- the worst pairing in the whole design, on the app's single most
+important button. A dark label on the same fill measures 5.72-7.84 across
+all five accents and both themes, so the fill stays exactly the
+reference's and only the text changes. It cannot be current_theme().ink
+either: that is near-white in the dark theme, which puts us straight back
+where we started. */
 #primaryButton {{
     background-color: {accent.base};
-    color: {BG_SHELL};
-    font-weight: 600;
+    color: {THEMES["dark"].bg};
+    font-weight: 700;
     border: 1px solid {accent.base};
 }}
 
@@ -360,87 +611,413 @@ QListWidget:focus, QTableWidget:focus {{
     background-color: {accent.hover};
 }}
 
+#primaryButton:pressed {{
+    background-color: {accent.pressed};
+}}
+
 #primaryButton:disabled {{
     background-color: {accent.disabled};
-    color: {TEXT_SECONDARY};
-    border-color: {BORDER};
+    color: {t.ink_4};
+    border-color: {accent.disabled};
 }}
 
+/* The reference's .btn.ghost-accent: an accent-tinted secondary action. */
+#ghostButton {{
+    background-color: {accent_soft(accent, t)};
+    border: 1px solid {soft(accent.base, on=t.card, amount=0.5)};
+    color: {accent.ink()};
+}}
+
+#ghostButton:hover {{
+    border-color: {accent.base};
+}}
+
+/* .btn.danger */
+#dangerButton {{
+    color: {t.offline_ink};
+    border-color: {soft(t.offline, on=t.card, amount=0.45)};
+}}
+
+#dangerButton:hover {{
+    border-color: {t.offline};
+    color: {t.offline_ink};
+}}
+
+/* Small buttons inside a card (Cancel, Download, View full log). The
+default 9px vertical padding plus 10pt text needs more room than these
+short fixed-height buttons have, and a fixed height wins the argument --
+so the descenders get clipped. Less padding, not a taller button: the
+card is dense on purpose. */
+#cardButton {{
+    padding: 2px 10px;
+    border-radius: {RADIUS_SM}px;
+}}
+
+/* ---------------- inputs ---------------- */
 QLineEdit, QSpinBox, QComboBox {{
-    background-color: {BG_SHELL};
-    border: 1px solid {BORDER};
-    border-radius: 4px;
-    padding: 4px 6px;
+    background-color: {t.fill};
+    border: 1px solid {t.border_2};
+    border-radius: {RADIUS_SM}px;
+    padding: 7px 10px;
+    color: {t.ink};
+    font-family: "{MONO_FONT_FAMILY}", "{MONO_FONT_FALLBACK}", monospace;
     selection-background-color: {accent.base};
+    selection-color: #FFFFFF;
 }}
 
-QListWidget::item, QTableWidget::item {{
-    padding: 4px;
-}}
-
-QListWidget::item:selected, QTableWidget::item:selected {{
-    background-color: {BORDER};
-}}
-
-QHeaderView::section {{
-    background-color: {BG_SURFACE};
-    color: {TEXT_SECONDARY};
+QComboBox::drop-down {{
     border: none;
-    border-bottom: 1px solid {BORDER};
-    padding: 4px;
+    width: 22px;
 }}
 
+QComboBox QAbstractItemView {{
+    background-color: {t.card};
+    border: 1px solid {t.border};
+    border-radius: {RADIUS_SM}px;
+    selection-background-color: {accent_soft(accent, t)};
+    selection-color: {accent.ink()};
+}}
+
+/* ---------------- progress ---------------- */
+/* The reference's .track: a rounded, unlabelled bar on the fill colour. */
 QProgressBar {{
-    background-color: {BG_SHELL};
-    border: 1px solid {BORDER};
-    border-radius: 4px;
+    background-color: {t.fill};
+    border: none;
+    border-radius: 5px;
+    height: 8px;
     text-align: center;
-    color: {TEXT_PRIMARY};
+    color: {t.ink_2};
 }}
 
 QProgressBar::chunk {{
     background-color: {accent.base};
-    border-radius: 3px;
+    border-radius: 5px;
 }}
 
-QScrollBar:vertical, QScrollBar:horizontal {{
-    background: {BG_SHELL};
+/* ---------------- scrollbars ---------------- */
+/* Thin, and invisible until the pointer is over the area -- the
+reference's `scrollbar-color: transparent` until :hover. */
+QScrollBar:vertical {{
+    background: transparent;
     border: none;
+    width: 8px;
+    margin: 0px;
+}}
+
+QScrollBar:horizontal {{
+    background: transparent;
+    border: none;
+    height: 8px;
+    margin: 0px;
 }}
 
 QScrollBar::handle {{
-    background: {BORDER};
+    background: {t.ink_4};
     border-radius: 4px;
+    min-height: 28px;
+    min-width: 28px;
 }}
 
+QScrollBar::handle:hover {{
+    background: {t.ink_3};
+}}
+
+QScrollBar::add-line, QScrollBar::sub-line {{
+    height: 0px;
+    width: 0px;
+    border: none;
+    background: none;
+}}
+
+QScrollBar::add-page, QScrollBar::sub-page {{
+    background: none;
+}}
+
+QScrollArea {{
+    background: transparent;
+    border: none;
+}}
+
+/* ---------------- tooltips, dialogs ---------------- */
 QToolTip {{
-    background-color: {BG_SURFACE};
-    color: {TEXT_PRIMARY};
-    border: 1px solid {BORDER};
+    background-color: {t.card};
+    color: {t.ink};
+    border: 1px solid {t.border};
+    border-radius: {RADIUS_SM}px;
+    padding: 6px 9px;
 }}
 
 QMessageBox {{
-    background-color: {BG_SURFACE};
+    background-color: {t.card};
+}}
+
+/* ---------------- shell: title bar ---------------- */
+#titleBar {{
+    background-color: transparent;
+}}
+
+#titleBarTitle {{
+    color: {t.ink_3};
+}}
+
+#windowButton {{
+    background-color: transparent;
+    border: none;
+    border-radius: {RADIUS_SM}px;
+    padding: 0px;
+    color: {t.ink_2};
+}}
+
+#windowButton:hover {{
+    background-color: {t.fill};
+    color: {t.ink};
+}}
+
+#closeButton:hover {{
+    background-color: {t.offline};
+    color: #FFFFFF;
+}}
+
+/* ---------------- shell: sidebar, navigation ---------------- */
+/* A floating rounded panel inset from the window edge, not a full-height
+flush rail. Children are NOT clipped by a parent's border-radius in Qt, so
+every nav item is inset far enough that the corner never has to clip. */
+#sidebar {{
+    background-color: {t.card};
+    border: 1px solid {t.border};
+    border-radius: {RADIUS_LG}px;
+}}
+
+/* Collapsed, the sidebar is a pill of circular icon buttons rather than a
+narrow version of the same rounded rectangle -- the shape change is what
+makes "collapsed" legible at a glance instead of just "narrower". */
+#sidebar[collapsed="true"] {{
+    border-radius: 34px;
+}}
+
+/* A custom QAbstractButton (ui/sidebar.py) rather than a QPushButton: the
+count pill has to sit at the trailing edge with the label filling the gap,
+which a QPushButton's single text slot cannot express. WA_StyledBackground
+is what lets these rules paint it at all -- see NavButton.__init__. */
+#navButton {{
+    background-color: transparent;
+    border: none;
+    border-radius: 12px;
+}}
+
+#navButton:hover {{
+    background-color: {t.fill};
+}}
+
+#navButton[active="true"] {{
+    background-color: {accent_soft(accent, t)};
+}}
+
+#navButton[collapsed="true"] {{
+    border-radius: 22px;
+}}
+
+#navPill {{
+    background-color: {t.fill};
+    color: {t.ink_2};
+    border-radius: 9px;
+    padding: 1px 7px;
+}}
+
+#navButton[active="true"] #navPill {{
+    background-color: {t.card};
+    color: {accent.ink()};
+}}
+
+#navPill[alert="true"] {{
+    background-color: {t.offline_t};
+    color: {t.offline_ink};
+}}
+
+#collapseButton {{
+    background-color: transparent;
+    border: 1px solid {t.border_2};
+    border-radius: 12px;
+    color: {t.ink_3};
+}}
+
+#collapseButton:hover {{
+    border-color: {t.ink_3};
+    color: {t.ink};
+}}
+
+#sidebarFooter {{
+    color: {t.ink_3};
+}}
+
+/* ---------------- header chrome ---------------- */
+#iconButton {{
+    background-color: {t.card};
+    border: 1px solid {t.border_2};
+    border-radius: {RADIUS_MD}px;
+    padding: 0px;
+    color: {t.ink_2};
+}}
+
+#iconButton:hover {{
+    border-color: {t.ink_3};
+    color: {t.ink};
+}}
+
+#iconButton[active="true"] {{
+    background-color: {accent_soft(accent, t)};
+    border-color: {soft(accent.base, on=t.card, amount=0.5)};
+    color: {accent.ink()};
+}}
+
+/* The bell's unread bubble. Bordered in the shell colour so it reads as
+sitting ON the button rather than inside it. */
+#notifCount {{
+    background-color: {accent.base};
+    color: #FFFFFF;
+    border: 2px solid {t.bg};
+    border-radius: 9px;
+}}
+
+/* Connection-health button: latency in mono, arcs tinted by verdict. */
+#wifiButton {{
+    background-color: {t.card};
+    border: 1px solid {t.border_2};
+    border-radius: {RADIUS_MD}px;
+    padding: 0px 12px;
+    color: {t.ink_2};
+}}
+
+#wifiButton:hover {{
+    border-color: {t.ink_3};
+}}
+
+/* ---------------- badges ---------------- */
+/* The reference's .badge: soft-tinted pill, a dot, and a WORD. The word is
+not decoration -- status is never carried by colour alone anywhere in this
+app (see the note on ThemePalette.warn and instance_card.status_for). */
+#badge {{
+    border-radius: 9px;
+    padding: 2px 9px;
+}}
+
+#badge[tone="active"]    {{ background-color: {t.active_t};  color: {t.active_ink}; }}
+#badge[tone="idle"]      {{ background-color: {t.fill};      color: {t.ink_3}; }}
+#badge[tone="offline"]   {{ background-color: {t.offline_t}; color: {t.offline_ink}; }}
+#badge[tone="paused"]    {{ background-color: {t.paused_t};  color: {t.paused_ink}; }}
+#badge[tone="warn"]      {{ background-color: {t.warn_t};    color: {t.warn_ink}; }}
+#badge[tone="accent"]    {{ background-color: {accent_soft(accent, t)}; color: {accent.ink()}; }}
+
+/* Hardware/meta chips inside a card -- the reference's .hw-chip. */
+#chip {{
+    background-color: {t.fill};
+    border: 1px solid {t.border};
+    border-radius: 8px;
+    padding: 3px 9px;
+    color: {t.ink_2};
+}}
+
+#chip[live="true"] {{
+    background-color: {accent_soft(accent, t)};
+    border-color: transparent;
+    color: {accent.ink()};
+}}
+
+/* ---------------- panels floated over the page ---------------- */
+#floatPanel {{
+    background-color: {t.card};
+    border: 1px solid {t.border_2};
+    border-radius: {RADIUS_LG}px;
+}}
+
+#toast {{
+    background-color: {t.card};
+    border: 1px solid {t.border_2};
+    border-radius: {RADIUS_MD}px;
+}}
+
+/* The offline banner: bordered in the offline colour rather than filled,
+so a persistent warning never shouts as loudly as a transient error. */
+#offlineBanner {{
+    background-color: {t.card};
+    border: 1px solid {soft(t.offline, on=t.card, amount=0.4)};
+    border-radius: {RADIUS_LG}px;
+}}
+
+#offlineBanner QLabel {{
+    color: {t.offline_ink};
+}}
+
+/* ---------------- dropzone ---------------- */
+#dropzone {{
+    background-color: transparent;
+    border: 2px dashed {t.border_2};
+    border-radius: {RADIUS_LG}px;
+    color: {t.ink_3};
+}}
+
+#dropzone[hot="true"] {{
+    border-color: {accent.base};
+    background-color: {accent_soft(accent, t)};
+    color: {accent.ink()};
+}}
+
+/* ---------------- settings ---------------- */
+/* The reference's .seg -- a segmented control, one button per option. */
+#segment {{
+    background-color: {t.fill};
+    border: 1px solid {t.border};
+    border-radius: {RADIUS_SM}px;
+    padding: 6px 14px;
+    color: {t.ink_2};
+}}
+
+#segment[active="true"] {{
+    background-color: {t.card};
+    color: {accent.ink()};
+    border-color: {soft(accent.base, on=t.card, amount=0.5)};
+}}
+
+#settingRow {{
+    background-color: transparent;
+    border-bottom: 1px solid {t.border};
+}}
+
+/* The reference's .toggle -- a pill switch. The knob is a child widget, so
+only the track is styled here. */
+#toggleTrack {{
+    background-color: {t.fill};
+    border: 1px solid {t.border_2};
+    border-radius: 11px;
+}}
+
+#toggleTrack[on="true"] {{
+    background-color: {accent.base};
+    border-color: {accent.base};
+}}
+
+#toggleKnob {{
+    background-color: {t.card};
+    border-radius: 8px;
 }}
 """
 
 
-# Backward-compatible: the default-accent stylesheet, computed eagerly.
-# Nothing in this codebase imports it, but it mirrors ACCENT above so a
-# caller reaching for the pre-Task-1 name still gets a working stylesheet.
-STYLESHEET = _stylesheet(ACCENTS[DEFAULT_ACCENT])
+# Backward-compatible: the default stylesheet, computed eagerly. Nothing in
+# this codebase imports it.
+STYLESHEET = _stylesheet(ACCENTS[DEFAULT_ACCENT], THEMES[DEFAULT_THEME])
 
 
-def apply(app: QApplication, accent: str = DEFAULT_ACCENT) -> None:
-    """Apply the BlendFleet theme to the whole application for the given
-    accent, registering the bundled fonts on first call.
+def apply(app: QApplication, accent: str = DEFAULT_ACCENT,
+          theme: str = DEFAULT_THEME) -> None:
+    """Apply the BlendFleet design system to the whole application, for the
+    given accent and theme, registering the bundled fonts on first call.
 
-    Re-appliable at runtime: calling this again with a different accent
-    name (e.g. after the user changes it in settings) re-derives the
-    stylesheet and sets it again -- nothing here accumulates state across
-    calls other than the one-time font registration. An accent name
-    ACCENTS doesn't recognise falls back to the default rather than
-    raising, via resolve_accent().
+    Re-appliable at runtime: calling this again with a different accent or
+    theme re-derives the stylesheet and sets it again -- nothing here
+    accumulates state across calls other than the one-time font
+    registration. A name neither ACCENTS nor THEMES recognises falls back
+    to the default rather than raising, via resolve_accent/resolve_theme.
 
     Called once, right after constructing QApplication and before any
     window or dialog is shown, a stylesheet set at the QApplication level
@@ -448,25 +1025,26 @@ def apply(app: QApplication, accent: str = DEFAULT_ACCENT) -> None:
     (SetupDialog) opened later -- that is the mechanism that guarantees no
     dialog is ever left unstyled.
 
-    Also updates the module-global `_active_accent_name` (what
-    current_accent() reads) and emits `theme_signal.changed`, in that
-    order, BEFORE returning -- so a connected slot that calls
-    current_accent() during the signal handler already sees the new
-    accent, not the one being replaced.
+    Updates the module globals `_active_accent_name` and
+    `_active_theme_name` (what current_accent()/current_theme() read) and
+    emits `theme_signal.changed`, in that order, BEFORE returning -- so a
+    connected slot that calls either during the signal handler already sees
+    the new values, not the ones being replaced.
     """
-    global _active_accent_name
+    global _active_accent_name, _active_theme_name
     register_fonts()
     _active_accent_name = accent if accent in ACCENTS else DEFAULT_ACCENT
-    palette = ACCENTS[_active_accent_name]
+    _active_theme_name = theme if theme in THEMES else DEFAULT_THEME
     app.setStyle("Fusion")
     app.setFont(ui_font())
-    app.setStyleSheet(_stylesheet(palette))
+    app.setStyleSheet(_stylesheet(ACCENTS[_active_accent_name],
+                                  THEMES[_active_theme_name]))
     theme_signal.changed.emit()
 
 
 def apply_theme(app: QApplication) -> None:
-    """Backward-compatible entry point: apply() with the default accent."""
-    apply(app, DEFAULT_ACCENT)
+    """Backward-compatible entry point: apply() with the defaults."""
+    apply(app, DEFAULT_ACCENT, DEFAULT_THEME)
 
 
 # ---------------- icons ----------------
@@ -550,4 +1128,10 @@ ICON_NAMES = [
     "check", "x", "circle-check", "circle-alert", "triangle-alert",
     "loader-circle", "upload", "download", "cpu", "activity", "settings",
     "plus", "trash-2", "play", "square", "folder-open", "users", "monitor",
+    # Added with the navigation sidebar: the collapse toggle. Rotated 180
+    # degrees when collapsed rather than shipped as a second mirrored file.
+    "chevron-left",
+    # Added with the frameless title bar (ui/title_bar.py). "x" doubles as
+    # the close glyph, so only three are new.
+    "minimise", "maximise", "restore",
 ]
