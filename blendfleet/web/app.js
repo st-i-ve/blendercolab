@@ -562,14 +562,10 @@ document.getElementById('btn-forget').onclick = () => {
      session while sounding like a cancel would be the worst lie this app
      could tell -- somebody else's quota keeps draining either way. */
   const ok = window.confirm(
-    'Stop tracking this job?
-
-'
+    'Stop tracking this job?\n\n'
     + 'This does NOT cancel anything. Any kernels still running on Kaggle '
     + 'keep running and keep spending quota, and this app will no longer '
-    + 'be able to stop them or collect their frames.
-
-'
+    + 'be able to stop them or collect their frames.\n\n'
     + 'Use this only when Kaggle refuses to cancel and you are stuck. '
     + 'Then stop them by hand at kaggle.com.');
   if (ok && backend) backend.forgetJob();
