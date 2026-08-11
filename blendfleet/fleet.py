@@ -361,6 +361,74 @@ class Fleet:
         so the UI can show the destination before anything is sent."""
         return f"{owner_username}/{slug_stem(blend)}-blend"
 
+    BLENDER_DATASET_PREFIX = "blender"
+
+    def blender_dataset_name(self, version: str) -> str:
+        """`blender-5-2-0-linux` for 5.2.0 -- Kaggle slugs take no dots."""
+        return f"{self.BLENDER_DATASET_PREFIX}-{version.replace('.', '-')}-linux"
+
+    def ensure_blender_dataset(self, tarball: Path, version: str,
+                               on_progress: Callable | None = None,
+                               on_stage: Callable | None = None,
+                               *, clients: dict | None = None,
+                               usernames: dict | None = None) -> str:
+        """Put Blender itself on Kaggle, once, and share it with everyone.
+
+        A Kaggle session has NO outbound network unless the account is
+        phone-verified -- enable_internet is accepted and silently ignored,
+        and DNS does not even resolve (measured on a real session). So the
+        notebook cannot download Blender, and every render this app started
+        died in that cell without producing a frame.
+
+        An attached dataset needs no network at all. It also starts in
+        seconds rather than minutes, and works on an unverified account --
+        which is what matters for a fleet of friends' accounts, since the
+        alternative is asking every one of them to phone-verify.
+
+        Uploaded once and reused: the tarball is ~300 MB and does not
+        change between renders, so this checks Kaggle first and skips.
+        """
+        if clients is None or usernames is None:
+            clients, usernames = self._resolve_clients()
+        owner = self.accounts[0]
+        owner_client = clients[owner.label]
+        owner_username = usernames[owner.label]
+        name = self.blender_dataset_name(version)
+        slug = f"{owner_username}/{name}"
+
+        def stage(key: str, detail: str = "") -> None:
+            if on_stage is not None:
+                on_stage(key, detail)
+
+        expected = tarball.stat().st_size
+        stage("blender-checking", slug)
+        try:
+            present = (owner_client.dataset_file_size(slug, tarball.name)
+                       == expected)
+        except Exception:
+            present = False
+
+        if not present:
+            stage("blender-uploading", f"{expected / 1e6:.0f} MB, one time only")
+            sync_blend(owner_client, tarball, slug,
+                       self.work_dir / "ds_blender", on_progress=on_progress)
+        else:
+            stage("blender-ready", slug)
+
+        friends = self.accounts[1:]
+        if friends:
+            stage("blender-sharing", "")
+            sdk = owner_client._sdk_factory(owner_client.token)
+            current = sharing.get_settings(sdk, owner_username, name)
+            try:
+                sharing.grant_readers(
+                    sdk, owner_username, name,
+                    [usernames[a.label] for a in friends], current)
+            except Exception as e:
+                raise _explain_bad_collaborators(e, friends, usernames) from e
+        stage("blender-ready", slug)
+        return slug
+
     def _require_real_usernames(self, friends: list, usernames: dict,
                                 clients: dict) -> None:
         """Refuse to grant access to a name Kaggle will not recognise.
@@ -580,7 +648,8 @@ class Fleet:
         return slug
 
     def start_workers(self, labels: list[str], settings: RenderSettings,
-                      dataset_slug: str) -> FleetState:
+                      dataset_slug: str,
+                      blender_slug: str | None = None) -> FleetState:
         """Bring machines up WITHOUT giving them work yet.
 
         Each pushed kernel reports the hardware it actually got, sets up
@@ -626,7 +695,8 @@ class Fleet:
                 kern_dir = self.work_dir / f"warm_{account.label}"
                 build([], settings, dataset_slug, kern_dir, kernel_slug,
                       mode="worker", control_slug=control,
-                      token=account.token, worker_label=account.label)
+                      token=account.token, worker_label=account.label,
+                      blender_slug=blender_slug)
                 client.push_kernel(kern_dir)
                 st.workers.append(WorkerState(
                     label=account.label, username=username,
@@ -642,7 +712,8 @@ class Fleet:
     def launch(self, blend: Path, settings: RenderSettings,
                start_frame: int, end_frame: int,
                on_progress: Callable | None = None,
-               dataset_slug: str | None = None) -> FleetState:
+               dataset_slug: str | None = None,
+               blender_slug: str | None = None) -> FleetState:
         """Launch a render across every configured account.
 
         `on_progress`, if given, is threaded straight through to
@@ -712,7 +783,8 @@ class Fleet:
                 kernel_slug = f"{username}/{stem}-render-{job_id}"
 
                 kern_dir = self.work_dir / f"kern_{account.label}"
-                build(frames, settings, dataset_slug, kern_dir, kernel_slug)
+                build(frames, settings, dataset_slug, kern_dir, kernel_slug,
+                      blender_slug=blender_slug)
                 client.push_kernel(kern_dir)
 
                 st.workers.append(WorkerState(

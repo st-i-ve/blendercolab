@@ -65,6 +65,19 @@ def explain(action: str, exc: Exception) -> str:
 # Fleet.fetch_failure_log when that came back empty).
 # ---------------------------------------------------------------------------
 _FAILURE_CAUSES: tuple[tuple[tuple[str, ...], str, str], ...] = (
+    # Measured on a real render: Blender exits in about a second, per
+    # frame, with "ERROR Cannot render, no camera" -- and without this the
+    # app reported only that every frame failed, which looks like a fault
+    # in the farm rather than a scene that cannot be rendered by anything.
+    # Listed FIRST because it also matches "blender quit" below, and the
+    # specific cause is far more useful than "Blender crashed".
+    (("cannot render, no camera", "no camera"),
+     "The scene has no camera",
+     "Blender cannot render a scene with no active camera, so every frame "
+     "failed within a second or so -- nothing to do with Kaggle, the GPU "
+     "or the fleet. Open the .blend, add a camera (or set an existing one "
+     "as the scene's active camera in Scene Properties), save, and upload "
+     "the scene again."),
     (("out of memory", "outofmemory", "cuda out of memory", "memoryerror",
       "bad_alloc", "killed process", "oom-killer", "oom killer"),
      "Ran out of memory",

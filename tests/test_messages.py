@@ -87,3 +87,16 @@ def test_explain_kernel_failure_never_returns_a_bare_status_word():
         cause, explanation = explain_kernel_failure(raw)
         assert cause.lower() != "error"
         assert explanation
+
+
+def test_a_scene_with_no_camera_is_named_as_such():
+    """Measured on a real render: Blender exits in about a second per
+    frame with "ERROR Cannot render, no camera". Reported as "Blender
+    crashed" -- which it matches on "blender quit" -- it looks like a fault
+    in the farm rather than a scene nothing could render."""
+    cause, explanation = explain_kernel_failure(
+        "00:02.617  reports  | ERROR Cannot render, no camera\n"
+        "Blender 5.2.0 LTS\nBlender quit")
+    assert cause == "The scene has no camera"
+    assert "add a camera" in explanation
+    assert "nothing to do with Kaggle" in explanation

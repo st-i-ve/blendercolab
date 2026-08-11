@@ -126,7 +126,8 @@ MAX_WORKER_LIFETIME_S = 10 * 3600
 def build(frames: list[int], settings: RenderSettings, dataset_slug: str,
           out_dir: Path, kernel_slug: str, *, mode: str = "render",
           control_slug: str | None = None, token: str | None = None,
-          worker_label: str | None = None) -> Path:
+          worker_label: str | None = None,
+          blender_slug: str | None = None) -> Path:
     """Write the notebook and its kernel-metadata.json.
 
     `mode="render"` is the one-shot job: render `frames`, then the session
@@ -141,6 +142,11 @@ def build(frames: list[int], settings: RenderSettings, dataset_slug: str,
     """
     if mode not in ("render", "worker"):
         raise ValueError(f"unknown notebook mode {mode!r}")
+    # Kaggle mounts a dataset at /kaggle/input/<name>, without the owner
+    # prefix, so the notebook needs the name and the metadata needs the
+    # full slug.
+    blender_dataset_name = (blender_slug.split("/", 1)[-1]
+                            if blender_slug else "")
     if mode == "worker" and not (control_slug and token and worker_label):
         raise ValueError(
             "worker mode needs control_slug, token and worker_label -- "
@@ -203,13 +209,27 @@ assert BLEND, "no .blend found under /kaggle/input"
 print("FRAMES =", FRAMES)
 '''
 
-    c2 = '''
-import os, subprocess, time
+    # Blender comes from an ATTACHED DATASET, not from the internet.
+    #
+    # A Kaggle session has no outbound network unless the account is
+    # phone-verified -- enable_internet is accepted and then silently
+    # ignored. Measured on a real session: DNS does not resolve at all
+    # ("Temporary failure in name resolution"), so the old `wget` of the
+    # release tarball failed every single time, ~41s in, and every render
+    # this app ever started died in this cell without producing a frame.
+    #
+    # An attached dataset needs no network, works on an unverified account
+    # -- which matters when the fleet is friends' accounts, since otherwise
+    # every one of them would have to phone-verify -- and starts in seconds
+    # instead of minutes. The wget path is kept only as a fallback for a
+    # caller that has no Blender dataset to attach.
+    c2 = f'''
+import os, glob, subprocess, time
 V = BLENDER_VERSION
 S = ".".join(V.split(".")[:2])
-T = f"blender-{V}-linux-x64.tar.xz"
-URL = f"https://download.blender.org/release/Blender{S}/{T}"
-BBIN = f"/kaggle/tmp/blender-{V}-linux-x64/blender"
+T = f"blender-{{V}}-linux-x64.tar.xz"
+BBIN = f"/kaggle/tmp/blender-{{V}}-linux-x64/blender"
+BLENDER_DATASET = {blender_dataset_name!r}
 os.makedirs("/kaggle/tmp", exist_ok=True)
 
 def sh(cmd):
@@ -220,11 +240,44 @@ def sh(cmd):
 
 if not os.path.exists(BBIN):
     t0 = time.time()
-    assert sh(f"wget -q -O /kaggle/tmp/{T} '{URL}'") == 0, "blender download failed"
-    assert sh(f"tar -xf /kaggle/tmp/{T} -C /kaggle/tmp") == 0, "extract failed"
-    os.remove(f"/kaggle/tmp/{T}")
-    print(f"blender ready in {time.time()-t0:.0f}s")
-sh(f"{BBIN} --version | head -2")
+    tarball = None
+    if BLENDER_DATASET:
+        # Searched across the WHOLE of /kaggle/input, with no assumption
+        # about where a dataset lands. Measured: Kaggle mounts them at
+        # /kaggle/input/datasets/<owner>/<name>/, not /kaggle/input/<name>
+        # -- guessing the second cost a whole render, silently, by falling
+        # through to a download that cannot work. The .blend in cell 1 is
+        # found by walking /kaggle/input for the same reason.
+        hits = sorted(glob.glob("/kaggle/input/**/blender-*.tar.xz",
+                                recursive=True))
+        if not hits:
+            hits = sorted(glob.glob("/kaggle/input/**/*.tar.xz",
+                                    recursive=True))
+        if hits:
+            tarball = hits[0]
+            print("blender from dataset:", tarball, flush=True)
+        else:
+            print("BLENDER DATASET WAS ATTACHED BUT NO TARBALL WAS FOUND "
+                  "anywhere under /kaggle/input:", flush=True)
+            for entry in sorted(glob.glob("/kaggle/input/**", recursive=True))[:40]:
+                print("   ", entry, flush=True)
+    if tarball is None:
+        # No dataset: fall back to downloading, which only works on a
+        # phone-verified account. Says so, so a failure here is not a
+        # mystery.
+        URL = f"https://download.blender.org/release/Blender{{S}}/{{T}}"
+        print("no blender dataset attached -- downloading, which requires "
+              "this Kaggle account to be phone-verified for internet access",
+              flush=True)
+        assert sh(f"wget -q -O /kaggle/tmp/{{T}} '{{URL}}'") == 0, (
+            "blender download failed -- this session has no internet. "
+            "Attach a Blender dataset, or phone-verify this Kaggle account.")
+        tarball = f"/kaggle/tmp/{{T}}"
+    assert sh(f"tar -xf '{{tarball}}' -C /kaggle/tmp") == 0, "extract failed"
+    if tarball.startswith("/kaggle/tmp"):
+        os.remove(tarball)
+    print(f"blender ready in {{time.time()-t0:.0f}}s", flush=True)
+sh(f"{{BBIN}} --version | head -2")
 '''
 
     c3 = f'''
@@ -459,11 +512,13 @@ print("WORKER stopped", flush=True)
         # were dropped (docs/machine-shape-findings.md, section 2).
         "machine_shape": MACHINE_SHAPE,
         "enable_internet": True,
-        # Only the scene. The control dataset is deliberately NOT attached:
-        # an attached dataset is pinned at session start, so a worker would
-        # never see a new version of it -- which is the entire mechanism.
-        # It is fetched over the API inside the loop instead.
-        "dataset_sources": [dataset_slug],
+        # The scene, plus Blender itself when it is being shipped as a
+        # dataset rather than downloaded. The CONTROL dataset is
+        # deliberately NOT attached: an attached dataset is pinned at
+        # session start, so a worker would never see a new version of it --
+        # which is the entire mechanism. That one is fetched over the API.
+        "dataset_sources": ([dataset_slug, blender_slug] if blender_slug
+                            else [dataset_slug]),
         "competition_sources": [],
         "kernel_sources": [],
         "model_sources": [],

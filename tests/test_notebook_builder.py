@@ -83,10 +83,16 @@ def test_progress_print_flushes(tmp_path, settings):
     # log stream sees nothing until the kernel exits -- the render appears
     # frozen for its entire duration.
     joined = "\n".join(cells_src(build([1], settings, "me/x", tmp_path, "me/r")))
-    # one flush=True each for PREFLIGHT, PREFLIGHT_FAIL (see
-    # test_preflight_* below), PROGRESS, and TELEMETRY (see test_telemetry_*
-    # below) -- never more, never fewer.
-    assert joined.count("flush=True") == 4, "expected exactly four flush=True"
+    # PREFLIGHT, PREFLIGHT_FAIL, PROGRESS and TELEMETRY must each flush --
+    # they are what the live log stream shows. Asserted by NAME rather than
+    # by a total count: the count was a proxy that broke the moment the
+    # Blender-setup cell gained its own progress prints, which flush for
+    # exactly the same reason and are not a regression.
+    for marker in ('print(f"PREFLIGHT', '"PROGRESS', '"TELEMETRY'):
+        index = joined.index(marker)
+        assert "flush=True" in joined[index:index + 220], (
+            f"{marker} does not flush -- the live log would not show it")
+    assert joined.count("flush=True") >= 4
     idx_progress = joined.index('print(f"PROGRESS')
     idx_flush = joined.index("flush=True", idx_progress)
     # flush=True must belong to the PROGRESS print call itself, not some
