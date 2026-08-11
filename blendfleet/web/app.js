@@ -450,20 +450,32 @@ function renderFleetTable(state) {
   const body = document.getElementById('inst-tbody');
   document.getElementById('inst-meta').textContent =
     `${state.instances.length} account(s)`;
+  /* Say what warm costs, rather than letting it look free. A machine
+     waiting for work bills quota at the same rate as one rendering. */
+  const warmCount = state.instances.filter(
+    i => i.worker && ['running','queued'].includes(i.worker.state)
+         && !i.worker.frames.length).length;
+  document.getElementById('warm-note').textContent = warmCount
+    ? `${warmCount} machine(s) warm — spending quota while they wait, and shutting themselves down after 10 idle minutes.`
+    : 'Starting a machine spends quota from that moment. It reports its hardware first, so you can decide before sending work.';
   body.innerHTML = state.instances.map(i => {
     const hw = i.hardware
       ? `${esc(i.hardware.gpus.map(g => g.model || 'GPU').join(', ') || 'no GPU seen')} <span class="dim">${fmtAge(i.hardware.ageSeconds)}</span>`
       : '<span class="dim">never run</span>';
     const state_ = i.worker ? i.worker.state : 'idle';
     const stoppable = i.worker && ['running', 'queued'].includes(i.worker.state);
-    return `<tr>
-      <td>${esc(i.label)}${i.verified ? '' : ' <span class="badge warn"><i></i>unverified</span>'}</td>
+    const warm = i.worker && ['running','queued'].includes(i.worker.state)
+               && !i.worker.frames.length;
+  return `<tr>
+      <td>${esc(i.label)}${i.verified ? '' : ' <span class="badge warn"><i></i>unverified</span>'}${warm ? ' <span class="badge accent"><i></i>warm</span>' : ''}</td>
       <td>${esc(i.username || '—')}</td>
       <td>${esc(i.quota || '—')}</td>
       <td>${hw}</td>
       <td>${esc(state_)}</td>
       <td style="text-align:right;white-space:nowrap">
-        ${stoppable ? `<button class="btn sm" data-cancel="${esc(i.label)}">Cancel</button>` : ''}
+        ${stoppable
+          ? `<button class="btn sm" data-cancel="${esc(i.label)}">Stop</button>`
+          : `<button class="btn sm" data-start="${esc(i.label)}">Start</button>`}
         <button class="btn sm" data-download="${esc(i.label)}">Download</button>
         <button class="btn sm danger" data-remove="${esc(i.label)}">Remove</button>
       </td></tr>`;
@@ -473,10 +485,18 @@ function renderFleetTable(state) {
 document.getElementById('inst-tbody').addEventListener('click', e => {
   const button = e.target.closest('button');
   if (!button || !backend) return;
+  if (button.dataset.start) backend.startInstances(JSON.stringify([button.dataset.start]));
   if (button.dataset.cancel) backend.cancelInstance(button.dataset.cancel);
   if (button.dataset.download) backend.collect(button.dataset.download);
   if (button.dataset.remove) backend.removeAccount(button.dataset.remove);
 });
+
+document.getElementById('btn-start-all').onclick = () =>
+  backend && backend.startInstances(JSON.stringify([]));
+document.getElementById('btn-stop-all').onclick = () =>
+  backend && backend.cancelAll();
+document.getElementById('btn-send-job').onclick = () =>
+  backend && backend.sendJob(JSON.stringify(renderOptions()));
 
 document.getElementById('btn-add').onclick = () => {
   const label = document.getElementById('ni-label').value.trim();

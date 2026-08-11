@@ -211,6 +211,16 @@
           </div>
           <div>
             <h2 class="sec">Fleet <span class="meta" id="inst-meta">—</span></h2>
+            <!-- Warm machines: start them, see what hardware Kaggle gave
+                 you, THEN decide what to send. Every started machine is
+                 spending quota from that moment, so the cost is on screen
+                 rather than implied. -->
+            <div class="fr-actions" style="margin-bottom:12px">
+              <button class="btn" id="btn-start-all">Start all warm</button>
+              <button class="btn danger" id="btn-stop-all">Stop all</button>
+              <button class="btn ghost-accent" id="btn-send-job">Send job to warm machines</button>
+              <span class="dz-sub" id="warm-note"></span>
+            </div>
             <div class="panel">
               <table class="inst-table">
                 <thead><tr><th>Account</th><th>Kaggle user</th><th>Quota (API)</th><th>Last known hardware</th><th>State</th><th></th></tr></thead>

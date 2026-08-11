@@ -811,3 +811,12 @@ like the rest of the app instead of appearing after a system delay. */
    that is what :focus-visible is for -- but Chromium also paints it after a
    mouse click on a button, which read as a permanently selected nav item. */
 button:focus:not(:focus-visible){outline:none}
+
+
+/* The fleet table carries a lot per row (quota, hardware with its age, and
+   three actions). Rather than let the actions fall off the right edge on a
+   narrow window, the table scrolls inside its own panel -- the page itself
+   must never scroll sideways. */
+.panel > .inst-table{min-width:720px}
+.setup-grid .panel:has(.inst-table){overflow-x:auto}
+.inst-table td:last-child{white-space:nowrap}

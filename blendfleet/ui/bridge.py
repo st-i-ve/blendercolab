@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import time
+import uuid
 from pathlib import Path
 from typing import Callable
 
@@ -478,6 +479,115 @@ class Backend(QObject):
             self.refreshQuota()
 
         self._start("launch", work, "Starting the render", ok)
+
+    @Slot(str)
+    def startInstances(self, labels_json: str) -> None:
+        """Bring machines up warm, without giving them work yet.
+
+        Requires an uploaded scene: a warm worker attaches the dataset at
+        session start, so there is nothing to warm up around until one
+        exists. Refusing here is much cheaper than starting machines that
+        would have to be thrown away and restarted once the upload lands.
+
+        Every machine started is spending quota from this moment. The
+        worker's own idle timeout is what bounds that -- see
+        notebook_builder.IDLE_TIMEOUT_S -- and it shuts itself down rather
+        than relying on this app still being here.
+        """
+        labels = json.loads(labels_json or "[]")
+        if not labels:
+            labels = [a.label for a in self.store.list()]
+        if not labels:
+            self.notification.emit("No accounts to start.", "offline")
+            return
+        if self._dataset is None:
+            self.notification.emit(
+                "Upload a scene first — a warm machine attaches the dataset "
+                "when it starts, so there is nothing to warm up around yet.",
+                "offline")
+            return
+
+        accounts = self.store.list()
+        slug = self._dataset["slug"]
+        settings = RenderSettings(1920, 1080, 128,
+                                  min_gpus=self.settings.min_gpus)
+
+        def work():
+            return self.fleet_factory(accounts).start_workers(
+                labels, settings, slug)
+
+        def ok(state) -> None:
+            self._last_state = state
+            self.logLine.emit(
+                f"started {len(labels)} machine(s) warm — they are spending "
+                "quota while they wait", "warn")
+            self.notification.emit(
+                f"Starting {len(labels)} machine(s). They report their "
+                "hardware as they come up, and shut themselves down after "
+                "10 idle minutes.", "idle")
+            self._emit_state()
+            self.poll()
+
+        self._start("start", work, "Starting machines", ok)
+
+    @Slot(str)
+    def sendJob(self, options_json: str) -> None:
+        """Give work to machines that are already warm.
+
+        Publishes a job descriptor the running workers pick up on their
+        next poll, instead of pushing new kernels. No setup cost, and no
+        second session per account.
+        """
+        options = json.loads(options_json)
+        start = int(options.get("startFrame", 1))
+        end = int(options.get("endFrame", 1))
+        if end < start:
+            self.notification.emit(
+                f"End frame ({end}) is before the start frame ({start}).",
+                "offline")
+            return
+        warm = [w.label for w in (self._last_state.workers
+                                  if self._last_state else [])]
+        if not warm:
+            self.notification.emit(
+                "No warm machines — start some first, or use Render across "
+                "fleet to push a one-shot job.", "offline")
+            return
+
+        from blendfleet.assignment import assign_frames
+        buckets = assign_frames(start, end, len(warm))
+        job = {
+            "id": uuid.uuid4().hex[:8],
+            "workers": warm,
+            "frames": [],
+            "resX": int(options.get("resX", 1920)),
+            "resY": int(options.get("resY", 1080)),
+            "samples": int(options.get("samples", 128)),
+            "format": options.get("format", "PNG"),
+        }
+        # One descriptor per worker: a machine renders only its own stride,
+        # exactly as a one-shot job splits them.
+        per_worker = {label: frames for label, frames in zip(warm, buckets)}
+        accounts = self.store.list()
+
+        def work():
+            fleet = self.fleet_factory(accounts)
+            # Published one job at a time, keyed to the worker it is for --
+            # a single shared descriptor cannot carry a different frame
+            # list per machine.
+            for label, frames in per_worker.items():
+                fleet.publish_job(dict(job, workers=[label], frames=frames))
+            return len(per_worker)
+
+        def ok(count) -> None:
+            self.logLine.emit(
+                f"sent job {job['id']} to {count} warm machine(s)", "active")
+            self.notification.emit(
+                f"Sent {end - start + 1} frames to {count} warm machine(s)",
+                "active")
+            self.poll()
+
+        self._start("job", work, "Sending the job", ok)
 
     @Slot()
     def cancelAll(self) -> None:
