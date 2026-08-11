@@ -782,3 +782,32 @@ same contract theme.brand_icon() uses on the Qt side. */
    from Dashboard-side notify() calls, so only the in/out states are here. */
 .toast{opacity:0;transform:translateY(8px);transition:opacity .22s,transform .22s}
 .toast.in{opacity:1;transform:none}
+
+
+/* ---------------- tooltips ----------------
+title= is drawn by the operating system: it cannot be themed, it ignores
+the accent, and it arrives as a black box in the middle of a warm light
+UI. These are ours -- same tokens as every other surface, and they animate
+like the rest of the app instead of appearing after a system delay. */
+[data-tip]{position:relative}
+[data-tip]::after{
+  content:attr(data-tip);position:absolute;left:50%;top:calc(100% + 8px);
+  transform:translateX(-50%) translateY(-4px);
+  background:var(--card);color:var(--ink-2);border:1px solid var(--border-2);
+  border-radius:var(--r-sm);box-shadow:var(--shadow-lg);
+  font-family:var(--font);font-size:11px;font-weight:400;letter-spacing:0;
+  text-transform:none;white-space:nowrap;padding:6px 10px;
+  opacity:0;pointer-events:none;transition:opacity .15s,transform .15s;
+  z-index:200;
+}
+[data-tip]:hover::after{opacity:1;transform:translateX(-50%) translateY(0)}
+/* The collapsed sidebar has no room below an item, so its tips go beside. */
+.side.collapsed [data-tip]::after{
+  left:calc(100% + 10px);top:50%;transform:translateY(-50%) translateX(-4px);
+}
+.side.collapsed [data-tip]:hover::after{transform:translateY(-50%) translateX(0)}
+
+/* A click should not leave a ring behind. Keyboard focus still shows one --
+   that is what :focus-visible is for -- but Chromium also paints it after a
+   mouse click on a button, which read as a permanently selected nav item. */
+button:focus:not(:focus-visible){outline:none}

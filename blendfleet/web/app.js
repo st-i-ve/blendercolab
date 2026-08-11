@@ -136,9 +136,17 @@ function notify(message, tone_) {
   const list = document.getElementById('notif-list');
   const empty = list.querySelector('.empty');
   if (empty) empty.remove();
+  /* The reference's own .notif-item markup. I had invented .notif/.nt/.nm,
+     which match nothing in app.css -- so every entry rendered as unstyled
+     text with no dot, no separator and no severity. */
   const row = document.createElement('div');
-  row.className = 'notif' + (tone_ === 'offline' ? ' err' : tone_ === 'active' ? ' ok' : '');
-  row.innerHTML = `<div class="nt">${esc(message)}</div><div class="nm">${clock()}</div>`;
+  row.className = 'notif-item' +
+    (tone_ === 'offline' ? ' err' : tone_ === 'active' ? ' ok' : '');
+  const title = { offline: 'Problem', active: 'Done' }[tone_] || 'Update';
+  row.innerHTML = `<span class="ni-dot"></span>
+    <div><div class="ni-t">${esc(title)}</div>
+      <div class="ni-m">${esc(message)}</div>
+      <div class="ni-time">${clock()}</div></div>`;
   list.prepend(row);
   unread++;
   updateBubble();
