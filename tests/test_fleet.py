@@ -3,11 +3,11 @@ from pathlib import Path
 import pytest
 import blendfleet.platform_paths as pp
 from blendfleet.accounts import Account
-from blendfleet.kaggle_client import KernelStatus, Quota
+from blendfleet.kaggle_client import KaggleError, KernelStatus, Quota
 from blendfleet.notebook_builder import RenderSettings
 from blendfleet.fleet import (Fleet, FleetBusyError, FleetState,
                               StaleDatasetError, UnreachableAccountsError,
-                              WorkerState)
+                              WorkerState, WrongUsernameError)
 
 
 class FakeDatasetApiClient:
@@ -904,3 +904,71 @@ def test_forget_job_with_no_job_is_a_no_op(tmp_path):
                            username="user_a")],
                   lambda t: object(), tmp_path / "w")
     assert fleet.forget_job() == []
+
+
+# ---------------------------------------------------------------------------
+# A username typed by hand can be a label, an email or a typo. Kaggle
+# answers that with 'The following collaborator usernames don't exist:
+# "james"' -- AFTER the whole .blend has been uploaded, and worded as if
+# the app had invented the name.
+# ---------------------------------------------------------------------------
+
+class _WhoamiClient:
+    def __init__(self, token, says):
+        self.token = token
+        self._says = says
+
+    def whoami(self):
+        if self._says is None:
+            raise KaggleError("this account has no notebooks or datasets")
+        return self._says
+
+
+def test_a_username_kaggle_disagrees_with_is_refused_before_sharing(tmp_path):
+    accounts = [Account(label="owner", token="KGAT_" + "0" * 32,
+                        username="realowner"),
+                Account(label="james", token="KGAT_" + "1" * 32,
+                        username="james")]
+    says = {"KGAT_" + "0" * 32: "realowner",
+            "KGAT_" + "1" * 32: "stepheneechikoi"}
+    fleet = Fleet(accounts, lambda t: _WhoamiClient(t, says[t]), tmp_path / "w")
+
+    with pytest.raises(WrongUsernameError) as excinfo:
+        fleet._require_real_usernames(
+            accounts[1:], {"owner": "realowner", "james": "james"},
+            {"owner": _WhoamiClient(accounts[0].token, "realowner"),
+             "james": _WhoamiClient(accounts[1].token, "stepheneechikoi")})
+
+    message = str(excinfo.value)
+    assert "james" in message and "stepheneechikoi" in message
+    assert "Set username" in message
+    assert "no render has started" in message
+
+
+def test_an_unverifiable_username_is_allowed_through(tmp_path):
+    """An account that owns nothing has no handle for Kaggle to report --
+    which is the very case manual entry exists for. Refusing it here would
+    block the fix. Kaggle stays the final word."""
+    accounts = [Account(label="owner", token="KGAT_" + "0" * 32,
+                        username="realowner"),
+                Account(label="friend", token="KGAT_" + "1" * 32,
+                        username="typed-by-hand")]
+    fleet = Fleet(accounts, lambda t: _WhoamiClient(t, None), tmp_path / "w")
+
+    fleet._require_real_usernames(
+        accounts[1:], {"owner": "realowner", "friend": "typed-by-hand"},
+        {"owner": _WhoamiClient(accounts[0].token, None),
+         "friend": _WhoamiClient(accounts[1].token, None)})
+
+
+def test_a_matching_username_passes(tmp_path):
+    accounts = [Account(label="owner", token="KGAT_" + "0" * 32,
+                        username="realowner"),
+                Account(label="friend", token="KGAT_" + "1" * 32,
+                        username="realfriend")]
+    fleet = Fleet(accounts, lambda t: _WhoamiClient(t, "realfriend"),
+                  tmp_path / "w")
+    fleet._require_real_usernames(
+        accounts[1:], {"owner": "realowner", "friend": "realfriend"},
+        {"owner": _WhoamiClient(accounts[0].token, "realowner"),
+         "friend": _WhoamiClient(accounts[1].token, "realfriend")})

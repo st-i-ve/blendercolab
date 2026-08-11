@@ -389,3 +389,81 @@ def test_no_live_block_at_all_before_anything_streams(qapp, tmp_path):
     honest answer -- not last run's numbers presented as current."""
     backend = make_backend(tmp_path, n=1)
     assert json.loads(backend.state())["instances"][0]["live"] is None
+
+
+# ---------------------------------------------------------------------------
+# Upload progress. Every tick reported "0 of 0" because the payload read
+# sent_bytes/total_bytes while uploader.UploadProgress calls them uploaded
+# and total -- a typo that getattr defaults absorbed silently instead of
+# raising. These read the REAL dataclasses so a rename cannot do it again.
+# ---------------------------------------------------------------------------
+
+def test_upload_progress_carries_real_byte_counts(qapp, tmp_path):
+    from blendfleet.uploader import UploadProgress
+
+    backend = make_backend(tmp_path, n=1)
+    blend = tmp_path / "scene.blend"
+    blend.write_bytes(b"x" * 64)
+    backend.blend = blend
+
+    seen = []
+    backend.uploadProgress.connect(lambda j: seen.append(json.loads(j)))
+
+    class ProgressFleet(Fleet):
+        def prepare_dataset(self, blend, on_progress=None, *, clients=None,
+                            usernames=None, on_stage=None):
+            on_stage("uploading", "me/scene-blend")
+            on_progress(UploadProgress(uploaded=32, total=64,
+                                       rate_bps=1024.0, retries=0,
+                                       resumed_from=0))
+            on_stage("sharing", "friend_1")
+            on_stage("ready", "me/scene-blend")
+            return "me/scene-blend"
+
+    backend.fleet_factory = lambda accounts: ProgressFleet(
+        accounts, lambda t: FakeClient(t), tmp_path / "w")
+    backend.syncDataset()
+    _settle(backend)
+
+    byte_ticks = [s for s in seen if "uploaded" in s]
+    assert byte_ticks, f"no byte progress reached the page; saw {seen}"
+    assert byte_ticks[0]["uploaded"] == 32
+    assert byte_ticks[0]["total"] == 64
+
+
+def test_every_upload_stage_is_reported_not_just_the_bytes(qapp, tmp_path):
+    """The byte counter stops moving during verify, share and
+    verify-access. Without a stage name, all three look like "stuck"."""
+    from blendfleet.uploader import UploadProgress
+
+    backend = make_backend(tmp_path, n=1)
+    blend = tmp_path / "scene.blend"
+    blend.write_bytes(b"x" * 8)
+    backend.blend = blend
+    seen = []
+    backend.uploadProgress.connect(lambda j: seen.append(json.loads(j)))
+
+    class StagedFleet(Fleet):
+        def prepare_dataset(self, blend, on_progress=None, *, clients=None,
+                            usernames=None, on_stage=None):
+            for key in ("uploading", "verifying", "sharing",
+                        "verifying-access", "ready"):
+                on_stage(key, "detail")
+            return "me/scene-blend"
+
+    backend.fleet_factory = lambda accounts: StagedFleet(
+        accounts, lambda t: FakeClient(t), tmp_path / "w")
+    backend.syncDataset()
+    _settle(backend)
+
+    stages = [s["stage"] for s in seen]
+    assert stages == ["uploading", "verifying", "sharing",
+                      "verifying-access", "ready"], stages
+
+
+def test_download_progress_carries_real_byte_counts(qapp, tmp_path):
+    """The same typo existed on the download side."""
+    from blendfleet.downloader import DownloadProgress
+
+    progress = DownloadProgress(downloaded=10, total=20, rate_bps=512.0)
+    assert progress.downloaded == 10 and progress.total == 20

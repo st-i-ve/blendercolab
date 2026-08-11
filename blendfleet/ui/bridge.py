@@ -461,11 +461,19 @@ class Backend(QObject):
             fleet = self.fleet_factory(accounts)
             return fleet.prepare_dataset(
                 blend,
+                # uploader.UploadProgress calls them `uploaded` and
+                # `total`. Reading sent_bytes/total_bytes through getattr
+                # defaults meant every tick reported 0 of 0 and the bar
+                # never moved -- a typo that a default silently absorbed.
                 on_progress=lambda p: self.uploadProgress.emit(json.dumps({
                     "label": owner,
-                    "sentBytes": getattr(p, "sent_bytes", 0),
-                    "totalBytes": getattr(p, "total_bytes", 0),
-                })))
+                    "stage": "uploading",
+                    "uploaded": p.uploaded,
+                    "total": p.total,
+                })),
+                on_stage=lambda key, detail: self.uploadProgress.emit(
+                    json.dumps({"label": owner, "stage": key,
+                                "detail": detail})))
 
         def ok(slug) -> None:
             self._dataset = {
@@ -525,8 +533,9 @@ class Backend(QObject):
                 blend, settings, start, end, dataset_slug=prepared,
                 on_progress=lambda p: self.uploadProgress.emit(json.dumps({
                     "label": owner,
-                    "sentBytes": getattr(p, "sent_bytes", 0),
-                    "totalBytes": getattr(p, "total_bytes", 0),
+                    "stage": "uploading",
+                    "uploaded": p.uploaded,
+                    "total": p.total,
                 })))
 
         def ok(state) -> None:
@@ -765,11 +774,15 @@ class Backend(QObject):
             return collect_frames(
                 state, accounts, fleet.client_factory, Path(destination),
                 worker_label=label or None,
+                # downloader.DownloadProgress calls them `downloaded` and
+                # `total` -- the same mistake as the upload side, which a
+                # getattr default turned into a permanent 0 of 0 instead of
+                # an error. Read directly so a rename fails loudly.
                 on_progress=lambda lbl, p: self.downloadProgress.emit(
                     json.dumps({
                         "label": lbl,
-                        "receivedBytes": getattr(p, "received_bytes", 0),
-                        "totalBytes": getattr(p, "total_bytes", 0),
+                        "downloaded": p.downloaded,
+                        "total": p.total,
                     })))
 
         def ok(report) -> None:
@@ -859,11 +872,42 @@ class Backend(QObject):
                 self.store.save()
                 self.logLine.emit(
                     f"{label}: username set to {username}", "active")
-                self.notification.emit(
-                    f"{label} is {username}", "active")
                 self._emit_state()
+                # Cross-checked against Kaggle where possible, off-thread.
+                # A wrong handle here is not harmless: it surfaces much
+                # later as "collaborator usernames don't exist", after an
+                # upload has already been spent.
+                self._verify_username(account, username)
                 return
         self.notification.emit(f"No account labelled {label}.", "offline")
+
+    def _verify_username(self, account, claimed: str) -> None:
+        token = account.token
+
+        def work():
+            return self.fleet_factory([account]).client_factory(token).whoami()
+
+        def ok(actual) -> None:
+            if actual and actual != claimed:
+                self.notification.emit(
+                    f"Kaggle says that account is {actual!r}, not "
+                    f"{claimed!r}. Sharing would fail with that name.",
+                    "offline")
+            else:
+                self.notification.emit(
+                    f"{account.label} is {claimed}", "active")
+
+        def cannot_check(_message: str) -> None:
+            # The usual reason is the one manual entry exists for: the
+            # account owns nothing Kaggle can read a handle from. Not being
+            # able to confirm is not the same as being wrong.
+            self.notification.emit(
+                f"{account.label} is {claimed} — Kaggle could not confirm "
+                "it (this account owns nothing to read a handle from), so "
+                "it will be used as typed.", "warn")
+
+        self._start(f"whoami:{account.label}", work,
+                    f"Checking {account.label}'s username", ok, cannot_check)
 
     @Slot(str)
     def removeAccount(self, label: str) -> None:

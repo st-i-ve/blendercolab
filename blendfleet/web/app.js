@@ -454,6 +454,38 @@ document.getElementById('dropzone').addEventListener('click', () => {
 document.getElementById('btn-upload').onclick = () =>
   backend && backend.syncDataset();
 
+/* Getting a scene onto Kaggle is four different waits, and the byte
+   counter stops moving during three of them. Without naming the stage,
+   "sharing with two friends" and "stuck" look identical. */
+const UPLOAD_STAGES = {
+  uploading:           d => [`uploading to ${d}`, 'this is the slow one'],
+  verifying:           d => [`checking Kaggle stored it`, `as ${d}`],
+  sharing:             d => ['granting access', `to ${d}`],
+  'verifying-access':  d => ['confirming access', `for ${d}`],
+  ready:               d => ['ready', d],
+};
+
+function showUploadStage(p) {
+  const describe = UPLOAD_STAGES[p.stage];
+  const [title, detail] = describe ? describe(p.detail || '') : [p.stage, ''];
+  const pct = p.total ? Math.round(100 * p.uploaded / p.total) : null;
+
+  document.getElementById('up-name').textContent =
+    pct === null ? title : `${title}`;
+  document.getElementById('up-pct').textContent =
+    pct === null ? detail : `${pct}% · ${fmtBytes(p.uploaded)} of ${fmtBytes(p.total)}`;
+  /* On a stage with no byte count, the bar holds its width rather than
+     snapping back to zero -- a bar that resets reads as "it failed and
+     started over". */
+  if (pct !== null) document.getElementById('up-bar').style.width = pct + '%';
+  if (p.stage === 'ready') {
+    document.getElementById('up-bar').style.width = '100%';
+    logLine(`dataset ready: ${p.detail}`, 'active');
+  } else {
+    logLine(`${title} ${detail}`.trim(), '');
+  }
+}
+
 function renderDataset(state) {
   const ds = state.dataset;
   document.getElementById('ds-blend').textContent =
@@ -687,16 +719,10 @@ new QWebChannel(qt.webChannelTransport, channel => {
   /* Upload and download report as bytes, not as a spinner: a 400 MB
      .blend on a slow line is the one moment the app looks frozen, and a
      percentage is the difference between waiting and worrying. */
-  backend.uploadProgress.connect(json => {
-    const p = JSON.parse(json);
-    const pct = p.totalBytes ? Math.round(100 * p.sentBytes / p.totalBytes) : 0;
-    document.getElementById('up-name').textContent = `uploading · ${p.label}`;
-    document.getElementById('up-pct').textContent = `${pct}%`;
-    document.getElementById('up-bar').style.width = pct + '%';
-  });
+  backend.uploadProgress.connect(json => showUploadStage(JSON.parse(json)));
   backend.downloadProgress.connect(json => {
     const p = JSON.parse(json);
-    const pct = p.totalBytes ? Math.round(100 * p.receivedBytes / p.totalBytes) : 0;
+    const pct = p.total ? Math.round(100 * p.downloaded / p.total) : 0;
     logLine(`${p.label}: downloading ${pct}%`, '');
   });
 

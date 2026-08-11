@@ -173,6 +173,17 @@ class FleetBusyError(RuntimeError):
     """
 
 
+class WrongUsernameError(RuntimeError):
+    """A stored Kaggle username is not what Kaggle says that account is.
+
+    Raised BEFORE any sharing is attempted. Kaggle's own answer --
+    'The following collaborator usernames don't exist: "james"' -- arrives
+    only after the whole .blend has been uploaded, and reads as if the app
+    had invented the name, so this catches it first and says which account
+    and where to fix it.
+    """
+
+
 class UnreachableAccountsError(RuntimeError):
     """A friend was granted READER but still can't reach the dataset.
 
@@ -294,9 +305,54 @@ class Fleet:
         so the UI can show the destination before anything is sent."""
         return f"{owner_username}/{slug_stem(blend)}-blend"
 
+    def _require_real_usernames(self, friends: list, usernames: dict,
+                                clients: dict) -> None:
+        """Refuse to grant access to a name Kaggle will not recognise.
+
+        A username here can have been typed by hand (Instances -> Set
+        username), which means it can be a label, an email, a display name
+        or a typo. Kaggle answers that with:
+
+            The following collaborator usernames don't exist: "james"
+
+        -- after the whole .blend has already been uploaded, and worded as
+        if the app had done something inexplicable. Each friend's own
+        client is asked to confirm its handle FIRST, so a wrong name costs
+        a sentence instead of an upload.
+
+        Only checked for accounts whose own client can answer. An account
+        that owns nothing has no handle to read (see KaggleClient.whoami),
+        and refusing it here would block the very case manual entry exists
+        for -- so an unanswerable check passes, and Kaggle remains the
+        final word.
+        """
+        wrong: list[str] = []
+        for account in friends:
+            claimed = usernames[account.label]
+            try:
+                # The client already resolved for this account, not a new
+                # one: whoami is a network call, and building a second
+                # client per friend doubles them for no benefit.
+                actual = clients[account.label].whoami()
+            except Exception:
+                continue        # cannot verify; not the same as wrong
+            if actual and actual != claimed:
+                wrong.append(
+                    f"{account.label} is set to {claimed!r} but Kaggle says "
+                    f"that account is {actual!r}")
+        if wrong:
+            raise WrongUsernameError(
+                "the Kaggle username stored for "
+                + ("an account" if len(wrong) == 1 else "some accounts")
+                + " does not match what Kaggle reports, so sharing the "
+                "scene would fail: " + "; ".join(wrong)
+                + ". Fix it under Instances -> Set username. Nothing has "
+                "been shared and no render has started.")
+
     def prepare_dataset(self, blend: Path, on_progress: Callable | None = None,
                         *, clients: dict | None = None,
-                        usernames: dict | None = None) -> str:
+                        usernames: dict | None = None,
+                        on_stage: Callable[[str, str], None] | None = None) -> str:
         """Upload the .blend as a Kaggle dataset, share it, and verify it.
 
         Split out of launch() so the upload can be driven on its own: it is
@@ -313,6 +369,13 @@ class Fleet:
         """
         if not self.accounts:
             raise ValueError("add at least one account before uploading")
+
+        def stage(key: str, detail: str = "") -> None:
+            # Bytes alone cannot distinguish "uploading" from "granting
+            # access to three friends" from "stuck": the byte counter stops
+            # moving for all three. Naming the stage is what separates them.
+            if on_stage is not None:
+                on_stage(key, detail)
         # Validate the name FIRST -- before the upload, before anything
         # that costs time. An unusable filename used to surface as a Kaggle
         # 400 from dataset_create, i.e. only after the entire .blend had
@@ -329,6 +392,7 @@ class Fleet:
 
         # One upload, shared by every account -- dataset sharing is
         # automatable, so N accounts does not mean N uploads.
+        stage("uploading", dataset_slug)
         sync_blend(owner_client, blend, dataset_slug,
                    self.work_dir / "ds_owner", on_progress=on_progress)
 
@@ -339,13 +403,16 @@ class Fleet:
         # it's the file just uploaded versus a stale one from an earlier
         # job with the same slug.
         expected_size = blend.stat().st_size
+        stage("verifying", owner_username)
         _require_matching_dataset(owner_client, owner_username, dataset_slug,
                                   blend.name, expected_size)
 
         friends = self.accounts[1:]
         friend_usernames = [usernames[a.label] for a in friends]
         if friend_usernames:
+            stage("sharing", ", ".join(friend_usernames))
             sdk = owner_client._sdk_factory(owner_client.token)
+            self._require_real_usernames(friends, usernames, clients)
             current = sharing.get_settings(sdk, owner_username, dataset_name)
             sharing.grant_readers(sdk, owner_username, dataset_name,
                                   friend_usernames, current)
@@ -370,9 +437,11 @@ class Fleet:
             # friend's OWN client is asked, in case Kaggle's read-side
             # replication genuinely disagrees between accounts.
             for account in friends:
+                stage("verifying-access", usernames[account.label])
                 _require_matching_dataset(
                     clients[account.label], usernames[account.label],
                     dataset_slug, blend.name, expected_size)
+        stage("ready", dataset_slug)
         return dataset_slug
 
     # ---- warm workers -------------------------------------------------
