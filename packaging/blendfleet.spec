@@ -26,6 +26,11 @@ datas += [(str(p), "assets/icons")
           for p in (_HERE / "../assets/icons").glob("*.svg")]
 datas += [(str(p), "assets/fonts")
           for p in (_HERE / "../assets/fonts").glob("*.ttf")]
+# The web UI. Kept at blendfleet/web/ in the bundle because app.css reaches
+# the vendored fonts and the brand mark with ../../assets/... -- the same
+# relative layout as the source tree, so one set of paths works in both.
+datas += [(str(p), "blendfleet/web")
+          for p in (_HERE / "../blendfleet/web").glob("*.*")]
 
 a = Analysis(["../blendfleet/__main__.py"], pathex=[".."], binaries=[],
              datas=datas, hiddenimports=["kagglesdk", "kaggle"],
