@@ -134,6 +134,52 @@ def _require_matching_dataset(client, username: str, slug: str,
             "copy before retrying.")
 
 
+def _atomic_write(path: Path, text: str) -> None:
+    """Write via a temporary file and replace, so an interrupted save can
+    never leave a truncated one behind.
+
+    A half-written state or accounts file reads back as "Expecting value:
+    line 1 column 1 (char 0)" from somewhere unrelated -- os.replace is
+    atomic on both Windows and POSIX, so the file on disk is only ever the
+    old contents or the new.
+    """
+    import os
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+_BAD_COLLABORATOR_RE = re.compile(
+    r"collaborator usernames don't exist:\s*(.+)", re.IGNORECASE)
+
+
+def _explain_bad_collaborators(error: Exception, friends: list,
+                               usernames: dict) -> Exception:
+    """Turn Kaggle's collaborator rejection into something actionable.
+
+    Kaggle names the handle it did not recognise but has no idea which of
+    YOUR accounts carries it, so the message is matched back to the account
+    label the user actually sees in the fleet. Anything that is not this
+    specific rejection is returned unchanged -- guessing at unrelated
+    failures would be worse than passing them through.
+    """
+    match = _BAD_COLLABORATOR_RE.search(str(error))
+    if not match:
+        return error
+    named = {name.strip().strip('"\'')
+             for name in match.group(1).replace(",", " ").split()}
+    culprits = [f"{a.label} (set to {usernames[a.label]!r})"
+                for a in friends if usernames.get(a.label) in named]
+    who = ", ".join(culprits) if culprits else ", ".join(sorted(named))
+    return WrongUsernameError(
+        f"Kaggle does not recognise the username on {who}. The scene "
+        "uploaded fine -- only sharing failed, so nothing is rendering and "
+        "no quota has been spent. Fix it under Instances -> Set username "
+        "(the name in that account's profile URL, kaggle.com/<username>), "
+        "or remove the account if it was a placeholder.")
+
+
 @dataclass
 class WorkerState:
     label: str
@@ -226,14 +272,24 @@ class Fleet:
         return state_dir() / STATE_FILE
 
     def _save(self, st: FleetState) -> None:
-        self._state_path().write_text(json.dumps(asdict(st), indent=2),
-                                      encoding="utf-8")
+        _atomic_write(self._state_path(), json.dumps(asdict(st), indent=2))
 
     def load(self) -> FleetState | None:
         p = self._state_path()
         if not p.exists():
             return None
-        d = json.loads(p.read_text(encoding="utf-8"))
+        raw = p.read_text(encoding="utf-8").strip()
+        if not raw:
+            # An empty state file is what a half-written save leaves
+            # behind, and json.loads answers it with "Expecting value:
+            # line 1 column 1 (char 0)" -- which surfaced as an unrelated
+            # upload failure. No tracked job is the truthful reading, and
+            # it is also the recoverable one.
+            return None
+        try:
+            d = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
         d["workers"] = [WorkerState(**w) for w in d["workers"]]
         return FleetState(**d)
 
@@ -390,11 +446,31 @@ class Fleet:
         owner_username = usernames[owner.label]
         dataset_slug = f"{owner_username}/{dataset_name}"
 
-        # One upload, shared by every account -- dataset sharing is
-        # automatable, so N accounts does not mean N uploads.
-        stage("uploading", dataset_slug)
-        sync_blend(owner_client, blend, dataset_slug,
-                   self.work_dir / "ds_owner", on_progress=on_progress)
+        # Is it already up there? Asked of KAGGLE, not of memory. "We
+        # uploaded this" used to be a fact the app only knew for the
+        # lifetime of one session, so restarting it -- or pressing Render
+        # without pressing Upload first -- re-sent the whole scene even
+        # though the identical bytes were already on Kaggle.
+        expected_size = blend.stat().st_size
+        stage("checking", dataset_slug)
+        already_there = False
+        try:
+            already_there = (
+                owner_client.dataset_file_size(dataset_slug, blend.name)
+                == expected_size)
+        except Exception:
+            # Never a reason to fail: not being able to check just means
+            # uploading, which is what would have happened anyway.
+            already_there = False
+
+        if already_there:
+            stage("already-uploaded", dataset_slug)
+        else:
+            # One upload, shared by every account -- dataset sharing is
+            # automatable, so N accounts does not mean N uploads.
+            stage("uploading", dataset_slug)
+            sync_blend(owner_client, blend, dataset_slug,
+                       self.work_dir / "ds_owner", on_progress=on_progress)
 
         # Confirm the upload that just happened actually landed as the
         # right content -- the remote-side counterpart of dataset_sync.py's
@@ -402,7 +478,6 @@ class Fleet:
         # only prove the dataset is THERE; they say nothing about whether
         # it's the file just uploaded versus a stale one from an earlier
         # job with the same slug.
-        expected_size = blend.stat().st_size
         stage("verifying", owner_username)
         _require_matching_dataset(owner_client, owner_username, dataset_slug,
                                   blend.name, expected_size)
@@ -414,8 +489,19 @@ class Fleet:
             sdk = owner_client._sdk_factory(owner_client.token)
             self._require_real_usernames(friends, usernames, clients)
             current = sharing.get_settings(sdk, owner_username, dataset_name)
-            sharing.grant_readers(sdk, owner_username, dataset_name,
-                                  friend_usernames, current)
+            try:
+                sharing.grant_readers(sdk, owner_username, dataset_name,
+                                      friend_usernames, current)
+            except Exception as e:
+                # The pre-check above cannot catch every bad name: an
+                # account that owns nothing has no handle for Kaggle to
+                # report, so it is allowed through deliberately and Kaggle
+                # is the one that finds out. When it does, its answer --
+                # 'The following collaborator usernames don\'t exist:
+                # "james"' -- names the handle but not WHICH account of
+                # yours carries it, and arrives wrapped as an unexplained
+                # failure. Translate it here, where both are known.
+                raise _explain_bad_collaborators(e, friends, usernames) from e
 
             # Verify access actually landed, not just that the write
             # returned cleanly -- see UnreachableAccountsError. Deliberately

@@ -22,6 +22,15 @@ FILENAME = "accounts.json"
 Verifier = Callable[[str], "str | None"]
 
 
+class CorruptAccountsError(RuntimeError):
+    """accounts.json is empty or unparseable.
+
+    Raised rather than returning an empty store: a silent empty list looks
+    identical to "every account vanished", and the user would add them all
+    again on top of a file that may still be recoverable.
+    """
+
+
 class TokenFormatError(ValueError):
     """Token is not in the KGAT_<32 hex> form Kaggle issues."""
 
@@ -110,8 +119,15 @@ class AccountStore:
 
     def save(self) -> None:
         p = self._path()
-        p.write_text(json.dumps([asdict(a) for a in self._accounts], indent=2),
-                     encoding="utf-8")
+        # Written via a temporary file and replaced: an interrupted save
+        # used to leave a truncated accounts.json, which reads back as
+        # "Expecting value: line 1 column 1 (char 0)" from wherever the
+        # next load happens to be -- and looks like every account vanished.
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        tmp.write_text(json.dumps([asdict(a) for a in self._accounts], indent=2),
+                       encoding="utf-8")
+        os.replace(tmp, p)
         try:
             os.chmod(p, 0o600)      # no-op on Windows, meaningful on Linux
         except OSError:
@@ -122,4 +138,22 @@ class AccountStore:
         p = config_dir() / FILENAME
         if not p.exists():
             return cls()
-        return cls([Account(**d) for d in json.loads(p.read_text(encoding="utf-8"))])
+        raw = p.read_text(encoding="utf-8").strip()
+        if not raw:
+            # Silently returning an empty store would look exactly like
+            # every account having vanished, and the user would re-add
+            # them over the top of a file that may still be recoverable.
+            raise CorruptAccountsError(
+                f"the accounts file at {p} is empty. Nothing has been lost "
+                "on Kaggle -- only this app's list of which accounts to "
+                "use. Restore it from a backup if you have one, or delete "
+                "it and add the accounts again.")
+        try:
+            entries = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise CorruptAccountsError(
+                f"the accounts file at {p} is not valid JSON ({e}). Nothing "
+                "has been lost on Kaggle -- only this app's list of which "
+                "accounts to use. Fix or delete the file and add the "
+                "accounts again.") from e
+        return cls([Account(**d) for d in entries])

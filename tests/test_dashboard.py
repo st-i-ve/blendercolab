@@ -203,6 +203,9 @@ class FakeClient:
     wiring can be exercised end-to-end without a real Kaggle upload."""
 
     fail_upload = False
+    # Class-level, like fail_upload: a dataset lives on Kaggle, not inside
+    # one client, so an upload by the owner is visible to every account.
+    uploaded = False
 
     def __init__(self, token, state="running", message=""):
         self.token = token
@@ -229,6 +232,14 @@ class FakeClient:
         # below) -- this suite exercises the dashboard's wiring, not Task
         # 5's staleness detection itself (see tests/test_fleet.py for
         # that), so it must match rather than spuriously fail launch.
+        #
+        # None BEFORE anything is uploaded, though: prepare_dataset now
+        # asks Kaggle whether the scene is already there and skips the
+        # upload if it is. A fake that answers "already there" from the
+        # first call makes every launch skip the upload -- which silently
+        # disabled the test that forces an upload FAILURE.
+        if not FakeClient.uploaded:
+            return None
         return 100
 
     def dataset_create(self, folder, on_progress=None):
@@ -241,6 +252,7 @@ class FakeClient:
             raise KaggleError(
                 "Dataset creation failed: the .blend file did not finish "
                 "uploading to Kaggle -- retry the render.")
+        FakeClient.uploaded = True
 
     def dataset_version(self, folder, message, on_progress=None):
         self.dataset_create(folder, on_progress=on_progress)
@@ -496,6 +508,7 @@ def test_telemetry_arriving_while_still_queued_shows_a_live_card(qapp, tmp_path,
 def test_launch_success_updates_upload_filmstrip_and_table(qapp, tmp_path):
     monkeypatch_targets = []
     FakeClient.fail_upload = False
+    FakeClient.uploaded = False
     dash = make_dashboard(qapp, tmp_path)
     blend = tmp_path / "remember.blend"
     blend.write_bytes(b"x" * 100)
@@ -524,6 +537,7 @@ def test_launch_success_updates_upload_filmstrip_and_table(qapp, tmp_path):
 def test_launch_failure_shows_friendly_message_not_raw_exception(qapp, tmp_path, stub_message_boxes):
     calls = stub_message_boxes
     FakeClient.fail_upload = True
+    FakeClient.uploaded = False
     try:
         dash = make_dashboard(qapp, tmp_path)
         blend = tmp_path / "remember.blend"
@@ -546,6 +560,7 @@ def test_launch_failure_shows_friendly_message_not_raw_exception(qapp, tmp_path,
         dash.close()
     finally:
         FakeClient.fail_upload = False
+    FakeClient.uploaded = False
 
 
 def test_launch_with_no_accounts_shows_actionable_warning(qapp, tmp_path, stub_message_boxes):

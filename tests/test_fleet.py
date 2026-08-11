@@ -1,6 +1,8 @@
+import json
 import re
 from pathlib import Path
 import pytest
+import blendfleet.fleet as fleet_mod
 import blendfleet.platform_paths as pp
 from blendfleet.accounts import Account
 from blendfleet.kaggle_client import KaggleError, KernelStatus, Quota
@@ -52,6 +54,14 @@ class FakeSdk:
 BLEND_SIZE = 100
 
 
+# Datasets live on Kaggle, not inside one client. Shared across the fakes
+# so an owner's upload is visible to the friends it is shared with -- which
+# is the whole point of the sharing path under test. Keyed slug -> the SIZE
+# actually staged, so re-uploading an edited scene of the same name is
+# distinguishable from not uploading at all.
+_UPLOADED_SLUGS: dict = {}
+
+
 class FakeClient:
     def __init__(self, token, state="running", dataset_exists=True,
                  dataset_reachable=True, remote_file_sizes=None):
@@ -78,9 +88,37 @@ class FakeClient:
     def dataset_file_size(self, slug, filename):
         if filename in self._remote_file_sizes:
             return self._remote_file_sizes[filename]
-        return BLEND_SIZE
-    def dataset_create(self, folder, on_progress=None): self.dataset_creates += 1
-    def dataset_version(self, folder, message, on_progress=None): self.dataset_versions += 1
+        # None until something has actually been uploaded, and shared
+        # across clients once it has. A dataset on Kaggle is ONE dataset:
+        # the owner uploads it and every friend then sees the same file.
+        # The fake used to report it present from the very first call,
+        # which hid the "is it already up there?" check entirely -- every
+        # test looked like a scene that was always already uploaded.
+        if slug in _UPLOADED_SLUGS:
+            return _UPLOADED_SLUGS[slug]
+        return None
+    def dataset_create(self, folder, on_progress=None):
+        self.dataset_creates += 1
+        self._record(folder)
+
+    def dataset_version(self, folder, message, on_progress=None):
+        self.dataset_versions += 1
+        self._record(folder)
+
+    def _record(self, folder):
+        slug = self._slug_being_written(folder)
+        staged = [f for f in Path(folder).iterdir()
+                  if f.name != "dataset-metadata.json"]
+        _UPLOADED_SLUGS[slug] = staged[0].stat().st_size if staged else 0
+
+    @staticmethod
+    def _slug_being_written(folder):
+        """The slug dataset_sync staged into `folder`'s metadata."""
+        import json as _json
+        meta = Path(folder) / "dataset-metadata.json"
+        if meta.exists():
+            return _json.loads(meta.read_text(encoding="utf-8")).get("id", "")
+        return ""
     def push_kernel(self, folder): self.pushed += 1
     def status(self, slug): return KernelStatus(state=self.state)
     def cancel(self, slug): self.cancelled.append(slug); return True
@@ -92,6 +130,14 @@ class RaisingCancelClient(FakeClient):
     """Cancel always raises, as if the network call or auth blew up."""
     def cancel(self, slug):
         raise RuntimeError("boom")
+
+
+@pytest.fixture(autouse=True)
+def _fresh_kaggle(monkeypatch):
+    """No dataset survives into the next test."""
+    _UPLOADED_SLUGS.clear()
+    yield
+    _UPLOADED_SLUGS.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -972,3 +1018,136 @@ def test_a_matching_username_passes(tmp_path):
         accounts[1:], {"owner": "realowner", "friend": "realfriend"},
         {"owner": _WhoamiClient(accounts[0].token, "realowner"),
          "friend": _WhoamiClient(accounts[1].token, "realfriend")})
+
+
+# ---------------------------------------------------------------------------
+# "Expecting value: line 1 column 1 (char 0)" -- json.loads' answer to an
+# empty file, surfacing from wherever the next load happens to be rather
+# than from the save that truncated it.
+# ---------------------------------------------------------------------------
+
+def test_an_empty_state_file_reads_as_no_job(tmp_path):
+    fleet = Fleet([Account(label="a", token="KGAT_" + "0" * 32,
+                           username="user_a")],
+                  lambda t: object(), tmp_path / "w")
+    fleet._state_path().parent.mkdir(parents=True, exist_ok=True)
+    fleet._state_path().write_text("", encoding="utf-8")
+    assert fleet.load() is None
+
+
+def test_a_corrupt_state_file_reads_as_no_job(tmp_path):
+    """No tracked job is both the truthful reading and the recoverable
+    one: the alternative is an app that cannot start, cancel or collect
+    anything until a file is edited by hand."""
+    fleet = Fleet([Account(label="a", token="KGAT_" + "0" * 32,
+                           username="user_a")],
+                  lambda t: object(), tmp_path / "w")
+    fleet._state_path().parent.mkdir(parents=True, exist_ok=True)
+    fleet._state_path().write_text("{not json", encoding="utf-8")
+    assert fleet.load() is None
+
+
+def test_saving_state_is_atomic(tmp_path):
+    """No .tmp left behind, and the file is complete JSON at every moment
+    a reader could see it."""
+    fleet = Fleet([Account(label="a", token="KGAT_" + "0" * 32,
+                           username="user_a")],
+                  lambda t: object(), tmp_path / "w")
+    fleet._save(FleetState(job_id="j", blend_name="s.blend", start_frame=1,
+                           end_frame=2, workers=[]))
+    path = fleet._state_path()
+    assert json.loads(path.read_text(encoding="utf-8"))["job_id"] == "j"
+    assert not list(path.parent.glob("*.tmp")), "a temporary file was left"
+
+
+def test_kaggles_collaborator_rejection_names_the_account_not_just_the_handle(
+        tmp_path):
+    """Kaggle says the handle is unknown but has no idea which of YOUR
+    accounts carries it -- and the pre-check cannot catch this case,
+    because an account that owns nothing has no handle to verify."""
+    friends = [Account(label="james", token="KGAT_" + "1" * 32,
+                       username="james")]
+    original = RuntimeError(
+        'granting james reader access failed: The following collaborator '
+        'usernames don\'t exist: "james"')
+
+    explained = fleet_mod._explain_bad_collaborators(
+        original, friends, {"james": "james"})
+
+    assert isinstance(explained, WrongUsernameError)
+    message = str(explained)
+    assert "james" in message
+    assert "Set username" in message
+    assert "no quota has been spent" in message
+
+
+def test_an_unrelated_sharing_failure_is_passed_through_unchanged(tmp_path):
+    """Guessing at failures it does not recognise would be worse than
+    letting them through with their own words."""
+    original = RuntimeError("503 Service Unavailable")
+    assert fleet_mod._explain_bad_collaborators(original, [], {}) is original
+
+
+def test_a_scene_already_on_kaggle_is_not_uploaded_again(blend, tmp_path):
+    """"Render across fleet" kept re-sending the whole scene.
+
+    "We already uploaded this" was remembered only for the lifetime of one
+    session, so restarting the app -- or pressing Render without pressing
+    Upload first -- re-sent bytes that were already on Kaggle. The question
+    is now asked of Kaggle, not of memory.
+    """
+    clients = {}
+
+    def factory(tok):
+        clients.setdefault(tok, FakeClient(tok))
+        return clients[tok]
+
+    accounts_ = accounts(2)
+    first = Fleet(accounts_, factory, tmp_path / "w")
+    first.prepare_dataset(blend)
+    uploads_after_first = sum(c.dataset_creates + c.dataset_versions
+                              for c in clients.values())
+    assert uploads_after_first == 1
+
+    # A brand-new Fleet: no memory of the first one whatsoever.
+    second = Fleet(accounts_, factory, tmp_path / "w2")
+    second.prepare_dataset(blend)
+
+    total = sum(c.dataset_creates + c.dataset_versions
+                for c in clients.values())
+    assert total == 1, f"re-uploaded a scene already on Kaggle ({total} uploads)"
+
+
+def test_a_changed_scene_of_the_same_name_IS_uploaded_again(blend, tmp_path):
+    """The check is on SIZE as well as name. Skipping on name alone would
+    render last week's scene and look like it worked."""
+    clients = {}
+
+    def factory(tok):
+        clients.setdefault(tok, FakeClient(tok))
+        return clients[tok]
+
+    accounts_ = accounts(1)
+    fleet = Fleet(accounts_, factory, tmp_path / "w")
+    fleet.prepare_dataset(blend)
+
+    blend.write_bytes(b"Y" * (BLEND_SIZE + 500))     # edited since
+    fleet.prepare_dataset(blend)
+
+    total = sum(c.dataset_creates + c.dataset_versions
+                for c in clients.values())
+    assert total == 2, "a changed scene was not re-uploaded"
+
+
+def test_the_stages_reported_say_whether_it_uploaded_or_skipped(blend, tmp_path):
+    """"Uploading, shared or stuck" was indistinguishable. Each wait now
+    names itself, including the one where there is nothing to do."""
+    seen = []
+    fleet = Fleet(accounts(1), lambda t: FakeClient(t), tmp_path / "w")
+    fleet.prepare_dataset(blend, on_stage=lambda k, d: seen.append(k))
+    assert "checking" in seen and "uploading" in seen and "ready" in seen
+
+    seen.clear()
+    fleet.prepare_dataset(blend, on_stage=lambda k, d: seen.append(k))
+    assert "already-uploaded" in seen
+    assert "uploading" not in seen

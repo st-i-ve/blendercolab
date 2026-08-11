@@ -458,6 +458,8 @@ document.getElementById('btn-upload').onclick = () =>
    counter stops moving during three of them. Without naming the stage,
    "sharing with two friends" and "stuck" look identical. */
 const UPLOAD_STAGES = {
+  checking:            d => ['checking Kaggle', `for ${d}`],
+  'already-uploaded':  d => ['already on Kaggle', 'skipping the upload'],
   uploading:           d => [`uploading to ${d}`, 'this is the slow one'],
   verifying:           d => [`checking Kaggle stored it`, `as ${d}`],
   sharing:             d => ['granting access', `to ${d}`],
