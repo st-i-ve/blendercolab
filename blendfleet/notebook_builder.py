@@ -254,6 +254,105 @@ JOB_POLL_SECONDS = 10
 MAX_WORKER_LIFETIME_S = 10 * 3600
 
 
+# WHAT HARDWARE DID THIS SESSION ACTUALLY GET?
+#
+# Shared verbatim between a render's first cell and the standalone
+# hardware probe, because these exact strings are a contract with
+# log_stream.parse_preflight / parse_hardware_banner. A probe that
+# re-implemented the format would drift from the parser the day either
+# one changed, and the failure would be silent: the app would simply
+# report no hardware.
+#
+# Why a probe exists at all: Kaggle's allocation is a lottery. The same
+# account asked for the same machine_shape minutes apart got 2x T4 once
+# and no GPU at all the next time (docs/machine-shape-findings.md, and
+# again on 2026-08-12 when two sessions were cancelled and a third
+# queued). Checking costs about a minute; discovering it from a render
+# costs the render.
+HARDWARE_REPORT = '''
+cpu_count = psutil.cpu_count(logical=True)
+ram_total = psutil.virtual_memory().total / 2**30
+gpu_listing = subprocess.run(
+    "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader",
+    shell=True, capture_output=True, text=True).stdout.strip()
+gpu_names = [row.split(",", 1)[0].strip()
+            for row in gpu_listing.splitlines() if row.strip()]
+
+# PREFLIGHT: the kernel is starting regardless, so report the REAL
+# hardware in the first seconds -- before the next cell downloads
+# Blender, let alone before the .blend is touched -- rather than only
+# finding out from a slow render or a wasted whole session. One line,
+# not one-per-GPU like the CPU/RAM + nvidia-smi lines below: this is the
+# single fact the desktop app needs to decide "keep going or stop" the
+# moment the kernel starts. Flushing stdout immediately is mandatory
+# here: without it, nothing reaches the live log stream until the kernel
+# exits (same reason PROGRESS/TELEMETRY flush explicitly further down).
+print(f"PREFLIGHT gpus={len(gpu_names)} "
+      f"gpu_names={'|'.join(gpu_names) if gpu_names else 'none'} "
+      f"cpu={cpu_count} ram={ram_total:.1f}", flush=True)
+
+print(f"CPU {cpu_count} cores | RAM {ram_total:.1f} GB", flush=True)
+print(gpu_listing, flush=True)
+'''
+
+
+def build_probe(out_dir: Path, kernel_slug: str) -> Path:
+    """A notebook that reports its hardware and stops. Nothing else.
+
+    No dataset, no Blender, no .blend -- so it starts in seconds, costs
+    about a minute of quota, and cannot fail for any reason except the one
+    being tested. That matters: the render path's first cell walks
+    /kaggle/input for a .blend and ASSERTS it found one, which a probe
+    with no dataset attached would trip on immediately.
+
+    It also checks DNS, because the two failures travel together: a
+    session that gets no GPU is usually the same session that gets no
+    outbound network (measured 2026-08-11 -- "Temporary failure in name
+    resolution", which is what made every early render die downloading
+    Blender). Knowing both from one probe is what tells the user whether
+    to retry or to attach the Blender dataset.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cell = f'''
+import socket, subprocess, psutil
+{HARDWARE_REPORT}
+try:
+    socket.getaddrinfo("download.blender.org", 443)
+    print("PROBE_DNS ok", flush=True)
+except Exception as e:
+    print(f"PROBE_DNS failed {{type(e).__name__}}: {{e}}", flush=True)
+print("PROBE_DONE", flush=True)
+'''
+    nb = {"cells": [_code(cell)],
+          "metadata": {"kernelspec": {"display_name": "Python 3",
+                                      "language": "python",
+                                      "name": "python3"},
+                       "language_info": {"name": "python"}},
+          "nbformat": 4, "nbformat_minor": 5}
+    (out_dir / "render.ipynb").write_text(json.dumps(nb, indent=1),
+                                          encoding="utf-8")
+    (out_dir / "kernel-metadata.json").write_text(json.dumps({
+        "id": kernel_slug,
+        "title": kernel_slug.split("/", 1)[1].replace("-", " "),
+        "code_file": "render.ipynb",
+        "language": "python",
+        "kernel_type": "notebook",
+        "is_private": True,
+        "enable_gpu": True,
+        "enable_internet": True,
+        # The whole point is to learn what THIS shape actually yields, so
+        # it must ask for exactly what a render asks for. A probe that
+        # requested something different would answer a question nobody
+        # asked.
+        "machine_shape": MACHINE_SHAPE,
+        "dataset_sources": [],
+        "competition_sources": [],
+        "kernel_sources": [],
+        "model_sources": [],
+    }, indent=2), encoding="utf-8")
+    return out_dir / "render.ipynb"
+
+
 def build(frames: list[int], settings: RenderSettings, dataset_slug: str,
           out_dir: Path, kernel_slug: str, *, mode: str = "render",
           control_slug: str | None = None, token: str | None = None,
@@ -294,27 +393,7 @@ BLENDER_VERSION = {settings.blender_version!r}
 MIN_GPUS = {settings.min_gpus!r}
 POST_GPU = {settings.post_on_gpu!r}
 
-cpu_count = psutil.cpu_count(logical=True)
-ram_total = psutil.virtual_memory().total / 2**30
-gpu_listing = subprocess.run(
-    "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader",
-    shell=True, capture_output=True, text=True).stdout.strip()
-gpu_names = [row.split(",", 1)[0].strip()
-            for row in gpu_listing.splitlines() if row.strip()]
-
-# PREFLIGHT: the kernel is starting regardless, so report the REAL
-# hardware in the first seconds -- before the next cell downloads
-# Blender, let alone before the .blend is touched -- rather than only
-# finding out from a slow render or a wasted whole session. One line,
-# not one-per-GPU like the CPU/RAM + nvidia-smi lines below: this is the
-# single fact the desktop app needs to decide "keep going or stop" the
-# moment the kernel starts. Flushing stdout immediately is mandatory
-# here: without it, nothing reaches the live log stream until the kernel
-# exits (same reason PROGRESS/TELEMETRY flush explicitly further down).
-print(f"PREFLIGHT gpus={{len(gpu_names)}} "
-      f"gpu_names={{'|'.join(gpu_names) if gpu_names else 'none'}} "
-      f"cpu={{cpu_count}} ram={{ram_total:.1f}}", flush=True)
-
+{HARDWARE_REPORT}
 if len(gpu_names) < MIN_GPUS:
     # Minimum-hardware gate: fail loudly and stop HERE, before Blender is
     # downloaded or the .blend is even walked for -- a wrong machine costs
@@ -324,9 +403,6 @@ if len(gpu_names) < MIN_GPUS:
     raise SystemExit(
         f"minimum hardware not met: requires >={{MIN_GPUS}} GPU(s), got "
         f"{{len(gpu_names)}} ({{gpu_names}})")
-
-print(f"CPU {{cpu_count}} cores | RAM {{ram_total:.1f}} GB")
-print(gpu_listing)
 
 # Datasets mount at /kaggle/input/datasets/<owner>/<slug>/<file>, NOT
 # /kaggle/input/<slug>/. Walk instead of assuming -- a hardcoded path

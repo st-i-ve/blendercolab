@@ -26,7 +26,7 @@ from blendfleet.accounts import Account
 from blendfleet.assignment import assign_frames
 from blendfleet.dataset_sync import sync_blend
 from blendfleet.kaggle_client import ACTIVE_STATES, RevokedTokenError
-from blendfleet.notebook_builder import RenderSettings, build
+from blendfleet.notebook_builder import RenderSettings, build, build_probe
 from blendfleet.platform_paths import state_dir
 
 STATE_FILE = "fleet.json"
@@ -658,6 +658,42 @@ class Fleet:
                                   [usernames[a.label] for a in friends],
                                   current)
         return slug
+
+    def check_hardware(self, label: str) -> str:
+        """Push a hardware probe on ONE account. Returns its kernel slug.
+
+        Kaggle's allocation is a lottery, not a setting: the same account
+        asking for the same machine_shape got 2x Tesla T4 one minute and
+        no GPU at all the next (docs/machine-shape-findings.md, and again
+        on 2026-08-12). A render is the expensive way to find that out --
+        this is the cheap way, and it is deliberately a SEPARATE kernel
+        rather than a flag on a render, so that finding out costs about a
+        minute of quota and never a scene upload.
+
+        Does NOT wait: a caller on a UI thread must not block on Kaggle,
+        and the answer arrives through the same log stream a render's
+        PREFLIGHT line does -- the probe prints the identical format (see
+        notebook_builder.HARDWARE_REPORT).
+
+        Deliberately does not touch the job state file. A probe is not a
+        job: writing it there would overwrite the record of a running
+        render, exactly the failure launch() guards against.
+        """
+        account = next((a for a in self.accounts if a.label == label), None)
+        if account is None:
+            raise ValueError(
+                f"no account labelled {label!r} to check -- add it under "
+                "Manage accounts… first")
+        client = self.client_factory(account.token)
+        username = account.username or client.whoami()
+        # A fresh slug per check. Reusing one would make Kaggle cancel the
+        # previous session on push, which is fine, but it also means two
+        # accounts' probes could collide on a shared name.
+        kernel_slug = f"{username}/blendfleet-hwcheck-{uuid.uuid4().hex[:8]}"
+        work = self.work_dir / f"hwcheck-{label}"
+        build_probe(work, kernel_slug)
+        client.push_kernel(work)
+        return kernel_slug
 
     def start_workers(self, labels: list[str], settings: RenderSettings,
                       dataset_slug: str,

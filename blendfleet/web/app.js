@@ -322,7 +322,13 @@ function instanceCard(inst) {
       <div class="hw-row">
         <span class="hw-chip">Quota (API) <b>${esc(inst.quota || '—')}</b></span>
       </div>
-      <div class="hw-row"><span class="hw-chip">${hw}</span></div>
+      <div class="hw-row">
+        <span class="hw-chip">${hw}</span>
+        ${(!inst.revoked && inst.username && !worker)
+          ? `<button class="btn sm" data-hwcheck="${esc(inst.label)}"
+               title="Kaggle decides what hardware a session gets, and it varies run to run. This starts a one-minute check so you know before committing a render.">Check hardware</button>`
+          : ''}
+      </div>
       ${liveHw}
       ${worker ? `
       <div class="assign">
@@ -612,6 +618,7 @@ document.getElementById('inst-tbody').addEventListener('click', e => {
     return;
   }
   if (button.dataset.start) backend.startInstances(JSON.stringify([button.dataset.start]));
+  if (button.dataset.hwcheck) backend.checkHardware(button.dataset.hwcheck);
   if (button.dataset.cancel) backend.cancelInstance(button.dataset.cancel);
   if (button.dataset.download) backend.collect(button.dataset.download);
   if (button.dataset.remove) backend.removeAccount(button.dataset.remove);

@@ -41,7 +41,8 @@ from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
 
 from blendfleet.accounts import AccountStore
 from blendfleet.assignment import estimate
-from blendfleet.instance_state import InstanceStore
+from blendfleet.instance_state import (GpuSnapshot, InstanceSnapshot,
+                                       InstanceStore)
 from blendfleet.log_stream import stream_progress
 from blendfleet.notebook_builder import RenderSettings
 from blendfleet.settings import Settings
@@ -134,6 +135,11 @@ class Backend(QObject):
         self._progress_q: "queue.Queue[tuple[str, int, int]]" = queue.Queue()
         self._telemetry_q: "queue.Queue[tuple[str, dict]]" = queue.Queue()
         self._hardware_q: "queue.Queue[tuple[str, dict]]" = queue.Queue()
+        # Notifications raised BY a stream thread (a hardware check
+        # that could not be watched). Queued like everything else so
+        # the signal is emitted on the UI thread, never from the
+        # thread that noticed.
+        self._notify_q: "queue.Queue[tuple[str, str]]" = queue.Queue()
         self._preflight_q: "queue.Queue[tuple[str, dict]]" = queue.Queue()
         # label -> what we have seen live this run. Cleared per launch.
         self._live: dict[str, dict] = {}
@@ -923,6 +929,101 @@ class Backend(QObject):
         self._emit_state()
 
     # ---- live streaming ------------------------------------------------
+    def _record_hardware(self, label: str, preflight: dict) -> None:
+        """Keep what a PREFLIGHT line said, with the time it said it.
+
+        `observed_at` is the whole honesty mechanism (see
+        instance_state.InstanceSnapshot): Kaggle reallocates, so a stored
+        snapshot is only ever "what this account got at this time", never
+        what it will get next. Saved immediately -- an app that is closed
+        before the next save would otherwise lose the observation it just
+        spent a minute of quota to make.
+
+        Never raises: failing to CACHE hardware must not break the run
+        that reported it.
+        """
+        try:
+            account = next((a for a in self.store.list()
+                            if a.label == label), None)
+            models = [m for m in (preflight.get("gpu_names") or []) if m]
+            snapshot = InstanceSnapshot(
+                username=(account.username if account else None),
+                # A probe has no TELEMETRY lines, so the physical index is
+                # not known here; position is the honest stand-in, and
+                # mem_total stays 0 rather than being invented.
+                gpus=[GpuSnapshot(index=i, mem_total=0, model=model)
+                      for i, model in enumerate(models)],
+                cpu_count=preflight.get("cpu"),
+                ram_total=preflight.get("ram"),
+                observed_at=time.time())
+            self.instance_store.record(label, snapshot)
+            self.instance_store.save()
+        except Exception as e:      # noqa: BLE001
+            self.logLine.emit(
+                f"could not save {label}'s hardware reading: {e}", "warn")
+
+    @Slot(str)
+    def checkHardware(self, label: str) -> None:
+        """What would Kaggle actually give this account right now?
+
+        Kaggle's allocation is a lottery, not a setting -- the same account
+        got 2x Tesla T4 one minute and no GPU the next. This spends about a
+        minute of quota to find out, instead of a scene upload and a
+        render.
+
+        Answered through the same log stream a render uses, so the reading
+        lands in exactly the same place on the page (see Fleet.
+        check_hardware and notebook_builder.HARDWARE_REPORT -- the probe
+        prints the identical PREFLIGHT format on purpose).
+        """
+        accounts = self.store.list()
+        account = next((a for a in accounts if a.label == label), None)
+        if account is None:
+            self.notification.emit(
+                f"There is no account called {label} to check.", "offline")
+            return
+
+        def work():
+            return self.fleet_factory(accounts).check_hardware(label)
+
+        def ok(slug: str) -> None:
+            self.logLine.emit(
+                f"{label}: asking Kaggle for a machine to see what it "
+                "gives — about a minute", "active")
+            self._stream_probe(account, str(slug))
+
+        self._start(f"hwcheck:{label}", work, "Checking the hardware", ok)
+
+    def _stream_probe(self, account, kernel_slug: str) -> None:
+        """Stream one hardware probe until it reports, then stop.
+
+        Uses the render path's own stream_progress, so a probe benefits
+        from the same reconnect-on-drop behaviour -- and its PREFLIGHT line
+        arrives on the same queue, which is why nothing downstream needs to
+        know a probe happened at all.
+        """
+        self._stream_threads = [t for t in self._stream_threads if t.is_alive()]
+        label = account.label
+
+        def run():
+            try:
+                stream_progress(
+                    account.token, kernel_slug.split("/", 1)[0],
+                    kernel_slug.split("/", 1)[1],
+                    lambda done, total: None,      # a probe renders nothing
+                    on_hardware=lambda r: self._hardware_q.put((label, r)),
+                    on_preflight=lambda r: self._preflight_q.put((label, r)))
+            except Exception as e:      # noqa: BLE001
+                # A probe that could not be watched is not a failed
+                # account -- say what happened and leave it at that.
+                self._notify_q.put((
+                    f"Could not read {label}'s hardware check: {e}", "warn"))
+
+        thread = threading.Thread(
+            target=run, name=f"blendfleet-hwcheck-{label}", daemon=True)
+        self._stream_threads.append(thread)
+        thread.start()
+
     def _start_streams(self, state) -> None:
         """One SSE log stream per worker, for as long as it runs.
 
@@ -1022,7 +1123,20 @@ class Backend(QObject):
             slot["preflight"] = record
             if not slot["phase"]:
                 slot["phase"] = "checking hardware"
+            # Persisted, not just shown live. Nothing wrote instance_store
+            # in this UI, so the "last known hardware" line -- which
+            # _state_payload has always read from it -- was permanently
+            # empty; every observation was lost the moment the stream
+            # ended. PREFLIGHT is the right thing to keep: it is the one
+            # line that reports what Kaggle actually allocated.
+            self._record_hardware(label, record)
             changed = True
+        for _ in range(50):
+            try:
+                message, tone = self._notify_q.get_nowait()
+            except queue.Empty:
+                break
+            self.notification.emit(message, tone)
         if changed:
             self._emit_state()
 
