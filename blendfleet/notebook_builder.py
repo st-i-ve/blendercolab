@@ -84,6 +84,39 @@ else:
 if _t_launch:
     print(f"[setup] startup+scene load {_t_ready - _t_launch:.1f}s", flush=True)
 
+# THE PER-FRAME WORK THAT WAS NOT ON THE GPU.
+#
+# Path tracing runs on both T4s, and then Cycles denoises and composites
+# the frame on the CPU -- of which a Kaggle session has four cores.
+# Measured 2026-08-12 on the scene this app was tested with:
+# denoiser=OPENIMAGEDENOISE, denoising_use_gpu=False, compositor nodes
+# enabled, and both GPUs idle for ~77% of every 23s frame.
+#
+# OIDN on the GPU is the SAME denoiser with the same weights, so the
+# output image does not change -- only which processor does the work.
+# Both assignments are guarded: these attribute names have moved between
+# Blender versions, and a missing one must cost a slower render, never
+# the render itself.
+if os.environ.get("BR_POST_GPU", "1") == "1":
+    _moved = []
+    if getattr(s.cycles, "use_denoising", False):
+        try:
+            s.cycles.denoising_use_gpu = True
+            _moved.append(f"denoise({s.cycles.denoiser})")
+        except (AttributeError, TypeError) as e:
+            print(f"[setup] could not move denoising to the GPU: {e}",
+                  flush=True)
+    try:
+        s.render.compositor_device = "GPU"
+        _moved.append("compositor")
+    except (AttributeError, TypeError):
+        pass        # no compositor device choice in this Blender
+    print(f"[setup] on GPU: {', '.join(_moved) or 'nothing to move'}",
+          flush=True)
+else:
+    print("[setup] post-processing left on the CPU (BR_POST_GPU=0)",
+          flush=True)
+
 FRAMES = [int(x) for x in os.environ["BR_FRAMES"].split(",") if x.strip()]
 OUT = os.environ["BR_OUTPUT"]
 done, failed = [], []
@@ -151,6 +184,18 @@ class RenderSettings:
     # the session before Blender is downloaded, rather than discovering the
     # shortfall only from a slow render.
     min_gpus: int = 0
+    # Cycles does per-frame POST-processing on the CPU by default -- the
+    # denoiser and the compositor both. Measured on a real session
+    # (2026-08-12): the scene ships denoiser=OPENIMAGEDENOISE with
+    # denoising_use_gpu=False, and a Kaggle box has FOUR cpu cores next to
+    # two Tesla T4s. Both T4s read idle for ~77% of a 23s frame, which is
+    # what that buys.
+    #
+    # True moves both onto the GPU. The denoiser is the same OIDN with the
+    # same weights, so the image is unchanged; only where it runs moves.
+    # A flag rather than unconditional because it costs VRAM, and a scene
+    # far larger than the one measured could want it off.
+    post_on_gpu: bool = True
 
 
 def _code(src: str) -> dict:
@@ -235,6 +280,7 @@ RES_X, RES_Y = {settings.resolution_x}, {settings.resolution_y}
 SAMPLES, FMT = {settings.samples}, {settings.file_format!r}
 BLENDER_VERSION = {settings.blender_version!r}
 MIN_GPUS = {settings.min_gpus!r}
+POST_GPU = {settings.post_on_gpu!r}
 
 cpu_count = psutil.cpu_count(logical=True)
 ram_total = psutil.virtual_memory().total / 2**30
@@ -546,6 +592,7 @@ ARCHIVE = "/kaggle/working/{archive_name}{ARCHIVE_SUFFIX}"
 env = os.environ.copy()
 env.update({{"BR_RES_X": str(RES_X), "BR_RES_Y": str(RES_Y),
             "BR_SAMPLES": str(SAMPLES), "BR_FORMAT": FMT,
+            "BR_POST_GPU": "1" if POST_GPU else "0",
             "BR_OUTPUT": f"{{OUT}}/f_"}})
 
 # ONE Blender process for every frame -- see SETUP_SCRIPT's header for the
@@ -635,6 +682,7 @@ while True:
                 "BR_RES_Y": str(job.get("resY", RES_Y)),
                 "BR_SAMPLES": str(job.get("samples", SAMPLES)),
                 "BR_FORMAT": job.get("format", FMT),
+                "BR_POST_GPU": "1" if job.get("postGpu", POST_GPU) else "0",
                 "BR_OUTPUT": f"{{OUT}}/f_"}})
     # Same batched runner as a one-shot render -- and the same PROGRESS
     # format. The warm worker used to print "PROGRESS 3/9", which

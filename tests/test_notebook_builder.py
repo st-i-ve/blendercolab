@@ -470,6 +470,77 @@ def test_the_one_time_setup_cost_is_measured_not_guessed(tmp_path, settings):
     assert "[setup] startup+scene load {_t_ready - _t_launch:.1f}s" in joined
 
 
+# --------------------------------------------------------------------------
+# Per-frame post-processing belongs on the idle GPUs.
+#
+# Measured on a real session (2026-08-12): the scene ships
+# denoiser=OPENIMAGEDENOISE with denoising_use_gpu=False, and a Kaggle box
+# pairs FOUR cpu cores with two Tesla T4s. Both GPUs read idle for ~77% of
+# every 23s frame while those four cores denoised and composited it.
+# --------------------------------------------------------------------------
+
+def test_denoising_and_compositing_are_moved_to_the_gpu(tmp_path, settings):
+    joined = "\n".join(cells_src(build([1], settings, "me/x", tmp_path,
+                                       "me/r")))
+    assert "s.cycles.denoising_use_gpu = True" in joined
+    assert 's.render.compositor_device = "GPU"' in joined
+
+
+def test_moving_post_processing_is_reported(tmp_path, settings):
+    # The whole reason this was invisible for so long is that nobody could
+    # see where the work ran. Both the setting and the outcome are logged.
+    joined = "\n".join(cells_src(build([1], settings, "me/x", tmp_path,
+                                       "me/r")))
+    assert "[setup] on GPU: " in joined
+
+
+def test_a_missing_blender_attribute_costs_speed_not_the_render(tmp_path,
+                                                               settings):
+    # These attribute names have moved between Blender versions
+    # (Scene.node_tree vanished in 5.2 and crashed a probe outright). A
+    # version without them must render slowly, never fail.
+    joined = "\n".join(cells_src(build([1], settings, "me/x", tmp_path,
+                                       "me/r")))
+    block = joined[joined.index('if os.environ.get("BR_POST_GPU"'):]
+    block = block[:block.index("FRAMES = [")]
+    assert block.count("except (AttributeError, TypeError)") == 2, \
+        "both assignments must be guarded independently"
+
+
+def test_denoising_is_not_switched_on_for_a_scene_that_has_it_off(tmp_path,
+                                                                 settings):
+    # Moving the denoiser to the GPU must never mean ENABLING denoising:
+    # that would change the image of a scene deliberately rendered raw.
+    joined = "\n".join(cells_src(build([1], settings, "me/x", tmp_path,
+                                       "me/r")))
+    assert 'if getattr(s.cycles, "use_denoising", False):' in joined
+    assert "s.cycles.use_denoising = True" not in joined
+
+
+def test_post_on_gpu_can_be_turned_off(tmp_path):
+    # It costs VRAM, so a scene bigger than the one measured can opt out.
+    off = RenderSettings(1920, 1080, 64, "PNG", post_on_gpu=False)
+    joined = "\n".join(cells_src(build([1], off, "me/x", tmp_path, "me/r")))
+    assert 'POST_GPU = False' in joined
+    assert '"BR_POST_GPU": "1" if POST_GPU else "0"' in joined
+
+
+def test_post_on_gpu_defaults_to_on(tmp_path, settings):
+    assert RenderSettings(1, 1, 1).post_on_gpu is True
+    joined = "\n".join(cells_src(build([1], settings, "me/x", tmp_path,
+                                       "me/r")))
+    assert "POST_GPU = True" in joined
+
+
+def test_warm_worker_also_gets_the_gpu_post_processing_flag(tmp_path,
+                                                            settings):
+    joined = "\n".join(cells_src(build(
+        [1, 2], settings, "me/x", tmp_path, "me/r", mode="worker",
+        control_slug="me/ctl", token="KGAT_x", worker_label="w1")))
+    assert '"BR_POST_GPU": "1" if job.get("postGpu", POST_GPU) else "0"' \
+        in joined
+
+
 def test_warm_worker_uses_the_same_runner_and_progress_format(tmp_path,
                                                               settings):
     # The warm worker used to print "PROGRESS 3/9", which
