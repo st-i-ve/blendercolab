@@ -297,6 +297,10 @@ h2.sec .meta{font-family:var(--mono);font-size:11px;font-weight:400;color:var(--
 .badge{
   font-family:var(--cond);font-size:10px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;
   padding:3px 10px;border-radius:20px;display:inline-flex;align-items:center;gap:6px;
+  /* Never break "RENDERING" across lines, and never let a flex parent
+     squeeze it narrower than its own text -- a badge that has been
+     shrunk is a badge that has been truncated. */
+  white-space:nowrap;flex:none;
 }
 .badge i{width:6px;height:6px;border-radius:50%;flex:none}
 .badge.active{background:var(--active-t);color:var(--active-ink)}   .badge.active i{background:var(--active)}
@@ -386,9 +390,31 @@ h2.sec .meta{font-family:var(--mono);font-size:11px;font-weight:400;color:var(--
   display:inline-block;vertical-align:1px;
 }
 .htag.none{background:var(--fill);color:var(--ink-3);font-weight:500}
-.inst-head .name{font-family:var(--mono);font-size:13px;font-weight:700}
-.inst-head .sub{font-family:var(--mono);font-size:10.5px;color:var(--ink-3)}
-.inst-head .right{margin-left:auto;display:flex;align-items:center;gap:8px}
+/* The status pill used to be clipped to "RENDERI…" on cards whose name
+   was long or which carried a second badge: every child of .inst-head is
+   a flex item, flex items default to min-width:auto, so nothing could
+   shrink, the row overflowed, and .inst's overflow:hidden cut the end
+   off. The state is an icon now (see ICON in app.js) so the row is far
+   narrower -- and the username, the one part that can lose characters
+   harmlessly, is the only thing allowed to shrink. It ellipsises.
+   Badges keep their full width and wrap before anything is ever cut. */
+.inst-head .name{font-family:var(--mono);font-size:13px;font-weight:700;flex:none}
+.inst-head .sub{
+  font-family:var(--mono);font-size:10.5px;color:var(--ink-3);
+  flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+.inst-head .right{
+  margin-left:auto;display:flex;align-items:center;gap:8px;
+  flex:none;flex-wrap:wrap;justify-content:flex-end;row-gap:6px;
+}
+/* Icon-only badge: a square of colour carrying a glyph, not a pill of
+   text. Sized so it matches the height of the text badges beside it. */
+.badge.ico{padding:4px;border-radius:9px;line-height:0}
+.badge.ico svg{width:14px;height:14px;display:block}
+.badge.ico.rendering svg{animation:spin 1.5s linear infinite;transform-origin:50% 50%}
+@media (prefers-reduced-motion:reduce){
+  .badge.ico.rendering svg{animation:none}
+}
 .mini-btn{width:29px;height:29px;border-radius:10px;border:1px solid var(--border-2);background:transparent;color:var(--ink-2);display:grid;place-items:center}
 .mini-btn:hover{border-color:var(--accent);color:var(--accent-ink)}
 .inst-body{padding:13px 15px 15px}
@@ -422,6 +448,9 @@ h2.sec .meta{font-family:var(--mono);font-size:11px;font-weight:400;color:var(--
 .res-lab .v{font-family:var(--mono);letter-spacing:0;text-transform:none;color:var(--ink-2)}
 .res-lab .v.low{color:var(--warn-ink);font-weight:700}
 .inst-foot{display:flex;gap:12px;font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:10px;flex-wrap:wrap}
+/* Pushed to the far end so the elapsed time lines up down a column of
+   cards, readable as a benchmark rather than as trailing prose. */
+.inst-foot .elapsed{margin-left:auto;font-variant-numeric:tabular-nums}
 .inst-foot b{color:var(--ink-2);font-weight:500}
 .log-card .log{padding:12px 17px;font-family:var(--mono);font-size:10.5px;line-height:2;color:var(--ink-2);max-height:300px;overflow:hidden;position:relative}
 .log-card .log::after{content:"";position:absolute;left:0;right:0;bottom:0;height:44px;background:linear-gradient(transparent,var(--card));pointer-events:none}

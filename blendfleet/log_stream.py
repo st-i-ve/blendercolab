@@ -28,6 +28,14 @@ TELEMETRY_RE = re.compile(
     r"temp=(\d+) power=(NA|[\d.]+)"
 )
 
+# System RAM and CPU, sampled on the same tick as the GPUs. A separate
+# marker from TELEMETRY on purpose: TELEMETRY_RE requires gpu=, and
+# widening it to make one regex serve both would make every consumer
+# guess which kind of record it had been handed.
+SYSTEM_RE = re.compile(
+    r"SYSTEM ram_used=(\d+) ram_total=(\d+) cpu_pct=(\d+)"
+)
+
 # blendfleet/notebook_builder.py's first cell prints, once per run, to the
 # same stdout the SSE stream carries:
 #   print(f"CPU {psutil.cpu_count(logical=True)} cores | RAM {vm.total/2**30:.1f} GB")
@@ -177,6 +185,32 @@ def parse_telemetry(line: str) -> dict | None:
     }
 
 
+def parse_system(line: str) -> dict | None:
+    """Return a system RAM/CPU sample from one SSE line, or None.
+
+    Bytes as reported, not gigabytes: the conversion is a presentation
+    choice, and rounding here would make the only live memory reading
+    this app has lossy before anything could use it.
+    """
+    if not line.startswith("data:"):
+        return None
+    payload = line[len("data:"):].strip()
+    try:
+        obj = json.loads(payload)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if obj.get("stream_name") != "stdout":
+        return None
+    m = SYSTEM_RE.search(obj.get("data", ""))
+    if not m:
+        return None
+    return {
+        "ram_used": int(m.group(1)),
+        "ram_total": int(m.group(2)),
+        "cpu_pct": int(m.group(3)),
+    }
+
+
 def parse_hardware_banner(line: str) -> dict | None:
     """Return one record from the notebook's first-cell hardware banner, or None.
 
@@ -258,6 +292,7 @@ def stream_progress(token: str, user_name: str, kernel_slug: str,
                     on_telemetry: Callable[[dict], None] | None = None,
                     on_hardware: Callable[[dict], None] | None = None,
                     on_preflight: Callable[[dict], None] | None = None,
+                    on_system: Callable[[dict], None] | None = None,
                     max_reconnects: int = 5,
                     sleep: Callable[[float], None] = time.sleep) -> None:
     """Block, calling on_progress(done, total) as lines arrive.
@@ -363,6 +398,11 @@ def stream_progress(token: str, user_name: str, kernel_slug: str,
                     record = parse_telemetry(raw)
                     if record:
                         on_telemetry(record)
+                        continue
+                if on_system is not None:
+                    sys_record = parse_system(raw)
+                    if sys_record:
+                        on_system(sys_record)
                         continue
                 if on_preflight is not None:
                     pf_record = parse_preflight(raw)

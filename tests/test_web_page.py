@@ -206,7 +206,11 @@ def test_a_card_shows_vram_used_against_total(card):
     """VRAM matters more than utilisation for a render that is about to
     fail: a card at 100% is working, a card at 15/15G is about to die."""
     html = card()
-    assert "VRAM" in html
+    # Labelled "GPU <n> memory", not "VRAM": stacked under a bar labelled
+    # "GPU", the old wording read as a second name for the same quantity
+    # rather than a different one (asked directly, 2026-08-12).
+    assert "GPU 0 memory" in html
+    assert "GPU 0 load" in html, "the two bars must name what they measure"
     assert "4/15G" in html
 
 
@@ -260,3 +264,142 @@ def test_a_card_with_no_live_data_claims_nothing(card):
     assert "VRAM" not in html
     assert "This session" not in html
     assert "Tesla P100" in html and "ago" in html
+
+
+# ---------------------------------------------------------------------------
+# The status pill became an icon.
+#
+# On a real dashboard (2026-08-12) it was clipped to "RENDERI…" and
+# "COMP…": .inst-head is a flex row, its children default to
+# min-width:auto so none of them could shrink, and .inst's overflow:hidden
+# cut the overflowing badge off. The word moved to the tooltip.
+# ---------------------------------------------------------------------------
+
+def test_the_status_badge_is_an_icon_not_a_clippable_word(card):
+    html = card()
+    assert '<svg' in html, "the state must render as an icon"
+    assert "badge ico rendering" in html
+    # The word must not come back as visible pill text -- that is what
+    # overflowed. It survives only as the accessible name.
+    assert ">rendering<" not in html
+
+
+def test_the_icon_still_says_what_it_means(card):
+    """An icon with no accessible name is worse than the word it replaced."""
+    html = card()
+    assert 'title="rendering"' in html
+    assert 'aria-label="rendering"' in html
+    assert 'role="img"' in html
+
+
+def test_each_state_gets_its_own_shape_not_just_its_own_colour(card):
+    """Meaning carried by colour alone is lost to a colour vision
+    deficiency -- which is exactly why this used to be a word. Distinct
+    silhouettes are what make the icon a fair replacement, so a shared
+    glyph between two states would quietly undo that."""
+    def icon_for(state):
+        html = card(LIVE_INSTANCE.replace("state: 'running'", f"state: '{state}'"))
+        start = html.index("<svg")
+        return html[start:html.index("</svg>", start)]
+
+    shapes = {s: icon_for(s) for s in
+              ("running", "queued", "complete", "error", "cancel_acknowledged")}
+    assert len(set(shapes.values())) == len(shapes), \
+        f"two states share a glyph: {shapes}"
+
+
+def test_a_username_identical_to_the_label_is_not_printed_twice(card):
+    """"sudaouserwithani sudaouserwithani" was noise, and it was what
+    pushed the pill off the edge of the card."""
+    same = LIVE_INSTANCE.replace("username: 'friend'", "username: 'acct0'")
+    html = card(same)
+    assert html.count("acct0") == 1, "the name must appear once, not twice"
+    assert 'class="sub"' not in html
+
+
+def test_a_renamed_account_still_shows_its_kaggle_username(card):
+    """Dropping the duplicate must not hide the real identity of an
+    account the user has given their own nickname."""
+    html = card()          # label 'acct0', username 'friend'
+    assert 'class="sub"' in html
+    assert "friend" in html
+
+
+# ---------------------------------------------------------------------------
+# Live system RAM.
+#
+# Only the machine's TOTAL was ever shown, once, in the session chip -- so
+# a session minutes from an out-of-memory kill displayed a reassuring
+# "31.3 GB RAM" the whole way down. ("i thought weed see the system ram
+# also", 2026-08-12.)
+# ---------------------------------------------------------------------------
+
+LIVE_WITH_RAM = LIVE_INSTANCE.replace(
+    "cpuCount: 4, ramTotal: 31.3,",
+    "cpuCount: 4, ramTotal: 31.3, ramUsed: 12884901888, cpuPct: 63,")
+
+
+def test_a_card_shows_system_ram_in_use_not_only_its_size(card):
+    html = card(LIVE_WITH_RAM)
+    assert "System RAM" in html
+    assert "12.0/31G" in html, "used against total, both visible"
+
+
+def test_system_ram_is_absent_until_it_has_actually_been_sampled(card):
+    """A bar at zero would claim a reading nobody took. The card must show
+    nothing at all until the first SYSTEM line arrives."""
+    html = card()          # no ramUsed in the payload
+    assert "System RAM" not in html
+
+
+# ---------------------------------------------------------------------------
+# "finished in 5:20" -- how long a render actually took.
+# ---------------------------------------------------------------------------
+
+def _duration(page, seconds):
+    out = {}
+    loop = QEventLoop()
+    page.runJavaScript(
+        f"(() => {{ try {{ return String(fmtDuration({seconds}));"
+        f" }} catch (e) {{ return 'THREW ' + e; }} }})()",
+        lambda r: (out.__setitem__("v", r or ""), loop.quit()))
+    QTimer.singleShot(5000, loop.quit)
+    loop.exec()
+    assert "v" in out, "the page never answered"
+    return out["v"]
+
+
+def test_a_duration_reads_like_a_stopwatch_under_an_hour(loaded_page):
+    page, _ = loaded_page
+    assert _duration(page, 320) == "5:20"
+    assert _duration(page, 9) == "0:09", "seconds must stay two digits"
+
+
+def test_a_duration_past_an_hour_is_spelled_out(loaded_page):
+    """"1:05:20" is ambiguous at a glance; hours deserve their unit."""
+    page, _ = loaded_page
+    assert _duration(page, 3920) == "1h 5m 20s"
+
+
+def test_an_unmeasured_duration_shows_nothing_rather_than_zero(loaded_page):
+    """A job launched before start times were recorded has no duration.
+    "0:00" would be a claim; blank is the truth."""
+    page, _ = loaded_page
+    assert _duration(page, "null") == ""
+
+
+def test_a_finished_card_says_how_long_it_took(card):
+    done = LIVE_INSTANCE.replace(
+        "framesDone: 1, message: ''",
+        "framesDone: 4, message: '', elapsed: 320, finished: true")
+    html = card(done)
+    assert "finished in 5:20" in html
+
+
+def test_a_running_card_shows_the_same_field_as_a_stopwatch(card):
+    running = LIVE_INSTANCE.replace(
+        "framesDone: 1, message: ''",
+        "framesDone: 1, message: '', elapsed: 95, finished: false")
+    html = card(running)
+    assert "1:35" in html
+    assert "finished in" not in html

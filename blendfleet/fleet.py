@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import unicodedata
 import uuid
 from dataclasses import dataclass, asdict, field
@@ -189,6 +190,14 @@ class WorkerState:
     state: str = "queued"
     frames_done: int = 0
     message: str = ""
+    # Epoch seconds. Both default to 0.0, meaning "not recorded" -- which
+    # is also what a state file written before these existed will load as,
+    # so an in-flight job survives the upgrade instead of reporting a
+    # 56-year render. Set at push, and once the kernel reaches a terminal
+    # state; NEVER derived from "now" at display time, or a finished job
+    # would keep ageing every time the dashboard repainted.
+    started_at: float = 0.0
+    finished_at: float = 0.0
 
 
 @dataclass
@@ -198,6 +207,9 @@ class FleetState:
     start_frame: int
     end_frame: int
     workers: list[WorkerState] = field(default_factory=list)
+    # When the fleet-wide job began, for "finished in 5:20". 0.0 means a
+    # job started before this was recorded.
+    started_at: float = 0.0
 
 
 @dataclass
@@ -818,7 +830,7 @@ class Fleet:
 
         st = FleetState(job_id=job_id, blend_name=blend.name,
                         start_frame=start_frame, end_frame=end_frame,
-                        workers=[])
+                        workers=[], started_at=time.time())
 
         # push_kernel ALWAYS starts a run, so a kernel that has been pushed is
         # already spending quota. Persist after EVERY push -- not once at the
@@ -837,7 +849,8 @@ class Fleet:
 
                 st.workers.append(WorkerState(
                     label=account.label, username=username,
-                    kernel_slug=kernel_slug, frames=frames))
+                    kernel_slug=kernel_slug, frames=frames,
+                    started_at=time.time()))
                 self._save(st)
         finally:
             # Belt and braces: covers an exception raised between the append
@@ -859,6 +872,13 @@ class Fleet:
                 continue
             s = self.client_factory(acct.token).status(w.kernel_slug)
             w.state, w.message = s.state, s.message
+            # Stamped once, when the worker stops being active. Not
+            # recomputed from "now" at display time, or a finished job
+            # would keep ageing every time the dashboard repainted; and
+            # guarded by `not w.finished_at` so a later poll of an
+            # already-finished worker cannot push its end time forward.
+            if w.state not in ACTIVE_STATES and not w.finished_at:
+                w.finished_at = time.time()
         self._save(st)
         return st
 

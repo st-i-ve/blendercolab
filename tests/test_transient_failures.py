@@ -322,3 +322,83 @@ def test_a_stop_event_still_ends_the_stream_promptly(monkeypatch):
     stop.set()
     log_stream.stream_progress("KGAT_x", "me", "k", lambda d, t: None,
                                stop_event=stop, sleep=lambda s: None)
+
+
+# --------------------------------------------------------------------------
+# A worker whose account can no longer be matched
+#
+# collect() used to skip it in silence: per_worker=0, nothing in
+# worker_errors, its frames in missing_frames. On 2026-08-12 that made a
+# 25-frame render across five accounts look like "two accounts did not
+# render any" -- both had in fact finished every frame, and both sets were
+# sitting on Kaggle the whole time.
+# --------------------------------------------------------------------------
+
+class NamedWorker(Worker):
+    def __init__(self, label, username, frames):
+        super().__init__(label, frames)
+        self.username = username
+
+
+class NamedAccount(Account):
+    def __init__(self, label, username=None):
+        super().__init__(label)
+        self.username = username
+
+
+class GoodClient:
+    def __init__(self, frames):
+        self.frames = frames
+
+    def fetch_output(self, slug, dest):
+        out = Path(dest)
+        out.mkdir(parents=True, exist_ok=True)
+        written = []
+        for f in self.frames:
+            p = out / f"f_{f:04d}.png"
+            p.write_bytes(b"PNG-real")
+            written.append(p)
+        return written
+
+
+def test_an_unmatched_worker_is_explained_never_silently_skipped(tmp_path):
+    worker = NamedWorker("worpstudios", "worpstudios", [4, 9, 14])
+    report = collect(State([worker]), [NamedAccount("someone-else", "other")],
+                     lambda tok: GoodClient([4, 9, 14]), tmp_path / "frames",
+                     sleep=lambda s: None)
+    assert "worpstudios" in report.worker_errors, \
+        "an unmatched worker must be reported, not skipped in silence"
+    message = report.worker_errors["worpstudios"]
+    # What happened, why, and what to do -- this app's rule for every
+    # user-facing string.
+    assert "3 frame(s)" in message
+    assert "still on Kaggle" in message
+    assert "Re-add that account" in message
+    assert "worpstudios" in message, "must name the Kaggle username to re-add"
+
+
+def test_renaming_an_account_mid_job_still_collects_its_frames(tmp_path):
+    # The label is the user's editable nickname; the username is the
+    # account's real identity. Renaming "worp" to "studio-2" while a job
+    # is running must not orphan that job's frames.
+    worker = NamedWorker("worp", "worpstudios", [1, 2, 3])
+    account = NamedAccount("studio-2", "worpstudios")
+    report = collect(State([worker]), [account],
+                     lambda tok: GoodClient([1, 2, 3]), tmp_path / "frames",
+                     sleep=lambda s: None)
+    assert report.copied == 3
+    assert report.worker_errors == {}
+    assert report.missing_frames == []
+
+
+def test_one_unmatched_worker_does_not_stop_the_others(tmp_path):
+    good = NamedWorker("stive", "stivestivewithani", [1, 2])
+    orphan = NamedWorker("gone", "worpstudios", [3])
+    state = State([good, orphan])
+    state.end_frame = 3
+    report = collect(state, [NamedAccount("stive", "stivestivewithani")],
+                     lambda tok: GoodClient([1, 2]), tmp_path / "frames",
+                     sleep=lambda s: None)
+    assert report.copied == 2, "the matched worker's frames still arrive"
+    assert "gone" in report.worker_errors
+    assert report.missing_frames == [3]

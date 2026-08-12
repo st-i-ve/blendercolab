@@ -223,19 +223,53 @@ function renderState(json) {
   renderDataset(state);
 }
 
+/* Status icons for the instance cards. Inline SVG, matching index.html's
+   own idiom exactly: 16x16 box, stroke="currentColor", stroke-width 1.4,
+   so each one inherits its badge's colour and needs no asset file.
+   Deliberately four unmistakable silhouettes -- arc, tick, clock, triangle
+   -- so the state survives being read in monochrome. */
+const ICON = {
+  spinner: '<svg viewBox="0 0 16 16" fill="none" aria-hidden="true">'
+    + '<path d="M8 1.8a6.2 6.2 0 1 1-6.2 6.2" stroke="currentColor"'
+    + ' stroke-width="1.8" stroke-linecap="round"/></svg>',
+  tick: '<svg viewBox="0 0 16 16" fill="none" aria-hidden="true">'
+    + '<path d="M3 8.4l3.2 3.2L13 4.8" stroke="currentColor"'
+    + ' stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  clock: '<svg viewBox="0 0 16 16" fill="none" aria-hidden="true">'
+    + '<circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.5"/>'
+    + '<path d="M8 4.6V8l2.4 1.6" stroke="currentColor" stroke-width="1.5"'
+    + ' stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  warning: '<svg viewBox="0 0 16 16" fill="none" aria-hidden="true">'
+    + '<path d="M8 5.5v3.2M8 11.2v.1" stroke="currentColor" stroke-width="1.6"'
+    + ' stroke-linecap="round"/><path d="M6.6 2.4c.6-1.1 2.2-1.1 2.8 0l4.4 8.1'
+    + 'c.6 1.1-.2 2.5-1.4 2.5H3.6c-1.2 0-2-1.4-1.4-2.5l4.4-8.1z"'
+    + ' stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>',
+  cross: '<svg viewBox="0 0 16 16" fill="none" aria-hidden="true">'
+    + '<path d="M4.6 4.6l6.8 6.8M11.4 4.6l-6.8 6.8" stroke="currentColor"'
+    + ' stroke-width="1.7" stroke-linecap="round"/></svg>',
+  dash: '<svg viewBox="0 0 16 16" fill="none" aria-hidden="true">'
+    + '<path d="M4.4 8h7.2" stroke="currentColor" stroke-width="1.8"'
+    + ' stroke-linecap="round"/></svg>',
+};
+
 function instanceCard(inst) {
   const worker = inst.worker;
   const state = worker ? worker.state : 'idle';
-  /* Symbol AND word, always. A dot with no word would put the whole
-     meaning on a colour, which ~8% of men cannot reliably read. */
+  /* An icon, not a word -- but a DISTINCT SHAPE per state, never a bare
+     coloured dot. The original rule here was "symbol AND word, always",
+     because meaning carried by colour alone is lost to the ~8% of men
+     with a colour vision deficiency. A spinner, a tick, a clock and a
+     warning triangle are different shapes in monochrome, so that rule
+     still holds; the word was what made the pill overflow its card and
+     get clipped to "RENDERI…". The word survives as the tooltip. */
   const badge = {
-    running:  ['rendering', 'rendering'],
-    queued:   ['idle', 'queued'],
-    complete: ['complete', 'complete'],
-    error:    ['warn', 'error'],
-    cancel_requested:    ['paused', 'cancelling'],
-    cancel_acknowledged: ['paused', 'cancelled'],
-  }[state] || ['idle', 'idle'];
+    running:  ['rendering', 'rendering', ICON.spinner],
+    queued:   ['idle', 'queued', ICON.clock],
+    complete: ['complete', 'complete', ICON.tick],
+    error:    ['warn', 'error', ICON.warning],
+    cancel_requested:    ['paused', 'cancelling', ICON.cross],
+    cancel_acknowledged: ['paused', 'cancelled', ICON.cross],
+  }[state] || ['idle', 'idle', ICON.dash];
   const dot = { running: 'active', error: 'offline', complete: 'active' }[state] || 'idle';
 
   /* Last-KNOWN hardware, with its age, or an honest blank. Never dressed
@@ -283,14 +317,21 @@ function instanceCard(inst) {
 
   /* One row per physical GPU, never combined -- an average across two
      cards hides one of them sitting idle. */
+  /* "GPU" over one bar and "VRAM" over the next read as two names for the
+     same thing. They are not: the first is how BUSY the chip is, the
+     second is how much of its MEMORY is occupied -- a card can be 99%
+     busy on 3 GB, or idle holding 14. Naming both after the card they
+     belong to, and the quantity they measure, says so without a legend. */
   const gpuRows = live && live.gpus.length
     ? live.gpus.map(g => `<div class="gpu-line">
-        <span class="tag on">GPU ${g.index}</span>
+        <span class="tag on" title="How busy this GPU is right now">GPU ${
+          g.index} load</span>
         <div class="track rendering"><i style="width:${g.util || 0}%"></i></div>
         <span class="pct">${g.util == null ? '—' : g.util + '%'}</span>
       </div>
       <div class="gpu-line">
-        <span class="tag">VRAM</span>
+        <span class="tag" title="Memory in use on this GPU, of its total">GPU ${
+          g.index} memory</span>
         <div class="track"><i style="width:${
           g.memTotal ? Math.round(100 * g.memUsed / g.memTotal) : 0}%"></i></div>
         <span class="pct">${g.memTotal
@@ -299,23 +340,54 @@ function instanceCard(inst) {
       </div>`).join('')
     : '';
 
+  /* System RAM, live, in the same shape as the GPU rows -- the machine's
+     memory is what an out-of-memory kill actually exhausts, and until now
+     only its TOTAL was ever shown (once, in the session chip). A session
+     could be seconds from being killed while the card read a reassuring
+     "31.3 GB RAM". Absent until the first SYSTEM sample: a bar at zero
+     would claim a measurement that has not been taken. */
+  const ramUsedGb = live && live.ramUsed ? live.ramUsed / (1024 ** 3) : null;
+  const sysRow = ramUsedGb && ramTotal
+    ? `<div class="gpu-line">
+        <span class="tag" title="System RAM in use on this machine, of its total">System RAM</span>
+        <div class="track"><i style="width:${
+          Math.min(100, Math.round(100 * ramUsedGb / ramTotal))}%"></i></div>
+        <span class="pct">${ramUsedGb.toFixed(1)}/${ramTotal.toFixed(0)}G</span>
+      </div>`
+    : '';
+
+  /* Elapsed time, and after it stops, the total. "finished in 5:20" is
+     the benchmark; while it runs the same number is the stopwatch, so
+     one field serves both and they cannot disagree. */
+  const elapsed = worker && worker.elapsed != null
+    ? `<span class="elapsed">${worker.finished ? 'finished in ' : ''}${
+        fmtDuration(worker.elapsed)}</span>`
+    : '';
   const phase = live && live.phase
-    ? `<div class="inst-foot"><b>${esc(live.phase)}</b></div>`
+    ? `<div class="inst-foot"><b>${esc(live.phase)}</b>${elapsed}</div>`
     : (worker && worker.state === 'queued'
        ? '<div class="inst-foot">queued — waiting for Kaggle to allocate a machine</div>'
-       : '');
+       : (elapsed ? `<div class="inst-foot">${elapsed}</div>` : ''));
 
   return `<div class="inst">
     <div class="inst-head">
       <span class="status-dot ${dot}"></span>
       <span class="name">${esc(inst.label)}</span>
-      <span class="sub">${esc(inst.username || '')}</span>
+      ${/* Shown ONLY when it differs from the label. For most accounts the
+            two are identical, and printing "sudaouserwithani
+            sudaouserwithani" was both noise and what pushed the status
+            pill off the edge of the card. A renamed account still needs
+            its real Kaggle identity visible, so it is not simply
+            deleted. */
+        inst.username && inst.username !== inst.label
+          ? `<span class="sub">${esc(inst.username)}</span>` : ''}
       <span class="right">
         ${inst.revoked
           ? '<span class="badge bad"><i></i>token revoked</span>'
           : inst.verified ? '' : '<span class="badge warn"><i></i>not verified</span>'}
         ${inst.username ? '' : '<span class="badge warn"><i></i>needs username</span>'}
-        <span class="badge ${badge[0]}"><i></i>${badge[1]}</span>
+        <span class="badge ico ${badge[0]}" title="${esc(badge[1])}"
+              role="img" aria-label="${esc(badge[1])}">${badge[2]}</span>
       </span>
     </div>
     <div class="inst-body">
@@ -339,6 +411,7 @@ function instanceCard(inst) {
         </div>
       </div>` : ''}
       ${gpuRows}
+      ${sysRow}
       ${phase}
       ${worker && worker.message ? `<div class="inst-foot"><b>${esc(worker.message)}</b></div>` : ''}
     </div>
@@ -408,6 +481,17 @@ function fmtAge(seconds) {
   if (seconds < 3600) return Math.floor(seconds / 60) + 'm ago';
   if (seconds < 86400) return Math.floor(seconds / 3600) + 'h ago';
   return Math.floor(seconds / 86400) + 'd ago';
+}
+/* How long a render took, read the way a person says it. Under an hour
+   it is mm:ss, which is how you read a stopwatch; past an hour the bare
+   "1:05:20" is ambiguous enough at a glance to be worth spelling out.
+   Seconds are always shown -- "1h 5m" hides up to 59s of a benchmark. */
+function fmtDuration(seconds) {
+  if (seconds == null || !isFinite(seconds) || seconds < 0) return '';
+  const s = Math.round(seconds);
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  if (h) return `${h}h ${m}m ${sec}s`;
+  return `${m}:${String(sec).padStart(2, '0')}`;
 }
 function esc(text) {
   return String(text).replace(/[&<>"']/g, c =>

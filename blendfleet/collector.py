@@ -184,6 +184,15 @@ def collect(fleet_state, accounts, client_factory: Callable,
     """
     dest.mkdir(parents=True, exist_ok=True)
     by_label = {a.label: a for a in accounts}
+    # A worker records BOTH its label (the user's own nickname for the
+    # account, which they can edit at any time) and its username (the
+    # account's actual Kaggle identity, which they cannot). Matching on
+    # label alone means renaming an account while a job is running
+    # orphans that job's frames -- they are on Kaggle, rendered and paid
+    # for, and the app can no longer name a token to fetch them with.
+    # Username is the stable key, so it is the fallback.
+    by_username = {getattr(a, "username", None): a for a in accounts
+                   if getattr(a, "username", None)}
     stem = Path(fleet_state.blend_name).stem
     report = CollectReport()
     found: set[int] = set()
@@ -193,9 +202,23 @@ def collect(fleet_state, accounts, client_factory: Callable,
         workers = [w for w in workers if w.label == worker_label]
 
     for w in workers:
-        acct = by_label.get(w.label)
+        acct = by_label.get(w.label) or by_username.get(w.username)
         if acct is None:
+            # This used to `continue` in silence. The worker's frames then
+            # landed in missing_frames with nothing to explain them, which
+            # on screen is indistinguishable from an account that rendered
+            # nothing at all -- and that is exactly how a real 25-frame
+            # render (2026-08-12) was read as "two accounts did not
+            # render", when both had in fact finished every frame.
             report.per_worker[w.label] = 0
+            report.worker_errors[w.label] = (
+                f"{w.username or w.label} rendered "
+                f"{len(w.frames)} frame(s), but no configured account "
+                f"matches it any more, so BlendFleet has no token to "
+                f"download them with. Nothing is lost -- the frames are "
+                f"still on Kaggle. Re-add that account under Manage "
+                f"accounts… (the Kaggle username is {w.username or 'unknown'}) "
+                f"and download again.")
             continue
         client = client_factory(acct.token)
         staging = dest / f".raw_{w.label}"

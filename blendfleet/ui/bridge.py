@@ -134,6 +134,7 @@ class Backend(QObject):
         self._stream_threads: list[threading.Thread] = []
         self._progress_q: "queue.Queue[tuple[str, int, int]]" = queue.Queue()
         self._telemetry_q: "queue.Queue[tuple[str, dict]]" = queue.Queue()
+        self._system_q: "queue.Queue[tuple[str, dict]]" = queue.Queue()
         self._hardware_q: "queue.Queue[tuple[str, dict]]" = queue.Queue()
         # Notifications raised BY a stream thread (a hardware check
         # that could not be watched). Queued like everything else so
@@ -230,6 +231,12 @@ class Backend(QObject):
                     "framesDone": worker.frames_done,
                     "message": (worker.message
                                 or self._failures.get(worker.label) or ""),
+                    # Seconds this worker has been going, or took. Frozen
+                    # once it finished -- the elapsed time of a completed
+                    # render is a fact about the render, not about how
+                    # long ago you ran it.
+                    "elapsed": _elapsed(worker),
+                    "finished": bool(worker.finished_at),
                 } if worker is not None else None,
                 # Live, cheap to poll, and never a promise.
                 "quota": self._quota.get(account.label, ""),
@@ -272,6 +279,8 @@ class Backend(QObject):
             "gpus": [slot["gpus"][k] for k in sorted(slot["gpus"])],
             "cpuCount": slot["cpuCount"],
             "ramTotal": slot["ramTotal"],
+            "ramUsed": slot["ramUsed"],
+            "cpuPct": slot["cpuPct"],
             "preflight": slot["preflight"],
         }
 
@@ -1052,6 +1061,7 @@ class Backend(QObject):
                         worker.kernel_slug.split("/", 1)[1], progress,
                         self._stop,
                         on_telemetry=lambda r: self._telemetry_q.put((label, r)),
+                        on_system=lambda r: self._system_q.put((label, r)),
                         on_hardware=lambda r: self._hardware_q.put((label, r)),
                         on_preflight=lambda r: self._preflight_q.put((label, r)))
                 except Exception:
@@ -1066,6 +1076,11 @@ class Backend(QObject):
         return self._live.setdefault(label, {
             "phase": "", "framesDone": 0, "framesTotal": 0,
             "gpus": {}, "cpuCount": None, "ramTotal": None, "preflight": None,
+            # Live system memory, distinct from ramTotal (which is the
+            # machine's size, reported once). None until the first
+            # SYSTEM line -- never 0, which would read as "no memory
+            # in use" rather than "not measured yet".
+            "ramUsed": None, "cpuPct": None,
         })
 
     def _live_tick(self) -> None:
@@ -1099,6 +1114,19 @@ class Backend(QObject):
             # arrival is itself evidence the setup finished.
             if not slot["phase"]:
                 slot["phase"] = "rendering"
+            changed = True
+        for _ in range(200):
+            try:
+                label, record = self._system_q.get_nowait()
+            except queue.Empty:
+                break
+            slot = self._slot(label)
+            # Bytes on the wire, GB at the edge -- the same discipline the
+            # GPU rows already follow with MiB.
+            slot["ramUsed"] = record.get("ram_used")
+            slot["cpuPct"] = record.get("cpu_pct")
+            if slot["ramTotal"] is None and record.get("ram_total"):
+                slot["ramTotal"] = record["ram_total"] / (1024 ** 3)
             changed = True
         for _ in range(200):
             try:
@@ -1160,6 +1188,22 @@ class Backend(QObject):
         for thread in self._stream_threads:
             thread.join(timeout=3.0)
         self._stream_threads = [t for t in self._stream_threads if t.is_alive()]
+
+
+def _elapsed(worker) -> float | None:
+    """Seconds this worker has been running, or took in total.
+
+    None when the start was never recorded -- a job launched by a build
+    before started_at existed, whose state file has 0.0. Returning
+    time.time() - 0.0 there would report a fifty-six year render, which
+    is the kind of number that makes a user distrust every other number
+    on the page.
+    """
+    started = getattr(worker, "started_at", 0.0) or 0.0
+    if not started:
+        return None
+    finished = getattr(worker, "finished_at", 0.0) or 0.0
+    return (finished or time.time()) - started
 
 
 def _snapshot_payload(snapshot) -> dict | None:

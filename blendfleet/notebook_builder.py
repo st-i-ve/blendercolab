@@ -608,6 +608,15 @@ print("[runner] batched render helper ready")
 
     c_telemetry = '''
 import subprocess, threading
+# Guarded, not a plain import: this cell must stay importable on any
+# machine. Kaggle ships psutil (cell 1 already uses it), but a telemetry
+# dependency that can raise at import time would take the whole render
+# down for the sake of a memory reading -- the same reason the sampler
+# runs on its own thread.
+try:
+    import psutil
+except Exception:
+    psutil = None
 
 def _telemetry_loop(stop_event, interval=5):
     # Runs on a background thread so a telemetry hiccup can never abort a
@@ -616,6 +625,20 @@ def _telemetry_loop(stop_event, interval=5):
     # P100 instead of the expected T4 x2), so each card must be independently
     # visible.
     while not stop_event.is_set():
+        # System RAM, sampled on the SAME tick as the GPUs. Only the
+        # total was ever reported (once, in the hardware banner), so a
+        # session could be minutes from being killed for memory and the
+        # dashboard showed a reassuring "31.3 GB RAM" the whole way down.
+        # Its own try/except: psutil failing must cost the RAM line, not
+        # the GPU lines underneath it.
+        try:
+            if psutil is not None:
+                vm = psutil.virtual_memory()
+                print(f"SYSTEM ram_used={vm.used} ram_total={vm.total} "
+                      f"cpu_pct={psutil.cpu_percent(interval=None):.0f}",
+                      flush=True)
+        except Exception:
+            pass
         try:
             p = subprocess.run(
                 ["nvidia-smi",
