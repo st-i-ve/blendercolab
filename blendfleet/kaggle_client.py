@@ -59,6 +59,94 @@ class KaggleError(Exception):
     """A Kaggle call failed."""
 
 
+class RevokedTokenError(KaggleError):
+    """This account's token is no longer accepted by Kaggle.
+
+    A KaggleError SUBCLASS, deliberately: every existing `except
+    KaggleError` site keeps working unchanged, while code that cares can
+    test for this one specifically. A sibling type would have silently
+    escaped all of them.
+
+    Worth naming at all because it is the one failure the user can only
+    fix by going to kaggle.com -- and the only
+    one worth marking an account with permanently. Retrying does not help,
+    and it must never be confused with a network blip: this app already
+    spent a whole session diagnosing a dropped connection as a dead
+    account, and reported a revoked token as "this account owns nothing"
+    in an earlier version.
+
+    See _is_revoked_token for what does and does not count.
+    """
+
+
+# Kaggle uses 403 for TWO unrelated things: a bad token, and a dataset
+# this account simply cannot see (kaggle_client.dataset_reachable's own
+# docstring: "A missing or invisible dataset raises HTTPError 403, not
+# 404"). Treating every 403 as revoked would report a private dataset --
+# a completely normal state during sharing propagation -- as a dead
+# account, and send the user off to regenerate a token that was fine.
+#
+# So 401 alone is conclusive. A 403 counts only when the failure is on an
+# authentication endpoint or says so in words.
+_REVOKED_STATUSES = frozenset({401})
+_AMBIGUOUS_STATUSES = frozenset({403})
+_AUTH_PHRASES = (
+    "introspecttoken",         # the OAuth introspection RPC itself
+    "oauthservice",
+    "invalid token",
+    "invalid access token",
+    "invalid api token",
+    "token has been revoked",
+    "token is revoked",
+    "expired token",
+    "unauthorized",
+)
+
+
+def _is_revoked_token(exc: BaseException) -> bool:
+    """True only when Kaggle actually rejected the credentials.
+
+    Deliberately conservative. A transient error (connection reset, SSL
+    EOF, read timeout, 429, any 5xx) is NOT a revoked token, and neither
+    is a 403 that is only about reachability -- both of those happened
+    repeatedly on real runs, and calling either one "revoked" would tell
+    the user to replace a working key.
+    """
+    status = None
+    response = getattr(exc, "response", None)
+    if response is not None:
+        status = getattr(response, "status_code", None)
+    text = f"{exc}".lower()
+
+    if status in _REVOKED_STATUSES:
+        return True
+    if status in _AMBIGUOUS_STATUSES:
+        return any(phrase in text for phrase in _AUTH_PHRASES)
+    if status is not None:
+        return False        # any other HTTP status: not an auth verdict
+    # No status at all (a bare library error). Only the explicit wording
+    # counts -- never a connection/SSL/timeout error, which carries none
+    # of these phrases.
+    return any(phrase in text for phrase in _AUTH_PHRASES)
+
+
+def revoked_token_message(account: str | None, token: str) -> str:
+    who = f"the account {account!r}" if account else \
+        f"the account with token {_mask_forward(token)}"
+    return (
+        f"Kaggle has rejected the token for {who} -- it has been revoked, "
+        "regenerated or expired, so nothing can run on this account until "
+        "it is replaced. Retrying will not help. Ask them to generate a "
+        "fresh one at kaggle.com -> Settings -> API -> Generate New Token, "
+        "then update the account under Manage accounts…")
+
+
+def _mask_forward(token: str) -> str:
+    # _mask is defined further down (it belongs with the auth helpers);
+    # this keeps the message builder next to the exception it explains.
+    return f"{token[:9]}…" if len(token) > 12 else "…"
+
+
 def _dataset_error_detail(e: HTTPError) -> str:
     """Pull the actual reason out of an HTTPError from the dataset API.
 
@@ -265,14 +353,22 @@ def _assert_bound_to_token(api, token: str, account: str | None) -> None:
             "risk running this account's work on somebody else's quota -- "
             "update BlendFleet, or reinstall the kaggle package.")
     if values.get(_CONFIG_NAME_TOKEN) != token:
-        raise KaggleError(
-            f"the token for {who} was not accepted by Kaggle. Kaggle then "
-            "fell back to the credentials stored on this computer, so every "
-            "call would have run as a DIFFERENT account -- spending the wrong "
-            "person's GPU quota and reporting the wrong username as verified. "
-            "Nothing has been run. Ask them to generate a fresh token at "
-            "kaggle.com -> Settings -> API -> Generate New Token, then "
-            "re-verify the account under Manage accounts…")
+        # RevokedTokenError, not a plain KaggleError: this IS the revoked
+        # -token case seen from the inside. authenticate() is a cascade, so
+        # a token Kaggle refuses does not raise -- it silently drops
+        # through to whatever else this computer has, which is why the
+        # check exists at all. Naming it lets the app mark the account
+        # instead of showing one more indistinguishable error.
+        raise RevokedTokenError(
+            f"the token for {who} was not accepted by Kaggle -- it has been "
+            "revoked, regenerated or expired. Kaggle did not reject the call "
+            "outright: it fell back to the credentials stored on this "
+            "computer, so every call would have run as a DIFFERENT account "
+            "-- spending the wrong person's GPU quota and reporting the "
+            "wrong username as verified. Nothing has been run. Retrying will "
+            "not help; ask them to generate a fresh token at kaggle.com -> "
+            "Settings -> API -> Generate New Token, then re-verify the "
+            "account under Manage accounts…")
 
 
 def _default_api_factory(token: str, account: str | None = None):
@@ -287,7 +383,18 @@ def _default_api_factory(token: str, account: str | None = None):
 
     def construct():
         api = KaggleApi()
-        api.authenticate()
+        try:
+            api.authenticate()
+        except Exception as e:
+            # A token revoked while the app is running fails here loudly,
+            # rather than by the silent cascade _assert_bound_to_token
+            # covers. Only re-labelled when Kaggle actually rejected the
+            # credentials -- a connection reset during authenticate() is a
+            # network problem and must keep its own error.
+            if _is_revoked_token(e):
+                raise RevokedTokenError(
+                    revoked_token_message(account, token)) from e
+            raise
         return api
 
     api = _with_env_token(token, construct)
@@ -425,7 +532,17 @@ class KaggleClient:
         # authenticates as somebody else, must surface its real error here.
         # Swallowing that would report a genuine auth failure as "this
         # account owns nothing", sending the user to fix the wrong thing.
-        for item in self.api.kernels_list(mine=True, page_size=1) or []:
+        # Named when Kaggle rejected the credentials outright, so
+        # verification can mark the account rather than showing a generic
+        # error; anything else keeps its own.
+        try:
+            listing = self.api.kernels_list(mine=True, page_size=1) or []
+        except Exception as e:
+            if _is_revoked_token(e):
+                raise RevokedTokenError(
+                    revoked_token_message(self.label, self.token)) from e
+            raise
+        for item in listing:
             ref = str(getattr(item, "ref", ""))
             if "/" in ref:
                 return ref.split("/", 1)[0]
@@ -578,6 +695,14 @@ class KaggleClient:
         except ValueError:
             return KernelStatus(state="not_started")
         except Exception as e:
+            # A token revoked mid-render surfaces HERE, because poll() is
+            # what runs every 30 seconds for the life of a job. Without
+            # this it would be reported as "usually a transient network
+            # problem -- will try again on the next check", which is the
+            # opposite of true: no number of retries will fix it.
+            if _is_revoked_token(e):
+                raise RevokedTokenError(
+                    revoked_token_message(self.label, self.token)) from e
             # Bare str(e) used to be re-raised verbatim here -- fine for a
             # test asserting on the underlying text, useless for a user
             # staring at a dialog with no idea whether to wait or worry.

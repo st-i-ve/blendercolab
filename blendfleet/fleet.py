@@ -25,7 +25,7 @@ from blendfleet import sharing
 from blendfleet.accounts import Account
 from blendfleet.assignment import assign_frames
 from blendfleet.dataset_sync import sync_blend
-from blendfleet.kaggle_client import ACTIVE_STATES
+from blendfleet.kaggle_client import ACTIVE_STATES, RevokedTokenError
 from blendfleet.notebook_builder import RenderSettings, build
 from blendfleet.platform_paths import state_dir
 
@@ -353,7 +353,19 @@ class Fleet:
         for account in self.accounts:
             client = self.client_factory(account.token)
             clients[account.label] = client
-            usernames[account.label] = account.username or client.whoami()
+            try:
+                usernames[account.label] = (account.username
+                                            or client.whoami())
+            except RevokedTokenError:
+                # A dead token is not a transient failure and not something
+                # the user can retry past, so the account is marked here --
+                # this is the one code path every launch, dataset step and
+                # quota refresh goes through, which makes it the only place
+                # guaranteed to notice. The error still propagates: nothing
+                # may proceed as if this account were usable.
+                account.verified = False
+                account.revoked = True
+                raise
         return clients, usernames
 
     def dataset_slug_for(self, blend: Path, owner_username: str) -> str:

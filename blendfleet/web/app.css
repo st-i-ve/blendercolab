@@ -308,6 +308,13 @@ h2.sec .meta{font-family:var(--mono);font-size:11px;font-weight:400;color:var(--
 .badge.uploaded{background:var(--fill);color:var(--ink-2)}          .badge.uploaded i{background:var(--ink-3)}
 .badge.complete{background:var(--accent-soft);color:var(--accent-ink)}.badge.complete i{background:var(--accent)}
 .badge.warn{background:var(--warn-t);color:var(--warn-ink)}         .badge.warn i{background:var(--warn-ink)}
+/* A hard, user-must-act failure -- a revoked token. Shares the offline
+   palette because it is the same severity, but named for the cause so the
+   markup says what it means. */
+.badge.bad{background:var(--offline-t);color:var(--offline-ink)}     .badge.bad i{background:var(--offline)}
+/* app.js has always used `badge accent` for the warm-worker badge, and it
+   was never given a rule -- it rendered with the bare .badge styling. */
+.badge.accent{background:var(--accent-soft);color:var(--accent-ink)} .badge.accent i{background:var(--accent)}
 .track{height:8px;border-radius:5px;background:var(--fill);overflow:hidden}
 .track i{display:block;height:100%;width:0%;background:var(--bar);border-radius:5px;transition:width .7s cubic-bezier(.4,0,.2,1),background-color .4s}
 .track.rendering i{background:var(--accent)}

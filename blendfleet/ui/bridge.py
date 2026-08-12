@@ -184,7 +184,12 @@ class Backend(QObject):
 
     def _accounts_payload(self) -> list[dict]:
         return [{"label": a.label, "username": a.username,
-                 "verified": bool(a.verified)} for a in self.store.list()]
+                 "verified": bool(a.verified),
+                 # Distinct from not-verified: Kaggle has REJECTED this
+                 # token, so the page says "replace it" rather than
+                 # "check it". Never set by a network failure.
+                 "revoked": bool(getattr(a, "revoked", False))}
+                for a in self.store.list()]
 
     def _state_payload(self) -> dict:
         """Everything the page needs to draw the fleet, in one object.
@@ -210,6 +215,7 @@ class Backend(QObject):
                 "label": account.label,
                 "username": account.username,
                 "verified": bool(account.verified),
+                "revoked": bool(getattr(account, "revoked", False)),
                 # Live only while a kernel runs; None means idle, which is
                 # a real state and not an error.
                 "worker": {

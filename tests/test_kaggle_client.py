@@ -6,7 +6,8 @@ from pathlib import Path
 import pytest
 from requests.exceptions import HTTPError
 
-from blendfleet.kaggle_client import KaggleClient, KaggleError, verify_token
+from blendfleet.kaggle_client import (KaggleClient, KaggleError,
+                                      RevokedTokenError, verify_token)
 
 TOKEN = "KGAT_" + "a" * 32
 
@@ -525,14 +526,42 @@ def test_verify_token_returns_none_when_no_notebooks():
     assert got is None
 
 
-def test_verify_token_propagates_other_kaggle_errors():
+def test_verify_token_reports_a_revoked_token_as_revoked():
+    """A 401 must not be swallowed -- and is now NAMED.
+
+    This test's fake was always called RevokedApi: a 401 from
+    kernels_list is exactly a dead token, and the original assertion was
+    only that it propagates rather than being reported as
+    "accepted-but-unresolved". It still propagates; it now arrives as
+    RevokedTokenError so the app can mark the account instead of showing
+    one more indistinguishable failure. The underlying error is kept as
+    the cause, so nothing about what Kaggle said is lost.
+    """
     class RevokedApi(FakeApi):
         def kernels_list(self, mine=False, page_size=1):
             raise RuntimeError("401 Client Error: Unauthorized")
 
     revoked, _ = client(api=RevokedApi())
-    with pytest.raises(RuntimeError, match="Unauthorized"):
+    with pytest.raises(RevokedTokenError) as exc_info:
         verify_token(TOKEN, client_factory=lambda t: revoked)
+    assert "Unauthorized" in str(exc_info.value.__cause__)
+    # Still a KaggleError, so every existing handler keeps working.
+    assert isinstance(exc_info.value, KaggleError)
+
+
+def test_verify_token_propagates_errors_that_are_not_about_the_token():
+    """An unrelated failure keeps its own type and message.
+
+    The counterpart to the test above: whoami() must not relabel
+    everything it cannot list as a revoked token.
+    """
+    class BrokenApi(FakeApi):
+        def kernels_list(self, mine=False, page_size=1):
+            raise RuntimeError("kaggle exploded")
+
+    broken, _ = client(api=BrokenApi())
+    with pytest.raises(RuntimeError, match="kaggle exploded"):
+        verify_token(TOKEN, client_factory=lambda t: broken)
 
 
 def test_fetch_output_returns_jpegs_too(tmp_path):

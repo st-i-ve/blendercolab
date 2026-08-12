@@ -7,6 +7,7 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Callable
 
+from blendfleet.kaggle_client import RevokedTokenError
 from blendfleet.platform_paths import config_dir
 
 TOKEN_RE = re.compile(r"^KGAT_[0-9a-fA-F]{32}$")
@@ -45,6 +46,13 @@ class Account:
     # they show up as "not verified" until the user re-verifies, rather
     # than crashing load() or lying about a state we never checked.
     verified: bool = False
+    # Kaggle has REJECTED this token, as opposed to merely not having
+    # checked it lately. Distinct from `verified` because the two say
+    # different things and need different words in the UI: not-verified
+    # means "unknown, go and check", revoked means "known dead, this one
+    # can only be replaced". Only ever set from RevokedTokenError -- never
+    # from a network failure, which is what `verified` going stale covers.
+    revoked: bool = False
 
 
 class AccountStore:
@@ -100,11 +108,27 @@ class AccountStore:
             if a.label == label:
                 try:
                     username = verifier(a.token)
+                except RevokedTokenError:
+                    # Kaggle said no. Recorded so the UI can say "token
+                    # revoked -- replace it" instead of "not verified",
+                    # which reads like nobody has got round to checking.
+                    a.verified = False
+                    a.revoked = True
+                    raise
                 except Exception:
+                    # Anything else -- a dropped connection, a timeout, a
+                    # 429 -- leaves `revoked` alone. It is NOT evidence
+                    # about the token, and marking it here would tell the
+                    # user to replace a working key every time their
+                    # internet hiccuped.
                     a.verified = False
                     raise
                 a.username = username
                 a.verified = True
+                # A token that works is not revoked, even if it was last
+                # time: this is how an account recovers after the user
+                # pastes a fresh token in.
+                a.revoked = False
                 return
         raise ValueError(f"no account labeled {label!r}")
 

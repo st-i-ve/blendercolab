@@ -311,7 +311,9 @@ function instanceCard(inst) {
       <span class="name">${esc(inst.label)}</span>
       <span class="sub">${esc(inst.username || '')}</span>
       <span class="right">
-        ${inst.verified ? '' : '<span class="badge warn"><i></i>not verified</span>'}
+        ${inst.revoked
+          ? '<span class="badge bad"><i></i>token revoked</span>'
+          : inst.verified ? '' : '<span class="badge warn"><i></i>not verified</span>'}
         ${inst.username ? '' : '<span class="badge warn"><i></i>needs username</span>'}
         <span class="badge ${badge[0]}"><i></i>${badge[1]}</span>
       </span>
@@ -573,7 +575,9 @@ function renderFleetTable(state) {
     const warm = i.worker && ['running','queued'].includes(i.worker.state)
                && !i.worker.frames.length;
   return `<tr>
-      <td>${esc(i.label)}${i.verified ? '' : ' <span class="badge warn"><i></i>unverified</span>'}${warm ? ' <span class="badge accent"><i></i>warm</span>' : ''}</td>
+      <td>${esc(i.label)}${i.revoked
+        ? ' <span class="badge bad"><i></i>token revoked</span>'
+        : i.verified ? '' : ' <span class="badge warn"><i></i>unverified</span>'}${warm ? ' <span class="badge accent"><i></i>warm</span>' : ''}</td>
       <td>${i.username
         ? esc(i.username)
         : `<button class="btn sm danger" data-username="${esc(i.label)}">Set username</button>`}</td>
