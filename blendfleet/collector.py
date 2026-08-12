@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import shutil
+import time
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -122,9 +123,37 @@ def _resolve_frame_sources(files: list[Path], staging: Path,
     return frame_paths
 
 
+def _fetch_with_retry(client, w, staging: Path, on_progress, sleep,
+                      attempts: int = 3) -> list[Path]:
+    """One worker's output files, retrying a dropped connection.
+
+    Every attempt starts from an empty staging folder: a truncated file
+    left behind by a failed attempt would otherwise be indistinguishable
+    from a complete one, and could be copied out as a "collected" frame.
+    """
+    last: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            if on_progress is not None and hasattr(
+                    client, "fetch_output_with_progress"):
+                return client.fetch_output_with_progress(
+                    w.kernel_slug, staging,
+                    on_progress=lambda p, label=w.label: on_progress(label, p))
+            return client.fetch_output(w.kernel_slug, staging)
+        except Exception as e:
+            last = e
+            if attempt == attempts:
+                break
+            _wipe(staging)
+            staging.mkdir(parents=True, exist_ok=True)
+            sleep(min(2 ** (attempt - 1), 8))
+    raise last
+
+
 def collect(fleet_state, accounts, client_factory: Callable,
             dest: Path, *, worker_label: str | None = None,
-            on_progress: Callable[[str, object], None] | None = None
+            on_progress: Callable[[str, object], None] | None = None,
+            sleep: Callable[[float], None] = time.sleep
             ) -> CollectReport:
     """Pull worker output into one folder, renamed by real frame number.
 
@@ -185,12 +214,16 @@ def collect(fleet_state, accounts, client_factory: Callable,
                 f"and collect again -- leaving it would make this report "
                 f"claim frames were rendered when they were not.")
         try:
-            if on_progress is not None and hasattr(client, "fetch_output_with_progress"):
-                files = client.fetch_output_with_progress(
-                    w.kernel_slug, staging,
-                    on_progress=lambda p, label=w.label: on_progress(label, p))
-            else:
-                files = client.fetch_output(w.kernel_slug, staging)
+            # Retried as a whole, on top of the per-file retry inside
+            # downloader.fetch_files: this also covers the no-progress
+            # path, which goes through kaggle's own kernels_output() and
+            # has no retry of its own. Measured 2026-08-11: a finished
+            # 15-minute render reported ZERO frames because one download
+            # was truncated, and simply calling collect again recovered
+            # all 15. The frames are already rendered and paid for by the
+            # time this runs -- a transient socket error must not be what
+            # loses them.
+            files = _fetch_with_retry(client, w, staging, on_progress, sleep)
 
             frame_paths = _resolve_frame_sources(files, staging, w.label, report)
 

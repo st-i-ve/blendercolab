@@ -1536,7 +1536,12 @@ def test_download_instance_failure_on_one_worker_leaves_the_button_usable_again(
     card = dash._instance_cards[label]
 
     dash._download_instance(label)
-    pump(dash._instance_download_workers[label])
+    # A worker whose fetch never succeeds now takes ~3s to give up:
+    # collect() retries a dropped download before reporting one, because a
+    # transient socket used to lose a whole finished render (see
+    # tests/test_transient_failures.py). The UI behaviour asserted below is
+    # unchanged -- only the wait is.
+    pump(dash._instance_download_workers[label], timeout=15000)
     settle(dash)
 
     # collect() itself never raises on a fetch failure (Task 6: one
@@ -1613,7 +1618,10 @@ def test_collect_fleet_wide_with_a_worker_error_warns_not_informs(
     dash._refresh_views()
 
     dash._collect()
-    pump(dash._collect_worker)
+    # acct0's fetch never succeeds, and collect() now retries a dropped
+    # download before reporting one -- ~3s, not instant. See the note in
+    # the per-instance failure test above.
+    pump(dash._collect_worker, timeout=15000)
     settle(dash)
 
     assert stub_message_boxes["warning"], \

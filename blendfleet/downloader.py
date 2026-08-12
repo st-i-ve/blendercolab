@@ -102,9 +102,24 @@ def _content_length(response: _Response) -> int:
         return 0
 
 
+class IncompleteDownload(Exception):
+    """A file's body ended before Content-Length said it would.
+
+    requests does not always raise for this: a connection dropped
+    mid-body can simply stop yielding chunks, leaving a short file that
+    looks like a complete one. Measured on a real collect (2026-08-11):
+    "IncompleteRead(25090570 bytes read, 11111634 more expected)" cost
+    every frame of a finished 15-minute render, because the truncated zip
+    was then unreadable. Detected explicitly here so it becomes a retry
+    rather than a corrupt file.
+    """
+
+
 def fetch_files(files: list[tuple[str, Path]], transport: Transport,
                 on_progress: Callable[[DownloadProgress], None] | None = None,
-                progress_interval: int = 1 << 20) -> None:
+                progress_interval: int = 1 << 20,
+                attempts: int = 4,
+                sleep: Callable[[float], None] = time.sleep) -> None:
     """Download every (url, dest_path) pair in `files`, one GET each, in
     order. `dest_path`'s parent directories are created as needed.
 
@@ -122,6 +137,14 @@ def fetch_files(files: list[tuple[str, Path]], transport: Transport,
     reached disk). `total` therefore grows additively as each new file's
     Content-Length becomes known, rather than being fixed from the start;
     it never decreases.
+
+    Each file is retried up to `attempts` times, from the start: a
+    dropped connection is the normal failure here, not the exception.
+    The frames were already rendered and paid for by the time this runs,
+    so losing them to one bad TCP connection is the worst possible
+    outcome -- three runs on 2026-08-11/12 lost exactly that way. A
+    partial file is deleted before each retry so a short read can never
+    be mistaken for a complete download.
     """
     reporter = _ProgressReporter(on_progress)
     downloaded = 0
@@ -130,24 +153,53 @@ def fetch_files(files: list[tuple[str, Path]], transport: Transport,
     start = time.monotonic()
 
     for url, dest in files:
-        response = transport.get(url)
-        try:
-            total += _content_length(response)
+        # Rewound before every attempt so a retry re-reports the same
+        # bytes instead of counting them twice. The reporter's high-water
+        # clamp means the user still never sees progress go backwards.
+        base_downloaded, base_total = downloaded, total
+        for attempt in range(1, attempts + 1):
+            downloaded, total = base_downloaded, base_total
+            since_tick = 0
             dest = Path(dest)
             dest.parent.mkdir(parents=True, exist_ok=True)
-            with dest.open("wb") as f:
-                for chunk in response.iter_content(_READ_CHUNK):
-                    if not chunk:
-                        continue
-                    f.write(chunk)
-                    n = len(chunk)
-                    downloaded += n
-                    since_tick += n
-                    if since_tick >= progress_interval or downloaded >= total:
-                        elapsed = max(time.monotonic() - start, 1e-9)
-                        reporter.report(downloaded, total, downloaded / elapsed)
-                        since_tick = 0
-        finally:
-            close = getattr(response, "close", None)
-            if close is not None:
-                close()
+            try:
+                response = transport.get(url)
+                declared = _content_length(response)
+                total += declared
+                written = 0
+                try:
+                    with dest.open("wb") as f:
+                        for chunk in response.iter_content(_READ_CHUNK):
+                            if not chunk:
+                                continue
+                            f.write(chunk)
+                            n = len(chunk)
+                            written += n
+                            downloaded += n
+                            since_tick += n
+                            if since_tick >= progress_interval or \
+                                    downloaded >= total:
+                                elapsed = max(time.monotonic() - start, 1e-9)
+                                reporter.report(downloaded, total,
+                                                downloaded / elapsed)
+                                since_tick = 0
+                finally:
+                    close = getattr(response, "close", None)
+                    if close is not None:
+                        close()
+                if declared and written < declared:
+                    raise IncompleteDownload(
+                        f"{dest.name} ended early: {written} of {declared} "
+                        f"bytes")
+                break
+            except Exception:
+                # Never leave a truncated file where a complete one
+                # belongs -- a later reader cannot tell them apart.
+                try:
+                    if dest.exists():
+                        dest.unlink()
+                except OSError:
+                    pass
+                if attempt == attempts:
+                    raise
+                sleep(min(2 ** (attempt - 1), 8))

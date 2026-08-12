@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import re
 import threading
+import time
 from typing import Callable
 
 # blendfleet/notebook_builder.py prints exactly:
@@ -256,7 +257,9 @@ def stream_progress(token: str, user_name: str, kernel_slug: str,
                     stop_event: threading.Event | None = None,
                     on_telemetry: Callable[[dict], None] | None = None,
                     on_hardware: Callable[[dict], None] | None = None,
-                    on_preflight: Callable[[dict], None] | None = None) -> None:
+                    on_preflight: Callable[[dict], None] | None = None,
+                    max_reconnects: int = 5,
+                    sleep: Callable[[float], None] = time.sleep) -> None:
     """Block, calling on_progress(done, total) as lines arrive.
 
     `on_telemetry`, if given, is called with the parsed dict (see
@@ -300,55 +303,107 @@ def stream_progress(token: str, user_name: str, kernel_slug: str,
     if stop_event is not None and stop_event.is_set():
         return
 
-    client = KaggleClient(api_token=token)
-    _install_request_timeout(client,
-                             (CONNECT_TIMEOUT_SECONDS, READ_TIMEOUT_SECONDS))
-    resp = client.kernels.kernels_api_client.get_kernel_session_logs_stream(req)
+    # Lines already dispatched, across every connection this call makes.
+    # Kaggle replays the log from the top on each new stream, so a
+    # reconnect re-delivers everything already seen -- skipping by count
+    # keeps one PROGRESS line to one on_progress call, and stops replayed
+    # TELEMETRY from briefly showing a GPU's state from five minutes ago.
+    seen_lines = 0
+    attempt = 0
 
-    finished = threading.Event()
-    closer: threading.Thread | None = None
-    if stop_event is not None:
-        closer = threading.Thread(
-            target=_close_when_stopped, args=(resp, stop_event, finished),
-            name="blendfleet-log-stream-closer", daemon=True)
-        closer.start()
+    while True:
+        if stop_event is not None and stop_event.is_set():
+            return
 
-    try:
-        for raw in resp.iter_lines(decode_unicode=True):
+        try:
+            client = KaggleClient(api_token=token)
+            _install_request_timeout(
+                client, (CONNECT_TIMEOUT_SECONDS, READ_TIMEOUT_SECONDS))
+            resp = client.kernels.kernels_api_client \
+                .get_kernel_session_logs_stream(req)
+        except Exception:       # noqa: BLE001
             if stop_event is not None and stop_event.is_set():
                 return
-            if not raw:
-                continue
-            if is_end_of_log(raw):
-                return
-            got = parse_progress(raw)
-            if got:
-                on_progress(*got)
-                continue
-            if on_telemetry is not None:
-                record = parse_telemetry(raw)
-                if record:
-                    on_telemetry(record)
-                    continue
-            if on_preflight is not None:
-                pf_record = parse_preflight(raw)
-                if pf_record:
-                    on_preflight(pf_record)
-                    continue
-            if on_hardware is not None:
-                hw_record = parse_hardware_banner(raw)
-                if hw_record:
-                    on_hardware(hw_record)
-    finally:
-        # Order matters: release the closer first so it cannot outlive this
-        # call, then drop the connection, then make sure the closer really
-        # is gone before returning -- a stream thread that has "finished"
-        # while quietly leaving a helper behind is the same leak in a
-        # smaller costume.
-        finished.set()
+            attempt += 1
+            if attempt > max_reconnects:
+                raise
+            sleep(min(2 ** (attempt - 1), 8))
+            continue
+
+        finished = threading.Event()
+        closer: threading.Thread | None = None
+        if stop_event is not None:
+            closer = threading.Thread(
+                target=_close_when_stopped, args=(resp, stop_event, finished),
+                name="blendfleet-log-stream-closer", daemon=True)
+            closer.start()
+
+        progressed = False
         try:
-            resp.close()
+            index = 0
+            for raw in resp.iter_lines(decode_unicode=True):
+                if stop_event is not None and stop_event.is_set():
+                    return
+                # Counted before anything else, blank lines included, so
+                # the index means the same thing on every connection.
+                index += 1
+                if index <= seen_lines:
+                    continue
+                seen_lines = index
+                progressed = True
+                if not raw:
+                    continue
+                if is_end_of_log(raw):
+                    return
+                got = parse_progress(raw)
+                if got:
+                    on_progress(*got)
+                    continue
+                if on_telemetry is not None:
+                    record = parse_telemetry(raw)
+                    if record:
+                        on_telemetry(record)
+                        continue
+                if on_preflight is not None:
+                    pf_record = parse_preflight(raw)
+                    if pf_record:
+                        on_preflight(pf_record)
+                        continue
+                if on_hardware is not None:
+                    hw_record = parse_hardware_banner(raw)
+                    if hw_record:
+                        on_hardware(hw_record)
         except Exception:       # noqa: BLE001
-            pass
-        if closer is not None:
-            closer.join(timeout=STOP_POLL_SECONDS * 8)
+            # A dropped stream is not a failed render. Measured on a real
+            # 15-frame run (2026-08-11): ChunkedEncodingError at frame 3,
+            # after which the app showed 3/15 for seven minutes while the
+            # kernel quietly finished all fifteen. Reconnect instead.
+            if stop_event is not None and stop_event.is_set():
+                return
+            if attempt >= max_reconnects and not progressed:
+                raise
+        finally:
+            # Order matters: release the closer first so it cannot outlive
+            # this iteration, then drop the connection, then make sure the
+            # closer really is gone -- a stream thread that has "finished"
+            # while quietly leaving a helper behind is the same leak in a
+            # smaller costume.
+            finished.set()
+            try:
+                resp.close()
+            except Exception:       # noqa: BLE001
+                pass
+            if closer is not None:
+                closer.join(timeout=STOP_POLL_SECONDS * 8)
+
+        if stop_event is not None and stop_event.is_set():
+            return
+        # Reaching here means the stream ended WITHOUT the end-of-log
+        # marker -- either an error above, or a body that simply stopped.
+        # A reconnect that delivered new lines is progress, so the budget
+        # resets; one that delivered nothing new counts against it, which
+        # is what stops a finished-but-unmarked log looping forever.
+        attempt = 0 if progressed else attempt + 1
+        if attempt > max_reconnects:
+            return
+        sleep(min(2 ** (max(attempt, 1) - 1), 8))
