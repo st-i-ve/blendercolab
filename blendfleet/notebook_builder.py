@@ -191,10 +191,22 @@ class RenderSettings:
     # two Tesla T4s. Both T4s read idle for ~77% of a 23s frame, which is
     # what that buys.
     #
-    # True moves both onto the GPU. The denoiser is the same OIDN with the
-    # same weights, so the image is unchanged; only where it runs moves.
-    # A flag rather than unconditional because it costs VRAM, and a scene
-    # far larger than the one measured could want it off.
+    # True moves both onto the GPU. Measured on the same 15 frames, same
+    # scene, same 1920x1080 / 64 samples, 2x T4:
+    #
+    #                     total    per frame   GPU duty cycle
+    #   CPU post         360.3s      22.9s        23%
+    #   GPU post         115.8s       6.7s      79-88%
+    #
+    # 3.1x, and the image is the same image: max difference 1/255 on any
+    # channel, no pixel differing by more than 2 -- the same magnitude as
+    # two frames of this static scene from a single run, i.e. inside
+    # Cycles' own sampling noise. Same OIDN, same weights, different
+    # processor.
+    #
+    # A flag rather than unconditional because it costs VRAM (the measured
+    # scene used 2.7 GB of each card's 15 GB), and a far larger scene
+    # could want it off.
     post_on_gpu: bool = True
 
 
