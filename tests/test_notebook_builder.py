@@ -158,8 +158,30 @@ def test_setup_script_reports_every_enabled_device_by_name(tmp_path, settings):
     # ("[setup] OPTIX -> ['Tesla T4', 'Tesla T4']") -- no Cycles-side bug,
     # nothing to fix here, only to pin.
     joined = "\n".join(cells_src(build([1], settings, "me/x", tmp_path, "me/r")))
-    assert 'print("[setup] " + chosen + " -> " +' in joined
-    assert "str([d.name for d in prefs.devices if d.use])" in joined
+    assert "[setup] backend={chosen} gpus={len(enabled)} devices={enabled}" \
+        in joined
+    assert "enabled = [d.name for d in prefs.devices if d.use]" in joined
+
+
+def test_setup_line_reaches_the_log_instead_of_being_swallowed(tmp_path,
+                                                               settings):
+    # The line above existed for weeks and was never once visible: the
+    # notebook ran Blender with stdout=PIPE and printed it ONLY on
+    # failure, so on every successful render "which backend" and "how many
+    # GPUs" were captured and discarded. A live 15-frame render on
+    # 2026-08-11 produced no [setup] line at all in its Kaggle log.
+    # The runner must echo it as it streams.
+    joined = "\n".join(cells_src(build([1], settings, "me/x", tmp_path, "me/r")))
+    assert 'line.startswith("[setup]")' in joined
+    assert "print(line, flush=True)" in joined
+
+
+def test_optix_is_preferred_over_cuda(tmp_path, settings):
+    # The T4s Kaggle allocates are Turing: they have RT cores that CUDA
+    # leaves idle. OptiX must be TRIED first, with CUDA as the fallback --
+    # order matters, so this pins the tuple rather than mere presence.
+    joined = "\n".join(cells_src(build([1], settings, "me/x", tmp_path, "me/r")))
+    assert 'for backend in ("OPTIX", "CUDA"):' in joined
 
 
 # --------------------------------------------------------------------------
@@ -269,10 +291,10 @@ def test_preflight_cell_is_still_valid_python_with_a_gate_configured(tmp_path):
 
 def test_writes_a_zip_archive_using_stdlib_zipfile(tmp_path, settings):
     cells = cells_src(build([1], settings, "me/x", tmp_path, "me/r"))
-    render_cell = next(c for c in cells if "PROGRESS frame=" in c)
-    assert "zipfile" in render_cell.splitlines()[0], \
+    runner = next(c for c in cells if "def _archive_new" in c)
+    assert "zipfile" in runner.splitlines()[0], \
         "zipfile must be imported (stdlib -- no dependency on either side)"
-    assert "zipfile.ZipFile" in render_cell
+    assert "zipfile.ZipFile" in runner
 
 
 def test_archive_uses_zip_stored_not_deflate(tmp_path, settings):
@@ -320,14 +342,20 @@ def test_archive_is_written_inside_the_frame_loop_not_only_at_the_end(tmp_path, 
     # archive -- the archive write must happen as each frame completes, so
     # a partial render still produces a partial (not empty, not missing)
     # archive alongside the loose files.
+    # Frames are now rendered by ONE Blender process, so "inside the loop"
+    # means inside the per-frame callback the runner fires as each
+    # PROGRESS line arrives -- not after the process exits. The guarantee
+    # is unchanged: a kernel killed mid-render still leaves a partial
+    # archive rather than none.
     cells = cells_src(build([1, 2, 3], settings, "me/x", tmp_path, "me/r"))
-    render_cell = next(c for c in cells if "PROGRESS frame=" in c)
-    zip_idx = render_cell.index("zipfile.ZipFile")
-    loop_idx = render_cell.index("for frame in FRAMES")
-    done_idx = render_cell.index('print("DONE"')
-    assert loop_idx < zip_idx < done_idx, (
-        "the archive write must sit inside the per-frame loop, strictly "
-        "before the final DONE summary")
+    runner = next(c for c in cells if "def render_frames" in c)
+    cb_idx = runner.index("def on_frame(")
+    archive_idx = runner.index("_archive_new(out_prefix, archive, archived)",
+                               cb_idx)
+    wait_idx = runner.index("rc, tail = _run_blender(")
+    assert cb_idx < archive_idx < wait_idx, (
+        "the archive write must happen in the per-frame callback, which "
+        "fires while Blender is still running -- not after it exits")
 
 
 def test_archive_write_does_not_replace_the_loose_frames(tmp_path, settings):
@@ -342,14 +370,116 @@ def test_archive_write_does_not_replace_the_loose_frames(tmp_path, settings):
     assert "os.remove(f\"{OUT}" not in joined
 
 
-def test_archive_only_includes_successfully_rendered_frames(tmp_path, settings):
+def test_archive_only_includes_frames_that_actually_exist(tmp_path, settings):
     # A failed frame's (nonexistent) output must never be swept into the
-    # archive -- only zip on ok, exactly like `done`/`failed` already track.
+    # archive. This used to be enforced by only zipping on ok; it is now
+    # enforced by construction -- the archiver adds what it finds ON DISK,
+    # and a frame that failed wrote no file. Each file is added once, so a
+    # later frame's pass cannot re-add an earlier one.
     cells = cells_src(build([1], settings, "me/x", tmp_path, "me/r"))
-    render_cell = next(c for c in cells if "PROGRESS frame=" in c)
-    ok_idx = render_cell.index("if ok:")
-    zip_idx = render_cell.index("zipfile.ZipFile")
-    assert ok_idx < zip_idx
+    runner = next(c for c in cells if "def _archive_new" in c)
+    assert "for path in sorted(glob.glob(out_prefix" in runner
+    assert "if name in archived:" in runner
+    assert "archived.add(name)" in runner
+
+
+# --------------------------------------------------------------------------
+# One process for the whole frame list.
+#
+# Measured on a live 15-frame render (2026-08-11): 35s per frame with both
+# T4s busy only ~25% of the wall clock, because every frame paid Blender
+# startup, GPU context creation and a fresh parse of the same 66 MB scene.
+# --------------------------------------------------------------------------
+
+def test_blender_is_launched_once_for_the_whole_frame_list(tmp_path, settings):
+    joined = "\n".join(cells_src(build([1, 2, 3], settings, "me/x", tmp_path,
+                                       "me/r")))
+    # The old shape: a subprocess per frame, told which frame with -f.
+    assert '"-f", str(frame)' not in joined, \
+        "one Blender process per frame re-parses the scene every time"
+    assert 'env["BR_FRAMES"] = ",".join(str(f) for f in frames)' in joined
+
+
+def test_the_frame_loop_runs_inside_blender(tmp_path, settings):
+    joined = "\n".join(cells_src(build([1, 2, 3], settings, "me/x", tmp_path,
+                                       "me/r")))
+    assert "for frame in FRAMES:" in joined
+    assert "bpy.ops.render.render(write_still=True)" in joined
+    # write_still writes filepath verbatim -- unlike -f it does NOT append
+    # the frame number, so every frame would overwrite the last without this.
+    assert 's.render.filepath = f"{OUT}{frame:04d}"' in joined
+
+
+def test_a_failed_frame_does_not_abort_the_rest_of_the_batch(tmp_path,
+                                                             settings):
+    # The whole risk of batching: one bad frame taking every later frame
+    # with it. The in-Blender loop must catch per-frame and carry on.
+    joined = "\n".join(cells_src(build([1, 2, 3], settings, "me/x", tmp_path,
+                                       "me/r")))
+    setup = joined[joined.index("for frame in FRAMES:"):]
+    assert "except Exception:" in setup
+    assert "(done if ok else failed).append(frame)" in setup
+
+
+def test_frames_the_batch_never_reported_are_retried_one_at_a_time(
+        tmp_path, settings):
+    # A segfault kills the process, not just its current frame -- Python's
+    # try/except cannot catch that. Anything unreported falls back to the
+    # old one-process-per-frame path, so the worst case is what batching
+    # replaced, never worse.
+    runner = next(c for c in cells_src(build([1, 2, 3], settings, "me/x",
+                                             tmp_path, "me/r"))
+                  if "def render_frames" in c)
+    assert "remaining = [f for f in frames if f not in seen]" in runner
+    assert "_run_blender([frame], blend, env, on_frame)" in runner
+
+
+def test_progress_totals_come_from_the_runner_not_from_blender(tmp_path,
+                                                               settings):
+    # A fallback child renders ONE frame and so reports "done=1/1". Echoing
+    # that would slam the app's progress bar to 100% on the first recovered
+    # frame of a 15-frame job, so the runner re-emits every PROGRESS line
+    # with the true total and never forwards Blender's own.
+    runner = next(c for c in cells_src(build([1, 2, 3], settings, "me/x",
+                                             tmp_path, "me/r"))
+                  if "def render_frames" in c)
+    assert "total = len(frames)" in runner
+    assert "done={len(done)}/{total}" in runner
+    echo = runner[runner.index("def _run_blender"):runner.index("def render_frames")]
+    assert "print(line, flush=True)" in echo
+    assert 'elif line.startswith("[setup]")' in echo, \
+        "PROGRESS must be parsed and re-emitted, not echoed straight through"
+
+
+def test_persistent_data_is_enabled_between_frames(tmp_path, settings):
+    # Only means anything once consecutive frames share a process: it
+    # keeps BVH and geometry resident instead of rebuilding per frame.
+    joined = "\n".join(cells_src(build([1, 2], settings, "me/x", tmp_path,
+                                       "me/r")))
+    assert "s.render.use_persistent_data = True" in joined
+    assert 'os.environ.get("BR_PERSISTENT", "1") == "1"' in joined
+
+
+def test_the_one_time_setup_cost_is_measured_not_guessed(tmp_path, settings):
+    # The reason for this whole change was inferred from GPU duty cycle.
+    # The notebook now reports it directly, so the next run states the
+    # startup+parse cost instead of implying it.
+    joined = "\n".join(cells_src(build([1, 2], settings, "me/x", tmp_path,
+                                       "me/r")))
+    assert 'env["BR_T0"] = repr(time.time())' in joined
+    assert "[setup] startup+scene load {_t_ready - _t_launch:.1f}s" in joined
+
+
+def test_warm_worker_uses_the_same_runner_and_progress_format(tmp_path,
+                                                              settings):
+    # The warm worker used to print "PROGRESS 3/9", which
+    # log_stream.PROGRESS_RE (it requires frame=) never matched -- a warm
+    # job's progress was invisible to the app.
+    joined = "\n".join(cells_src(build(
+        [1, 2], settings, "me/x", tmp_path, "me/r", mode="worker",
+        control_slug="me/ctl", token="KGAT_x", worker_label="w1")))
+    assert "render_frames(frames, blend, env," in joined
+    assert "PROGRESS {len(done)}/{len(frames)}" not in joined
 
 
 def test_every_cell_is_still_valid_python_with_archiving(tmp_path, settings):

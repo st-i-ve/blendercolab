@@ -4,18 +4,55 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+# THE SCENE IS LOADED ONCE, AND EVERY FRAME IS RENDERED INSIDE THIS ONE
+# PROCESS.
+#
+# This script used to do setup only, and the notebook drove frames by
+# running Blender once per frame with -f N. That works, but it pays
+# Blender's startup, CUDA/OptiX context creation and a full parse of the
+# .blend FOR EVERY FRAME. Measured on a real 15-frame render of a 66 MB
+# scene (2026-08-11): 35s per frame of which the GPUs were busy for only
+# ~25% of the wall clock -- both T4s sat idle while frame N+1's copy of
+# Blender re-read the same file frame N had just finished with.
+#
+# So the loop lives here now, on the far side of that one-time cost.
+# Blender's own -f accepts a frame list and would also load once, but then
+# Blender owns the loop: per-frame PROGRESS would have to be scraped out
+# of its stdout, and one bad frame would kill every frame after it.
+# Looping in Python keeps the exact PROGRESS format log_stream.py parses,
+# and keeps a failed frame to ONE failed frame.
 SETUP_SCRIPT = '''
-import os, bpy
+import os, sys, time, traceback, bpy
+
+# Set by the notebook immediately before launching Blender, so the gap
+# between it and now is exactly what the old per-frame loop was paying
+# over and over: process start, addon registration, and the .blend parse.
+_t_launch = float(os.environ.get("BR_T0") or 0)
+_t_ready = time.time()
+
 s = bpy.context.scene
 s.render.resolution_x = int(os.environ["BR_RES_X"])
 s.render.resolution_y = int(os.environ["BR_RES_Y"])
 s.render.resolution_percentage = 100
 s.render.image_settings.file_format = os.environ["BR_FORMAT"]
-s.render.filepath = os.environ["BR_OUTPUT"]
 s.render.engine = "CYCLES"
 s.cycles.samples = int(os.environ["BR_SAMPLES"])
+
+# Keeps BVH and geometry resident BETWEEN frames -- which only means
+# anything now that consecutive frames share a process. Costs RAM/VRAM
+# (measured headroom: the 66 MB test scene used 2.7 GB of each T4's 15 GB),
+# so it is a flag rather than a certainty.
+if os.environ.get("BR_PERSISTENT", "1") == "1":
+    try:
+        s.render.use_persistent_data = True
+    except AttributeError:
+        pass        # older Blender: not fatal, just slower
+
 prefs = bpy.context.preferences.addons["cycles"].preferences
 chosen = None
+# OPTIX first, deliberately: it uses the RT cores CUDA leaves idle on the
+# Turing-class T4s Kaggle allocates. Falls back to CUDA when the driver or
+# build has no OptiX, which is why this is a loop and not an assignment.
 for backend in ("OPTIX", "CUDA"):
     try:
         prefs.compute_device_type = backend
@@ -32,11 +69,48 @@ if chosen:
     for d in prefs.devices:
         d.use = (d.type == chosen)
     s.cycles.device = "GPU"
-    print("[setup] " + chosen + " -> " +
-          str([d.name for d in prefs.devices if d.use]))
+    enabled = [d.name for d in prefs.devices if d.use]
+    # Printed with an explicit count: "which backend" and "how many cards"
+    # are the two questions a slow render raises, and both were previously
+    # invisible -- the notebook captured Blender's stdout and threw it away
+    # unless the process failed, so nobody could tell OptiX from CUDA, or
+    # two GPUs from one.
+    print(f"[setup] backend={chosen} gpus={len(enabled)} devices={enabled}",
+          flush=True)
 else:
     s.cycles.device = "CPU"
-    print("[setup] *** NO GPU BACKEND -> CPU (very slow) ***")
+    print("[setup] *** NO GPU BACKEND -> CPU (very slow) ***", flush=True)
+
+if _t_launch:
+    print(f"[setup] startup+scene load {_t_ready - _t_launch:.1f}s", flush=True)
+
+FRAMES = [int(x) for x in os.environ["BR_FRAMES"].split(",") if x.strip()]
+OUT = os.environ["BR_OUTPUT"]
+done, failed = [], []
+for frame in FRAMES:
+    t0 = time.time()
+    s.frame_set(frame)
+    # -f used to append the frame number for us. write_still does not: it
+    # writes scene.render.filepath verbatim (plus the format's extension),
+    # so the number has to be part of the path or every frame would
+    # overwrite the last one.
+    s.render.filepath = f"{OUT}{frame:04d}"
+    try:
+        bpy.ops.render.render(write_still=True)
+        ok = True
+    except Exception:
+        ok = False
+        print(f"[frame {frame}] FAILED", flush=True)
+        traceback.print_exc()
+        sys.stdout.flush()
+    (done if ok else failed).append(frame)
+    # EXACT format parsed by log_stream.PROGRESS_RE -- frame=, ok=, secs=,
+    # done=N/M. Echoed verbatim by the notebook, so the app sees the same
+    # lines it always has.
+    print(f"PROGRESS frame={frame} ok={ok} secs={time.time()-t0:.1f} "
+          f"done={len(done)}/{len(FRAMES)}", flush=True)
+print(f"[setup] batch finished done={sorted(done)} failed={sorted(failed)}",
+      flush=True)
 '''
 
 
@@ -285,6 +359,119 @@ open("/kaggle/working/render_setup.py", "w").write({SETUP_SCRIPT!r})
 print("wrote render_setup.py")
 '''
 
+    # Shared by the one-shot render cell and the warm worker, so the two
+    # cannot drift apart in how frames are actually run -- the same reason
+    # render_setup.py is shared. Progress numbers are re-emitted HERE
+    # rather than echoed from Blender: a fallback child renders a single
+    # frame and so believes it is "1/1", which would make the app's
+    # progress bar jump to 100% on the first recovered frame.
+    c_runner = '''
+import collections, glob, os, subprocess, time, zipfile
+
+def _archive_new(out_prefix, archive, archived):
+    """Append newly-written frames to the archive, once each.
+
+    Called after every frame rather than at the end: the archive is an
+    optimisation for collect(), and a kernel killed mid-run should still
+    have every frame it finished. The loose files in /kaggle/working
+    remain the fallback, so a failure to archive is reported and ignored,
+    never raised.
+    """
+    if not archive:
+        return
+    for path in sorted(glob.glob(out_prefix + "*")):
+        name = os.path.basename(path)
+        if name in archived:
+            continue
+        try:
+            with zipfile.ZipFile(archive, "a", zipfile.ZIP_STORED) as zf:
+                zf.write(path, arcname=name)
+            archived.add(name)
+        except Exception as e:
+            print(f"ARCHIVE skipped {name}: {type(e).__name__}", flush=True)
+
+
+def _run_blender(frames, blend, env, on_frame):
+    """One Blender process rendering the whole of `frames`.
+
+    Returns (returncode, tail). `on_frame(frame, ok, secs)` fires as each
+    frame's PROGRESS line arrives, so the caller can archive and report
+    without waiting for the process to exit.
+    """
+    env = dict(env)
+    env["BR_FRAMES"] = ",".join(str(f) for f in frames)
+    env["BR_T0"] = repr(time.time())
+    p = subprocess.Popen(
+        [BBIN, blend, "-b", "-noaudio", "-P",
+         "/kaggle/working/render_setup.py"],
+        env=env, text=True, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, bufsize=1)
+    tail = collections.deque(maxlen=80)
+    for line in p.stdout:
+        line = line.rstrip("\\n")
+        tail.append(line)
+        if line.startswith("PROGRESS frame="):
+            fields = dict(kv.split("=", 1)
+                          for kv in line.split()[1:] if "=" in kv)
+            try:
+                frame = int(fields.get("frame", ""))
+            except ValueError:
+                continue
+            try:
+                secs = float(fields.get("secs", "0"))
+            except ValueError:
+                secs = 0.0
+            on_frame(frame, fields.get("ok") == "True", secs)
+        elif line.startswith("[setup]") or line.startswith("[frame "):
+            print(line, flush=True)     # backend, device count, load time
+    p.wait()
+    return p.returncode, list(tail)
+
+
+def render_frames(frames, blend, env, out_prefix, archive):
+    """Render `frames` in ONE process, per-frame only for what it drops.
+
+    A crash takes the whole batch down with it, not just the frame that
+    caused it -- so anything the batch never reported is retried one
+    process at a time. That is the old behaviour, reached only on failure:
+    worst case this matches what it replaced, best case it skips a scene
+    reload per frame.
+    """
+    done, failed, archived = [], [], set()
+    total = len(frames)
+
+    def on_frame(frame, ok, secs):
+        (done if ok else failed).append(frame)
+        _archive_new(out_prefix, archive, archived)
+        print(f"PROGRESS frame={frame} ok={ok} secs={secs:.1f} "
+              f"done={len(done)}/{total}", flush=True)
+
+    t0 = time.time()
+    rc, tail = _run_blender(frames, blend, env, on_frame)
+    if rc != 0:
+        print(f"BATCH exited rc={rc} after {time.time()-t0:.1f}s", flush=True)
+        for line in tail[-25:]:
+            print("   ", line, flush=True)
+
+    seen = set(done) | set(failed)
+    remaining = [f for f in frames if f not in seen]
+    if remaining:
+        print(f"FALLBACK one process per frame for {remaining}", flush=True)
+        for frame in remaining:
+            before = len(done) + len(failed)
+            rc2, tail2 = _run_blender([frame], blend, env, on_frame)
+            if len(done) + len(failed) == before:
+                # Died without even reporting its own frame.
+                failed.append(frame)
+                print(f"PROGRESS frame={frame} ok=False secs=0.0 "
+                      f"done={len(done)}/{total}", flush=True)
+                for line in tail2[-25:]:
+                    print("   ", line, flush=True)
+    return sorted(set(done)), sorted(set(failed))
+
+print("[runner] batched render helper ready")
+'''
+
     c_telemetry = '''
 import subprocess, threading
 
@@ -361,30 +548,14 @@ env.update({{"BR_RES_X": str(RES_X), "BR_RES_Y": str(RES_Y),
             "BR_SAMPLES": str(SAMPLES), "BR_FORMAT": FMT,
             "BR_OUTPUT": f"{{OUT}}/f_"}})
 
-done, failed, _archived = [], [], set()
-for frame in FRAMES:
-    t0 = time.time()
-    p = subprocess.run([BBIN, blend, "-b", "-noaudio", "-P",
-                        "/kaggle/working/render_setup.py", "-f", str(frame)],
-                       env=env, text=True, stdout=subprocess.PIPE,
-                       stderr=subprocess.STDOUT)
-    ok = p.returncode == 0
-    (done if ok else failed).append(frame)
-    if ok:
-        # Appended right after THIS frame succeeds, not batched to the
-        # end of the loop -- see the ARCHIVE comment above for why.
-        for f in glob.glob(f"{{OUT}}/*"):
-            name = os.path.basename(f)
-            if name in _archived:
-                continue
-            with zipfile.ZipFile(ARCHIVE, "a", zipfile.ZIP_STORED) as zf:
-                zf.write(f, arcname=name)
-            _archived.add(name)
-    # PROGRESS lines are what the desktop app parses out of the log stream.
-    print(f"PROGRESS frame={{frame}} ok={{ok}} secs={{time.time()-t0:.1f}} "
-          f"done={{len(done)}}/{{len(FRAMES)}}", flush=True)
-    if not ok:
-        print(p.stdout[-2000:])
+# ONE Blender process for every frame -- see SETUP_SCRIPT's header for the
+# measurement that motivated it. PROGRESS lines still arrive one per
+# frame, from render_frames.
+_t_render = time.time()
+done, failed = render_frames(FRAMES, blend, env, f"{{OUT}}/f_", ARCHIVE)
+_elapsed = time.time() - _t_render
+print(f"[batch] {{len(done)}}/{{len(FRAMES)}} frames in {{_elapsed:.1f}}s "
+      f"({{_elapsed/max(len(done), 1):.1f}}s per rendered frame)", flush=True)
 
 print("DONE", sorted(done), "FAILED", sorted(failed))
 for f in sorted(glob.glob(f"{{OUT}}/*")):
@@ -465,20 +636,11 @@ while True:
                 "BR_SAMPLES": str(job.get("samples", SAMPLES)),
                 "BR_FORMAT": job.get("format", FMT),
                 "BR_OUTPUT": f"{{OUT}}/f_"}})
-    done, failed = [], []
-    for frame in frames:
-        t0 = time.time()
-        p = subprocess.run([BBIN, blend, "-b", "-noaudio", "-P",
-                            "/kaggle/working/render_setup.py", "-f", str(frame)],
-                           env=env, text=True, stdout=subprocess.PIPE,
-                           stderr=subprocess.STDOUT)
-        ok = p.returncode == 0
-        (done if ok else failed).append(frame)
-        print(f"FRAME {{frame}} {{'ok' if ok else 'FAILED'}} "
-              f"{{time.time() - t0:.1f}}s", flush=True)
-        if not ok:
-            print(p.stdout[-1500:], flush=True)
-        print(f"PROGRESS {{len(done)}}/{{len(frames)}}", flush=True)
+    # Same batched runner as a one-shot render -- and the same PROGRESS
+    # format. The warm worker used to print "PROGRESS 3/9", which
+    # log_stream.PROGRESS_RE (which requires frame=) never matched, so a
+    # warm job's progress was invisible to the app.
+    done, failed = render_frames(frames, blend, env, f"{{OUT}}/f_", None)
     print("DONE", sorted(done), "FAILED", sorted(failed), flush=True)
     # The clock restarts from the END of the work, not its start: a job
     # that took an hour must not count as an hour of idling.
@@ -489,8 +651,8 @@ print("WORKER stopped", flush=True)
 '''
 
     render_cell = c_worker if mode == "worker" else c4
-    nb = {"cells": [_code(c1), _code(c2), _code(c3), _code(c_telemetry),
-                    _code(render_cell)],
+    nb = {"cells": [_code(c1), _code(c2), _code(c3), _code(c_runner),
+                    _code(c_telemetry), _code(render_cell)],
           "metadata": {"kernelspec": {"display_name": "Python 3",
                                       "language": "python", "name": "python3"},
                        "language_info": {"name": "python"}},
