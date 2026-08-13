@@ -703,13 +703,39 @@ class Backend(QObject):
         # unshared_accounts the moment that call returns.
         fleet = self.fleet_factory(all_accounts)
 
-        # No "labels" used to mean "every configured account", because
+        # ABSENT "labels" used to mean "every configured account", because
         # only one job could ever be running. With several jobs possible
         # at once (Tasks 3-5), that default has to mean "whatever is free"
         # instead -- otherwise a second launch with nothing selected would
         # ask to render on an account the first launch is still using.
-        requested = options.get("labels") or []
-        if requested:
+        #
+        # `is None`, not `or` -- Fix round 1, Critical: an explicitly EMPTY
+        # list ("labels": []) means every per-instance checkbox was
+        # unticked (Task 7 adds exactly those), and `or` collapsed that
+        # into the same case as the key being absent entirely, silently
+        # widening "render on nobody" back out to "render on whatever is
+        # free" -- the exact bug Fleet.launch's own `accounts=[]` guard
+        # (fleet.py) exists to prevent, reopened one layer up because this
+        # slot resolves accounts and calls fleet.launch() before that
+        # guard ever sees the list. Both layers must agree: this refuses
+        # up front, and Fleet.launch keeps its own refusal as the backstop
+        # for every other caller.
+        requested = options.get("labels")
+        if requested is None:
+            accounts = fleet.free_accounts()
+            if not accounts:
+                self.notification.emit(
+                    "Every configured account is already rendering "
+                    "something else. Choose specific accounts to render "
+                    "on, wait for a job to finish, or cancel one first.",
+                    "offline")
+                return
+        elif not requested:
+            self.notification.emit(
+                "No machines selected — tick at least one instance to "
+                "render on.", "offline")
+            return
+        else:
             by_label = {a.label: a for a in all_accounts}
             unknown = [label for label in requested if label not in by_label]
             if unknown:
@@ -719,15 +745,6 @@ class Backend(QObject):
                     "reselect accounts and try again.", "offline")
                 return
             accounts = [by_label[label] for label in requested]
-        else:
-            accounts = fleet.free_accounts()
-            if not accounts:
-                self.notification.emit(
-                    "Every configured account is already rendering "
-                    "something else. Choose specific accounts to render "
-                    "on, wait for a job to finish, or cancel one first.",
-                    "offline")
-                return
 
         owner = all_accounts[0].label
 
@@ -949,6 +966,46 @@ class Backend(QObject):
 
         self._start("forget", work, "Forgetting the job", ok)
 
+    @Slot(int)
+    def forgetUnreadableJob(self, index: int) -> None:
+        """Acknowledge ONE entry from `unreadableJobs`, so a warning the
+        user has already resolved by hand at kaggle.com does not sit on
+        the page forever with no way to clear it (Fix round 1,
+        Important 3).
+
+        `index` is that entry's position in the `unreadableJobs` list the
+        payload just handed the page -- see _unreadable_jobs_payload()'s
+        own docstring for why position, not job_id, is the stable key
+        here. Exactly like forgetJob(), this is NOT a cancel: whatever the
+        raw entry might have been tracking (if anything) keeps running on
+        Kaggle and keeps spending quota. All this does is stop this app
+        from being able to warn about it -- said here as plainly as
+        forgetJob() already says it for a parsed job.
+        """
+        accounts = self.store.list()
+
+        def work():
+            return self.fleet_factory(accounts).forget_unreadable(index)
+
+        def ok(entry) -> None:
+            if entry is None:
+                self.notification.emit(
+                    "That record was already gone — nothing to forget.",
+                    "idle")
+            else:
+                self.notification.emit(
+                    "Stopped tracking that unreadable record. It was NOT "
+                    "cancelled — if it named any kernels and they are "
+                    "still running, they keep spending quota. Stop them "
+                    "by hand at kaggle.com.", "warn")
+                self.logLine.emit(
+                    "stopped tracking an unreadable job record — not "
+                    "cancelled", "warn")
+            self._emit_state()
+
+        self._start(f"forget-unreadable:{index}", work,
+                    "Forgetting that record", ok)
+
     @Slot(str)
     def cancelInstance(self, label: str) -> None:
         """Stop ONE account's session.
@@ -976,20 +1033,35 @@ class Backend(QObject):
         self._start(f"cancel:{label}", work, f"Cancelling {label}", ok)
 
     @Slot(str)
-    def collect(self, label: str = "") -> None:
-        """Download rendered frames -- every tracked job, or one account.
+    @Slot(str, str)
+    def collect(self, label: str = "", job_id: str = "") -> None:
+        """Download rendered frames from ONE job -- named explicitly by
+        `job_id`, inferred from `label` (whichever job that account
+        belongs to), or -- with neither given -- the most recent tracked
+        job.
 
-        `fleet.load()` -- the single newest job -- used to be the whole
-        answer here. With several jobs able to run at once (Tasks 3-5),
-        that quietly stopped collecting from any job except the most
-        recently launched or polled one: an older scene's finished frames
-        would simply never come down through this button again. Every
-        tracked job is collected from now (each into its own scene_key
-        subfolder -- see collector.collect), and their reports are merged
-        into one so the notification still reads as a single outcome.
+        Fix round 1 (Important 1+2, Minors 1+2): this used to load and
+        collect from EVERY tracked job with no filter on state or age,
+        merging their CollectReports with plain dict.update(). Neither
+        half of that held up: `load_jobs()` is never pruned except one
+        job at a time via forget_job(), so a fleet-wide button grew to
+        re-download every job this app had EVER tracked, including ones
+        still queued or running; and dict.update() silently drops one
+        job's worker_errors behind another's for the same label (measured:
+        an old job's "could not reach user_0" vanished behind a newer
+        job's "token revoked"), which CollectReport.worker_errors' own
+        docstring says must never happen. Scoping to exactly ONE job below
+        removes both problems by construction rather than by merging
+        better -- this is exactly `Fleet.load()`'s own pre-Task-6 answer
+        (the newest job) when neither `label` nor `job_id` narrows it.
+        `label` continues to search every tracked job, unchanged: an
+        account belongs to at most one job at a time, so that search is
+        never ambiguous and was never the part that grew unbounded.
+        `job_id` is unused by the page today; Task 7 wires it to a
+        per-job collect button, which is the right way to reach a
+        specific older job -- a fleet-wide button should not guess.
         """
         from PySide6.QtWidgets import QFileDialog
-        from blendfleet.collector import CollectReport
         from blendfleet.collector import collect as collect_frames
 
         destination = QFileDialog.getExistingDirectory(None, "Save frames to")
@@ -1001,41 +1073,33 @@ class Backend(QObject):
         def work():
             fleet = self.fleet_factory(accounts)
             jobs = fleet.load_jobs()
-            if label:
-                # Scoped to whichever job actually has this worker -- a
-                # label is unique to one account, and an account renders
-                # in at most one job at a time, so at most one job ever
-                # matches.
-                jobs = [j for j in jobs
-                        if any(w.label == label for w in j.workers)]
-            if not jobs:
+            if job_id:
+                job = next((j for j in jobs if j.job_id == job_id), None)
+            elif label:
+                job = next((j for j in jobs
+                           if any(w.label == label for w in j.workers)),
+                          None)
+            else:
+                job = jobs[-1] if jobs else None
+            if job is None:
                 return None
-            combined = CollectReport()
-            for job in jobs:
-                report = collect_frames(
-                    job, accounts, fleet.client_factory, Path(destination),
-                    worker_label=label or None,
-                    # downloader.DownloadProgress calls them `downloaded`
-                    # and `total` -- the same mistake as the upload side,
-                    # which a getattr default turned into a permanent 0 of
-                    # 0 instead of an error. Read directly so a rename
-                    # fails loudly.
-                    on_progress=lambda lbl, p: self.downloadProgress.emit(
-                        json.dumps({
-                            "label": lbl,
-                            "downloaded": p.downloaded,
-                            "total": p.total,
-                            # Read directly for the same reason as the two
-                            # above: a getattr default would turn a rename
-                            # into a permanent, plausible-looking 0 B/s.
-                            "rate": p.rate_bps,
-                        })))
-                combined.copied += report.copied
-                combined.missing_frames.extend(report.missing_frames)
-                combined.per_worker.update(report.per_worker)
-                combined.archive_errors.update(report.archive_errors)
-                combined.worker_errors.update(report.worker_errors)
-            return combined
+            return collect_frames(
+                job, accounts, fleet.client_factory, Path(destination),
+                worker_label=label or None,
+                # downloader.DownloadProgress calls them `downloaded` and
+                # `total` -- the same mistake as the upload side, which a
+                # getattr default turned into a permanent 0 of 0 instead of
+                # an error. Read directly so a rename fails loudly.
+                on_progress=lambda lbl, p: self.downloadProgress.emit(
+                    json.dumps({
+                        "label": lbl,
+                        "downloaded": p.downloaded,
+                        "total": p.total,
+                        # Read directly for the same reason as the two
+                        # above: a getattr default would turn a rename
+                        # into a permanent, plausible-looking 0 B/s.
+                        "rate": p.rate_bps,
+                    })))
 
         def ok(report) -> None:
             if report is None:
@@ -1054,7 +1118,7 @@ class Backend(QObject):
                 message += f". Could not reach: {detail}"
             self.notification.emit(message, tone)
 
-        self._start(f"collect:{label}", work,
+        self._start(f"collect:{label}:{job_id}", work,
                     f"Collecting frames from {who}", ok)
 
     @Slot(str, str)
@@ -1475,30 +1539,61 @@ def _unreadable_jobs_payload(raw_entries: list) -> list[dict]:
     them to recover -- most likely for a per-job parse failure, where only
     one field was malformed -- and says plainly when it cannot, rather
     than guessing a slug that might not exist.
+
+    `index` is this entry's position in `Fleet.unreadable_jobs` --
+    forgetUnreadableJob()'s own key, since a job_id may be missing (a
+    whole-file JSON failure has no fields to read at all) or, being only
+    32 bits of uuid4, could collide; position is the one identifier that
+    is always present and never ambiguous (Fix round 1, Critical fix's
+    sibling problem, Important 3).
+
+    Fix round 1, Minor 1: a per-job parse failure (as opposed to a
+    whole-file one) usually still HAS `job_id`/`blend_name` -- discarding
+    them made every such entry read as the identical generic sentence,
+    even with several unreadable jobs on screen at once. Used here when
+    present; a kernel slug is also turned into the actual kaggle.com/code
+    URL, since that is the page the user has to open to act on it, not
+    just the slug this app happens to store internally.
     """
     payload = []
-    for entry in raw_entries:
+    for index, entry in enumerate(raw_entries):
         kernels = []
+        job_id = None
+        blend_name = None
         if isinstance(entry, dict):
+            job_id = entry.get("job_id")
+            blend_name = entry.get("blend_name")
             for w in entry.get("workers") or []:
                 if isinstance(w, dict):
                     slug = w.get("kernel_slug")
                     if slug:
                         kernels.append(slug)
+        urls = [f"https://www.kaggle.com/code/{slug}" for slug in kernels]
+        if blend_name and job_id:
+            which = f"the job rendering {blend_name!r} ({job_id})"
+        elif job_id:
+            which = f"job {job_id}"
+        else:
+            which = "a tracked job"
         if kernels:
             message = (
-                "A job's record could not be read, so BlendFleet can no "
-                "longer track, cancel, or collect it here. If any of "
-                f"these kernels are still running, they keep spending "
-                f"quota: {', '.join(kernels)}. Check kaggle.com and stop "
-                "them by hand if needed.")
+                f"BlendFleet could not read the record for {which}, so it "
+                "can no longer track, cancel, or collect it here. If any "
+                f"of these kernels are still running, they keep spending "
+                f"quota: {', '.join(urls)}. Check kaggle.com and stop "
+                "them by hand, then use \"Forget this record\" to clear "
+                "this warning.")
         else:
             message = (
-                "A job's record could not be read at all, so BlendFleet "
-                "cannot say which kernels (if any) it belongs to. If a "
-                "render is still running, it will not show up here -- "
-                "check kaggle.com for anything still active.")
-        payload.append({"kernels": kernels, "message": message})
+                f"BlendFleet could not read the record for {which} at "
+                "all, so it cannot say which kernels (if any) belong to "
+                "it. If a render is still running, it will not show up "
+                "here -- check kaggle.com for anything still active, "
+                "then use \"Forget this record\" to clear this warning.")
+        payload.append({
+            "index": index, "jobId": job_id, "blend": blend_name,
+            "kernels": kernels, "kernelUrls": urls, "message": message,
+        })
     return payload
 
 

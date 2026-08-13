@@ -279,7 +279,8 @@ def test_a_synced_dataset_is_reused_when_the_scene_matches(qapp, tmp_path):
 
     class RecordingFleet(Fleet):
         def launch(self, blend, settings, start_frame, end_frame,
-                   on_progress=None, dataset_slug=None, accounts=None):
+                   on_progress=None, dataset_slug=None, blender_slug=None,
+                   *, accounts=None):
             seen["slug"] = dataset_slug
             return FleetState(job_id="j", blend_name=blend.name,
                               start_frame=start_frame, end_frame=end_frame,
@@ -307,7 +308,8 @@ def test_a_dataset_for_a_different_scene_is_not_reused(qapp, tmp_path):
 
     class RecordingFleet(Fleet):
         def launch(self, blend, settings, start_frame, end_frame,
-                   on_progress=None, dataset_slug=None, accounts=None):
+                   on_progress=None, dataset_slug=None, blender_slug=None,
+                   *, accounts=None):
             seen["slug"] = dataset_slug
             return FleetState(job_id="j", blend_name=blend.name,
                               start_frame=start_frame, end_frame=end_frame,
@@ -704,6 +706,32 @@ def test_an_unreadable_job_names_its_kernels_and_points_at_kaggle(
     assert len(entries) == 1
     assert entries[0]["kernels"] == ["u9/x-render-1"]
     assert "kaggle.com" in entries[0]["message"]
+    # Fix round 1, Minor 1: job_id/blend_name are read from the raw entry
+    # when present, and a kernel slug becomes the actual page to open.
+    assert entries[0]["jobId"] == "bad"
+    assert entries[0]["blend"] == "x.blend"
+    assert entries[0]["kernelUrls"] == \
+        ["https://www.kaggle.com/code/u9/x-render-1"]
+    assert "x.blend" in entries[0]["message"]
+
+
+def test_two_unreadable_jobs_get_two_different_messages(qapp, tmp_path):
+    """Fix round 1, Minor 1: discarding job_id/blend_name made every
+    unreadable entry read as the identical generic sentence -- with more
+    than one on screen at once there was no way to tell them apart."""
+    backend = make_backend(tmp_path, n=1)
+    fleet = backend.fleet_factory(backend.store.list())
+    fleet._state_path().write_text(json.dumps({"jobs": [
+        {"job_id": "bad-1", "blend_name": "one.blend", "workers": [],
+         "not_a_real_field": 1},
+        {"job_id": "bad-2", "blend_name": "two.blend", "workers": [],
+         "not_a_real_field": 1},
+    ]}), encoding="utf-8")
+
+    entries = json.loads(backend.state())["unreadableJobs"]
+    assert len(entries) == 2
+    assert entries[0]["message"] != entries[1]["message"]
+    assert entries[0]["index"] == 0 and entries[1]["index"] == 1
 
 
 def test_a_totally_unparseable_state_file_says_so_without_a_kernel_list(
@@ -724,6 +752,72 @@ def test_a_totally_unparseable_state_file_says_so_without_a_kernel_list(
 def test_no_unreadable_jobs_when_the_state_file_is_clean(qapp, tmp_path):
     backend = _two_job_backend(tmp_path)
     assert json.loads(backend.state())["unreadableJobs"] == []
+
+
+def test_forgetting_an_unreadable_job_clears_it_from_the_payload(
+        qapp, tmp_path):
+    """Fix round 1, Important 3: an unreadable entry used to have no way
+    to be dismissed at all -- save_jobs() re-writes it verbatim on every
+    save, and forgetJob() only ever pops a PARSED job by position, never
+    reaching self.unreadable_jobs. Once the user has gone and dealt with
+    it by hand at kaggle.com, forgetUnreadableJob() must be able to clear
+    the warning."""
+    backend = make_backend(tmp_path, n=1)
+    fleet = backend.fleet_factory(backend.store.list())
+    fleet._state_path().write_text(json.dumps({"jobs": [{
+        "job_id": "bad", "blend_name": "x.blend",
+        "workers": [{"label": "acct9", "username": "u9",
+                     "kernel_slug": "u9/x-render-1", "frames": [1]}],
+        "not_a_real_field": 1,
+    }]}), encoding="utf-8")
+    assert len(json.loads(backend.state())["unreadableJobs"]) == 1
+
+    backend.forgetUnreadableJob(0)
+    _settle(backend)
+
+    assert json.loads(backend.state())["unreadableJobs"] == []
+    # A save-then-load round trip (poll(), _save(), ...) must not bring
+    # the forgotten entry back -- see save_jobs()'s own "carries it
+    # through on every write" contract, which this call has to survive
+    # having actually removed the entry from.
+    fleet2 = backend.fleet_factory(backend.store.list())
+    fleet2.load_jobs()
+    assert fleet2.unreadable_jobs == []
+
+
+def test_forgetting_an_unreadable_job_does_not_touch_a_real_one(
+        qapp, tmp_path):
+    """The two lists (parsed jobs, unreadable entries) are independent --
+    forgetting index 0 of one must never remove the other."""
+    backend = _two_job_backend(tmp_path)
+    fleet = backend.fleet_factory(backend.store.list())
+    # Append one unreadable entry alongside the two good jobs already
+    # seeded by _two_job_backend().
+    raw = json.loads(fleet._state_path().read_text(encoding="utf-8"))
+    raw["jobs"].append({"job_id": "bad", "blend_name": "x.blend",
+                        "workers": [], "not_a_real_field": 1})
+    fleet._state_path().write_text(json.dumps(raw), encoding="utf-8")
+
+    before = json.loads(backend.state())
+    assert len(before["jobs"]) == 2
+    assert len(before["unreadableJobs"]) == 1
+
+    backend.forgetUnreadableJob(0)
+    _settle(backend)
+
+    after = json.loads(backend.state())
+    assert [j["scene"] for j in after["jobs"]] == ["alpha", "beta"]
+    assert after["unreadableJobs"] == []
+
+
+def test_forgetting_an_already_gone_unreadable_index_says_so(
+        qapp, tmp_path):
+    backend = make_backend(tmp_path, n=1)
+    notes = []
+    backend.notification.connect(lambda m, t: notes.append((m, t)))
+    backend.forgetUnreadableJob(0)      # nothing tracked at all
+    _settle(backend)
+    assert notes and notes[0][1] == "idle"
 
 
 # ---------------------------------------------------------------------------
@@ -771,7 +865,8 @@ def test_no_unshared_block_before_any_upload_this_session(qapp, tmp_path):
 def _account_workers_fleet():
     class RecordingFleet(Fleet):
         def launch(self, blend, settings, start_frame, end_frame,
-                   on_progress=None, dataset_slug=None, accounts=None):
+                   on_progress=None, dataset_slug=None, blender_slug=None,
+                   *, accounts=None):
             RecordingFleet.seen_labels = [a.label for a in accounts]
             return FleetState(
                 job_id="j", blend_name=blend.name,
@@ -820,6 +915,36 @@ def test_launch_with_no_labels_only_uses_free_accounts(qapp, tmp_path):
     assert RecordingFleet.seen_labels == ["acct1"]
 
 
+def test_launch_refuses_an_explicitly_empty_label_list(qapp, tmp_path):
+    """Fix round 1, Critical: `"labels": []` means every per-instance
+    checkbox was unticked -- a caller explicitly asking for nobody -- and
+    is a DIFFERENT request from the key being absent entirely (which means
+    "whatever is free"). `or` used to collapse the two, so this launched
+    on every free account instead of refusing -- exactly the widening
+    Fleet.launch's own `accounts=[]` guard (fleet.py) exists to prevent,
+    reopened one layer up because this slot resolves accounts and calls
+    fleet.launch() before that guard ever runs.
+    """
+    RecordingFleet = _account_workers_fleet()
+    backend = make_backend(tmp_path, n=3)
+    backend.fleet_factory = lambda accounts: RecordingFleet(
+        accounts, lambda t: FakeClient(t), tmp_path / "w")
+    blend = tmp_path / "scene.blend"
+    blend.write_bytes(b"x" * 8)
+    backend.blend = blend
+    notes = []
+    backend.notification.connect(lambda m, t: notes.append((m, t)))
+
+    backend.launch(json.dumps({"startFrame": 1, "endFrame": 4,
+                              "labels": []}))
+    _settle(backend)
+
+    assert getattr(RecordingFleet, "seen_labels", None) is None, \
+        "must not launch on ANY account when labels is explicitly empty"
+    assert notes and notes[0][1] == "offline"
+    assert "launch" not in backend._workers
+
+
 def test_launch_refuses_an_unknown_label(qapp, tmp_path):
     backend = make_backend(tmp_path, n=2)
     blend = tmp_path / "scene.blend"
@@ -856,17 +981,17 @@ def test_launch_refuses_when_every_account_is_already_busy(qapp, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# collect() across every tracked job.
+# collect() -- scoped to exactly ONE job (Fix round 1, Important 1+2):
+# `load_jobs()` is never pruned except one job at a time via forget_job(),
+# so collecting from EVERY tracked job with no filter grows unbounded and
+# re-downloads jobs that finished long ago; merging their reports with
+# dict.update() also silently drops one job's worker_errors behind
+# another's for the same label. Scoping to one job at a time removes both
+# problems by construction.
 # ---------------------------------------------------------------------------
 
-def test_collect_merges_frames_from_every_tracked_job(
-        qapp, tmp_path, monkeypatch):
-    """Two scenes can render at once -- collecting "the whole fleet" must
-    not silently skip whichever job was not the most recently launched or
-    polled."""
-    import blendfleet.collector as collector_mod
-    from blendfleet.collector import CollectReport
-
+def _two_job_collect_backend(tmp_path):
+    """acct0 finished "job-a" (older); acct1 finished "job-b" (newer)."""
     backend = make_backend(tmp_path, n=2)
     fleet = backend.fleet_factory(backend.store.list())
     fleet.save_jobs([
@@ -881,15 +1006,88 @@ def test_collect_merges_frames_from_every_tracked_job(
                                         kernel_slug="user_1/beta-render-1",
                                         frames=[1, 2], state="complete")]),
     ])
+    return backend
 
-    seen_job_ids = []
+
+def _stub_collect_frames(monkeypatch, tmp_path, seen_job_ids):
+    import blendfleet.collector as collector_mod
+    from blendfleet.collector import CollectReport
 
     def fake_collect(state, accounts, client_factory, dest, *,
                      worker_label=None, on_progress=None):
         seen_job_ids.append(state.job_id)
-        return CollectReport(copied=len(state.workers[0].frames),
-                             per_worker={state.workers[0].label:
-                                        len(state.workers[0].frames)})
+        return CollectReport(copied=len(state.workers[0].frames))
+
+    monkeypatch.setattr(collector_mod, "collect", fake_collect)
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory",
+                        lambda *a, **kw: str(tmp_path / "out"))
+
+
+def test_collect_with_no_label_only_reaches_the_most_recent_job(
+        qapp, tmp_path, monkeypatch):
+    """With neither `label` nor `job_id` given, exactly ONE job is
+    collected -- the most recent -- matching `Fleet.load()`'s own answer
+    from before several jobs could be tracked at once. Never every job
+    this app has ever tracked."""
+    backend = _two_job_collect_backend(tmp_path)
+    seen_job_ids = []
+    _stub_collect_frames(monkeypatch, tmp_path, seen_job_ids)
+
+    backend.collect("")
+    _settle(backend)
+
+    assert seen_job_ids == ["job-b"], \
+        "must collect only the most recent job, not every tracked job"
+
+
+def test_collect_with_a_label_finds_its_job_even_if_not_the_newest(
+        qapp, tmp_path, monkeypatch):
+    """A label search is never ambiguous (an account renders in at most
+    one job at a time) and is unaffected by this fix -- it must keep
+    finding an OLDER job's worker, not just the newest job's."""
+    backend = _two_job_collect_backend(tmp_path)
+    seen_job_ids = []
+    _stub_collect_frames(monkeypatch, tmp_path, seen_job_ids)
+
+    backend.collect("acct0")            # acct0 is in the OLDER job
+    _settle(backend)
+
+    assert seen_job_ids == ["job-a"]
+
+
+def test_collect_with_an_explicit_job_id_reaches_that_job(
+        qapp, tmp_path, monkeypatch):
+    """Task 7's per-job collect button will carry a job id directly --
+    the right way to reach a specific older job, rather than a fleet-wide
+    button guessing at every job it has ever tracked."""
+    backend = _two_job_collect_backend(tmp_path)
+    seen_job_ids = []
+    _stub_collect_frames(monkeypatch, tmp_path, seen_job_ids)
+
+    backend.collect("", "job-a")
+    _settle(backend)
+
+    assert seen_job_ids == ["job-a"]
+
+
+def test_collect_does_not_leak_worker_errors_between_jobs(
+        qapp, tmp_path, monkeypatch):
+    """The bug a fleet-wide merge produced: dict.update() let a newer
+    job's worker_errors for one label silently replace an older job's,
+    for a DIFFERENT label, the moment both jobs were collected in one
+    call. Scoped to one job at a time, this cannot happen -- collecting
+    the older job on its own must still report ITS OWN error."""
+    import blendfleet.collector as collector_mod
+    from blendfleet.collector import CollectReport
+
+    backend = _two_job_collect_backend(tmp_path)
+
+    def fake_collect(state, accounts, client_factory, dest, *,
+                     worker_label=None, on_progress=None):
+        if state.job_id == "job-a":
+            return CollectReport(
+                worker_errors={"acct0": "could not reach acct0"})
+        return CollectReport(worker_errors={"acct1": "token revoked"})
 
     monkeypatch.setattr(collector_mod, "collect", fake_collect)
     monkeypatch.setattr(QFileDialog, "getExistingDirectory",
@@ -897,9 +1095,7 @@ def test_collect_merges_frames_from_every_tracked_job(
 
     notes = []
     backend.notification.connect(lambda m, t: notes.append((m, t)))
-    backend.collect("")
+    backend.collect("", "job-a")
     _settle(backend)
 
-    assert sorted(seen_job_ids) == ["job-a", "job-b"], \
-        "must collect from every tracked job, not just the newest"
-    assert notes and "Collected 5 frame(s)" in notes[0][0]
+    assert notes and "could not reach acct0" in notes[0][0]

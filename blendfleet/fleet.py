@@ -509,6 +509,44 @@ class Fleet:
         self.save_jobs(jobs)
         return list(target.workers)
 
+    def forget_unreadable(self, index: int) -> object | None:
+        """Drop ONE entry from self.unreadable_jobs by its position,
+        without touching anything on Kaggle -- forget_job()'s counterpart
+        for a job record broken badly enough that it was never turned into
+        a FleetState at all (Fix round 1, Important 3).
+
+        forget_job() can only pop a PARSED job by position; a record on
+        self.unreadable_jobs never becomes one, so it had no way to be
+        forgotten and, since save_jobs() deliberately re-writes every
+        unreadable entry verbatim on every write (see that method's own
+        docstring -- the whole point is that a load-then-save round trip
+        must never erase it), it sat on the payload forever with no way to
+        acknowledge it once the user had actually gone and dealt with it
+        by hand at kaggle.com.
+
+        By POSITION, matching forget_job()'s own reasoning: an unreadable
+        entry may have no job_id at all (a whole-file JSON failure has no
+        fields to match on), and even when one is present it is only 32
+        bits of uuid4, so equality could drop two for the price of one.
+
+        Returns the dropped raw entry (whatever shape it had -- a dict, or
+        the literal raw text for a whole-file failure), or None if `index`
+        no longer exists: already forgotten, or the file changed since
+        whatever payload named this index was read. This is NOT a cancel:
+        whatever this entry might have been tracking (if anything) keeps
+        running and keeps spending quota; all this does is stop the
+        warning from being able to point at it any more.
+        """
+        # Refreshes self.unreadable_jobs as a side effect (see its own
+        # docstring) -- read fresh, exactly like forget_job() reads a
+        # fresh `jobs` before popping from it.
+        jobs = self.load_jobs()
+        if not (0 <= index < len(self.unreadable_jobs)):
+            return None
+        target = self.unreadable_jobs.pop(index)
+        self.save_jobs(jobs)
+        return target
+
     def active_workers(self) -> list[WorkerState]:
         """Workers whose kernel Kaggle currently reports as queued/running.
 
