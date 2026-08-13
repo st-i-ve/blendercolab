@@ -1631,6 +1631,43 @@ def test_collect_fleet_wide_with_a_worker_error_warns_not_informs(
     dash.close()
 
 
+def test_collect_fleet_wide_message_names_the_actual_scene_subfolder(
+        qapp, tmp_path, monkeypatch, stub_message_boxes):
+    """Minor (Task 5 fix round 1): collect() writes under
+    Path(d)/<scene_key>, not straight into the folder `d` the user picked
+    -- this dialog is the ONLY place the app says where a render's frames
+    went, and it kept saying "to {d}" regardless, which is now wrong for
+    every caller."""
+    def make_client(tok, acct):
+        if acct.label == "acct0":
+            return BoomFetchClient(tok)
+        return DownloadingClient(tok)
+
+    store, factory, st = _seed_job(tmp_path, make_client, n=2)
+    dest = tmp_path / "downloaded"
+    monkeypatch.setattr(dashboard_mod.QFileDialog, "getExistingDirectory",
+                        lambda *a, **kw: str(dest))
+
+    dash = Dashboard(store, lambda accounts: Fleet(accounts, factory, tmp_path / "w"),
+                     verifier=lambda t: "someone")
+    _LIVE_DASHBOARDS.append(dash)
+    settle(dash)
+    dash._last_state = st
+    dash._refresh_views()
+
+    dash._collect()
+    pump(dash._collect_worker, timeout=15000)
+    settle(dash)
+
+    assert stub_message_boxes["warning"], "expected a worker_errors warning"
+    _, message = stub_message_boxes["warning"][-1]
+    # _seed_job launches "remember.blend" -- collect()'s own scene_key.
+    expected = str(dest / "remember")
+    assert expected in message, (
+        f"the dialog must name where frames actually landed: {message!r}")
+    dash.close()
+
+
 # ---------------------------------------------------------------------------
 # Review findings on the Task 6 download wiring above.
 # ---------------------------------------------------------------------------

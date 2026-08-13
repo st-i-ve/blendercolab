@@ -350,3 +350,147 @@ def test_colliding_scene_names_share_a_key_but_never_a_filename(fleet):
     b = FleetState(job_id="j2", blend_name="shot-1.blend",
                   start_frame=1, end_frame=1)
     assert a.scene_key == b.scene_key == "shot-1"
+
+
+# ---------------------------------------------------------------------------
+# Task 5 fix round 1 -- code review on the first landing of Task 5 found
+# poll_all()/cancel_all()/cancel_job() re-introducing (or newly creating,
+# for poll_all's save) the very bugs Task 5 itself exists to fix.
+# ---------------------------------------------------------------------------
+
+def test_one_jobs_broken_status_check_does_not_abort_polling_the_others(fleet):
+    """IMPORTANT 1: poll_all's own bug (an unrefreshed worker sits
+    "queued" forever and never frees its account) re-entered through the
+    other door -- one job's status() call raising (dead account, network
+    blip) used to abort refreshing every OTHER job too."""
+    class Client:
+        def __init__(self, token): self.token = token
+        def status(self, slug):
+            if "alpha" in slug:
+                raise RuntimeError("network blip")
+            from blendfleet.kaggle_client import KernelStatus
+            return KernelStatus(state="complete")
+    fleet.client_factory = Client
+    fleet.save_jobs([job("alpha", ["a0"], "j1"), job("beta", ["a1"], "j2")])
+
+    jobs = fleet.poll_all()
+
+    alpha, beta = jobs
+    assert alpha.workers[0].state == "queued", "left alone, not crashed"
+    assert beta.workers[0].state == "complete", "must still be refreshed"
+    # Persisted, not just returned in memory.
+    reloaded = fleet.load_jobs()
+    assert reloaded[1].workers[0].state == "complete"
+
+
+def test_an_unparseable_state_file_is_preserved_through_a_save_jobs_round_trip(
+        fleet, tmp_path):
+    """IMPORTANT 2: the json.loads failure path used to return `[]`
+    without recording anything on self.unreadable_jobs, so ANY caller
+    that loads then saves (poll_all, _save, forget_job) would silently
+    replace a file this mangled -- which might still be the only
+    surviving record of a running kernel's slug -- with `{"jobs": []}`."""
+    garbage = "{ this is not json but user0/render-old1 is still readable"
+    (tmp_path / "fleet.json").write_text(garbage, encoding="utf-8")
+
+    jobs = fleet.load_jobs()
+    assert jobs == []
+    fleet.save_jobs(jobs)   # exactly what poll_all()/_save() do internally
+
+    on_disk = (tmp_path / "fleet.json").read_text(encoding="utf-8")
+    assert "render-old1" in on_disk, (
+        f"the only surviving record of that kernel's slug was erased: {on_disk!r}")
+
+
+def test_polling_an_unparseable_state_file_does_not_erase_it(fleet, tmp_path):
+    """IMPORTANT 2, poll_all()'s own angle: it saved unconditionally, so
+    the very next unattended 30-second timer tick after the state file
+    became unparseable would overwrite it with an empty job list."""
+    garbage = "{not valid json, but kernel_slug user0/render-old1 is in here"
+    (tmp_path / "fleet.json").write_text(garbage, encoding="utf-8")
+
+    jobs = fleet.poll_all()
+
+    assert jobs == []
+    on_disk = (tmp_path / "fleet.json").read_text(encoding="utf-8")
+    assert on_disk == garbage, (
+        f"poll_all() must not write anything when it loaded nothing: {on_disk!r}")
+
+
+def test_a_job_launched_while_a_poll_is_in_flight_is_not_erased(fleet):
+    """IMPORTANT 3: dashboard's 30s poll timer and _LaunchWorker run
+    concurrently with no mutual exclusion. poll_all() used to overwrite
+    the WHOLE file with its own pre-poll snapshot, so a job launched
+    while an older job's poll was still in flight vanished from the
+    state file -- its kernels left running, uncancellable and
+    uncollectable."""
+    fleet.save_jobs([job("alpha", ["a0"], "j1")])
+
+    class Client:
+        def __init__(self, token): self.token = token
+        def status(self, slug):
+            # Simulates a launch landing on disk WHILE this poll is still
+            # running -- BEFORE poll_all() has written back its own
+            # result.
+            fleet.save_jobs(fleet.load_jobs() + [job("beta", ["a1"], "j2")])
+            from blendfleet.kaggle_client import KernelStatus
+            return KernelStatus(state="complete")
+    fleet.client_factory = Client
+
+    fleet.poll_all()
+
+    remaining = fleet.load_jobs()
+    assert [j.job_id for j in remaining] == ["j1", "j2"], (
+        "the job launched mid-poll must survive, and the polled job's "
+        "own refreshed state must still be persisted")
+    assert remaining[0].workers[0].state == "complete"
+
+
+def test_cancel_all_skips_workers_that_already_finished(fleet):
+    """IMPORTANT 5: once cancel_all() started reading every tracked job
+    instead of just the newest, it also started re-"cancelling" jobs
+    that finished days ago and were simply never forgotten -- each one
+    answering False and degrading the dashboard's "could not be
+    cancelled" warning into routine noise, plus a wasted HTTP call."""
+    cancelled = []
+
+    class Client:
+        def __init__(self, token): self.token = token
+        def cancel(self, slug):
+            cancelled.append(slug)
+            return True
+    fleet.client_factory = Client
+
+    old_job = job("alpha", ["a0"], "j1")
+    old_job.workers[0].state = "complete"   # finished days ago
+    fleet.save_jobs([old_job, job("beta", ["a1"], "j2")])
+
+    results = fleet.cancel_all()
+
+    assert [r.label for r in results] == ["a1"], (
+        "a finished job's workers must never be cancelled again")
+    assert all("alpha" not in s for s in cancelled), cancelled
+    assert any("beta" in s for s in cancelled), cancelled
+
+
+def test_cancel_job_with_a_duplicate_job_id_cancels_both(fleet):
+    """Minor: unlike forget_job() (which deliberately touches only the
+    FIRST duplicate, so it cannot drop two jobs for the price of one),
+    cancel_job() must stop EVERY job under a duplicate id -- leaving a
+    second one's kernel running and billing is the one outcome a cancel
+    action must never produce."""
+    cancelled = []
+
+    class Client:
+        def __init__(self, token): self.token = token
+        def cancel(self, slug):
+            cancelled.append(slug)
+            return True
+    fleet.client_factory = Client
+    fleet.save_jobs([job("alpha", ["a0"], "dup"), job("beta", ["a1"], "dup")])
+
+    results = fleet.cancel_job("dup")
+
+    assert len(results) == 2, results
+    assert any("alpha" in s for s in cancelled), cancelled
+    assert any("beta" in s for s in cancelled), cancelled

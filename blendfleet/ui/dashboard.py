@@ -1575,12 +1575,23 @@ class Dashboard(FramelessMixin, QMainWindow):
             return   # a collect is already in flight -- the button is disabled too
         from blendfleet.collector import collect
         accounts = self.store.list()
+        # Set inside work() (background thread), read from done_ok() only
+        # after that thread has finished -- _DownloadWorker's succeeded
+        # signal fires strictly after work() returns, so this is never
+        # read concurrently with the write. Needed because collect() now
+        # writes under Path(d)/<scene_key> (Task 5), not straight into
+        # Path(d) -- see the fix to `msg` below (Task 5 fix round 1,
+        # Minor: this dialog was the app's only place saying where a
+        # render's frames actually went, and it kept saying "to {d}" even
+        # though that stopped being true the moment the subfolder shipped).
+        landed_in = {"path": d}
 
         def work(on_progress):
             fleet = self.fleet_factory(accounts)
             st = fleet.load()
             if st is None:
                 return None
+            landed_in["path"] = str(Path(d) / st.scene_key)
             return collect(st, accounts, fleet.client_factory, Path(d),
                            on_progress=on_progress)
 
@@ -1601,7 +1612,8 @@ class Dashboard(FramelessMixin, QMainWindow):
                     self, "Nothing to collect",
                     "No render job was found -- start a render first.")
                 return
-            msg = self._describe_collect_result(r, destination_phrase=f"to {d}")
+            msg = self._describe_collect_result(
+                r, destination_phrase=f"to {landed_in['path']}")
             if r.worker_errors:
                 # Consistent with _show_download_instance_result's own
                 # per-instance path below: at least one account's fetch
@@ -1652,12 +1664,18 @@ class Dashboard(FramelessMixin, QMainWindow):
         who = (account.username or label) if account else label
         accounts = self.store.list()
         card = self._instance_cards.get(label)
+        # Same reasoning as _collect()'s own `landed_in` above: collect()
+        # writes under Path(d)/<scene_key>, not straight into Path(d), and
+        # this dict is only ever read from done_ok() after work() (the
+        # background thread that fills it in) has already finished.
+        landed_in = {"path": d}
 
         def work(on_progress):
             fleet = self.fleet_factory(accounts)
             st = fleet.load()
             if st is None:
                 return None
+            landed_in["path"] = str(Path(d) / st.scene_key)
             return collect(st, accounts, fleet.client_factory, Path(d),
                            worker_label=label, on_progress=on_progress)
 
@@ -1672,7 +1690,7 @@ class Dashboard(FramelessMixin, QMainWindow):
             if card is not None:
                 card.set_download_busy(False)
                 card.set_download_progress(None)
-            self._show_download_instance_result(who, d, r)
+            self._show_download_instance_result(who, landed_in["path"], r)
 
         def done_fail(message: str) -> None:
             self._instance_download_workers.pop(label, None)

@@ -249,6 +249,20 @@ class FleetState:
         copied FRAME from the raw, un-slugified stem, never from
         scene_key, so two colliding scenes only ever end up sharing a
         folder, never overwriting each other's files inside it.
+
+        That reasoning has exactly one hole, and it is NOT fixed here:
+        two stems that differ ONLY by case ("Kitchen.blend" vs
+        "kitchen.blend") are already identical strings by the time this
+        property lowercases them, but their raw, case-PRESERVED stems are
+        what collect() actually names files from -- and on a case-
+        insensitive filesystem (Windows, default macOS)
+        "Kitchen_0001.png" and "kitchen_0001.png" are the same path, so
+        the "never overwriting" guarantee above would break for exactly
+        that pair. This property has no way to see that coming (it only
+        ever looks at one blend_name at a time); collect() itself detects
+        and disambiguates that one case at write time, by inspecting what
+        is already on disk -- see its own comment, right where the
+        collision would otherwise happen.
         """
         return _capped_stem(Path(self.blend_name).stem) or "scene"
 
@@ -393,6 +407,15 @@ class Fleet:
         try:
             d = json.loads(raw)
         except json.JSONDecodeError:
+            # Preserved, not dropped -- exactly like the per-entry failure
+            # path below preserves a single bad job on self.unreadable_jobs.
+            # A file mangled badly enough that even the OUTER JSON fails to
+            # parse might still be the only surviving record of a running
+            # kernel's slug; the next save_jobs() call (poll_all(), _save())
+            # must carry this raw text through rather than silently
+            # replacing it with an empty job list (Task 5 fix round 1,
+            # IMPORTANT 2).
+            self.unreadable_jobs = [raw]
             return []
         raw_jobs = d.get("jobs") if isinstance(d, dict) and "jobs" in d else [d]
         if not isinstance(raw_jobs, list):
@@ -1227,20 +1250,50 @@ class Fleet:
         the state file, and busy_labels()/require_free() (which read
         w.state straight off disk) never saw them finish, so those
         accounts could never come free for a new launch (measured with
-        two live jobs). Saved once, as the whole list, rather than once
-        per job through _save() -- a job with no workers of its own to
-        refresh is still written back unchanged, and _save()'s own
-        in-place-by-job_id contract is irrelevant here since this already
-        has every job in hand.
+        two live jobs).
+
+        Nothing is saved when there is nothing to refresh (Task 5 fix
+        round 1, IMPORTANT 2) -- mirrors poll()'s own original guard,
+        which returned early without writing when load() answered None.
+        load_jobs() also answers `[]` for a file it could NOT parse (see
+        its own docstring / self.unreadable_jobs); writing back here
+        regardless would silently replace that unparseable-but-maybe-
+        still-readable text with a flat `{"jobs": []}`, destroying the one
+        thing a user would need to go cancel a kernel by hand at
+        kaggle.com. Guarding on an empty snapshot rather than on
+        self.unreadable_jobs specifically means this holds even if some
+        future load_jobs() failure mode forgets to populate
+        self.unreadable_jobs the way this one now does.
+
+        Re-reads and merges each polled job back by job_id, exactly like
+        _save()'s own in-place contract, rather than overwriting the whole
+        file with this call's own (now possibly stale) snapshot (Task 5
+        fix round 1, IMPORTANT 3) -- dashboard's 30s poll timer and
+        _LaunchWorker run concurrently with no mutual exclusion, and a job
+        launched WHILE a poll is in flight must survive being polled at
+        the exact moment it is created, or its kernels end up running,
+        uncancellable and uncollectable.
         """
         jobs = self.load_jobs()
+        if not jobs:
+            return jobs
         by_label = {a.label: a for a in self.accounts}
         for st in jobs:
             for w in st.workers:
                 acct = by_label.get(w.label)
                 if acct is None:
                     continue
-                s = self.client_factory(acct.token).status(w.kernel_slug)
+                try:
+                    s = self.client_factory(acct.token).status(w.kernel_slug)
+                except Exception:
+                    # One worker's status check failing (network blip,
+                    # revoked token) must not abort refreshing every OTHER
+                    # worker in every OTHER job -- that is this method's
+                    # OWN bug (see its first docstring paragraph above) re-
+                    # entered through the other door (Task 5 fix round 1,
+                    # IMPORTANT 1). Left exactly as it was; not fatal, and
+                    # not overwritten with a guess.
+                    continue
                 w.state, w.message = s.state, s.message
                 # Stamped once, when the worker stops being active. Not
                 # recomputed from "now" at display time, or a finished job
@@ -1249,7 +1302,10 @@ class Fleet:
                 # already-finished worker cannot push its end time forward.
                 if w.state not in ACTIVE_STATES and not w.finished_at:
                     w.finished_at = time.time()
-        self.save_jobs(jobs)
+        current = self.load_jobs()
+        updated_by_id = {st.job_id: st for st in jobs}
+        merged = [updated_by_id.get(j.job_id, j) for j in current]
+        self.save_jobs(merged)
         return jobs
 
     def poll(self) -> FleetState | None:
@@ -1295,8 +1351,8 @@ class Fleet:
         return results
 
     def cancel_job(self, job_id: str) -> list[CancelResult]:
-        """Cancel every worker in exactly the job named `job_id`, leaving
-        every OTHER tracked job's kernels running untouched.
+        """Cancel every worker in every tracked job named `job_id`, leaving
+        every OTHER job's kernels running untouched.
 
         cancel_all() used to be the only cancel there was, and it only
         ever read load() -- the single newest job -- so with two jobs
@@ -1306,21 +1362,43 @@ class Fleet:
         looking at must never stop a different scene they never asked
         about. An unknown job_id cancels nothing (empty list), same as
         "no job at all" -- there is genuinely nothing to do.
+
+        Matches EVERY job with this id, not just the first (Task 5 fix
+        round 1, Minor): job_id is only 32 bits of uuid4 and save_jobs()
+        does not itself forbid a duplicate (see
+        forget_job()'s own docstring on this same class of bug). Unlike
+        forget_job() -- which deliberately touches only ONE duplicate, so
+        it cannot drop two jobs for the price of one -- a cancel that
+        stopped only the first of two duplicates would leave the second
+        one's kernel running and billing, which is the one outcome a
+        cancel action must never produce.
         """
-        st = next((j for j in self.load_jobs() if j.job_id == job_id), None)
-        return self._cancel_workers(st.workers) if st is not None else []
+        matches = [j for j in self.load_jobs() if j.job_id == job_id]
+        return [result for st in matches
+                for result in self._cancel_workers(st.workers)]
 
     def cancel_all(self) -> list[CancelResult]:
-        """Cancel every worker in every tracked job.
+        """Cancel every ACTIVE worker in every tracked job.
 
         Deliberately every job, not just load()'s newest: cancel_all() is
         the fleet-wide "stop everything" action, and a second job left
         running because it was not the most recent one would keep
         spending its accounts' quota while the user believes nothing is
         rendering any more.
+
+        Filtered to ACTIVE_STATES (Task 5 fix round 1, IMPORTANT 5): once
+        this started reading every tracked job instead of just the
+        newest, it also started re-"cancelling" every job that had
+        already finished days ago and was simply never forgotten -- each
+        one answering False (nothing to cancel) and landing in the
+        dashboard's "N account(s) could not be cancelled and may still be
+        running" warning, degrading that warning into routine noise (plus
+        a wasted HTTP call) for kernels that were never running in the
+        first place.
         """
         return [result for st in self.load_jobs()
-                for result in self._cancel_workers(st.workers)]
+                for result in self._cancel_workers(
+                    [w for w in st.workers if w.state in ACTIVE_STATES])]
 
     def cancel_worker(self, label: str) -> CancelResult | None:
         """Cancel exactly the worker labelled `label`, leaving every other

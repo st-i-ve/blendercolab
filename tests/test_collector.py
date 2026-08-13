@@ -544,3 +544,38 @@ def test_colliding_scene_names_share_a_folder_but_not_a_filename(tmp_path):
     shared = tmp_path / "frames" / "shot-1"
     assert (shared / "shot 1_0001.png").exists()
     assert (shared / "shot-1_0001.png").exists()
+
+
+def test_case_only_collision_disambiguates_instead_of_overwriting(tmp_path):
+    """Task 5 fix round 1, IMPORTANT 4: "Kitchen.blend" and "kitchen.blend"
+    share a scene_key ("kitchen" -- slugify_stem already lowercases)
+    exactly like the differently-spelled collision above -- but here the
+    raw stems differ ONLY by case, so on a case-insensitive filesystem
+    (Windows, default macOS) "Kitchen_0001.png" and "kitchen_0001.png" are
+    literally the SAME path. Without disambiguation the second collect's
+    shutil.copy would silently replace the first scene's already-rendered,
+    already-paid-for frame."""
+    acct = [Account("a0", "KGAT_" + "0"*32)]
+
+    def factory(tok):
+        return FakeClient(tok, ["f_0001.png"])
+
+    st_a = FleetState(job_id="j1", blend_name="Kitchen.blend", start_frame=1,
+                      end_frame=1,
+                      workers=[WorkerState("a0", "u0", "u0/k0", [1])])
+    st_b = FleetState(job_id="j2", blend_name="kitchen.blend", start_frame=1,
+                      end_frame=1,
+                      workers=[WorkerState("a0", "u0", "u0/k1", [1])])
+
+    collect(st_a, acct, factory, tmp_path / "frames")
+    collect(st_b, acct, factory, tmp_path / "frames")
+
+    shared = tmp_path / "frames" / "kitchen"
+    names = sorted(p.name for p in shared.glob("*.png"))
+    assert len(names) == 2, (
+        "both scenes' frames must survive -- neither may silently "
+        f"replace the other on a case-insensitive filesystem: {names}")
+    assert "Kitchen_0001.png" in names, names
+    assert "kitchen-j2_0001.png" in names, (
+        "the SECOND, colliding job's frame must be disambiguated with "
+        f"its own job_id rather than overwrite the first: {names}")

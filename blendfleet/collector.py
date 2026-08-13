@@ -208,6 +208,28 @@ def collect(fleet_state, accounts, client_factory: Callable,
     by_username = {getattr(a, "username", None): a for a in accounts
                    if getattr(a, "username", None)}
     stem = Path(fleet_state.blend_name).stem
+    # Task 5 fix round 1, IMPORTANT 4: two scenes whose stems differ ONLY
+    # by case ("Kitchen.blend" vs "kitchen.blend") slugify to the exact
+    # same scene_key -- see FleetState.scene_key's own docstring -- so
+    # they deliberately share this folder. But their FRAME filenames come
+    # from the raw, case-preserved stem, and on a case-insensitive
+    # filesystem (Windows, default macOS) "Kitchen_0001.png" and
+    # "kitchen_0001.png" are literally the same path: writing this job's
+    # frames under its own raw stem would silently replace the other
+    # scene's already-rendered, already-paid-for output. Detected by
+    # reading what is ALREADY on disk -- every completed frame's filename
+    # already records the exact stem that wrote it (undo-able with
+    # FRAME_RE) -- rather than a separate bookkeeping file, and fixed by
+    # making THIS job's stem unique with its own job_id, which is stable
+    # and already unique per launch. A stem that matches something
+    # already on disk EXACTLY (the normal re-collect-the-same-job case,
+    # covered by the tests above) is left alone -- only a same-but-
+    # differently-cased stem is disambiguated.
+    existing_stems = {FRAME_RE.sub("", p.name) for p in dest.iterdir()
+                      if p.is_file() and FRAME_RE.search(p.name)}
+    if any(s != stem and s.casefold() == stem.casefold()
+           for s in existing_stems):
+        stem = f"{stem}-{fleet_state.job_id}"
     report = CollectReport()
     found: set[int] = set()
 
