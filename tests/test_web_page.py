@@ -945,26 +945,35 @@ def test_cancelling_a_job_asks_for_confirmation_first(loaded_page):
     which only ever reaches Fleet.cancel_worker() -> load()'s single
     newest job, so cancelling any OLDER of two live scenes cancelled
     nothing at all and reported "already stopped" while its kernels kept
-    running and billing."""
+    running and billing.
+
+    Clicks the SECOND job's button (j-beta, jobs[1]), not the first: a
+    handler rewired to always use jobs[0].jobId -- beta's Cancel button
+    silently stopping alpha's kernels instead -- would still pass a
+    version of this test that only ever clicked jobs[0]'s own button,
+    since jobs[0].jobId and the clicked button's id would coincide."""
     page, _ = loaded_page
     state = _two_scene_state()
     result = _preview_state(page,
         f"renderState(JSON.stringify({state}));"
         " const cancelled = [];"
+        " const confirmMessages = [];"
         " backend = { cancelJob: jobId => cancelled.push(jobId) };"
-        " window.confirm = () => false;"
-        " document.querySelector('[data-job-cancel=\"j-alpha\"]').click();"
+        " window.confirm = msg => { confirmMessages.push(msg); return false; };"
+        " document.querySelector('[data-job-cancel=\"j-beta\"]').click();"
         " const declined = cancelled.slice();"
-        " window.confirm = () => true;"
-        " document.querySelector('[data-job-cancel=\"j-alpha\"]').click();"
+        " window.confirm = msg => { confirmMessages.push(msg); return true; };"
+        " document.querySelector('[data-job-cancel=\"j-beta\"]').click();"
         " const accepted = cancelled.slice();"
         " backend = null;"
-        " return JSON.stringify({declined, accepted});")
+        " return JSON.stringify({declined, accepted, confirmMessages});")
     import json as _json
     got = _json.loads(result)
     assert got["declined"] == [], "declining must not cancel anything"
-    assert got["accepted"] == ["j-alpha"], \
+    assert got["accepted"] == ["j-beta"], \
         "accepting must cancel exactly this job, by id, not every job"
+    assert all("beta" in m and "acct1" in m for m in got["confirmMessages"]), \
+        "the confirmation must name the SECOND job, not jobs[0]"
 
 
 def test_confirmed_shared_and_never_checked_are_not_the_same_banner(
@@ -996,13 +1005,24 @@ def test_forgetting_an_unreadable_record_asks_for_confirmation_first(
     cancel" honesty confined to a hover title nobody has to read. It
     permanently discards what may be the only surviving trace of kernels
     still billing on Kaggle -- the same stakes as btn-forget's own
-    confirm."""
+    confirm.
+
+    Two unreadable records, not one (same single-row hole must-fix 6
+    fixed for scenes): a one-row fixture makes "the button clicked" and
+    "the first row" the same element, so a handler rebuilt around a
+    hard-coded row 0 would still pass unnoticed. Clicking the SECOND
+    row's button must reach the SECOND record's own index/fingerprint."""
     page, _ = loaded_page
     payload = """({
       job: null, jobs: [], instances: [],
-      unreadableJobs: [{index:0, jobId:'j1', blend:'x.blend',
-        kernels:['a/b'], kernelUrls:['https://www.kaggle.com/code/a/b'],
-        message:'could not read it', fingerprint:'fp1'}],
+      unreadableJobs: [
+        {index:0, jobId:'j1', blend:'x.blend',
+         kernels:['a/b'], kernelUrls:['https://www.kaggle.com/code/a/b'],
+         message:'could not read it', fingerprint:'fp1'},
+        {index:1, jobId:'j2', blend:'y.blend',
+         kernels:['c/d'], kernelUrls:['https://www.kaggle.com/code/c/d'],
+         message:'could not read it either', fingerprint:'fp2'}
+      ],
       blend: null, approximate: true, dataset: null, unshared: null
     })"""
     result = _preview_state(page,
@@ -1010,17 +1030,19 @@ def test_forgetting_an_unreadable_record_asks_for_confirmation_first(
         " const forgotten = [];"
         " backend = { forgetUnreadableJob: (i, fp) => forgotten.push([i, fp]) };"
         " window.confirm = () => false;"
-        " document.querySelector('[data-forget-unreadable]').click();"
+        " document.querySelectorAll('[data-forget-unreadable]')[1].click();"
         " const declined = forgotten.slice();"
         " window.confirm = () => true;"
-        " document.querySelector('[data-forget-unreadable]').click();"
+        " document.querySelectorAll('[data-forget-unreadable]')[1].click();"
         " const accepted = forgotten.slice();"
         " backend = null;"
         " return JSON.stringify({declined, accepted});")
     import json as _json
     got = _json.loads(result)
     assert got["declined"] == [], "declining must not forget the record"
-    assert got["accepted"] == [[0, "fp1"]]
+    assert got["accepted"] == [[1, "fp2"]], (
+        "clicking the SECOND row's Forget button must forget the SECOND "
+        f"record, not the first: {got['accepted']}")
 
 
 # ---------------------------------------------------------------------------
