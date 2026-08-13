@@ -42,9 +42,10 @@ from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
 from blendfleet.accounts import AccountStore
 from blendfleet.assignment import estimate
 from blendfleet.blender_versions import KNOWN_VERSIONS, validate_version
-from blendfleet.fleet import fingerprint_unreadable_entry
+from blendfleet.fleet import _capped_stem, fingerprint_unreadable_entry
 from blendfleet.instance_state import (GpuSnapshot, InstanceSnapshot,
                                        InstanceStore)
+from blendfleet.kaggle_client import ACTIVE_STATES
 from blendfleet.log_stream import stream_progress
 from blendfleet.notebook_builder import RenderSettings
 from blendfleet.platform_paths import state_dir
@@ -968,6 +969,16 @@ class Backend(QObject):
         that sharing accounts lose access -- happens in the page, before
         this is ever called; this slot trusts that already happened and
         does not ask again.
+
+        Fix round 1 (Minor): refuses outright, like every other
+        consequential action here (require_free's own pattern), while a
+        tracked job still has a worker actively rendering FROM this
+        dataset. Matched via `scene_key`, never via Scene.blend_name's own
+        GUESSED filename (that class's docstring is explicit it may not
+        be the real one): `stem` below is derived from `slug` the exact
+        same way Fleet.launch_from_dataset derives it, so it can never
+        disagree with the scene_key a job launched from THIS dataset was
+        actually given.
         """
         accounts = self.store.list()
         owner_username = slug.split("/", 1)[0] if "/" in slug else ""
@@ -981,6 +992,25 @@ class Backend(QObject):
                 "that account under Manage accounts…, or confirm its "
                 "stored username matches what Kaggle reports (Instances -> "
                 "Set username), then try again.", "offline")
+            return
+
+        dataset_name = slug.split("/", 1)[-1]
+        stem = (dataset_name[: -len("-blend")]
+                if dataset_name.endswith("-blend") else dataset_name)
+        stem = _capped_stem(stem) or "scene"
+        rendering = sorted({
+            w.label for job in self.fleet_factory(accounts).load_jobs()
+            if job.scene_key == stem
+            for w in job.workers if w.state in ACTIVE_STATES})
+        if rendering:
+            self.notification.emit(
+                f"Cannot delete {slug!r} -- {', '.join(rendering)} "
+                f"{'is' if len(rendering) == 1 else 'are'} still rendering "
+                "it right now. Deleting a scene mid-render can break that "
+                "render for every account using it. Nothing has been "
+                "deleted -- wait for it to finish, cancel it, or use "
+                "'Stop tracking job' if Kaggle refuses to cancel, then "
+                "try deleting again.", "offline")
             return
 
         def work():

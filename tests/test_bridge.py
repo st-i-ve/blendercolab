@@ -1546,6 +1546,70 @@ def test_deleting_uses_the_owners_token_never_a_friends(qapp, tmp_path):
     assert "Deleted" in notes[0][0]
 
 
+def test_deleting_refuses_while_a_tracked_job_is_still_rendering_it(
+        qapp, tmp_path):
+    """Fix round 1, Minor: every other consequential action here goes
+    through a require_free-style guard (launch(), renderScene(), ...) --
+    deleteScene() previously never checked at all, even though deleting a
+    dataset out from under an active render can break that render for
+    every account using it."""
+    backend = make_backend(tmp_path, n=1)
+    fleet = backend.fleet_factory(backend.store.list())
+    fleet.save_jobs([FleetState(
+        job_id="job1", blend_name="remember.blend",
+        start_frame=1, end_frame=4,
+        workers=[WorkerState(label="acct0", username="user_0",
+                             kernel_slug="user_0/remember-render-1",
+                             frames=[1, 2], state="running")])])
+    calls = []
+
+    class DeleteClient(FakeClient):
+        def delete_dataset(self, slug):
+            calls.append(slug)
+
+    backend.fleet_factory = lambda accts: Fleet(
+        accts, lambda t: DeleteClient(t), tmp_path / "w")
+    notes = []
+    backend.notification.connect(lambda m, t: notes.append((m, t)))
+
+    backend.deleteScene("user_0/remember-blend")
+
+    assert calls == [], \
+        "must not delete while a tracked job is actively rendering it"
+    assert notes and notes[0][1] == "offline"
+    assert "acct0" in notes[0][0]
+    assert "delete-scene:user_0/remember-blend" not in backend._workers
+
+
+def test_deleting_is_not_blocked_by_a_finished_job_for_the_same_scene(
+        qapp, tmp_path):
+    """A completed job holds nobody -- Fleet.busy_labels()'s own contract
+    -- so it must not block deleting the scene it rendered."""
+    backend = make_backend(tmp_path, n=1)
+    accounts = backend.store.list()
+    fleet = backend.fleet_factory(accounts)
+    fleet.save_jobs([FleetState(
+        job_id="job1", blend_name="remember.blend",
+        start_frame=1, end_frame=4,
+        workers=[WorkerState(label="acct0", username="user_0",
+                             kernel_slug="user_0/remember-render-1",
+                             frames=[1, 2], state="complete",
+                             finished_at=1.0)])])
+    calls = []
+
+    class DeleteClient(FakeClient):
+        def delete_dataset(self, slug):
+            calls.append(slug)
+
+    backend.fleet_factory = lambda accts: Fleet(
+        accts, lambda t: DeleteClient(t), tmp_path / "w")
+
+    backend.deleteScene("user_0/remember-blend")
+    _settle(backend)
+
+    assert calls == ["user_0/remember-blend"]
+
+
 def test_deleting_refuses_when_no_configured_account_owns_it(qapp, tmp_path):
     """Never guessed -- Scene.owner (here, the slug's own owner segment)
     is what decides whose token to use, and if nobody configured matches

@@ -1037,11 +1037,47 @@ def _scene_confirm_html(page, scene_js):
 
 def test_the_delete_confirm_names_the_scene_and_says_it_is_permanent(
         loaded_page):
+    """Fix round 1, Important 2: the brief's own `"remember" in html`
+    assertion is vacuous -- the message's own boilerplate used to contain
+    the literal word "remember" ("-- and remember: any account...")
+    regardless of the scene's actual name, so this passed even with
+    `scene.name` dropped entirely (verified pre-fix: it still passed with
+    no `name` at all, rendering `Delete "undefined"?`). Asserted here
+    where the name actually has to appear -- the quoted title -- and the
+    wording no longer uses that word at all (see deleteConfirmMessage's
+    own comment)."""
     page, _ = loaded_page
     html = _scene_confirm_html(
         page,
         "{name:'remember', slug:'user0/remember-blend', sizeBytes:52428800}")
-    assert "remember" in html and "cannot be undone" in html
+    assert '"remember"' in html
+    assert "cannot be undone" in html
+
+
+def test_the_delete_confirm_names_a_distinctive_scene_name(loaded_page):
+    """A name chosen so it cannot collide with any word already in the
+    message's own boilerplate -- pins that the NAME shown is the one
+    passed in, not an accident of shared vocabulary with the wording
+    around it."""
+    page, _ = loaded_page
+    html = _scene_confirm_html(
+        page,
+        "{name:'xyzzy-plugh-42', slug:'user0/xyzzy-plugh-42-blend', "
+        "sizeBytes:1024}")
+    assert '"xyzzy-plugh-42"' in html
+
+
+def test_the_delete_confirm_never_says_the_word_remember(loaded_page):
+    """Pins Important 2's actual fix, not just the reworded test above:
+    the boilerplate itself must not reintroduce a word that happens to
+    collide with a real scene name used throughout this app's own tests
+    and docs."""
+    page, _ = loaded_page
+    html = _scene_confirm_html(
+        page,
+        "{name:'xyzzy-plugh-42', slug:'user0/xyzzy-plugh-42-blend', "
+        "sizeBytes:1024}")
+    assert "remember" not in html.lower()
 
 
 def test_the_delete_confirm_says_sharing_accounts_lose_access(loaded_page):
@@ -1102,6 +1138,40 @@ def test_an_undated_scene_never_shows_a_default_date(loaded_page):
     assert "1970" not in html and "Jan 1" not in html
 
 
+def _scene_updated_text(page, iso_js):
+    """Drive the page's own fmtSceneUpdated(iso) directly."""
+    out = {}
+    loop = QEventLoop()
+    page.runJavaScript(
+        "(() => { try { return String(fmtSceneUpdated("
+        + iso_js + ")); } catch (e) { return 'THREW ' + e; } })()",
+        lambda r: (out.__setitem__("v", r or ""), loop.quit()))
+    QTimer.singleShot(5000, loop.quit)
+    loop.exec()
+    assert "v" in out and not out["v"].startswith("THREW"), out.get("v")
+    return out["v"]
+
+
+def test_a_future_timestamp_is_not_dressed_up_as_just_now(loaded_page):
+    """Fix round 1, Minor: `Math.max(age, 0)` used to clamp clock skew
+    (a timestamp in the future) into a false "just now" reading -- one of
+    the fabricated readings this app forbids everywhere else."""
+    page, _ = loaded_page
+    text = _scene_updated_text(
+        page, "new Date(Date.now() + 3600000).toISOString()")
+    assert "just now" not in text
+    assert "unknown" in text
+
+
+def test_an_unparseable_timestamp_is_not_shown_as_nan(loaded_page):
+    """Fix round 1, Minor: an unparseable string used to produce
+    "NaNd ago" -- also a fabricated reading, not an honest unknown."""
+    page, _ = loaded_page
+    text = _scene_updated_text(page, "'not-a-real-date'")
+    assert "NaN" not in text
+    assert "unknown" in text
+
+
 def test_a_scene_never_claims_to_be_verified(loaded_page):
     """The "-blend" suffix is a naming CONVENTION, not proof (scenes.py's
     own docstring) -- the page must say so, not present it as confirmed."""
@@ -1114,6 +1184,23 @@ def test_no_scenes_shows_an_empty_state_not_a_blank_panel(loaded_page):
     page, _ = loaded_page
     html = _scenes_html(page, "({scenes: [], errors: {}})")
     assert "No scenes" in html
+
+
+def test_no_scenes_because_every_account_failed_says_unknown_not_empty(
+        loaded_page):
+    """Fix round 1, Important 1: with EVERY account erroring (a single
+    misconfigured account is the common case this hits), "No scenes on
+    Kaggle yet" is a false positive claim about what IS on Kaggle -- the
+    truth is that nothing could be READ, which is a different, weaker
+    claim. index.html's own comment on #scene-errors already says this
+    absence "must never be mistaken for 'nothing on Kaggle'"; this pins
+    that the empty-list sentence itself honours that, not just the
+    banner above it."""
+    page, _ = loaded_page
+    html = _scenes_html(page, "({scenes: [], "
+                         "errors: {acct0: 'rate limited'}})")
+    assert "No scenes on Kaggle yet" not in html
+    assert "unknown" in html
 
 
 def test_one_unreachable_account_does_not_hide_the_others_scenes_on_the_page(

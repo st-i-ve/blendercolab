@@ -984,8 +984,18 @@ document.getElementById('btn-collect').onclick = () => backend && backend.collec
    reason, with its own honest text for the genuinely-unknown case rather
    than falling through to some default date. */
 function fmtSceneUpdated(iso) {
-  if (!iso) return 'unknown — Kaggle reported no timestamp for it';
-  return fmtAge(Math.max((Date.now() - new Date(iso).getTime()) / 1000, 0));
+  const UNKNOWN = 'unknown — no usable timestamp for it';
+  if (!iso) return UNKNOWN;
+  const ageSeconds = (Date.now() - new Date(iso).getTime()) / 1000;
+  /* Fix round 1, Minor: `Math.max(ageSeconds, 0)` used to clamp a FUTURE
+     timestamp (clock skew between this machine and Kaggle) into a false
+     "just now" reading, and an unparseable string produced "NaNd ago" --
+     both are fabricated readings the rest of this app never allows
+     itself. Routed to the same honest-unknown text already used for a
+     genuinely absent timestamp, rather than letting fmtAge dress up
+     either one as a real age. */
+  if (!Number.isFinite(ageSeconds) || ageSeconds < 0) return UNKNOWN;
+  return fmtAge(ageSeconds);
 }
 
 /* Pure, like instanceCard()/renderFrameGrid() -- reads only the one scene
@@ -1034,9 +1044,25 @@ function renderScenes(json) {
     : '';
 
   const list = document.getElementById('scene-list');
-  list.innerHTML = scenes.length
-    ? scenes.map(sceneRowHtml).join('')
-    : '<div class="empty">No scenes on Kaggle yet — upload a .blend above to add one.</div>';
+  if (scenes.length) {
+    list.innerHTML = scenes.map(sceneRowHtml).join('');
+  } else if (errNames.length) {
+    /* Fix round 1, Important 1: "No scenes on Kaggle yet" is a claim
+       about what IS on Kaggle -- true only once every account was
+       actually reached. With every account (or the only configured one)
+       failing, what is really there is UNKNOWN, not empty; saying so
+       instead of the "nothing yet" sentence is the whole point of this
+       branch existing separately from the one below. The banner above
+       already names who failed and why -- this just makes sure the
+       empty-list sentence itself cannot be misread as "your Kaggle is
+       empty" when it might just be a rate limit or a stale token. */
+    list.innerHTML = '<div class="empty">Could not read the scene library '
+      + `for ${errNames.length} account(s) — see above. What is on Kaggle `
+      + 'right now is unknown until that is fixed. Retry, or check those '
+      + 'accounts under Manage accounts…</div>';
+  } else {
+    list.innerHTML = '<div class="empty">No scenes on Kaggle yet — upload a .blend above to add one.</div>';
+  }
 }
 
 /* The delete confirmation, factored out so it can be exercised directly
@@ -1044,14 +1070,24 @@ function renderScenes(json) {
    size, and says plainly that deleting is permanent and that any account
    this scene was shared with loses access -- Kaggle has no undo, trash or
    recycle bin for a deleted dataset (KaggleClient.delete_dataset's own
-   docstring). */
+   docstring).
+
+   Fix round 1, Important 2: used to close with "-- and remember: any
+   account...", which put the literal word "remember" into EVERY one of
+   these messages regardless of the scene's actual name -- and "remember"
+   is itself a name this exact app's own tests and docs use for an
+   example scene throughout. `"remember" in confirmMessage` therefore
+   passed even with the name dropped entirely (verified: it still passes
+   with `scene.name` undefined, rendering `Delete "undefined"?`). Reworded
+   to drop that word -- the scene's name only ever appears once, inside
+   the quoted title, which is where a test must look for it. */
 function deleteConfirmMessage(scene) {
   return `Delete "${scene.name}"?\n\n`
     + `This permanently deletes the ${fmtBytes(scene.sizeBytes)} dataset `
     + `${scene.slug} from Kaggle. This cannot be undone — Kaggle keeps no `
-    + `undo, trash or recycle bin for a deleted dataset — and remember: `
-    + 'any account this scene was shared with loses access to it the '
-    + 'moment it is gone.';
+    + 'undo, trash or recycle bin for a deleted dataset, and any account '
+    + 'this scene was shared with loses access to it the moment it is '
+    + 'gone.';
 }
 
 document.getElementById('scene-list').addEventListener('click', e => {
