@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 from requests.exceptions import HTTPError
 
-from blendfleet.kaggle_client import (KaggleClient, KaggleError,
+from blendfleet.kaggle_client import (DatasetInfo, KaggleClient, KaggleError,
                                       RevokedTokenError, verify_token)
 
 TOKEN = "KGAT_" + "a" * 32
@@ -63,12 +63,29 @@ class FakeListFilesResponse:
         self.dataset_files = files
 
 
+class FakeDataset:
+    """Stands in for one dataset_list() item -- only the fields DatasetInfo
+    (Task 8) actually reads: ref, title, total_bytes, last_updated,
+    is_private, owner_ref (confirmed live against the installed kagglesdk,
+    2026-08-12, a real account holding 8 datasets)."""
+
+    def __init__(self, ref, title, total_bytes, last_updated, is_private,
+                owner_ref):
+        self.ref = ref
+        self.title = title
+        self.total_bytes = total_bytes
+        self.last_updated = last_updated
+        self.is_private = is_private
+        self.owner_ref = owner_ref
+
+
 class FakeApi:
     """Stands in for KaggleApi. Raises what the real API actually raises."""
 
     def __init__(self, status="COMPLETE", dataset_ok=True, kernels=None,
                  create_error=None, version_error=None, list_files_ok=True,
-                 list_files_response=None):
+                 list_files_response=None, datasets=None,
+                 dataset_delete_error=None):
         self._status = status
         self._dataset_ok = dataset_ok
         self._list_files_ok = list_files_ok
@@ -77,9 +94,16 @@ class FakeApi:
             FakeKernel("stivestivewithani/remember-render")]
         self._create_error = create_error
         self._version_error = version_error
+        self._datasets = datasets if datasets is not None else []
+        self._dataset_delete_error = dataset_delete_error
         self.pushed = []
         self.created = []
         self.versioned = []
+        # Every call list_datasets() actually made -- lets a test assert on
+        # what was ASKED for (user=... not mine=True), not merely on what
+        # came back.
+        self.dataset_list_calls: list[dict] = []
+        self.dataset_delete_calls: list[tuple] = []
         # Every call this fake's kernels_output() received, in order --
         # lets a test assert on what fetch_log_tail actually ASKED for
         # (the file_pattern), not merely on the text that came back.
@@ -140,6 +164,24 @@ class FakeApi:
         if self._version_error is not None:
             raise self._version_error
         self.versioned.append((folder, version_notes, kw))
+
+    def dataset_list(self, sort_by=None, size=None, file_type=None,
+                     license_name=None, tag_ids=None, search=None,
+                     user=None, mine=False, page=1, max_size=None,
+                     min_size=None):
+        # Mirrors the real KaggleApi.dataset_list signature EXACTLY
+        # (confirmed live, 2026-08-12) -- deliberately no page_size
+        # parameter, so a regression that reintroduces it fails this fake
+        # with a TypeError exactly like the real one does.
+        self.dataset_list_calls.append({"user": user, "mine": mine})
+        return self._datasets
+
+    def dataset_delete(self, owner_slug, dataset_slug, no_confirm=False):
+        self.dataset_delete_calls.append(
+            (owner_slug, dataset_slug, no_confirm))
+        if self._dataset_delete_error is not None:
+            raise self._dataset_delete_error
+        return True
 
 
 def client(api=None, **kw):
@@ -355,6 +397,84 @@ def test_dataset_version_other_400_surfaces_real_message(tmp_path):
     message = str(exc_info.value)
     assert "Invalid dataset slug" in message
     assert "did not finish uploading" not in message
+
+
+# ------------------------------------------------- list/delete (Task 8) --
+# The scene library needs to show and manage an account's own datasets.
+# list_datasets() wraps dataset_list(user=...) (NOT mine=True -- see its
+# docstring); delete_dataset() wraps dataset_delete(..., no_confirm=True)
+# and must turn a bare Kaggle permission refusal into words, since deletion
+# only ever works with the dataset's OWNER token.
+
+def test_listing_datasets_reads_the_fields_the_ui_needs():
+    """The installed SDK takes page/max_size and NOT page_size -- passing
+    page_size raises TypeError, which is how the first probe of this
+    failed (2026-08-12)."""
+    last_updated = _dt.datetime(2026, 8, 1, 12, 0, 0)
+    ds = FakeDataset(ref="stivestivewithani/my-scene-blend",
+                     title="my scene", total_bytes=123456,
+                     last_updated=last_updated, is_private=True,
+                     owner_ref="stivestivewithani")
+    c, api = client(datasets=[ds])
+
+    got = c.list_datasets()
+
+    assert got == [DatasetInfo(ref="stivestivewithani/my-scene-blend",
+                               title="my scene", total_bytes=123456,
+                               last_updated=last_updated, is_private=True,
+                               owner="stivestivewithani")]
+    # user=<this account's own handle>, not mine=True -- see list_datasets'
+    # own docstring for why whoami()'s answer is the one trusted here.
+    assert api.dataset_list_calls == [
+        {"user": "stivestivewithani", "mine": False}]
+
+
+def test_deleting_a_dataset_never_prompts():
+    """no_confirm=True stops the CLI prompting at a terminal nobody is
+    watching. The confirmation is the app's own, in the UI, where the
+    consequence can be spelled out."""
+    c, api = client()
+
+    c.delete_dataset("stivestivewithani/old-scene-blend")
+
+    assert api.dataset_delete_calls == [
+        ("stivestivewithani", "old-scene-blend", True)]
+
+
+def test_deleting_reports_a_refusal_in_words():
+    """A friend's token cannot delete another account's dataset -- Kaggle
+    refuses with a bare 403 that, left unwrapped, reads exactly like a bug
+    in BlendFleet rather than what it actually is: the wrong account's
+    token was used for an owner-only call."""
+    error = RuntimeError(
+        "403 Client Error: Forbidden for url: "
+        "https://api.kaggle.com/v1/datasets.DatasetApiService/"
+        "DeleteDataset")
+    c, api = client(dataset_delete_error=error)
+
+    with pytest.raises(KaggleError) as excinfo:
+        c.delete_dataset("someone-else/their-scene-blend")
+
+    message = str(excinfo.value)
+    assert "permission" in message.lower()
+    assert "OWNER" in message
+    assert "Nothing was deleted" in message
+
+
+def test_deleting_reports_other_failures_without_claiming_permission(tmp_path):
+    """A failure that is NOT a 403 must not be mislabeled as a permission
+    problem -- that would send the user to switch accounts for a totally
+    unrelated error (e.g. a transient network blip)."""
+    error = RuntimeError("connection reset")
+    c, api = client(dataset_delete_error=error)
+
+    with pytest.raises(KaggleError) as excinfo:
+        c.delete_dataset("stivestivewithani/old-scene-blend")
+
+    message = str(excinfo.value)
+    assert "permission" not in message.lower()
+    assert "connection reset" in message
+    assert "Nothing was" in message
 
 
 # ------------------------------------------------------- upload preflight --

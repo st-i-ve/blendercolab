@@ -11,6 +11,7 @@ import os
 import shutil
 import threading
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
@@ -128,6 +129,27 @@ def _is_revoked_token(exc: BaseException) -> bool:
     # counts -- never a connection/SSL/timeout error, which carries none
     # of these phrases.
     return any(phrase in text for phrase in _AUTH_PHRASES)
+
+
+def _is_permission_denied(exc: BaseException) -> bool:
+    """True for a 403 on `dataset_delete` specifically, once
+    _is_revoked_token has already ruled out a dead token.
+
+    Unlike dataset_reachable's 403 (which can mean "shared but not yet
+    visible" -- see that method's own docstring), delete has no benign
+    reading of a 403 at all: Kaggle only ever accepts this call from the
+    dataset's OWNER token, so once the token itself is confirmed live,
+    a 403 here can only mean the account behind it does not own the
+    dataset -- a collaborator with full read access is refused exactly
+    the same way.
+    """
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status == 403:
+        return True
+    if status is not None:
+        return False        # a non-403 HTTP status is not a permission verdict
+    text = f"{exc}".lower()
+    return "403" in text or "forbidden" in text or "permission" in text
 
 
 def revoked_token_message(account: str | None, token: str) -> str:
@@ -286,6 +308,22 @@ class Quota:
     refresh_time: str
     source: str = "api"     # ALWAYS label the source: the settings page has
                             # been observed to disagree with this figure.
+
+
+@dataclass
+class DatasetInfo:
+    """One dataset_list() item, trimmed to the fields the scene library's
+    UI actually needs (Task 8). Field names and types are checked live
+    against the installed kagglesdk (2026-08-12, a real account holding 8
+    datasets) -- `owner` comes off `owner_ref`, not parsed out of `ref`,
+    because a future ref format change would silently break that parse.
+    """
+    ref: str                 # "owner/name"
+    title: str
+    total_bytes: int
+    last_updated: datetime
+    is_private: bool
+    owner: str
 
 
 def _with_env_token(token: str, construct: Callable):
@@ -681,6 +719,92 @@ class KaggleClient:
                                             delete_old_versions=False)
         except HTTPError as e:
             _raise_dataset_upload_error("Dataset versioning", e)
+
+    def list_datasets(self) -> list[DatasetInfo]:
+        """This account's own Kaggle datasets, for the scene library to
+        list and manage.
+
+        Passes `user=<this account's own handle>` rather than `mine=True`:
+        whoami() is already the one place this module trusts to say who an
+        account actually is (Kaggle exposes no "who am I" call -- see its
+        own docstring), so re-deriving the handle here keeps this listing
+        answering the same question delete_dataset() below checks, instead
+        of trusting the SDK's own session-bound `mine` flag to agree with
+        it independently.
+
+        The installed SDK's dataset_list() takes `page`/`max_size`, NOT
+        `page_size` -- passing page_size raises TypeError (confirmed live,
+        2026-08-12, and how the first probe of this failed). No pagination
+        is done here: a scene library's own dataset count is small, and a
+        second page is not something this task needs.
+        """
+        try:
+            who = self.whoami()
+            items = self.api.dataset_list(user=who) or []
+        except KaggleError:
+            raise      # whoami() already produced its own well-formed message
+        except Exception as e:
+            if _is_revoked_token(e):
+                raise RevokedTokenError(
+                    revoked_token_message(self.label, self.token)) from e
+            raise KaggleError(
+                f"could not list datasets: {e}. This is usually a "
+                "transient network or rate-limit problem -- retry; if it "
+                "keeps happening, confirm this account still has a valid "
+                "token under Manage accounts…") from e
+        return [
+            DatasetInfo(
+                ref=str(getattr(d, "ref", "")),
+                title=str(getattr(d, "title", "")),
+                total_bytes=int(getattr(d, "total_bytes", 0) or 0),
+                last_updated=getattr(d, "last_updated", None),
+                is_private=bool(getattr(d, "is_private", False)),
+                owner=str(getattr(d, "owner_ref", "")),
+            )
+            for d in items
+        ]
+
+    def delete_dataset(self, slug: str) -> None:
+        """Permanently delete Kaggle dataset `slug` ("owner/name").
+        IRREVERSIBLE -- Kaggle has no undo, trash, or recycle bin for a
+        deleted dataset.
+
+        Only the dataset's OWNER token can do this. Kaggle rejects the
+        call outright for any other account -- including a collaborator
+        this dataset has been explicitly SHARED with via a READER grant
+        (Task 3): read access and delete access are not the same
+        permission. Left unwrapped, that refusal is a bare permission
+        error that reads exactly like a bug in BlendFleet rather than what
+        it actually is -- the wrong account's token was used. Callers MUST
+        pass the owning account's KaggleClient here, never a friend's.
+
+        `no_confirm=True` is passed to the underlying call because the
+        kaggle package's own confirmation is a terminal `input()` prompt
+        -- nothing is reading stdin in this GUI app, so it would either
+        hang forever or silently default to "no". The real confirmation is
+        BlendFleet's own, in its UI, at the point where the irreversible
+        consequence can actually be explained to whoever clicks the button.
+        """
+        owner, name = slug.split("/", 1)
+        try:
+            self.api.dataset_delete(owner, name, no_confirm=True)
+        except Exception as e:
+            if _is_revoked_token(e):
+                raise RevokedTokenError(
+                    revoked_token_message(self.label, self.token)) from e
+            if _is_permission_denied(e):
+                raise KaggleError(
+                    f"could not delete dataset {slug!r}: Kaggle refused "
+                    f"with a permission error ({e}). Only the dataset's "
+                    "OWNER can delete it -- a collaborator's token is "
+                    "refused even with full read access. Nothing was "
+                    "deleted; switch to the account that owns this "
+                    "dataset and try again.") from e
+            raise KaggleError(
+                f"could not delete dataset {slug!r}: {e}. Nothing was "
+                "deleted. Retry, and if it keeps happening confirm this "
+                "account still has a valid token under Manage "
+                "accounts…") from e
 
     # ---------------- kernels ----------------
     def push_kernel(self, folder: Path) -> None:
