@@ -893,6 +893,50 @@ def test_cancel_worker_reports_a_removed_account_as_failure(blend, tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Must-fix 1: cancel_worker() used to start from self.load() -- the
+# single newest tracked job -- so a worker belonging to any OLDER job was
+# invisible to it. The per-job Cancel button (cancelInstance -> this
+# method) and the Instances-page Stop button both reach cancel_worker()
+# by label; with two scenes rendering at once, the account being stopped
+# is just as likely to be busy in an older job as in the newest one.
+# ---------------------------------------------------------------------------
+
+def test_cancel_worker_finds_the_worker_in_an_older_job_not_just_the_newest(
+        tmp_path):
+    """acct0's live kernel is in job-old; job-new (the only one load()
+    would see) belongs to a different account entirely. Cancelling acct0
+    must still find and stop it, not report "already stopped" while it
+    keeps running and billing."""
+    clients = {}
+    def factory(tok):
+        clients[tok] = FakeClient(tok, "running"); return clients[tok]
+    accts = accounts(2)
+    f = Fleet(accts, factory, tmp_path / "w")
+    f.save_jobs([
+        FleetState(job_id="job-old", blend_name="alpha.blend",
+                  start_frame=1, end_frame=4,
+                  workers=[WorkerState(label="a0", username="user_0",
+                                       kernel_slug="user_0/alpha-render-old",
+                                       frames=[1, 2, 3, 4], state="running")]),
+        FleetState(job_id="job-new", blend_name="beta.blend",
+                  start_frame=1, end_frame=4,
+                  workers=[WorkerState(label="a1", username="user_1",
+                                       kernel_slug="user_1/beta-render-new",
+                                       frames=[1, 2, 3, 4], state="running")]),
+    ])
+
+    result = f.cancel_worker("a0")
+
+    assert result is not None, (
+        "acct0's worker lives in the OLDER job, invisible to load() -- "
+        "this must still find and cancel it")
+    assert result.ok is True
+    assert clients[accts[0].token].cancelled == ["user_0/alpha-render-old"]
+    # The other job's account must never even be reached by this call.
+    assert accts[1].token not in clients
+
+
+# ---------------------------------------------------------------------------
 # Task 4: fetch_failure_log(label) -- the tail of the kernel log, fetched
 # only for a worker Kaggle has actually reported as "error". Never a
 # network call for a healthy worker.
@@ -943,6 +987,39 @@ def test_fetch_failure_log_with_unknown_label_returns_empty(blend, tmp_path):
     f.launch(blend, RenderSettings(1920, 1080, 128), 1, 4)
     f.poll()
     assert f.fetch_failure_log("does-not-exist") == ""
+
+
+def test_fetch_failure_log_finds_an_errored_worker_in_an_older_job(
+        tmp_path):
+    """Must-fix 1, same defect as cancel_worker(): this used to read only
+    load()'s single newest job, so an errored worker belonging to an
+    OLDER job silently returned "" as if it had never failed."""
+    clients = {}
+    accts = accounts(2)
+
+    def factory(tok):
+        text = ("RuntimeError: CUDA out of memory" if tok == accts[0].token
+                else "")
+        clients[tok] = LogFetchingClient(tok, "running", log_text=text)
+        return clients[tok]
+
+    f = Fleet(accts, factory, tmp_path / "w")
+    f.save_jobs([
+        FleetState(job_id="job-old", blend_name="alpha.blend",
+                  start_frame=1, end_frame=4,
+                  workers=[WorkerState(label="a0", username="user_0",
+                                       kernel_slug="user_0/alpha-render-old",
+                                       frames=[1, 2, 3, 4], state="error")]),
+        FleetState(job_id="job-new", blend_name="beta.blend",
+                  start_frame=1, end_frame=4,
+                  workers=[WorkerState(label="a1", username="user_1",
+                                       kernel_slug="user_1/beta-render-new",
+                                       frames=[1, 2, 3, 4], state="running")]),
+    ])
+
+    text = f.fetch_failure_log("a0")
+
+    assert text == "RuntimeError: CUDA out of memory"
 
 
 # ------------------------------------------------- dataset slug scrubbing --

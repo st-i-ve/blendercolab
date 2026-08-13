@@ -938,13 +938,20 @@ def test_cancelling_a_job_asks_for_confirmation_first(loaded_page):
     reshuffles every 30 seconds; one misclick used to end work other
     people's quota already paid for, immediately, with no undo.
     btn-forget confirms for an action that is strictly LESS destructive
-    (forgetting stops nothing) -- this must confirm too."""
+    (forgetting stops nothing) -- this must confirm too.
+
+    Must-fix 1: this now drives backend.cancelJob(jobId) -- the per-job
+    Cancel button used to loop cancelInstance() per account instead,
+    which only ever reaches Fleet.cancel_worker() -> load()'s single
+    newest job, so cancelling any OLDER of two live scenes cancelled
+    nothing at all and reported "already stopped" while its kernels kept
+    running and billing."""
     page, _ = loaded_page
     state = _two_scene_state()
     result = _preview_state(page,
         f"renderState(JSON.stringify({state}));"
         " const cancelled = [];"
-        " backend = { cancelInstance: label => cancelled.push(label) };"
+        " backend = { cancelJob: jobId => cancelled.push(jobId) };"
         " window.confirm = () => false;"
         " document.querySelector('[data-job-cancel=\"j-alpha\"]').click();"
         " const declined = cancelled.slice();"
@@ -956,8 +963,8 @@ def test_cancelling_a_job_asks_for_confirmation_first(loaded_page):
     import json as _json
     got = _json.loads(result)
     assert got["declined"] == [], "declining must not cancel anything"
-    assert got["accepted"] == ["acct0"], \
-        "accepting must cancel exactly this job's own accounts"
+    assert got["accepted"] == ["j-alpha"], \
+        "accepting must cancel exactly this job, by id, not every job"
 
 
 def test_confirmed_shared_and_never_checked_are_not_the_same_banner(

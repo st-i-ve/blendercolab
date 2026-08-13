@@ -1314,11 +1314,13 @@ document.getElementById('instances').addEventListener('click', e => {
   }
   const cancelBtn = e.target.closest('[data-job-cancel]');
   if (cancelBtn && backend && lastStateJson) {
-    /* No per-job cancel exists on the bridge (by design -- Kaggle's unit
-       of control is one session, see cancelInstance's own comment), so
-       this cancels exactly the accounts THIS job's own payload names,
-       one cancelInstance() call per account, rather than reaching for
-       cancelAll() and stopping every OTHER running scene too. */
+    /* backend.cancelJob(jobId) stops exactly this job's own accounts via
+       Fleet.cancel_job(), which searches every tracked job -- unlike
+       looping cancelInstance() per account, which only ever reaches
+       Fleet.cancel_worker() -> load()'s single newest job, so cancelling
+       any OLDER of two live scenes cancelled nothing and reported
+       "already stopped" while that account's kernel kept running and
+       billing (must-fix 1). */
     const jobId = cancelBtn.dataset.jobCancel;
     const job = (JSON.parse(lastStateJson).jobs || [])
       .find(j => j.jobId === jobId);
@@ -1336,7 +1338,7 @@ document.getElementById('instances').addEventListener('click', e => {
       + `This stops ${labels.length} account(s) rendering it: `
       + `${labels.join(', ')}.\n`
       + 'Restarting later spends that quota again.');
-    if (ok) labels.forEach(label => backend.cancelInstance(label));
+    if (ok) backend.cancelJob(jobId);
   }
 });
 document.getElementById('instances').addEventListener('keydown', e => {

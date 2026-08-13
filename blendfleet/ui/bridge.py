@@ -1218,6 +1218,47 @@ class Backend(QObject):
 
         self._start("cancel", work, "Cancelling the render", ok)
 
+    @Slot(str)
+    def cancelJob(self, job_id: str) -> None:
+        """Stop every account rendering job `job_id`, leaving every OTHER
+        tracked job's kernels running untouched -- the per-job counterpart
+        to cancelAll(), built on Fleet.cancel_job() (must-fix 1).
+
+        Fleet.cancel_job() was built in Task 5 for exactly this and had
+        ZERO production callers until now: the page's per-job Cancel
+        button was instead wired to one cancelInstance() call per account
+        in the job, which only ever reaches Fleet.cancel_worker() ->
+        load()'s single newest job. Cancelling any OLDER of two live
+        scenes therefore cancelled nothing at all and reported
+        "acct0 had already stopped." while that account's kernel kept
+        running and billing -- the worst outcome this app can produce.
+        Reports per-CancelResult outcomes exactly like cancelAll() above,
+        so a cancel that silently failed for one account is never
+        indistinguishable from one that actually stopped it.
+        """
+        accounts = self.store.list()
+
+        def work():
+            return self.fleet_factory(accounts).cancel_job(job_id)
+
+        def ok(results) -> None:
+            results = list(results or [])
+            failed = [r for r in results if not r.ok]
+            if not results:
+                self.notification.emit("Nothing to cancel.", "idle")
+            elif failed:
+                detail = "; ".join(f"{r.label}: {r.error}" for r in failed)
+                self.notification.emit(
+                    f"{len(failed)} of {len(results)} did NOT stop and may "
+                    f"still be spending quota — {detail}. Stop them by hand "
+                    f"at kaggle.com.", "offline")
+            else:
+                self.notification.emit(
+                    f"Cancelled {len(results)} account(s)", "idle")
+            self.poll()
+
+        self._start(f"cancel-job:{job_id}", work, "Cancelling the render", ok)
+
     @Slot()
     def forgetJob(self) -> None:
         """Stop tracking a job this app can no longer control.

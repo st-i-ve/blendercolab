@@ -593,12 +593,14 @@ class Fleet:
         """Replace `st` among the tracked jobs, matched by job_id, IN
         PLACE -- appending only if no job with this id exists yet.
 
-        load() answers with the LAST job in the list, and every one of
-        active_workers/poll/cancel_all/cancel_worker/fetch_failure_log and
-        forget_job()'s default all go through load(). Re-appending a
-        re-saved job (rather than replacing it where it already sits)
-        would silently move it to the end and repoint every one of those
-        at the wrong job the moment more than one job is tracked at once.
+        load() answers with the LAST job in the list, and active_workers,
+        poll and forget_job()'s default all go through load() -- cancel_worker
+        and fetch_failure_log used to as well (must-fix 1's other half; both
+        now search load_jobs() so a non-newest job's worker is not silently
+        invisible to them). Re-appending a re-saved job (rather than
+        replacing it where it already sits) would silently move it to the
+        end and repoint every remaining load()-based caller at the wrong
+        job the moment more than one job is tracked at once.
         """
         jobs = self.load_jobs()
         for i, j in enumerate(jobs):
@@ -1858,12 +1860,20 @@ class Fleet:
         of this method is stopping somebody's GPU quota from draining, and
         a cancel that quietly does nothing defeats that just as badly here
         as it would in cancel_all().
+
+        Searches load_jobs() -- every tracked job -- not load()'s single
+        newest one (must-fix 1): the Instances-page Stop button and
+        cancelInstance() both reach this method by label, and with two
+        scenes live at once the account being stopped is just as likely
+        to belong to an OLDER job as to the newest. Reading only load()
+        found nothing for any but the newest job's workers and reported
+        "already stopped" for a kernel this call never even looked at --
+        while it kept running and billing.
         """
-        st = self.load()
-        if st is None:
-            return None
-        worker = next((w for w in st.workers if w.label == label), None)
-        if worker is None or worker.state not in ACTIVE_STATES:
+        worker = next(
+            (w for j in self.load_jobs() for w in j.workers
+             if w.label == label and w.state in ACTIVE_STATES), None)
+        if worker is None:
             return None
         acct = next((a for a in self.accounts if a.label == label), None)
         if acct is None:
@@ -1896,12 +1906,16 @@ class Fleet:
         polling path. Returns "" (not an error) for no job, no such
         worker, or a worker that is not (or no longer) in "error": there
         is genuinely nothing to fetch.
+
+        Searches load_jobs() -- every tracked job, newest first -- not
+        load()'s single newest one (must-fix 1, same defect as
+        cancel_worker() above): an errored worker belonging to an OLDER
+        job returned "" here, silently, as if it had never failed at all.
         """
-        st = self.load()
-        if st is None:
-            return ""
-        worker = next((w for w in st.workers if w.label == label), None)
-        if worker is None or worker.state != "error":
+        worker = next(
+            (w for j in reversed(self.load_jobs()) for w in j.workers
+             if w.label == label and w.state == "error"), None)
+        if worker is None:
             return ""
         acct = next((a for a in self.accounts if a.label == label), None)
         if acct is None:

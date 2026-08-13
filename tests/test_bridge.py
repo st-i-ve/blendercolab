@@ -1083,6 +1083,97 @@ def test_launch_refuses_when_every_account_is_already_busy(qapp, tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Must-fix 1: cancelJob(job_id) -- Fleet.cancel_job() was built in Task 5
+# for exactly this and had ZERO production callers until now. The page's
+# per-job Cancel button used to loop cancelInstance() (-> Fleet.cancel_worker()
+# -> load()'s single newest job) once per account, so cancelling the OLDER
+# of two live jobs cancelled nothing and reported "already stopped" while
+# that job's kernels kept running and billing.
+# ---------------------------------------------------------------------------
+
+def _two_job_backend_for_cancel(tmp_path):
+    """acct0 renders job-old (still running); acct1 renders job-new
+    (also still running) -- two LIVE jobs at once, the exact shape
+    per-job Cancel exists for."""
+    backend = make_backend(tmp_path, n=2)
+    fleet = backend.fleet_factory(backend.store.list())
+    fleet.save_jobs([
+        FleetState(job_id="job-old", blend_name="alpha.blend",
+                  start_frame=1, end_frame=3,
+                  workers=[WorkerState(label="acct0", username="user_0",
+                                       kernel_slug="user_0/alpha-render-1",
+                                       frames=[1, 2, 3], state="running")]),
+        FleetState(job_id="job-new", blend_name="beta.blend",
+                  start_frame=1, end_frame=2,
+                  workers=[WorkerState(label="acct1", username="user_1",
+                                       kernel_slug="user_1/beta-render-1",
+                                       frames=[1, 2], state="running")]),
+    ])
+    return backend
+
+
+def test_cancel_job_stops_only_that_jobs_own_accounts(qapp, tmp_path):
+    """Cancelling job-old (the OLDER of two live jobs) must reach acct0's
+    kernel and must never touch acct1's still-running job-new -- exactly
+    the case where the old cancelInstance()-loop wiring found nothing."""
+    backend = _two_job_backend_for_cancel(tmp_path)
+    cancelled = []
+
+    class RecordingClient:
+        def __init__(self, token):
+            self.token = token
+        def cancel(self, slug):
+            cancelled.append(slug)
+            return True
+        def status(self, slug):
+            from blendfleet.kaggle_client import KernelStatus
+            return KernelStatus(state="running")
+
+    fleet = backend.fleet_factory(backend.store.list())
+    fleet.client_factory = RecordingClient
+    backend.fleet_factory = lambda accounts: fleet
+
+    notes = []
+    backend.notification.connect(lambda m, t: notes.append((m, t)))
+
+    backend.cancelJob("job-old")
+    _settle(backend)
+
+    assert cancelled == ["user_0/alpha-render-1"], (
+        f"must cancel exactly job-old's own kernel, not job-new's: {cancelled}")
+    assert notes and "1" in notes[0][0] and "Cancelled" in notes[0][0]
+
+
+def test_cancel_job_reports_a_failed_cancel_by_name(qapp, tmp_path):
+    """A silently-failed per-job cancel is the same worst-case outcome as
+    a silently-failed cancelAll() -- must be named, never swallowed."""
+    backend = _two_job_backend_for_cancel(tmp_path)
+
+    class RefusingClient:
+        def __init__(self, token):
+            self.token = token
+        def cancel(self, slug):
+            return False
+        def status(self, slug):
+            from blendfleet.kaggle_client import KernelStatus
+            return KernelStatus(state="running")
+
+    fleet = backend.fleet_factory(backend.store.list())
+    fleet.client_factory = RefusingClient
+    backend.fleet_factory = lambda accounts: fleet
+
+    notes = []
+    backend.notification.connect(lambda m, t: notes.append((m, t)))
+
+    backend.cancelJob("job-old")
+    _settle(backend)
+
+    assert notes
+    assert notes[0][1] == "offline"
+    assert "acct0" in notes[0][0]
+
+
+# ---------------------------------------------------------------------------
 # collect() -- scoped to exactly ONE job (Fix round 1, Important 1+2):
 # `load_jobs()` is never pruned except one job at a time via forget_job(),
 # so collecting from EVERY tracked job with no filter grows unbounded and
