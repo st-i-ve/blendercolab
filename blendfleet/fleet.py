@@ -1728,10 +1728,36 @@ class Fleet:
                     # dashboard can surface, exactly mirroring how
                     # _resolve_clients() marks the same account dead on
                     # the launch side.
+                    #
+                    # was_active is read BEFORE w.state is overwritten
+                    # below (must-fix 5): a worker that was queued/running
+                    # the moment its token died has a kernel that may
+                    # still be executing on Kaggle RIGHT NOW, with nobody
+                    # able to cancel or collect it through this app any
+                    # more -- the orphaned-kernel case in its purest form.
+                    # revoked_token_message() alone only talks about the
+                    # future ("nothing can run ... until it is replaced"),
+                    # which reads as a claim about the CURRENT kernel too
+                    # unless this appends the actual state of that kernel,
+                    # names it, and points at the one place left to check
+                    # or stop it. A worker that was already finished needs
+                    # no such warning -- there is no live kernel to lose
+                    # track of.
+                    was_active = w.state in ACTIVE_STATES
                     acct.verified = False
                     acct.revoked = True
                     w.state = "error"
-                    w.message = revoked_token_message(w.label, acct.token)
+                    message = revoked_token_message(w.label, acct.token)
+                    if was_active:
+                        message += (
+                            f" The kernel {w.kernel_slug!r} was still "
+                            "running when this happened and may STILL be "
+                            "running right now -- with this token dead, "
+                            "BlendFleet can no longer cancel or collect "
+                            "it. Check https://www.kaggle.com/code/"
+                            f"{w.kernel_slug} and stop it there by hand "
+                            "if it is still active.")
+                    w.message = message
                     if not w.finished_at:
                         w.finished_at = time.time()
                     continue

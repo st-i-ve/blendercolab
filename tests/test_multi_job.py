@@ -548,6 +548,62 @@ def test_a_revoked_token_during_poll_marks_the_account_revoked(fleet):
     assert acct0.verified is False
 
 
+# ---------------------------------------------------------------------------
+# Must-fix 5: revoked_token_message() alone only talks about the FUTURE
+# ("nothing can run ... until it is replaced"), which reads as a claim
+# about the kernel that is running RIGHT NOW unless poll_all() says
+# otherwise -- the orphaned-kernel case in its purest form. A worker that
+# was queued/running the moment its token died may still be executing on
+# Kaggle, with nobody able to cancel or collect it through this app any
+# more.
+# ---------------------------------------------------------------------------
+
+def test_a_revoked_token_during_poll_names_the_still_running_kernel(fleet):
+    from blendfleet.kaggle_client import RevokedTokenError
+
+    class Client:
+        def __init__(self, token): self.token = token
+        def status(self, slug):
+            raise RevokedTokenError("dead token")
+    fleet.client_factory = Client
+    fleet.save_jobs([job("alpha", ["a0"], "j1")])   # worker starts "queued"
+
+    jobs = fleet.poll_all()
+
+    message = jobs[0].workers[0].message
+    kernel_slug = jobs[0].workers[0].kernel_slug
+    assert kernel_slug in message, "must name the actual kernel slug"
+    assert f"https://www.kaggle.com/code/{kernel_slug}" in message, (
+        "must point at the one place left to check or stop it")
+    assert "may" in message and "running" in message, (
+        "must say plainly that the kernel may still be running")
+
+
+def test_a_revoked_token_on_an_already_finished_worker_gets_no_kernel_warning(
+        fleet):
+    """The other half: a worker that was already complete before its
+    token died has no live kernel to lose track of, so the extra warning
+    must not be tacked onto every revoked-token message regardless."""
+    from blendfleet.kaggle_client import RevokedTokenError
+
+    st = job("alpha", ["a0"], "j1")
+    st.workers[0].state = "complete"
+    st.workers[0].finished_at = 1000.0
+    fleet.save_jobs([st])
+
+    class Client:
+        def __init__(self, token): self.token = token
+        def status(self, slug):
+            raise RevokedTokenError("dead token")
+    fleet.client_factory = Client
+
+    jobs = fleet.poll_all()
+
+    message = jobs[0].workers[0].message
+    assert jobs[0].workers[0].kernel_slug not in message
+    assert "may still be running" not in message
+
+
 def test_a_revoked_token_during_poll_does_not_leave_the_account_looking_busy_forever(
         fleet):
     """The failure poll_all()'s own docstring says it exists to fix
