@@ -460,6 +460,20 @@ def test_launch_refuses_with_no_accounts(blend, tmp_path):
         f.launch(blend, RenderSettings(1920, 1080, 128), 1, 4)
 
 
+def test_launch_with_an_explicitly_empty_selection_is_refused_not_widened(
+        blend, tmp_path):
+    """IMPORTANT 2: accounts=None means "the whole fleet"; accounts=[] means
+    the caller asked for nobody (every per-instance checkbox unticked) --
+    it must never be silently widened back out to the whole fleet, or
+    unticking everyone and hitting Render would start a render on every
+    account anyway."""
+    accts = accounts(4)
+    f = Fleet(accts, lambda t: FakeClient(t), tmp_path / "w")
+    with pytest.raises(ValueError, match="account"):
+        f.launch(blend, RenderSettings(1920, 1080, 128), 1, 4, accounts=[])
+    assert f.load() is None, "nothing was started, so no state may be written"
+
+
 # ---------------------------------------------------------------------------
 # CRITICAL C1: a partial launch must never orphan already-started kernels.
 # push_kernel ALWAYS starts a run, so every kernel pushed before the failure
@@ -580,6 +594,58 @@ def test_unreachable_account_does_not_wedge_launch(blend, tmp_path):
     f.launch(blend, RenderSettings(1920, 1080, 128), 1, 4)
     f.forget_job()
     f.launch(blend, RenderSettings(1920, 1080, 128), 5, 8)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# Task 4 review, fix round 1 -- IMPORTANT 3: nothing exercised launch()'s
+# own accounts= threading (as opposed to busy_labels/require_free/
+# free_accounts, which the earlier Task 4 tests already cover). This is
+# exactly what would have caught IMPORTANT 1 below.
+# ---------------------------------------------------------------------------
+
+def test_launch_on_a_subset_pushes_only_that_subset(blend, tmp_path):
+    """Regression for IMPORTANT 1: a fresh upload (dataset_slug=None, the
+    realistic default -- Task 6 calls launch() exactly this way for any
+    scene not already uploaded this session) used to KeyError inside
+    prepare_dataset() for ANY proper subset that excluded self.accounts[0]
+    or self.accounts[1:] members not in the subset, because
+    prepare_dataset() shares with self.accounts[1:] regardless of which
+    subset renders THIS job."""
+    accts = accounts(4)
+    f = Fleet(accts, lambda t: FakeClient(t), tmp_path / "w")
+    subset = [accts[2], accts[3]]
+
+    st = f.launch(blend, RenderSettings(1920, 1080, 128), 1, 8,
+                  accounts=subset)
+
+    assert [w.label for w in st.workers] == ["a2", "a3"]
+    assert sorted(fr for w in st.workers for fr in w.frames) == list(range(1, 9))
+
+
+def test_launch_on_a_subset_never_resolves_a_client_outside_it(blend, tmp_path):
+    """The render-path resolution (used to build and push each worker's own
+    kernel) must stay scoped to the requested subset -- resolving an
+    account nobody asked for is a wasted network call at best and a
+    spurious failure (a revoked token on an account not being used) at
+    worst. An already-known dataset_slug is passed so the dataset step
+    -- which, unlike this, is deliberately fleet-wide (see IMPORTANT 1) --
+    is skipped entirely, isolating exactly the render-path scoping."""
+    accts = accounts(4)
+    resolved: list[str] = []
+
+    def factory(tok):
+        resolved.append(tok)
+        return FakeClient(tok)
+
+    f = Fleet(accts, factory, tmp_path / "w")
+    subset = [accts[2], accts[3]]
+    dataset_slug = "user_2/remember-blend"
+    _UPLOADED_SLUGS[dataset_slug] = BLEND_SIZE
+
+    f.launch(blend, RenderSettings(1920, 1080, 128), 1, 8,
+             dataset_slug=dataset_slug, accounts=subset)
+
+    assert set(resolved) == {accts[2].token, accts[3].token}
 
 
 # ---------------------------------------------------------------------------

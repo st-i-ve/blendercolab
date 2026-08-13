@@ -506,7 +506,9 @@ class Fleet:
             raise FleetBusyError(
                 f"these accounts are already busy: {detail}. Nothing has "
                 "been started. Wait for that render to finish, cancel it, "
-                "or choose different accounts for this scene.")
+                "choose different accounts for this scene, or -- if Kaggle "
+                "is refusing the cancel, which does happen -- use 'Stop "
+                "tracking job' so this app stops refusing on its account.")
 
     def _resolve_clients(
             self, accounts: list[Account] | None = None) -> tuple[dict, dict]:
@@ -946,7 +948,13 @@ class Fleet:
         (the dashboard's upload view) shows real upload progress instead of
         the UI thread blocking silently for however long a 60+ MB PUT takes.
         """
-        accounts = accounts or self.accounts
+        # `is None`, not `or`: accounts=None means "the whole fleet", but
+        # accounts=[] means the caller explicitly asked for nobody (e.g.
+        # every per-instance checkbox unticked) -- `or` would silently
+        # widen that empty selection back out to every configured account
+        # and start a render nobody asked for. An empty list instead falls
+        # through to the guard just below, with a real error message.
+        accounts = self.accounts if accounts is None else accounts
         if not accounts:
             raise ValueError("add at least one account before launching")
 
@@ -983,8 +991,28 @@ class Fleet:
         # evidence, and a stale or half-replaced dataset would otherwise
         # render the wrong scene on somebody else's quota.
         if dataset_slug is None:
+            # Render scope and sharing scope are deliberately NOT the same
+            # thing. `accounts` is who renders THIS job; prepare_dataset()
+            # shares the freshly-uploaded dataset with self.accounts[1:] --
+            # every OTHER configured account, full stop -- because a friend
+            # sitting this job out may well render a later job against the
+            # very same dataset, and re-sharing per launch would mean
+            # re-granting the same reader access over and over for no
+            # reason. That means prepare_dataset() indexes clients/
+            # usernames by self.accounts[0]/[1:], not by `accounts` -- so
+            # it must be handed a resolution that covers the WHOLE fleet,
+            # not just this launch's subset, or it KeyErrors on the very
+            # first account this launch didn't ask for. Reuse the
+            # resolution above when it already covers everyone (the common
+            # case: accounts=None); otherwise resolve the rest of the
+            # fleet too.
+            if {a.label for a in accounts} == {a.label for a in self.accounts}:
+                dataset_clients, dataset_usernames = clients, usernames
+            else:
+                dataset_clients, dataset_usernames = self._resolve_clients()
             dataset_slug = self.prepare_dataset(
-                blend, on_progress, clients=clients, usernames=usernames)
+                blend, on_progress, clients=dataset_clients,
+                usernames=dataset_usernames)
         else:
             expected_size = blend.stat().st_size
             for account in accounts:
