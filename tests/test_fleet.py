@@ -1056,7 +1056,9 @@ def test_saving_state_is_atomic(tmp_path):
     fleet._save(FleetState(job_id="j", blend_name="s.blend", start_frame=1,
                            end_frame=2, workers=[]))
     path = fleet._state_path()
-    assert json.loads(path.read_text(encoding="utf-8"))["job_id"] == "j"
+    # Task 3: the on-disk shape became {"jobs": [...]} so more than one job
+    # can be tracked at once -- job_id now lives inside that list.
+    assert json.loads(path.read_text(encoding="utf-8"))["jobs"][0]["job_id"] == "j"
     assert not list(path.parent.glob("*.tmp")), "a temporary file was left"
 
 

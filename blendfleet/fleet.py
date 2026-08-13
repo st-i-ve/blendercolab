@@ -211,6 +211,16 @@ class FleetState:
     # job started before this was recorded.
     started_at: float = 0.0
 
+    @property
+    def scene_key(self) -> str:
+        """This job's scene, as a filesystem- and slug-safe stem.
+
+        Used for the output folder and as the job's identity in the UI.
+        Derived from blend_name rather than stored, so it cannot drift
+        from the scene actually being rendered.
+        """
+        return slugify_stem(Path(self.blend_name).stem) or "scene"
+
 
 @dataclass
 class CancelResult:
@@ -283,36 +293,80 @@ class Fleet:
     def _state_path(self) -> Path:
         return state_dir() / STATE_FILE
 
-    def _save(self, st: FleetState) -> None:
-        _atomic_write(self._state_path(), json.dumps(asdict(st), indent=2))
+    def save_jobs(self, jobs: list[FleetState]) -> None:
+        """Persist every tracked job, oldest first.
 
-    def load(self) -> FleetState | None:
+        Written atomically for the same reason as before: a half-written
+        state file reads back as an unrelated error from wherever it is
+        next parsed, and with two jobs it would now orphan twice as many
+        running kernels.
+        """
+        _atomic_write(self._state_path(),
+                      json.dumps({"jobs": [asdict(j) for j in jobs]}, indent=2))
+
+    def load_jobs(self) -> list[FleetState]:
+        """Every tracked job. Empty when there is nothing running.
+
+        Tolerates the pre-multi-job format -- one FleetState at the top
+        level -- because an in-flight render must survive the upgrade;
+        dropping it would orphan kernels that are running right now.
+        """
         p = self._state_path()
         if not p.exists():
-            return None
+            return []
         raw = p.read_text(encoding="utf-8").strip()
         if not raw:
             # An empty state file is what a half-written save leaves
             # behind, and json.loads answers it with "Expecting value:
             # line 1 column 1 (char 0)" -- which surfaced as an unrelated
-            # upload failure. No tracked job is the truthful reading, and
+            # upload failure. No tracked jobs is the truthful reading, and
             # it is also the recoverable one.
-            return None
+            return []
         try:
             d = json.loads(raw)
         except json.JSONDecodeError:
-            return None
-        d["workers"] = [WorkerState(**w) for w in d["workers"]]
-        return FleetState(**d)
+            return []
+        raw_jobs = d.get("jobs") if isinstance(d, dict) and "jobs" in d else [d]
+        jobs = []
+        for entry in raw_jobs:
+            try:
+                entry = dict(entry)
+                entry["workers"] = [WorkerState(**w)
+                                    for w in entry.get("workers", [])]
+                jobs.append(FleetState(**entry))
+            except (TypeError, ValueError):
+                continue    # one unreadable job must not hide the others
+        return jobs
 
-    def forget_job(self) -> list[WorkerState]:
-        """Drop the tracked job WITHOUT stopping anything on Kaggle.
+    def load(self) -> FleetState | None:
+        """The most recent job, or None.
+
+        Kept because every existing caller uses it. "Most recent" rather
+        than "the only one" -- with two jobs live, an arbitrary pick would
+        be a silent bug.
+        """
+        jobs = self.load_jobs()
+        return jobs[-1] if jobs else None
+
+    def _save(self, st: FleetState) -> None:
+        """Replace `st` among the tracked jobs, matched by job_id."""
+        jobs = [j for j in self.load_jobs() if j.job_id != st.job_id]
+        jobs.append(st)
+        self.save_jobs(jobs)
+
+    def forget_job(self, job_id: str | None = None) -> list[WorkerState]:
+        """Drop one tracked job WITHOUT stopping anything on Kaggle.
 
         The escape hatch for a genuine deadlock: Kaggle reports a kernel as
         still active but refuses the cancel request, so cancel_all() cannot
         clear it and launch() keeps refusing because a job is "still
         running". Without this the app is wedged with no way out but
         editing state by hand.
+
+        `job_id` defaults to the most recent job, matching load()'s own
+        "most recent" answer -- but any job_id may be named explicitly, so
+        forgetting one stuck job does not force forgetting a different one
+        that is fine.
 
         This is deliberately NOT a cancel and must never be worded as one.
         Whatever is running on Kaggle keeps running, and keeps spending
@@ -322,13 +376,15 @@ class Fleet:
         kaggle.com, and the returned workers are exactly what it has
         stopped being able to reach.
         """
-        st = self.load()
-        if st is None:
+        jobs = self.load_jobs()
+        if not jobs:
             return []
-        path = self._state_path()
-        if path.exists():
-            path.unlink()
-        return list(st.workers)
+        target = (jobs[-1] if job_id is None
+                  else next((j for j in jobs if j.job_id == job_id), None))
+        if target is None:
+            return []
+        self.save_jobs([j for j in jobs if j.job_id != target.job_id])
+        return list(target.workers)
 
     def active_workers(self) -> list[WorkerState]:
         """Workers whose kernel Kaggle currently reports as queued/running.
