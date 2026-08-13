@@ -126,11 +126,54 @@ Fakes for `dataset_list`/`dataset_delete` in the existing
 Page tests (`test_web_page.py`) for the list rendering, the empty state, and
 that the delete confirm names the scene.
 
+## The seam for multi-scene rendering
+
+Added after the fact (2026-08-12), when the follow-up question arrived:
+*"i decide machine a b and c render this scene and d e f render another
+scene, can we also have that provision"*.
+
+That is a bigger change than this spec — the app is single-job by
+construction. `fleet.json` is a single slot and `launch()` refuses to start
+while a job is live, because overwriting it would leave running kernels
+uncancellable and uncollectable, spending other people's quota. Making jobs
+concurrent means a list of jobs, each owning a subset of accounts, and
+per-job poll / collect / cancel / dashboard. It is its own project.
+
+**But one cheap change here makes it much cheaper later**: `launch` and
+`launch_from_dataset` take an explicit `accounts` argument instead of
+assuming `self.accounts`. Nothing else changes yet — the caller passes every
+account, and behaviour is identical — but "which machines render this
+scene" stops being implicit, which is the whole difficulty of the later
+work.
+
+Deliberately NOT done now, so this stays one reviewable change:
+
+- multiple concurrent jobs in the state file
+- per-job dashboard grouping
+- assigning specific accounts to a scene in the UI
+
+## Output folders
+
+Also from that question: where do two scenes' results go?
+
+Today `collect` writes `<dest>/<stem>_0001.png`, so two scenes rendering at
+once would write into the same folder — and two scenes whose `.blend` files
+share a stem would overwrite each other outright.
+
+`collect` gains a per-scene subfolder: `<dest>/<stem>/<stem>_0001.png`. It
+costs nothing while there is one job, and it is a precondition for two.
+Worth doing now rather than as part of the larger change, because it is a
+one-line difference in where files land and a large difference in whether
+the later work can collide.
+
 ## Not in scope
 
 - Renaming or re-uploading over an existing scene.
-- Folders. The list is flat and sorted by date; "folder system view" was the
-  user's phrase for browsability, and a flat list of a handful of scenes is
-  browsable without inventing a hierarchy to maintain.
+- Nested folders. The scene list is flat and sorted by date; "folder system
+  view" was the user's phrase for browsability, and a flat list of a handful
+  of scenes is browsable without inventing a hierarchy to maintain. Output
+  folders (above) are a different thing: one directory per scene, not a tree.
 - Frame previews for old renders — outputs expire with their kernels and are
-  a separate concern from scenes.
+  a separate concern from scenes. (Previewing a frame of the CURRENT job
+  shipped separately, 2026-08-12.)
+- Multiple concurrent jobs — see the seam above.
