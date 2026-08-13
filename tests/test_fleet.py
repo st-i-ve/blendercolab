@@ -1375,3 +1375,38 @@ def test_the_stages_reported_say_whether_it_uploaded_or_skipped(blend, tmp_path)
     fleet.prepare_dataset(blend, on_stage=lambda k, d: seen.append(k))
     assert "already-uploaded" in seen
     assert "uploading" not in seen
+
+
+# ---------------------------------------------------------------------------
+# Must-fix 2: start_workers() used to guard with active_workers(), which
+# reads self.load() -- the single newest tracked job -- and asks Kaggle
+# LIVE. With an OLDER job still rendering and a NEWER job already
+# finished, that guard passed and pushed a second warm kernel onto an
+# account that was already mid-render, double-billing it. No test in
+# this file called start_workers() at all before this.
+# ---------------------------------------------------------------------------
+
+def test_start_workers_refuses_an_account_busy_in_an_older_job(blend, tmp_path):
+    """a0 is mid-render in job-old; job-new (the only one active_workers()
+    -> load() would ever see) is a0's own job already complete, and a1's
+    account is untouched by either. Starting a0 warm must be refused;
+    starting a1 (never busy in any job) must still be allowed."""
+    accts = accounts(2)
+
+    def factory(tok):
+        state = "running" if tok == accts[0].token else "complete"
+        return FakeClient(tok, state)
+
+    f = Fleet(accts, factory, tmp_path / "w")
+    f.launch(blend, RenderSettings(1920, 1080, 128), 1, 4,
+            accounts=[accts[0]])
+    f.poll()   # a0's worker becomes "running" -- an OLDER job now
+    f.launch(blend, RenderSettings(1920, 1080, 128), 5, 8,
+            accounts=[accts[1]])
+    f.poll()   # a1's worker becomes "complete" -- the NEWEST job
+
+    with pytest.raises(FleetBusyError, match="a0"):
+        f.start_workers(["a0"], RenderSettings(1920, 1080, 128), "u/scene")
+
+    st = f.start_workers(["a1"], RenderSettings(1920, 1080, 128), "u/scene")
+    assert [w.label for w in st.workers] == ["a1"]

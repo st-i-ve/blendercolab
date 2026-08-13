@@ -28,7 +28,8 @@ from blendfleet.accounts import Account
 from blendfleet.assignment import assign_frames
 from blendfleet.dataset_sync import sync_blend
 from blendfleet.kaggle_client import (
-    ACTIVE_STATES, RevokedTokenError, revoked_token_message)
+    ACTIVE_STATES, PENDING_STATES, TERMINAL_STATES, RevokedTokenError,
+    revoked_token_message)
 from blendfleet.notebook_builder import RenderSettings, build, build_probe
 from blendfleet.platform_paths import state_dir
 
@@ -733,14 +734,19 @@ class Fleet:
         return live
 
     def busy_labels(self) -> set[str]:
-        """Accounts with a worker still active in some tracked job.
+        """Accounts with a worker still holding a job in some tracked job.
 
-        Active means ACTIVE_STATES (queued/running) -- a completed job
-        holds nobody, so the fleet is reusable the moment its frames are
-        done rather than when the user gets round to collecting.
+        PENDING_STATES, not ACTIVE_STATES (must-fix 3): a kernel that has
+        been pushed but whose Kaggle session does not exist yet reports
+        "not_started", which is NOT the same thing as finished -- treating
+        it as "not active, therefore free" let a just-pushed render's
+        account be handed to a second launch before the first had even
+        started. A completed job (TERMINAL_STATES) holds nobody, so the
+        fleet is reusable the moment its frames are done rather than when
+        the user gets round to collecting.
         """
         return {w.label for j in self.load_jobs() for w in j.workers
-                if w.state in ACTIVE_STATES}
+                if w.state in PENDING_STATES}
 
     def free_accounts(self) -> list[Account]:
         """Configured accounts not currently rendering anything."""
@@ -754,11 +760,17 @@ class Fleet:
         launch while ANY job is live is what made two scenes impossible,
         but launching a second kernel on an account that is already
         rendering would spend its quota twice for the same output.
+
+        PENDING_STATES, not ACTIVE_STATES (must-fix 3, same reasoning as
+        busy_labels()): a kernel just pushed for an OLDER job can sit at
+        "not_started" for a poll or two before Kaggle's status API can see
+        it, and that account must stay held for exactly that window, or a
+        second launch racing the first one's own startup double-books it.
         """
         busy = {}
         for j in self.load_jobs():
             for w in j.workers:
-                if w.state in ACTIVE_STATES:
+                if w.state in PENDING_STATES:
                     busy[w.label] = j.blend_name
         clash = [(a.label, busy[a.label]) for a in accounts
                  if a.label in busy]
@@ -1259,13 +1271,20 @@ class Fleet:
         """
         if not labels:
             raise ValueError("name at least one account to start")
-        busy = self.active_workers()
-        if busy:
-            raise FleetBusyError(
-                "already running on: "
-                + ", ".join(f"{w.label} ({w.kernel_slug})" for w in busy)
-                + ". Stop those before starting more, or the state file "
-                  "would lose track of them.")
+        # require_free(), scoped to the accounts THIS warm start actually
+        # wants -- not active_workers() (must-fix 2). active_workers() only
+        # ever asks Kaggle about load()'s single newest job: with an OLDER
+        # job still rendering and a newer one already finished, that guard
+        # passed and pushed a second warm kernel onto an account mid-
+        # render, double-billing it -- and because _state_payload maps
+        # each label to its NEWEST job while the dashboard groups sections
+        # by job id, the still-running older job's whole section (Cancel
+        # and Collect included) then vanished from the page. require_free()
+        # is the same guard every other launch path already uses, and it
+        # is scoped to `wanted` so accounts outside this warm start are
+        # never blocked by a job they have nothing to do with.
+        wanted = [a for a in self.accounts if a.label in labels]
+        self.require_free(wanted)
 
         clients, usernames = self._resolve_clients()
         owner_username = usernames[self.accounts[0].label]
@@ -1279,7 +1298,6 @@ class Fleet:
         job_id = uuid.uuid4().hex[:8]
         st = FleetState(job_id=job_id, blend_name="", start_frame=0,
                         end_frame=0, workers=[])
-        wanted = [a for a in self.accounts if a.label in labels]
         try:
             for account in wanted:
                 client = clients[account.label]
@@ -1730,12 +1748,28 @@ class Fleet:
                     # the very next poll, unlike RevokedTokenError above.
                     continue
                 w.state, w.message = s.state, s.message
-                # Stamped once, when the worker stops being active. Not
-                # recomputed from "now" at display time, or a finished job
-                # would keep ageing every time the dashboard repainted; and
-                # guarded by `not w.finished_at` so a later poll of an
-                # already-finished worker cannot push its end time forward.
-                if w.state not in ACTIVE_STATES and not w.finished_at:
+                # Terminal is stamped for TERMINAL_STATES explicitly
+                # (must-fix 3), never merely for "not in ACTIVE_STATES":
+                # a kernel that has been pushed but whose Kaggle session
+                # does not exist YET answers "not_started" (and one whose
+                # session exists but has not run its first cell answers
+                # "new_script") -- neither is active, but neither is
+                # finished either. Reading "not active" as "finished" used
+                # to free the account for a second launch the moment a
+                # poll landed in that window (busy_labels()/require_free()
+                # -- see PENDING_STATES) and, because finished_at was
+                # never cleared, permanently stamped a render that had not
+                # even started as "finished in 0:04" the very first time
+                # it came back "running". Stamped once (guarded by `not
+                # w.finished_at`) rather than recomputed from "now" at
+                # display time, or a finished job would keep ageing every
+                # time the dashboard repainted; and cleared if the worker
+                # is ever observed back in ACTIVE_STATES, so a stale stamp
+                # from an earlier, mistaken poll cannot outlive the render
+                # actually starting.
+                if w.state in ACTIVE_STATES:
+                    w.finished_at = 0.0
+                elif w.state in TERMINAL_STATES and not w.finished_at:
                     w.finished_at = time.time()
         current = self.load_jobs()
         updated_by_id = {st.job_id: st for st in jobs}

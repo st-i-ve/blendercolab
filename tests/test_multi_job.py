@@ -13,8 +13,9 @@ import pytest
 
 import blendfleet.fleet as fleet_mod
 from blendfleet.accounts import Account
-from blendfleet.fleet import (Fleet, FleetState, NoBlendInDatasetError,
-                              StaleDatasetError, WorkerState)
+from blendfleet.fleet import (Fleet, FleetBusyError, FleetState,
+                              NoBlendInDatasetError, StaleDatasetError,
+                              WorkerState)
 from blendfleet.notebook_builder import RenderSettings
 
 
@@ -569,6 +570,65 @@ def test_a_revoked_token_during_poll_does_not_leave_the_account_looking_busy_for
         "a revoked account must never look permanently busy -- every "
         "future launch on it would be refused with a false "
         "'already rendering' error, forever, in total silence")
+
+
+# ---------------------------------------------------------------------------
+# Must-fix 3: poll_all() used to stamp finished_at for anything outside
+# ACTIVE_STATES, and busy_labels()/require_free() used ACTIVE_STATES as
+# their own busy predicate. A kernel that has been pushed but whose
+# Kaggle session does not exist YET reports "not_started" -- not active,
+# but not finished either. A poll landing in that window used to free the
+# account for a second launch (double-book) and permanently stamp the
+# job "finished in 0:04" the moment it later came back "running".
+# ---------------------------------------------------------------------------
+
+def test_a_not_started_status_does_not_free_the_account_or_finish_the_job(
+        fleet):
+    from blendfleet.kaggle_client import KernelStatus
+
+    class Client:
+        def __init__(self, token): self.token = token
+        def status(self, slug):
+            return KernelStatus(state="not_started")
+    fleet.client_factory = Client
+    fleet.save_jobs([job("alpha", ["a0"], "j1")])
+
+    jobs = fleet.poll_all()
+
+    assert jobs[0].workers[0].state == "not_started"
+    assert jobs[0].workers[0].finished_at == 0.0, (
+        "a kernel that has not even started yet must never be stamped "
+        "finished")
+    assert "a0" in fleet.busy_labels(), (
+        "a just-pushed kernel must still hold its account -- a second "
+        "launch must not be able to double-book it before Kaggle even "
+        "shows a session for it")
+    with pytest.raises(FleetBusyError):
+        fleet.require_free([a for a in fleet.accounts if a.label == "a0"])
+
+
+def test_a_worker_coming_back_active_clears_a_stale_finished_stamp(fleet):
+    """The other half of must-fix 3: finished_at, once cleared, must not
+    resurface as a false "finished" reading the moment the worker is
+    later observed genuinely active again."""
+    fleet.save_jobs([job("alpha", ["a0"], "j1")])
+    st = fleet.load()
+    st.workers[0].finished_at = 12345.0   # a stale stamp from a bad prior poll
+    fleet._save(st)
+
+    from blendfleet.kaggle_client import KernelStatus
+
+    class Client:
+        def __init__(self, token): self.token = token
+        def status(self, slug):
+            return KernelStatus(state="running")
+    fleet.client_factory = Client
+
+    fleet.poll_all()
+
+    assert fleet.load().workers[0].finished_at == 0.0, (
+        "a worker that comes back ACTIVE must never keep reporting a "
+        "three-hour render as already finished")
 
 
 def test_poll_returns_the_newest_job_even_when_one_was_launched_mid_poll(fleet):

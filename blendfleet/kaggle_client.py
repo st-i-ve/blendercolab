@@ -25,6 +25,27 @@ from blendfleet.uploader import UploadError, upload_file
 # Status strings returned by ApiGetKernelSessionStatusResponse.status
 ACTIVE_STATES = {"queued", "running"}
 
+# Pushed, but not yet visibly active: a kernel Kaggle has accepted but has
+# not yet started a session for answers "not_started" (KaggleClient.status()
+# below translates the "Cannot access kernel" ValueError into this), and one
+# whose session exists but has not run its first cell answers "new_script".
+# Neither is a synonym for "finished" -- a poll landing in this window used
+# to fall through to "not ACTIVE_STATES therefore done", which freed the
+# account for a second launch (Fleet.busy_labels()/require_free()) and
+# stamped finished_at on a render that had not even started yet (must-fix
+# 3). Both still hold the account, exactly like queued/running.
+PENDING_STATES = ACTIVE_STATES | {"not_started", "new_script"}
+
+# Genuinely done -- nothing further happens to this worker's kernel without
+# a brand new push. Fleet.poll_all() stamps finished_at ONLY for these,
+# never merely for "not in ACTIVE_STATES": that used to be treated as the
+# same thing, which is exactly must-fix 3 (a worker sitting in
+# PENDING_STATES minus ACTIVE_STATES read as both free-to-reuse and
+# permanently finished). cancel_requested is deliberately NOT included --
+# it is in-flight, not done; treating it (and cancel_acknowledged, already
+# here) as free-to-reuse is a separate, known should-fix, not this one.
+TERMINAL_STATES = {"complete", "error", "cancel_acknowledged"}
+
 # Kaggle's own dataset-metadata files -- never data to upload as a blob.
 # Mirrors kaggle_api_extended.py's DATASET_METADATA_FILE/OLD_DATASET_METADATA_FILE
 # (dataset-metadata.json / datapackage.json), which upload_files() skips too.
