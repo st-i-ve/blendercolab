@@ -233,18 +233,16 @@ class CancelResult:
 
 
 class FleetBusyError(RuntimeError):
-    """A job with live kernels is already running.
+    """One of the accounts a launch actually asked for is already
+    rendering something, in some tracked job -- not just the most recent
+    one. See Fleet.require_free().
 
-    The state file can hold a LIST of jobs (Task 3), but the guard this
-    backs -- active_workers() -- still only inspects the MOST RECENT one
-    (load(), not load_jobs()). So this correctly refuses a second launch
-    while today's single latest job is live, but it does not yet see any
-    OLDER job that might also still be running. Until active_workers()
-    (and everything built on load() below it: poll, cancel_all,
-    cancel_worker, fetch_failure_log) becomes job-aware, launching past
-    this guard would leave an earlier job's kernels unreachable from
-    here: nothing on this path can cancel or collect them, while they
-    keep spending other people's GPU quota.
+    Scoped to the REQUESTED accounts, not to "any job is live anywhere":
+    two kernels from the same account rendering the same job's frames
+    would spend that account's quota twice for the same output, which is
+    the only thing this guard exists to prevent. A different account
+    being busy with an unrelated scene must not refuse this launch, or
+    two scenes could never render at once.
     """
 
 
@@ -472,16 +470,60 @@ class Fleet:
                 continue
         return live
 
-    def _resolve_clients(self) -> tuple[dict, dict]:
-        """A client and a Kaggle username for every account.
+    def busy_labels(self) -> set[str]:
+        """Accounts with a worker still active in some tracked job.
+
+        Active means ACTIVE_STATES (queued/running) -- a completed job
+        holds nobody, so the fleet is reusable the moment its frames are
+        done rather than when the user gets round to collecting.
+        """
+        return {w.label for j in self.load_jobs() for w in j.workers
+                if w.state in ACTIVE_STATES}
+
+    def free_accounts(self) -> list[Account]:
+        """Configured accounts not currently rendering anything."""
+        busy = self.busy_labels()
+        return [a for a in self.accounts if a.label not in busy]
+
+    def require_free(self, accounts: list[Account]) -> None:
+        """Raise FleetBusyError if any of `accounts` is already rendering.
+
+        Scoped to the accounts actually being asked for: refusing every
+        launch while ANY job is live is what made two scenes impossible,
+        but launching a second kernel on an account that is already
+        rendering would spend its quota twice for the same output.
+        """
+        busy = {}
+        for j in self.load_jobs():
+            for w in j.workers:
+                if w.state in ACTIVE_STATES:
+                    busy[w.label] = j.blend_name
+        clash = [(a.label, busy[a.label]) for a in accounts
+                 if a.label in busy]
+        if clash:
+            detail = "; ".join(f"{label} is rendering {scene}"
+                               for label, scene in clash)
+            raise FleetBusyError(
+                f"these accounts are already busy: {detail}. Nothing has "
+                "been started. Wait for that render to finish, cancel it, "
+                "or choose different accounts for this scene.")
+
+    def _resolve_clients(
+            self, accounts: list[Account] | None = None) -> tuple[dict, dict]:
+        """A client and a Kaggle username for every account in `accounts`
+        (every configured account when omitted).
 
         One network call per account (whoami), so callers that need both a
         dataset step and a push step resolve once and hand the result down
-        rather than paying for it twice.
+        rather than paying for it twice. Scoped to `accounts` rather than
+        always resolving self.accounts, so a launch restricted to a subset
+        does not pay for (or spuriously fail on) an account it never asked
+        for.
         """
+        accounts = accounts if accounts is not None else self.accounts
         clients: dict[str, object] = {}
         usernames: dict[str, str] = {}
-        for account in self.accounts:
+        for account in accounts:
             client = self.client_factory(account.token)
             clients[account.label] = client
             try:
@@ -892,8 +934,10 @@ class Fleet:
                start_frame: int, end_frame: int,
                on_progress: Callable | None = None,
                dataset_slug: str | None = None,
-               blender_slug: str | None = None) -> FleetState:
-        """Launch a render across every configured account.
+               blender_slug: str | None = None, *,
+               accounts: list[Account] | None = None) -> FleetState:
+        """Launch a render across `accounts` (every configured account
+        when omitted, so every existing caller is unaffected).
 
         `on_progress`, if given, is threaded straight through to
         dataset_sync.sync_blend -> KaggleClient.dataset_create/version ->
@@ -902,7 +946,8 @@ class Fleet:
         (the dashboard's upload view) shows real upload progress instead of
         the UI thread blocking silently for however long a 60+ MB PUT takes.
         """
-        if not self.accounts:
+        accounts = accounts or self.accounts
+        if not accounts:
             raise ValueError("add at least one account before launching")
 
         # Validate the name FIRST -- before the busy check, before the
@@ -911,28 +956,24 @@ class Fleet:
         # i.e. only after the entire .blend had finished uploading.
         stem = slug_stem(blend)
 
-        # active_workers() only inspects the MOST RECENT tracked job
-        # (load(), not load_jobs()) -- so this still refuses a second
-        # launch while THAT job is live, but does not yet see any OLDER
-        # job that might also still be running. Relying on this before
-        # active_workers() is made job-aware would leave an earlier job's
-        # kernels unreachable from here: uncancellable and uncollectable
-        # while they keep spending other people's GPU quota.
-        busy = self.active_workers()
-        if busy:
-            raise FleetBusyError(
-                "a render is still running on: "
-                + ", ".join(f"{w.label} ({w.kernel_slug})" for w in busy)
-                + ". Cancel it before starting another job, or its kernels "
-                  "would keep running with no way to stop them from here.")
+        # Scoped to the accounts THIS launch actually wants, across every
+        # tracked job (not just the most recent) -- two kernels from the
+        # same account rendering the same job's frames would spend that
+        # account's quota twice for the same output, but a different
+        # account being busy with an unrelated scene must not block this
+        # one, or two scenes could never render at once.
+        self.require_free(accounts)
 
         job_id = uuid.uuid4().hex[:8]
-        buckets = assign_frames(start_frame, end_frame, len(self.accounts))
+        buckets = assign_frames(start_frame, end_frame, len(accounts))
 
         # Resolve a client + username for every account up front: needed
         # for the push loop below regardless, and for the dataset step
-        # that has to happen before it.
-        clients, usernames = self._resolve_clients()
+        # that has to happen before it. Scoped to `accounts`, not
+        # self.accounts -- resolving an account that is not part of this
+        # launch is a wasted network call at best and a spurious failure
+        # (e.g. a revoked token on an account nobody asked for) at worst.
+        clients, usernames = self._resolve_clients(accounts)
 
         # The dataset step. Skipped entirely when the caller has already
         # run prepare_dataset() and hands the slug back -- re-uploading a
@@ -946,7 +987,7 @@ class Fleet:
                 blend, on_progress, clients=clients, usernames=usernames)
         else:
             expected_size = blend.stat().st_size
-            for account in self.accounts:
+            for account in accounts:
                 _require_matching_dataset(
                     clients[account.label], usernames[account.label],
                     dataset_slug, blend.name, expected_size)
@@ -960,7 +1001,7 @@ class Fleet:
         # end -- so a failure part-way through (revoked token on account 3)
         # still leaves accounts 1 and 2 on disk, cancellable and collectable.
         try:
-            for account, frames in zip(self.accounts, buckets):
+            for account, frames in zip(accounts, buckets):
                 client = clients[account.label]
                 username = usernames[account.label]
                 kernel_slug = f"{username}/{stem}-render-{job_id}"

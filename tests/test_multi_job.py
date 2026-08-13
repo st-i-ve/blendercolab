@@ -163,6 +163,40 @@ def test_a_non_list_jobs_value_degrades_to_no_jobs(fleet, tmp_path, bad_jobs):
     assert fleet.load_jobs() == []
 
 
+# ---------------------------------------------------------------------------
+# Task 4 -- launch() takes the accounts it should use, and the busy check
+# narrows from "any job is live" to "these particular accounts are busy".
+# ---------------------------------------------------------------------------
+
+def test_launching_a_second_scene_on_free_accounts_is_allowed(fleet,
+                                                              monkeypatch):
+    """The whole point: a0/a1 render one scene while a2/a3 render another."""
+    fleet.save_jobs([job("alpha", ["a0", "a1"], "j1")])
+    busy = fleet.busy_labels()
+    assert busy == {"a0", "a1"}
+    assert fleet.free_accounts() == [a for a in fleet.accounts
+                                     if a.label in {"a2", "a3"}]
+
+
+def test_launching_onto_an_account_that_is_already_rendering_is_refused(fleet):
+    """Two kernels from one account on one job's frames would spend that
+    account's quota twice for the same output."""
+    from blendfleet.fleet import FleetBusyError
+    fleet.save_jobs([job("alpha", ["a0", "a1"], "j1")])
+    with pytest.raises(FleetBusyError) as excinfo:
+        fleet.require_free([a for a in fleet.accounts if a.label == "a1"])
+    message = str(excinfo.value)
+    assert "a1" in message
+    assert "alpha.blend" in message, "must name what it is already doing"
+
+
+def test_a_finished_job_does_not_hold_its_accounts(fleet):
+    finished = job("alpha", ["a0"], "j1")
+    finished.workers[0].state = "complete"
+    fleet.save_jobs([finished])
+    assert fleet.busy_labels() == set()
+
+
 def test_forget_job_with_a_duplicate_job_id_drops_only_one(fleet):
     """job_id is only 32 bits of uuid4 and save_jobs() does not itself
     forbid a duplicate -- filtering by equality would drop both jobs for

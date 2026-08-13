@@ -531,12 +531,13 @@ def test_failed_first_push_leaves_previous_job_state_intact(blend, tmp_path):
 
 
 def test_launch_refuses_while_a_job_is_still_running(blend, tmp_path):
-    """A second launch would overwrite the single-slot state file and orphan
-    the first job's kernels."""
+    """A second launch on the SAME accounts would push a second kernel onto
+    an account that already has one live, spending its quota twice for the
+    same output (see Fleet.require_free)."""
     f = Fleet(accounts(2), lambda t: FakeClient(t, "running"), tmp_path / "w")
     first = f.launch(blend, RenderSettings(1920, 1080, 128), 1, 4)
 
-    with pytest.raises(FleetBusyError, match="still running"):
+    with pytest.raises(FleetBusyError, match="already busy"):
         f.launch(blend, RenderSettings(1920, 1080, 128), 5, 8)
 
     # First job untouched: still cancellable and collectable.
@@ -552,16 +553,24 @@ def test_launch_refusal_names_the_busy_accounts(blend, tmp_path):
 
 
 def test_launch_allowed_once_the_previous_job_finished(blend, tmp_path):
+    """require_free() (see Fleet) reads persisted worker state, not a live
+    Kaggle call -- poll() is what refreshes that state from "queued" to a
+    terminal one, so it is run here exactly as the app's own 30s timer
+    would before a second launch is attempted."""
     f = Fleet(accounts(2), lambda t: FakeClient(t, "complete"), tmp_path / "w")
     first = f.launch(blend, RenderSettings(1920, 1080, 128), 1, 4)
+    f.poll()
     second = f.launch(blend, RenderSettings(1920, 1080, 128), 5, 8)
     assert second.job_id != first.job_id
     assert f.load().job_id == second.job_id
 
 
 def test_unreachable_account_does_not_wedge_launch(blend, tmp_path):
-    """A revoked token means status() raises. That must not block every
-    future render forever -- there would be no way out from the UI."""
+    """A revoked token means status() raises, so poll() can never move this
+    account's worker out of "queued" -- require_free() (persisted state
+    only, no live call) would otherwise refuse every future launch on this
+    account forever. forget_job() is the documented way out (see the
+    deadlock escape hatch, below)."""
     class StatusRaises(FakeClient):
         def status(self, slug):
             raise RuntimeError("401 Unauthorized")
@@ -569,6 +578,7 @@ def test_unreachable_account_does_not_wedge_launch(blend, tmp_path):
     accts = accounts(1)
     f = Fleet(accts, lambda t: StatusRaises(t), tmp_path / "w")
     f.launch(blend, RenderSettings(1920, 1080, 128), 1, 4)
+    f.forget_job()
     f.launch(blend, RenderSettings(1920, 1080, 128), 5, 8)  # must not raise
 
 
