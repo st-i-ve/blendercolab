@@ -74,13 +74,27 @@ def slugify_stem(name: str) -> str:
     return _SLUG_STRIP_RE.sub("-", folded.lower()).strip("-")
 
 
+def _capped_stem(name: str) -> str:
+    """slugify_stem(name), capped to MAX_STEM_LENGTH.
+
+    Split out so slug_stem() (used for Kaggle dataset/kernel names) and
+    FleetState.scene_key (used for the output folder) apply the exact
+    same cap through the exact same code, and can never independently
+    drift apart again -- Task 5's own defect was scene_key skipping this
+    cap entirely, so a scene name over 30 slug characters got a
+    scene_key that disagreed with the stem already baked into that same
+    job's kernel_slug.
+    """
+    return slugify_stem(name)[:MAX_STEM_LENGTH].strip("-")
+
+
 def slug_stem(blend: Path) -> str:
     """The validated slug stem for `blend`, or raise InvalidBlendNameError.
 
     Called at the very top of launch(), before any upload, so an unusable
     filename costs the user a dialog rather than a completed upload.
     """
-    stem = slugify_stem(Path(blend).stem)[:MAX_STEM_LENGTH].strip("-")
+    stem = _capped_stem(Path(blend).stem)
     if len(stem) < MIN_STEM_LENGTH:
         raise InvalidBlendNameError(
             f"the file name {Path(blend).name!r} cannot be turned into a "
@@ -215,11 +229,28 @@ class FleetState:
     def scene_key(self) -> str:
         """This job's scene, as a filesystem- and slug-safe stem.
 
-        Used for the output folder and as the job's identity in the UI.
-        Derived from blend_name rather than stored, so it cannot drift
-        from the scene actually being rendered.
+        Used for the output folder (see collector.collect) and as the
+        job's identity in the UI. Derived from blend_name rather than
+        stored, so it cannot drift from the scene actually being
+        rendered.
+
+        Goes through _capped_stem -- the same length cap slug_stem()
+        applies -- rather than raw slugify_stem, so this NEVER disagrees
+        with the stem already baked into this same job's kernel_slug
+        (see _capped_stem's docstring for the bug this fixes). Unlike
+        slug_stem(), never raises: this only ever describes an
+        ALREADY-launched job, and a getter that blows up on it would be
+        strictly worse than falling back to "scene".
+
+        Two differently-named .blend files can still collapse to the
+        same scene_key ("shot 1.blend" and "shot-1.blend" both slugify
+        to "shot-1") -- that collision is accepted, not fixed away here,
+        because it is harmless where it matters: collect() names every
+        copied FRAME from the raw, un-slugified stem, never from
+        scene_key, so two colliding scenes only ever end up sharing a
+        folder, never overwriting each other's files inside it.
         """
-        return slugify_stem(Path(self.blend_name).stem) or "scene"
+        return _capped_stem(Path(self.blend_name).stem) or "scene"
 
 
 @dataclass
@@ -1187,40 +1218,62 @@ class Fleet:
                 self._save(st)
         return st
 
-    def poll(self) -> FleetState | None:
-        st = self.load()
-        if st is None:
-            return None
-        by_label = {a.label: a for a in self.accounts}
-        for w in st.workers:
-            acct = by_label.get(w.label)
-            if acct is None:
-                continue
-            s = self.client_factory(acct.token).status(w.kernel_slug)
-            w.state, w.message = s.state, s.message
-            # Stamped once, when the worker stops being active. Not
-            # recomputed from "now" at display time, or a finished job
-            # would keep ageing every time the dashboard repainted; and
-            # guarded by `not w.finished_at` so a later poll of an
-            # already-finished worker cannot push its end time forward.
-            if w.state not in ACTIVE_STATES and not w.finished_at:
-                w.finished_at = time.time()
-        self._save(st)
-        return st
+    def poll_all(self) -> list[FleetState]:
+        """Refresh every tracked job's worker states, not just the newest.
 
-    def cancel_all(self) -> list[CancelResult]:
-        """Cancel every worker, reporting the outcome for each.
-
-        Failures are RETURNED, never swallowed: "I clicked cancel and nothing
-        happened" must not look identical to success when the difference is
-        hours of somebody else's GPU quota.
+        poll() used to call load() -- the single newest job -- so with two
+        concurrent jobs the OLDER one's workers were never refreshed at
+        all: they sat "queued" forever, Kaggle's real state never reached
+        the state file, and busy_labels()/require_free() (which read
+        w.state straight off disk) never saw them finish, so those
+        accounts could never come free for a new launch (measured with
+        two live jobs). Saved once, as the whole list, rather than once
+        per job through _save() -- a job with no workers of its own to
+        refresh is still written back unchanged, and _save()'s own
+        in-place-by-job_id contract is irrelevant here since this already
+        has every job in hand.
         """
-        st = self.load()
-        if st is None:
-            return []
+        jobs = self.load_jobs()
+        by_label = {a.label: a for a in self.accounts}
+        for st in jobs:
+            for w in st.workers:
+                acct = by_label.get(w.label)
+                if acct is None:
+                    continue
+                s = self.client_factory(acct.token).status(w.kernel_slug)
+                w.state, w.message = s.state, s.message
+                # Stamped once, when the worker stops being active. Not
+                # recomputed from "now" at display time, or a finished job
+                # would keep ageing every time the dashboard repainted; and
+                # guarded by `not w.finished_at` so a later poll of an
+                # already-finished worker cannot push its end time forward.
+                if w.state not in ACTIVE_STATES and not w.finished_at:
+                    w.finished_at = time.time()
+        self.save_jobs(jobs)
+        return jobs
+
+    def poll(self) -> FleetState | None:
+        """Kept for every existing caller (bridge.py's timer, the Qt
+        dashboard): refreshes EVERY tracked job via poll_all(), same as
+        before this cost nothing extra when there was only ever one, and
+        answers with the newest -- exactly load()'s own definition of
+        "the" job -- so nothing downstream has to change.
+        """
+        jobs = self.poll_all()
+        return jobs[-1] if jobs else None
+
+    def _cancel_workers(self, workers: list[WorkerState]) -> list[CancelResult]:
+        """Cancel exactly `workers`, reporting the outcome for each.
+
+        Shared by cancel_job() and cancel_all() so the two can never
+        answer a cancel request differently. Failures are RETURNED, never
+        swallowed: "I clicked cancel and nothing happened" must not look
+        identical to success when the difference is hours of somebody
+        else's GPU quota.
+        """
         by_label = {a.label: a for a in self.accounts}
         results: list[CancelResult] = []
-        for w in st.workers:
+        for w in workers:
             acct = by_label.get(w.label)
             if not acct:
                 results.append(CancelResult(
@@ -1240,6 +1293,34 @@ class Fleet:
                 w.label, w.kernel_slug, bool(ok),
                 "" if ok else "Kaggle rejected the cancel request"))
         return results
+
+    def cancel_job(self, job_id: str) -> list[CancelResult]:
+        """Cancel every worker in exactly the job named `job_id`, leaving
+        every OTHER tracked job's kernels running untouched.
+
+        cancel_all() used to be the only cancel there was, and it only
+        ever read load() -- the single newest job -- so with two jobs
+        live, cancelling looked like it worked but silently left an
+        older job's kernels running (and its accounts un-freed). This is
+        the per-job counterpart: a user who cancels the scene they are
+        looking at must never stop a different scene they never asked
+        about. An unknown job_id cancels nothing (empty list), same as
+        "no job at all" -- there is genuinely nothing to do.
+        """
+        st = next((j for j in self.load_jobs() if j.job_id == job_id), None)
+        return self._cancel_workers(st.workers) if st is not None else []
+
+    def cancel_all(self) -> list[CancelResult]:
+        """Cancel every worker in every tracked job.
+
+        Deliberately every job, not just load()'s newest: cancel_all() is
+        the fleet-wide "stop everything" action, and a second job left
+        running because it was not the most recent one would keep
+        spending its accounts' quota while the user believes nothing is
+        rendering any more.
+        """
+        return [result for st in self.load_jobs()
+                for result in self._cancel_workers(st.workers)]
 
     def cancel_worker(self, label: str) -> CancelResult | None:
         """Cancel exactly the worker labelled `label`, leaving every other

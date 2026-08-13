@@ -26,6 +26,7 @@ import pytest
 from blendfleet import log_stream
 from blendfleet.collector import collect
 from blendfleet.downloader import IncompleteDownload, fetch_files
+from blendfleet.fleet import FleetState
 
 
 # --------------------------------------------------------------------------
@@ -136,6 +137,13 @@ class State:
         self.end_frame = len(workers[0].frames)
         self.blend_name = "remember.blend"   # collect names frames from it
 
+    @property
+    def scene_key(self):
+        # Delegates to the real FleetState.scene_key (rather than a
+        # second, hand-copied slugify) so this fake can never drift from
+        # what collect() actually derives its per-scene subfolder from.
+        return FleetState.scene_key.fget(self)
+
 
 class Account:
     def __init__(self, label):
@@ -187,9 +195,11 @@ def test_a_failed_attempts_leftovers_are_never_collected(tmp_path):
     dest = tmp_path / "frames"
     worker = Worker("stive", [1, 2, 3])
     client = FlakyClient(failures=1, frames=[1, 2, 3])
-    collect(State([worker]), [Account("stive")], lambda tok: client, dest,
+    state = State([worker])
+    collect(state, [Account("stive")], lambda tok: client, dest,
             sleep=lambda s: None)
-    for f in dest.iterdir():
+    # Task 5: collect() writes under dest/scene_key, not straight into dest.
+    for f in (dest / state.scene_key).iterdir():
         assert f.read_bytes() == b"PNG-real", f"{f.name} is a partial file"
 
 

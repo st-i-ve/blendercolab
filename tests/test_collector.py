@@ -66,7 +66,10 @@ def test_collects_from_all_workers(tmp_path):
     r = collect(state(), accts(), factory, tmp_path / "out")
     assert r.copied == 4
     assert r.missing_frames == []
-    assert sorted(p.name for p in (tmp_path / "out").glob("*.png")) == [
+    # Task 5: every frame lands under a subfolder named for the scene
+    # ("r", from blend_name "r.blend" -- state()'s own scene_key) rather
+    # than straight in the chosen destination.
+    assert sorted(p.name for p in (tmp_path / "out" / "r").glob("*.png")) == [
         "r_0001.png", "r_0002.png", "r_0003.png", "r_0004.png"]
 
 
@@ -93,7 +96,7 @@ def test_duplicate_frame_counted_once(tmp_path):
     r = collect(state(), accts(), factory, tmp_path / "out")
     assert r.copied == 1
     assert sum(r.per_worker.values()) == 1
-    assert len(list((tmp_path / "out").glob("*.png"))) == 1
+    assert len(list((tmp_path / "out" / "r").glob("*.png"))) == 1
 
 
 def test_account_removed_mid_job(tmp_path):
@@ -130,7 +133,10 @@ def test_second_job_into_the_same_folder_reports_its_own_missing_frames(tmp_path
 
     r1 = collect(job1, accts(), factory1, out)
     assert r1.copied == 4 and r1.missing_frames == []
-    assert not list(out.glob(".raw_*")), "staging left behind"
+    # Task 5: staging lives inside the per-scene subfolder (both jobs here
+    # share blend_name "r.blend", hence scene_key "r"), not straight under
+    # `out`.
+    assert not list((out / "r").glob(".raw_*")), "staging left behind"
 
     # Job 2 renders the SAME frame range but every worker comes back empty
     # (e.g. both kernels errored). Every frame must be reported missing.
@@ -145,7 +151,7 @@ def test_second_job_into_the_same_folder_reports_its_own_missing_frames(tmp_path
     r2 = collect(job2, accts(), factory2, out)
     assert r2.copied == 0
     assert r2.missing_frames == [1, 2, 3, 4]
-    assert not list(out.glob(".raw_*"))
+    assert not list((out / "r").glob(".raw_*"))
 
 
 def test_second_job_into_the_same_folder_via_archives_reports_its_own_missing_frames(
@@ -164,7 +170,7 @@ def test_second_job_into_the_same_folder_via_archives_reports_its_own_missing_fr
                                WorkerState("a1", "u1", "u1/k1", [2])])
     r1 = collect(job1, accts(), factory1, out)
     assert r1.copied == 2 and r1.missing_frames == []
-    assert not list(out.glob(".raw_*"))
+    assert not list((out / "r").glob(".raw_*"))
 
     job2 = FleetState(job_id="j2", blend_name="r.blend", start_frame=1, end_frame=2,
                       workers=[WorkerState("a0", "u0", "u0/k2", [1]),
@@ -176,7 +182,7 @@ def test_second_job_into_the_same_folder_via_archives_reports_its_own_missing_fr
     r2 = collect(job2, accts(), factory2, out)
     assert r2.copied == 0
     assert r2.missing_frames == [1, 2]
-    assert not list(out.glob(".raw_*"))
+    assert not list((out / "r").glob(".raw_*"))
 
 
 def test_staging_is_cleaned_up_after_a_successful_collect(tmp_path):
@@ -185,7 +191,8 @@ def test_staging_is_cleaned_up_after_a_successful_collect(tmp_path):
                           else ["f_0002.png"])
     out = tmp_path / "out"
     collect(state(), accts(), factory, out)
-    assert sorted(p.name for p in out.iterdir()) == ["r_0001.png", "r_0002.png"]
+    assert sorted(p.name for p in (out / "r").iterdir()) == [
+        "r_0001.png", "r_0002.png"]
 
 
 def test_staging_is_cleaned_up_even_when_a_fetch_raises(tmp_path):
@@ -200,7 +207,7 @@ def test_staging_is_cleaned_up_even_when_a_fetch_raises(tmp_path):
 
     out = tmp_path / "out"
     r = collect(state(), accts(), factory, out)
-    assert not list(out.glob(".raw_*"))
+    assert not list((out / "r").glob(".raw_*"))
     # Task 6: a fetch failure is REPORTED, not raised -- see the
     # one-worker's-failure-must-not-abort-the-others tests below.
     assert r.copied == 0
@@ -215,7 +222,10 @@ def test_unclearable_staging_fails_loudly_rather_than_under_reporting(tmp_path,
     import blendfleet.collector as collector_mod
 
     out = tmp_path / "out"
-    stale = out / ".raw_a0"
+    # Staging lives under the per-scene subfolder ("r", from state()'s
+    # blend_name "r.blend") that collect() itself creates -- so the stale
+    # folder blocking the real collect must be planted there too.
+    stale = out / "r" / ".raw_a0"
     stale.mkdir(parents=True)
     (stale / "f_0001.png").write_bytes(b"PNG")
     monkeypatch.setattr(collector_mod.shutil, "rmtree",
@@ -237,7 +247,7 @@ def test_collects_jpeg_frames_keeping_the_extension(tmp_path):
     r = collect(state(), accts(), factory, tmp_path / "out")
     assert r.copied == 4
     assert r.missing_frames == []
-    assert sorted(p.name for p in (tmp_path / "out").glob("*.jpg")) == [
+    assert sorted(p.name for p in (tmp_path / "out" / "r").glob("*.jpg")) == [
         "r_0001.jpg", "r_0002.jpg", "r_0003.jpg", "r_0004.jpg"]
 
 
@@ -264,7 +274,7 @@ def test_collects_from_archive_when_present_no_loose_files(tmp_path):
     r = collect(state(), accts(), factory, tmp_path / "out")
     assert r.copied == 4
     assert r.missing_frames == []
-    out = tmp_path / "out"
+    out = tmp_path / "out" / "r"
     assert (out / "r_0001.png").read_bytes() == b"AAA"
     assert (out / "r_0003.png").read_bytes() == b"BBB"
     assert not r.archive_errors
@@ -312,7 +322,7 @@ def test_archive_lagging_one_frame_behind_loose_files_still_finds_it(tmp_path):
     r = collect(state(), accts(), factory, tmp_path / "out")
     assert r.copied == 4
     assert r.missing_frames == []
-    out = tmp_path / "out"
+    out = tmp_path / "out" / "r"
     assert (out / "r_0001.png").read_bytes() == b"AAA"
     assert (out / "r_0003.png").exists()   # recovered from the loose file
 
@@ -366,7 +376,7 @@ def test_archive_zip_slip_entries_are_rejected_not_extracted_outside_staging(tmp
     r = collect(st, [Account("a0", "KGAT_" + "0"*32)], factory, out)
 
     assert r.copied == 1
-    assert (out / "r_0001.png").read_bytes() == b"AAA"
+    assert (out / "r" / "r_0001.png").read_bytes() == b"AAA"
     assert list(tmp_path.rglob("evil_0002.png")) == [], (
         "the escaping entry must never be extracted anywhere on disk")
 
@@ -395,7 +405,7 @@ def test_worker_label_targets_only_that_one_worker(tmp_path):
     assert r.copied == 2
     assert r.per_worker == {"a0": 2}
     assert "a1" not in r.per_worker
-    out = tmp_path / "out"
+    out = tmp_path / "out" / "r"
     assert sorted(p.name for p in out.glob("*.png")) == ["r_0001.png", "r_0003.png"]
 
 
@@ -432,7 +442,7 @@ def test_one_workers_failure_does_not_abort_collecting_the_others(tmp_path):
     assert "network died mid-download" in r.worker_errors["a0"]
     assert "a1" not in r.worker_errors
     assert r.missing_frames == [1, 3]   # a0's frames never came in
-    out = tmp_path / "out"
+    out = tmp_path / "out" / "r"
     assert sorted(p.name for p in out.glob("*.png")) == ["r_0002.png", "r_0004.png"]
     assert not list(out.glob(".raw_*"))
 
@@ -472,3 +482,65 @@ def test_progress_requested_but_client_lacks_progress_support_still_collects(tmp
     r = collect(state(), accts(), factory, tmp_path / "out",
                on_progress=lambda label, p: None)
     assert r.copied == 2
+
+
+# --------------------------------------------------------------------------
+# Task 5: one output folder per scene.
+# --------------------------------------------------------------------------
+
+def test_frames_land_in_a_folder_named_for_their_scene(tmp_path):
+    """Two scenes rendering at once would otherwise write into one folder,
+    and two scenes whose .blend files share a stem would overwrite each
+    other outright."""
+    st = FleetState(job_id="j1", blend_name="alpha.blend", start_frame=1,
+                    end_frame=1,
+                    workers=[WorkerState("a0", "u0", "u0/k0", [1])])
+
+    def factory(tok):
+        return FakeClient(tok, ["f_0001.png"])
+
+    collect(st, [Account("a0", "KGAT_" + "0"*32)], factory, tmp_path / "frames")
+    assert (tmp_path / "frames" / "alpha" / "alpha_0001.png").exists()
+
+
+def test_subfolder_false_writes_straight_into_dest(tmp_path):
+    """The opt-out for a caller that already owns a scene-specific
+    destination and does not want a second layer of nesting under it."""
+    st = FleetState(job_id="j1", blend_name="alpha.blend", start_frame=1,
+                    end_frame=1,
+                    workers=[WorkerState("a0", "u0", "u0/k0", [1])])
+
+    def factory(tok):
+        return FakeClient(tok, ["f_0001.png"])
+
+    collect(st, [Account("a0", "KGAT_" + "0"*32)], factory, tmp_path / "frames",
+           subfolder=False)
+    assert (tmp_path / "frames" / "alpha_0001.png").exists()
+    assert not (tmp_path / "frames" / "alpha").exists()
+
+
+def test_colliding_scene_names_share_a_folder_but_not_a_filename(tmp_path):
+    """The residual collision FleetState.scene_key's docstring accepts as
+    harmless: "shot 1.blend" and "shot-1.blend" slugify to the identical
+    scene_key ("shot-1"), so both collects land in the SAME folder -- but
+    each worker's copied filename comes from its own raw, un-slugified
+    stem (collector.collect's own `stem`, not scene_key), so the second
+    collect must never overwrite the first's frame."""
+    acct = [Account("a0", "KGAT_" + "0"*32)]
+
+    def factory(tok):
+        return FakeClient(tok, ["f_0001.png"])
+
+    st_a = FleetState(job_id="j1", blend_name="shot 1.blend", start_frame=1,
+                      end_frame=1,
+                      workers=[WorkerState("a0", "u0", "u0/k0", [1])])
+    st_b = FleetState(job_id="j2", blend_name="shot-1.blend", start_frame=1,
+                      end_frame=1,
+                      workers=[WorkerState("a0", "u0", "u0/k1", [1])])
+
+    collect(st_a, acct, factory, tmp_path / "frames")
+    collect(st_b, acct, factory, tmp_path / "frames")
+
+    shared = tmp_path / "frames" / "shot-1"
+    assert (shared / "shot 1_0001.png").exists()
+    assert (shared / "shot-1_0001.png").exists()

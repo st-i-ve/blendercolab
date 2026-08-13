@@ -153,7 +153,8 @@ def _fetch_with_retry(client, w, staging: Path, on_progress, sleep,
 def collect(fleet_state, accounts, client_factory: Callable,
             dest: Path, *, worker_label: str | None = None,
             on_progress: Callable[[str, object], None] | None = None,
-            sleep: Callable[[float], None] = time.sleep
+            sleep: Callable[[float], None] = time.sleep,
+            subfolder: bool = True
             ) -> CollectReport:
     """Pull worker output into one folder, renamed by real frame number.
 
@@ -181,7 +182,20 @@ def collect(fleet_state, accounts, client_factory: Callable,
     `report.worker_errors` rather than raised, so it can never abort
     collecting the rest of the fleet -- see the class docstring on
     `CollectReport.worker_errors`.
+
+    `subfolder`, on by default, is `fleet_state.scene_key` -- see its own
+    docstring for why frames landing straight in `dest` is exactly what
+    makes two concurrent scenes overwrite each other's output. Only ever
+    turned off by a caller that already owns a scene-specific destination
+    (none exist yet); every current caller passes a directory the user
+    picked once from a file dialog, which is exactly the case this exists
+    to protect.
     """
+    # One folder per scene. Two jobs rendering at once would otherwise
+    # write into the same directory, and two scenes whose .blend files
+    # share a stem would overwrite each other's frames outright.
+    if subfolder:
+        dest = dest / fleet_state.scene_key
     dest.mkdir(parents=True, exist_ok=True)
     by_label = {a.label: a for a in accounts}
     # A worker records BOTH its label (the user's own nickname for the

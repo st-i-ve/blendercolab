@@ -209,3 +209,144 @@ def test_forget_job_with_a_duplicate_job_id_drops_only_one(fleet):
     assert len(remaining) == 1, "forgetting one duplicate must not drop both"
     assert [w.label for w in forgotten] == ["a0"]
     assert [j.blend_name for j in remaining] == ["beta.blend"]
+
+
+# ---------------------------------------------------------------------------
+# Task 5 -- poll() only ever refreshed load()'s newest job, so with two
+# concurrent jobs the OLDER one's workers stayed "queued" forever and its
+# accounts never came free (measured). cancel_all() had the identical bug
+# for cancelling. poll_all()/cancel_job() are the fix.
+# ---------------------------------------------------------------------------
+
+def test_polling_updates_every_job(fleet, monkeypatch):
+    class Client:
+        def __init__(self, token): self.token = token
+        def status(self, slug):
+            from blendfleet.kaggle_client import KernelStatus
+            return KernelStatus(state="complete")
+    fleet.client_factory = Client
+    fleet.save_jobs([job("alpha", ["a0"], "j1"), job("beta", ["a1"], "j2")])
+    jobs = fleet.poll_all()
+    assert [w.state for j in jobs for w in j.workers] == ["complete", "complete"]
+
+
+def test_polling_persists_every_jobs_refreshed_state(fleet):
+    """Not just the return value -- a second load_jobs() must see the
+    same refreshed states, exactly as poll() persists load()'s job."""
+    class Client:
+        def __init__(self, token): self.token = token
+        def status(self, slug):
+            from blendfleet.kaggle_client import KernelStatus
+            return KernelStatus(state="complete")
+    fleet.client_factory = Client
+    fleet.save_jobs([job("alpha", ["a0"], "j1"), job("beta", ["a1"], "j2")])
+    fleet.poll_all()
+    reloaded = fleet.load_jobs()
+    assert [w.state for j in reloaded for w in j.workers] == ["complete", "complete"]
+
+
+def test_poll_still_answers_with_the_newest_job_after_refreshing_both(fleet):
+    """poll() becomes a thin wrapper over poll_all() -- every existing
+    caller (bridge.py's timer, the Qt dashboard) keeps its "one job"
+    answer, and it is the freshly-refreshed newest job, not a stale one."""
+    class Client:
+        def __init__(self, token): self.token = token
+        def status(self, slug):
+            from blendfleet.kaggle_client import KernelStatus
+            return KernelStatus(state="complete")
+    fleet.client_factory = Client
+    fleet.save_jobs([job("alpha", ["a0"], "j1"), job("beta", ["a1"], "j2")])
+    st = fleet.poll()
+    assert st.job_id == "j2"
+    assert st.workers[0].state == "complete"
+
+
+def test_cancelling_one_job_leaves_the_other_running(fleet):
+    cancelled = []
+
+    class Client:
+        def __init__(self, token): self.token = token
+        def cancel(self, slug):
+            cancelled.append(slug)
+            return True
+    fleet.client_factory = Client
+    fleet.save_jobs([job("alpha", ["a0"], "j1"), job("beta", ["a1"], "j2")])
+    fleet.cancel_job("j1")
+    assert all("alpha" in s for s in cancelled), cancelled
+
+
+def test_cancel_job_reports_per_worker_results_for_just_that_job(fleet):
+    class Client:
+        def __init__(self, token): self.token = token
+        def cancel(self, slug):
+            return True
+    fleet.client_factory = Client
+    fleet.save_jobs([job("alpha", ["a0"], "j1"), job("beta", ["a1"], "j2")])
+    results = fleet.cancel_job("j1")
+    assert [r.label for r in results] == ["a0"]
+    assert all(r.ok for r in results)
+
+
+def test_cancel_job_for_an_unknown_id_cancels_nothing(fleet):
+    cancelled = []
+
+    class Client:
+        def __init__(self, token): self.token = token
+        def cancel(self, slug):
+            cancelled.append(slug)
+            return True
+    fleet.client_factory = Client
+    fleet.save_jobs([job("alpha", ["a0"], "j1")])
+    assert fleet.cancel_job("no-such-job") == []
+    assert cancelled == []
+
+
+def test_cancel_all_stops_every_tracked_job_not_just_the_newest(fleet):
+    """cancel_all() used to read load() -- the single newest job -- so a
+    second, older job's kernels kept running (and its accounts stayed
+    busy) even after the user hit "cancel everything"."""
+    cancelled = []
+
+    class Client:
+        def __init__(self, token): self.token = token
+        def cancel(self, slug):
+            cancelled.append(slug)
+            return True
+    fleet.client_factory = Client
+    fleet.save_jobs([job("alpha", ["a0"], "j1"), job("beta", ["a1"], "j2")])
+    results = fleet.cancel_all()
+    assert sorted(r.label for r in results) == ["a0", "a1"]
+    assert any("alpha" in s for s in cancelled)
+    assert any("beta" in s for s in cancelled)
+
+
+# ---------------------------------------------------------------------------
+# Task 5 -- scene_key must apply slug_stem's own length cap (else it can
+# disagree with the stem already baked into this same job's kernel_slug),
+# and a residual collision between two differently-named scenes that
+# happen to slugify to the same string is accepted as HARMLESS rather than
+# fixed away -- see FleetState.scene_key's own docstring for why.
+# ---------------------------------------------------------------------------
+
+def test_scene_key_is_capped_exactly_like_the_kernel_slugs_own_stem(fleet):
+    from blendfleet.fleet import slug_stem, MAX_STEM_LENGTH
+    from pathlib import Path
+
+    long_name = "x" * 40   # well over MAX_STEM_LENGTH once slugified
+    st = job(long_name, ["a0"])
+    assert st.scene_key == slug_stem(Path(f"{long_name}.blend"))
+    assert len(st.scene_key) <= MAX_STEM_LENGTH
+
+
+def test_colliding_scene_names_share_a_key_but_never_a_filename(fleet):
+    """"shot 1.blend" and "shot-1.blend" both slugify to "shot-1" -- a
+    genuine collision in the folder scene_key produces. It is harmless,
+    not fixed away, because collect() names every copied FRAME from the
+    raw, un-slugified stem (see collector.collect), never from scene_key
+    -- so two colliding scenes only ever end up sharing a folder, never
+    overwriting each other's files inside it."""
+    a = FleetState(job_id="j1", blend_name="shot 1.blend",
+                  start_frame=1, end_frame=1)
+    b = FleetState(job_id="j2", blend_name="shot-1.blend",
+                  start_frame=1, end_frame=1)
+    assert a.scene_key == b.scene_key == "shot-1"
