@@ -152,3 +152,33 @@ def test_load_with_min_gpus_key_missing_falls_back():
     p.write_text(json.dumps({"accent": "blue"}), encoding="utf-8")
     s = Settings.load()
     assert s.min_gpus == DEFAULT_MIN_GPUS
+
+
+# NOTE: Settings uses config_dir(), NOT state_dir(), and its loader reads
+# every field explicitly with data.get(...) rather than **data -- so a new
+# field needs a line in load() as well as on the dataclass. Both verified
+# against blendfleet/settings.py:94-106 before writing this.
+def test_the_blender_version_is_remembered(tmp_path, monkeypatch):
+    """Choosing a version once and having it reset next launch would be
+    worse than not offering the choice."""
+    import blendfleet.settings as settings_mod
+    monkeypatch.setattr(settings_mod, "config_dir", lambda: tmp_path)
+    s = Settings()
+    assert s.blender_version == "5.2.0"
+    s.blender_version = "4.2.9"
+    s.save()
+    assert Settings.load().blender_version == "4.2.9"
+
+
+def test_a_settings_file_from_before_this_field_still_loads(tmp_path,
+                                                            monkeypatch):
+    """A settings.json written by any earlier build must not lose the
+    user's accent or theme just because a field was added."""
+    import json
+    import blendfleet.settings as settings_mod
+    monkeypatch.setattr(settings_mod, "config_dir", lambda: tmp_path)
+    (tmp_path / settings_mod.FILENAME).write_text(
+        json.dumps({"accent": "blue"}), encoding="utf-8")
+    loaded = Settings.load()
+    assert loaded.blender_version == "5.2.0"
+    assert loaded.accent == "blue", "the rest of the file must survive"

@@ -562,6 +562,7 @@ function renderOptions() {
     resY: +document.getElementById('f-ry').value,
     samples: +document.getElementById('f-spp').value,
     format: document.getElementById('f-fmt').value,
+    blenderVersion: document.getElementById('sel-blender').value,
   };
 }
 
@@ -973,6 +974,17 @@ new QWebChannel(qt.webChannelTransport, channel => {
 
   backend.preferences(json => { applyPrefs(JSON.parse(json)); syncSettingsControls(); });
   backend.settingsChanged.connect(json => { applyPrefs(JSON.parse(json)); syncSettingsControls(); });
+
+  /* Offered as a menu, not a gate -- an unlisted-but-valid version typed
+     by hand elsewhere still renders; this list is only what the picker
+     shows by default. */
+  backend.blenderVersions(json => {
+    const v = JSON.parse(json);
+    const sel = document.getElementById('sel-blender');
+    sel.innerHTML = v.versions.map(x =>
+      `<option value="${esc(x)}"${x === v.current ? ' selected' : ''}>${esc(x)}</option>`
+    ).join('');
+  });
 
   /* Upload and download report as bytes, not as a spinner: a 400 MB
      .blend on a slow line is the one moment the app looks frozen, and a

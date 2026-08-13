@@ -632,6 +632,19 @@ def test_opening_a_preview_shows_the_frame_and_who_rendered_it(loaded_page):
     assert got["src"].endswith("f_0007.png")
 
 
+def test_the_page_offers_a_blender_version_picker(loaded_page):
+    _, result = loaded_page
+    page, _ = loaded_page
+    out = {}
+    loop = QEventLoop()
+    page.runJavaScript(
+        "String(document.getElementById('sel-blender') !== null)",
+        lambda r: (out.__setitem__("v", r), loop.quit()))
+    QTimer.singleShot(5000, loop.quit)
+    loop.exec()
+    assert out["v"] == "true"
+
+
 def test_closing_a_preview_drops_the_image(loaded_page):
     """Left in place, the previous frame flashes up while the next one is
     still decoding -- which reads as the wrong frame having been fetched."""

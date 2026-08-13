@@ -67,12 +67,17 @@ def test_kernel_metadata(tmp_path, settings):
 
 
 def test_settings_with_double_quote_still_parse(tmp_path):
-    # file_format / blender_version are interpolated into a generated string
-    # literal. Task 9 wires these to UI fields, so a stray double quote must
-    # not break the generated cell's syntax -- values must be repr()'d, not
-    # dropped straight into a "..." literal.
+    # file_format is interpolated into a generated string literal. Task 9
+    # wires it to a UI field, so a stray double quote must not break the
+    # generated cell's syntax -- values must be repr()'d, not dropped
+    # straight into a "..." literal. blender_version is not exercised with
+    # a quote here: Task 2's validate_version now rejects anything shaped
+    # like an injection (it must be major.minor.patch, digits only) before
+    # the cell is ever built, so that specific field's quote-safety is
+    # covered by test_an_unusable_version_is_refused_before_a_kernel_is_built
+    # instead.
     settings = RenderSettings(resolution_x=1920, resolution_y=1080, samples=128,
-                              file_format='PN"G', blender_version='5.2".0')
+                              file_format='PN"G')
     p = build([1], settings, "me/x", tmp_path, "me/r")
     for src in cells_src(p):
         ast.parse(src)
@@ -650,6 +655,26 @@ def test_the_token_is_never_printed(tmp_path):
 def test_worker_only_takes_a_job_addressed_to_it_or_to_everyone(tmp_path):
     source, _ = _worker_source(tmp_path)
     assert "WORKER_LABEL in (job.get(\"workers\") or [WORKER_LABEL])" in source
+
+
+def test_the_notebook_downloads_the_version_it_was_given(tmp_path):
+    from blendfleet.notebook_builder import RenderSettings, build
+    settings = RenderSettings(64, 36, 1, "PNG", blender_version="4.2.9")
+    joined = "\n".join(cells_src(build([1], settings, "me/x", tmp_path, "me/r")))
+    assert "blender-4.2.9-linux-x64.tar.xz" in joined
+    assert "release/Blender4.2/" in joined, \
+        "the release directory is major.minor, not the full version"
+
+
+def test_an_unusable_version_is_refused_before_a_kernel_is_built(tmp_path):
+    """A 404 inside a running session costs that session's startup and
+    reads like a network fault rather than a typo."""
+    import pytest
+    from blendfleet.notebook_builder import RenderSettings, build
+    settings = RenderSettings(64, 36, 1, "PNG", blender_version="latest")
+    with pytest.raises(ValueError) as excinfo:
+        build([1], settings, "me/x", tmp_path, "me/r")
+    assert "major.minor.patch" in str(excinfo.value)
 
 
 def test_setup_is_identical_between_render_and_worker_modes(tmp_path):

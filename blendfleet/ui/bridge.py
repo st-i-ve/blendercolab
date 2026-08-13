@@ -41,6 +41,7 @@ from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
 
 from blendfleet.accounts import AccountStore
 from blendfleet.assignment import estimate
+from blendfleet.blender_versions import KNOWN_VERSIONS, validate_version
 from blendfleet.instance_state import (GpuSnapshot, InstanceSnapshot,
                                        InstanceStore)
 from blendfleet.log_stream import stream_progress
@@ -316,6 +317,17 @@ class Backend(QObject):
             "minGpus": self.settings.min_gpus,
             "fullscreen": self.settings.fullscreen,
         })
+
+    @Slot(result=str)
+    def blenderVersions(self) -> str:
+        """The versions offered, and the one currently chosen.
+
+        The list is a menu, not a gate -- an unlisted but well-formed
+        version is accepted, because Blender releases far more often than
+        this app does.
+        """
+        return json.dumps({"versions": list(KNOWN_VERSIONS),
+                           "current": self.settings.blender_version})
 
     @Slot(int, int, result=str)
     def estimateRender(self, start_frame: int, end_frame: int) -> str:
@@ -615,6 +627,8 @@ class Backend(QObject):
         settings = RenderSettings(
             int(options.get("resX", 1920)), int(options.get("resY", 1080)),
             int(options.get("samples", 128)), options.get("format", "PNG"),
+            blender_version=validate_version(
+                options.get("blenderVersion") or self.settings.blender_version),
             min_gpus=self.settings.min_gpus)
         accounts = self.store.list()
         blend = self.blend

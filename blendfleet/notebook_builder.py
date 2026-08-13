@@ -4,6 +4,8 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+from blendfleet.blender_versions import download_url, validate_version
+
 # THE SCENE IS LOADED ONCE, AND EVERY FRAME IS RENDERED INSIDE THIS ONE
 # PROCESS.
 #
@@ -370,6 +372,10 @@ def build(frames: list[int], settings: RenderSettings, dataset_slug: str,
     producing a notebook that would come up and wait forever for a job it
     has no way to hear about.
     """
+    # Validated HERE, not in the notebook: a bad version otherwise 404s
+    # inside a running Kaggle session, costing that session's startup to
+    # discover what is really a typo.
+    validate_version(settings.blender_version)
     if mode not in ("render", "worker"):
         raise ValueError(f"unknown notebook mode {mode!r}")
     # Kaggle mounts a dataset at /kaggle/input/<name>, without the owner
@@ -472,8 +478,11 @@ if not os.path.exists(BBIN):
     if tarball is None:
         # No dataset: fall back to downloading, which only works on a
         # phone-verified account. Says so, so a failure here is not a
-        # mystery.
-        URL = f"https://download.blender.org/release/Blender{{S}}/{{T}}"
+        # mystery. The URL itself is baked in at BUILD time via
+        # blender_versions.download_url -- the exact same layout the
+        # runtime S/T above already produce, but pinned in one place
+        # instead of reconstructed from V a second time.
+        URL = {download_url(settings.blender_version)!r}
         print("no blender dataset attached -- downloading, which requires "
               "this Kaggle account to be phone-verified for internet access",
               flush=True)

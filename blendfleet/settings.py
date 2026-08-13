@@ -14,6 +14,7 @@ import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from blendfleet.blender_versions import DEFAULT_VERSION
 from blendfleet.platform_paths import config_dir
 from blendfleet.ui.theme import (ACCENTS, DEFAULT_ACCENT, DEFAULT_THEME,
                                   THEMES)
@@ -56,6 +57,11 @@ class Settings:
     # the right default, not something the user has to discover and turn
     # on themselves.
     min_gpus: int = DEFAULT_MIN_GPUS
+    # Which Blender renders. Remembered because choosing it every launch
+    # would be worse than not offering the choice. See
+    # blendfleet/blender_versions.py for why an unlisted version is still
+    # allowed.
+    blender_version: str = DEFAULT_VERSION
 
     def __post_init__(self) -> None:
         # Total, not just "wrong value": a hand-edited or forward-dated
@@ -109,4 +115,5 @@ class Settings:
             sound=data.get("sound", True),
             fullscreen=bool(data.get("fullscreen", False)),
             min_gpus=data.get("min_gpus", DEFAULT_MIN_GPUS),
+            blender_version=data.get("blender_version", DEFAULT_VERSION),
         )
