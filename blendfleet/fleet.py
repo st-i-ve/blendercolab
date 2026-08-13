@@ -302,6 +302,13 @@ class Fleet:
         # silently ERASE the one thing a user would need to go cancel that
         # job's kernels by hand at kaggle.com. See load_jobs().
         self.unreadable_jobs: list = []
+        # label -> why, for every account prepare_dataset() could not
+        # share the most recent upload with. Only ever populated for
+        # accounts OUTSIDE that call's `required` list -- sharing with
+        # them is an optimisation, not something the launch needed, so
+        # this is a report for the caller to surface, not an error.
+        # Overwritten (not accumulated) on every prepare_dataset() call.
+        self.unshared_accounts: dict[str, str] = {}
 
     def _state_path(self) -> Path:
         return state_dir() / STATE_FILE
@@ -543,6 +550,37 @@ class Fleet:
                 raise
         return clients, usernames
 
+    def _resolve_clients_tolerant(
+            self, accounts: list[Account]) -> tuple[dict, dict]:
+        """Best-effort counterpart to _resolve_clients(): an account whose
+        client cannot even be built, or whose whoami() fails, is simply
+        left out of the returned dicts rather than raising.
+
+        Used only for accounts a caller does NOT strictly need -- see
+        prepare_dataset's `required` -- where sharing with them is purely
+        an optimisation (a later launch on that account needs no
+        re-upload), so a dead account there must not block whatever this
+        resolution was actually for.
+        """
+        clients: dict[str, object] = {}
+        usernames: dict[str, str] = {}
+        for account in accounts:
+            try:
+                client = self.client_factory(account.token)
+                username = account.username or client.whoami()
+            except RevokedTokenError:
+                # Same bookkeeping as _resolve_clients() -- this account
+                # really is dead and the rest of the app should know that
+                # too -- just without re-raising past an optional account.
+                account.verified = False
+                account.revoked = True
+                continue
+            except Exception:
+                continue
+            clients[account.label] = client
+            usernames[account.label] = username
+        return clients, usernames
+
     def dataset_slug_for(self, blend: Path, owner_username: str) -> str:
         """Where `blend` lives on Kaggle once uploaded. Pure -- no network,
         so the UI can show the destination before anything is sent."""
@@ -663,7 +701,8 @@ class Fleet:
     def prepare_dataset(self, blend: Path, on_progress: Callable | None = None,
                         *, clients: dict | None = None,
                         usernames: dict | None = None,
-                        on_stage: Callable[[str, str], None] | None = None) -> str:
+                        on_stage: Callable[[str, str], None] | None = None,
+                        required: list[Account] | None = None) -> str:
         """Upload the .blend as a Kaggle dataset, share it, and verify it.
 
         Split out of launch() so the upload can be driven on its own: it is
@@ -676,10 +715,30 @@ class Fleet:
         Costs no GPU quota: a dataset upload is not a session. Nothing here
         starts a kernel, so a caller may run this as often as it likes.
 
+        `required` names the accounts this particular call cannot proceed
+        without -- every configured account when omitted, which is the
+        original, fully-strict behaviour every caller except launch() still
+        gets (the standalone "Upload" action, existing tests, etc.).
+        launch() instead passes its own render subset: sharing with a
+        configured account OUTSIDE that subset is only ever an
+        optimisation -- so THAT job's later render on it needs no
+        re-upload -- and a revoked or unreachable account there must not
+        fail a launch that never asked to render on it. An account INSIDE
+        `required` gets the ORIGINAL, strict treatment, same as the owner
+        below: its kernel is about to be pushed, and a scene it cannot see
+        would burn its quota failing to find the .blend. Everything this
+        call could not share with an optional account is recorded on
+        self.unshared_accounts (label -> why) rather than raised.
+
         Returns the dataset slug every worker's notebook will reference.
         """
         if not self.accounts:
             raise ValueError("add at least one account before uploading")
+        required_labels = ({a.label for a in required} if required is not None
+                           else {a.label for a in self.accounts})
+        # Reset, not accumulated: a stale entry from a PREVIOUS upload
+        # must never be reported as something that just happened.
+        self.unshared_accounts = {}
 
         def stage(key: str, detail: str = "") -> None:
             # Bytes alone cannot distinguish "uploading" from "granting
@@ -697,6 +756,14 @@ class Fleet:
         if clients is None or usernames is None:
             clients, usernames = self._resolve_clients()
         owner = self.accounts[0]
+        # The owner is never optional, in `required` or not: without it
+        # there is no account left to perform the upload at all, so a dead
+        # owner is a hard failure regardless of who is actually rendering.
+        # Indexing straight in (not a tolerant .get) keeps that contract
+        # explicit -- a missing owner here is the CALLER's bug (it must
+        # resolve the owner strictly before calling this, exactly as
+        # launch() does below), not something to paper over with a vague
+        # KeyError.
         owner_client = clients[owner.label]
         owner_username = usernames[owner.label]
         dataset_slug = f"{owner_username}/{dataset_name}"
@@ -737,16 +804,42 @@ class Fleet:
         _require_matching_dataset(owner_client, owner_username, dataset_slug,
                                   blend.name, expected_size)
 
+        # "Sharing" is attempted for every configured account -- see the
+        # docstring above for why that stays fleet-wide regardless of
+        # `required` -- but a friend whose OWN client/whoami() already
+        # failed (see launch()'s tolerant resolution) has no client to
+        # share or verify with at all. A required one reaching here missing
+        # is the caller's bug, exactly like a missing owner above; an
+        # optional one is simply not shareable right now.
         friends = self.accounts[1:]
-        friend_usernames = [usernames[a.label] for a in friends]
-        if friend_usernames:
-            stage("sharing", ", ".join(friend_usernames))
+        for account in friends:
+            if account.label not in usernames:
+                if account.label in required_labels:
+                    raise ValueError(
+                        f"{account.label} is required for this launch but "
+                        "has no resolved client -- resolve it before "
+                        "calling prepare_dataset, or remove it from "
+                        "`required`.")
+                self.unshared_accounts[account.label] = (
+                    "could not be reached to share the scene with")
+        resolvable = [a for a in friends if a.label in usernames]
+
+        if resolvable:
+            stage("sharing", ", ".join(usernames[a.label] for a in resolvable))
             sdk = owner_client._sdk_factory(owner_client.token)
-            self._require_real_usernames(friends, usernames, clients)
+            # Wrong-username and bulk-grant-rejection failures are NOT
+            # split by required/optional below -- both remain fully strict
+            # for every resolvable friend, same as before this method took
+            # a `required` list. Splitting THOSE too is possible but is
+            # not what launch()'s coupling bug needed: this only has to
+            # stop a REVOKED/UNREACHABLE account outside the subset from
+            # failing a launch that never asked to render on it.
+            self._require_real_usernames(resolvable, usernames, clients)
             current = sharing.get_settings(sdk, owner_username, dataset_name)
             try:
-                sharing.grant_readers(sdk, owner_username, dataset_name,
-                                      friend_usernames, current)
+                sharing.grant_readers(
+                    sdk, owner_username, dataset_name,
+                    [usernames[a.label] for a in resolvable], current)
             except Exception as e:
                 # The pre-check above cannot catch every bad name: an
                 # account that owns nothing has no handle for Kaggle to
@@ -756,7 +849,7 @@ class Fleet:
                 # "james"' -- names the handle but not WHICH account of
                 # yours carries it, and arrives wrapped as an unexplained
                 # failure. Translate it here, where both are known.
-                raise _explain_bad_collaborators(e, friends, usernames) from e
+                raise _explain_bad_collaborators(e, resolvable, usernames) from e
 
             # Verify access actually landed, not just that the write
             # returned cleanly -- see UnreachableAccountsError. Deliberately
@@ -764,24 +857,46 @@ class Fleet:
             # on dataset_status(), measured live to 404 for a non-owner
             # account even with a genuine READER grant, so it would refuse
             # every shared launch here.
-            unreachable = [usernames[a.label] for a in friends
-                          if not clients[a.label].dataset_reachable(dataset_slug)]
-            if unreachable:
+            #
+            # Split by required/optional: an optional friend Kaggle hasn't
+            # made the grant visible to yet is exactly the "best effort"
+            # case this `required` parameter exists for -- recorded, not
+            # raised, so a launch that never asked to render on them is not
+            # held up by their propagation delay.
+            unreachable_required = []
+            still_checkable = []
+            for account in resolvable:
+                if clients[account.label].dataset_reachable(dataset_slug):
+                    still_checkable.append(account)
+                elif account.label in required_labels:
+                    unreachable_required.append(usernames[account.label])
+                else:
+                    self.unshared_accounts[account.label] = (
+                        "granted READER access, but Kaggle has not made "
+                        "the dataset reachable for this account yet")
+            if unreachable_required:
                 raise UnreachableAccountsError(
                     "granted READER access but the dataset is still not "
-                    f"reachable for: {', '.join(unreachable)}. Nothing has "
-                    "been started -- retry once Kaggle's grant has "
-                    "propagated.")
+                    f"reachable for: {', '.join(unreachable_required)}. "
+                    "Nothing has been started -- retry once Kaggle's grant "
+                    "has propagated.")
 
             # Reachable proves a friend can see A copy -- not that it is
             # the SAME copy just verified above for the owner. Each
             # friend's OWN client is asked, in case Kaggle's read-side
-            # replication genuinely disagrees between accounts.
-            for account in friends:
+            # replication genuinely disagrees between accounts. Same
+            # required/optional split as above: a STALE or missing copy on
+            # an optional friend is recorded, not raised.
+            for account in still_checkable:
                 stage("verifying-access", usernames[account.label])
-                _require_matching_dataset(
-                    clients[account.label], usernames[account.label],
-                    dataset_slug, blend.name, expected_size)
+                try:
+                    _require_matching_dataset(
+                        clients[account.label], usernames[account.label],
+                        dataset_slug, blend.name, expected_size)
+                except StaleDatasetError as e:
+                    if account.label in required_labels:
+                        raise
+                    self.unshared_accounts[account.label] = str(e)
         stage("ready", dataset_slug)
         return dataset_slug
 
@@ -998,21 +1113,40 @@ class Fleet:
             # sitting this job out may well render a later job against the
             # very same dataset, and re-sharing per launch would mean
             # re-granting the same reader access over and over for no
-            # reason. That means prepare_dataset() indexes clients/
-            # usernames by self.accounts[0]/[1:], not by `accounts` -- so
-            # it must be handed a resolution that covers the WHOLE fleet,
-            # not just this launch's subset, or it KeyErrors on the very
-            # first account this launch didn't ask for. Reuse the
-            # resolution above when it already covers everyone (the common
-            # case: accounts=None); otherwise resolve the rest of the
-            # fleet too.
+            # reason. `required=accounts` tells prepare_dataset which of
+            # those accounts this launch cannot proceed without (their
+            # kernel is about to be pushed) versus which are purely an
+            # optimisation for some possible future launch -- a revoked or
+            # unreachable account in the second group must not fail a
+            # launch that never asked to render on it (see
+            # prepare_dataset's `required` and self.unshared_accounts).
             if {a.label for a in accounts} == {a.label for a in self.accounts}:
                 dataset_clients, dataset_usernames = clients, usernames
             else:
-                dataset_clients, dataset_usernames = self._resolve_clients()
+                # The owner is never optional (see prepare_dataset) --
+                # resolved STRICTLY here, merged with the subset's own
+                # strict resolution above, so prepare_dataset never has to
+                # guess whether a missing dict entry means "revoked" or
+                # merely "not part of this launch". Every OTHER configured
+                # account is resolved TOLERANTLY: a friend this launch
+                # never asked to render on being unreachable is not this
+                # launch's problem, and must not become its failure.
+                dataset_clients, dataset_usernames = dict(clients), dict(usernames)
+                owner = self.accounts[0]
+                if owner.label not in dataset_usernames:
+                    owner_clients, owner_usernames = self._resolve_clients(
+                        [owner])
+                    dataset_clients.update(owner_clients)
+                    dataset_usernames.update(owner_usernames)
+                others = [a for a in self.accounts
+                         if a.label not in dataset_usernames]
+                extra_clients, extra_usernames = (
+                    self._resolve_clients_tolerant(others))
+                dataset_clients.update(extra_clients)
+                dataset_usernames.update(extra_usernames)
             dataset_slug = self.prepare_dataset(
                 blend, on_progress, clients=dataset_clients,
-                usernames=dataset_usernames)
+                usernames=dataset_usernames, required=accounts)
         else:
             expected_size = blend.stat().st_size
             for account in accounts:

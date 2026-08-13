@@ -5,7 +5,8 @@ import pytest
 import blendfleet.fleet as fleet_mod
 import blendfleet.platform_paths as pp
 from blendfleet.accounts import Account
-from blendfleet.kaggle_client import KaggleError, KernelStatus, Quota
+from blendfleet.kaggle_client import (KaggleError, KernelStatus, Quota,
+                                      RevokedTokenError)
 from blendfleet.notebook_builder import RenderSettings
 from blendfleet.fleet import (Fleet, FleetBusyError, FleetState,
                               StaleDatasetError, UnreachableAccountsError,
@@ -646,6 +647,74 @@ def test_launch_on_a_subset_never_resolves_a_client_outside_it(blend, tmp_path):
              dataset_slug=dataset_slug, accounts=subset)
 
     assert set(resolved) == {accts[2].token, accts[3].token}
+
+
+# ---------------------------------------------------------------------------
+# Task 4 review, fix round 2 -- NEW IMPORTANT: fix round 1's dataset-sharing
+# resolution (see IMPORTANT 1 above) resolved the WHOLE fleet strictly, so a
+# dead account ANYWHERE -- in or out of the launch subset -- failed every
+# subset launch that needed a fresh upload. Split into a HARD requirement
+# for accounts inside the launch and a BEST-EFFORT one for accounts outside
+# it (Fleet.prepare_dataset's `required`, Fleet.unshared_accounts).
+# ---------------------------------------------------------------------------
+
+class RevokedWhoamiClient(FakeClient):
+    """Stands in for an account whose Kaggle token has been revoked --
+    whoami() is where _resolve_clients() notices that for real."""
+    def whoami(self):
+        raise RevokedTokenError(
+            "this account's Kaggle token has been revoked. Go to "
+            "kaggle.com -> Settings -> API -> Generate New Token.")
+
+
+def test_launch_tolerates_a_revoked_account_outside_the_subset(blend, tmp_path):
+    """The account excluded from the render (a1, a plain friend -- NOT the
+    fleet's owner, so this isolates the actual coupling bug rather than the
+    separate, unavoidable "the owner itself must always work" question)
+    being revoked must not fail a launch that never asked to render on it.
+    It must still be named somewhere so the user knows that account was
+    not shared with and will need re-sharing/re-upload before it can be
+    used."""
+    accts = accounts(4)
+
+    def factory(tok):
+        if tok == accts[1].token:
+            return RevokedWhoamiClient(tok)
+        return FakeClient(tok)
+
+    f = Fleet(accts, factory, tmp_path / "w")
+    subset = [accts[2], accts[3]]
+
+    st = f.launch(blend, RenderSettings(1920, 1080, 128), 1, 8,
+                  accounts=subset)  # must not raise
+
+    assert [w.label for w in st.workers] == ["a2", "a3"]
+    assert "a1" in f.unshared_accounts, (
+        "the account this launch could not share with must be named, not "
+        "silently dropped")
+
+
+def test_launch_still_fails_when_a_required_account_cannot_see_the_scene(
+        blend, tmp_path):
+    """The other half of the same split: an account INSIDE this launch's
+    subset must still block the launch if it cannot see the scene -- its
+    kernel is about to be pushed, and it would burn its quota failing to
+    find the .blend. Uses an unreachable-after-grant account (checked only
+    inside prepare_dataset's grant/verify step, not the earlier
+    resolve-before-anything-else guard) so this specifically pins the
+    required/optional split itself: a wrong or over-broadened version of
+    that split (e.g. "simplifying" it back to treating every account the
+    same) would let this one through silently instead of raising."""
+    accts = accounts(4)
+    f = Fleet(accts, lambda t: FakeClient(
+        t, dataset_reachable=(t != accts[2].token)), tmp_path / "w")
+    subset = [accts[2], accts[3]]
+
+    with pytest.raises(UnreachableAccountsError, match="user_2"):
+        f.launch(blend, RenderSettings(1920, 1080, 128), 1, 8,
+                 accounts=subset)
+
+    assert f.load() is None, "nothing should have been started"
 
 
 # ---------------------------------------------------------------------------
