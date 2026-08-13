@@ -88,6 +88,19 @@
         </div>
       </div>
 
+      <!-- A tracked job whose record on disk could not be parsed at all.
+           Never auto-cleared: its kernels may still be running on Kaggle,
+           billing quota, with nothing here able to cancel or collect them
+           any more. "Forget this record" only stops this app from being
+           able to WARN about it -- it is not a cancel, and the wording
+           inside each row says so plainly. -->
+      <div class="unreadable-banner" id="unreadable-banner"></div>
+
+      <!-- Who the LAST scene upload could not be shared with. Explicitly
+           scoped: this is a snapshot of that one upload, never a live
+           check of the dataset in use right now. -->
+      <div class="unshared-banner" id="unshared-banner"></div>
+
       <!-- ============ DASHBOARD ============ -->
       <div class="page on" id="page-dashboard">
         <!-- Four figures this app can actually source. There is no "fleet
@@ -115,7 +128,14 @@
         <div class="dash-grid" style="margin-top:22px">
           <div>
             <h2 class="sec">Running processes <span class="meta" id="job-meta">no scene chosen</span></h2>
-            <div class="instances" id="instances"></div>
+            <!-- One job-group section per running scene, each with its own
+                 card grid and frame grid, then a final idle section -- see
+                 renderJobSections() in app.js. Its OWN class is "job-list"
+                 (stacked, one column) rather than "instances" (a card
+                 grid): giving the outer wrap the inner cards' own grid
+                 class would lay job-group SECTIONS out side by side
+                 instead of stacking them. -->
+            <div class="job-list" id="instances"></div>
           </div>
           <div>
             <h2 class="sec">Fleet log</h2>
@@ -167,18 +187,11 @@
               </div>
             </div>
 
-            <h2 class="sec" style="margin-top:26px">Frames <span class="meta" id="fg-meta">no job yet</span></h2>
-            <div class="fgrid-wrap show">
-              <div class="fgrid" id="fgrid"></div>
-              <!-- The caveat is not a footnote. The notebook reports how
-                   many frames succeeded, not which, so a failed frame
-                   shifts every later cell for that account. -->
-              <div class="fgrid-legend">
-                <span><i style="background:var(--accent)"></i>done <b>(approximate)</b></span>
-                <span><i style="background:var(--fill)"></i>not yet</span>
-              </div>
-              <div class="dz-sub" style="margin-top:8px">The render reports a COUNT of successful frames, not a list — a failed frame shifts every later cell for that account. Collect frames is the authoritative list of what exists.</div>
-            </div>
+            <!-- Frame-by-frame progress moved to Dashboard: each running
+                 scene now gets its own grid there, next to its own accounts
+                 and its own collect/cancel controls (see #instances /
+                 jobSectionHtml in app.js) -- a single grid here could only
+                 ever show ONE job the moment a second scene started. -->
           </div>
 
           <div>
@@ -191,6 +204,17 @@
               <div class="f-row"><label>Samples</label><input id="f-spp" type="number" min="1" value="128"></div>
               <div class="f-row"><label>Format</label><select id="f-fmt"><option>PNG</option><option>JPEG</option></select></div>
               <div class="f-row"><label>Blender</label><select id="sel-blender"></select></div>
+              <!-- One checkbox per account, so this scene lands only on
+                   machines actually chosen for it. Absent selection means
+                   "every free account" (launch()'s own default); an
+                   account already rendering something else is shown
+                   disabled -- ticking it would spend that account's quota
+                   twice for the same output, which is never offered as a
+                   choice. -->
+              <div class="f-row">
+                <label>Render on</label>
+                <div id="assign-list" class="assign-list"></div>
+              </div>
               <div class="dz-sub" id="eta" style="margin:6px 0 12px"></div>
               <div class="fr-actions">
                 <button class="btn primary" id="btn-render">Render across fleet</button>

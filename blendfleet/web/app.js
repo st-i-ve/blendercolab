@@ -197,7 +197,7 @@ function renderState(json) {
   if (!state.instances.length) {
     wrap.innerHTML = '<div class="empty">No accounts yet — add one under Instances to start rendering.</div>';
   } else {
-    wrap.innerHTML = state.instances.map(instanceCard).join('');
+    wrap.innerHTML = renderJobSections(state);
   }
 
   const online = state.instances.length;
@@ -217,23 +217,87 @@ function renderState(json) {
   setStat('gpus', gpus);
   setStat('frames', frames);
 
+  const jobs = state.jobs || [];
   const jobMeta = document.getElementById('job-meta');
   if (jobMeta) {
-    jobMeta.textContent = state.job
-      ? `${state.job.blend} · frames ${state.job.startFrame}-${state.job.endFrame}`
+    jobMeta.textContent = jobs.length
+      ? `${jobs.length} scene${jobs.length === 1 ? '' : 's'} rendering`
       : (state.blend ? `${state.blend.name} · not started` : 'no scene chosen');
   }
   document.getElementById('nav-running').textContent = running;
   document.getElementById('nav-inst').textContent = online;
-  document.getElementById('nav-files').textContent = state.job ? 1 : 0;
+  document.getElementById('nav-files').textContent = jobs.length ? 1 : 0;
 
   /* Every page is driven from the SAME payload on the same tick. A count
      in the sidebar that updates on a different schedule from the page it
      points at is worse than no count. */
   renderFleetTable(state);
-  renderFrameGrid(state);
+  renderAssignList(state);
+  renderUnreadable(state);
+  renderUnshared(state);
   renderFailures(state);
   renderDataset(state);
+}
+
+/* Groups state.instances by the job they belong to -- one section per
+   SCENE, each with its own frame grid and its own collect/cancel
+   controls (carrying data-job, so a click can never be misrouted to the
+   wrong scene), then a final section for accounts that are idle. Two
+   concurrent renders used to be indistinguishable: every card landed in
+   one flat grid with no heading saying which scene it belonged to. */
+function renderJobSections(state) {
+  const byJob = {};
+  const idle = [];
+  state.instances.forEach(inst => {
+    if (inst.jobId) (byJob[inst.jobId] = byJob[inst.jobId] || []).push(inst);
+    else idle.push(inst);
+  });
+  const jobsById = new Map((state.jobs || []).map(j => [j.jobId, j]));
+  const sections = Object.keys(byJob).map(jobId => {
+    /* A job a running account points at but that is missing from
+       `jobs[]` (a payload inconsistency, never expected in practice) is
+       still shown -- its own instances must not silently vanish -- but
+       honestly, as an unknown scene rather than a guessed one. */
+    const job = jobsById.get(jobId) || {
+      jobId, scene: 'unknown scene', blend: 'unknown', startFrame: 1,
+      endFrame: 0, labels: [], elapsed: null, finished: false,
+    };
+    return jobSectionHtml(job, byJob[jobId]);
+  });
+  return sections.join('') + idleSectionHtml(idle);
+}
+
+function jobSectionHtml(job, instances) {
+  const elapsed = job.elapsed != null
+    ? `<span class="job-sub">${job.finished ? 'finished in ' : ''}${
+        fmtDuration(job.elapsed)}</span>`
+    : '';
+  return `<section class="job-group">
+    <div class="job-head">
+      <h3 class="job-title">${esc(job.scene)}</h3>
+      <span class="job-sub">${esc(job.blend)} · frames ${job.startFrame}-${job.endFrame}</span>
+      ${elapsed}
+      <div class="job-actions">
+        <button class="btn sm" data-job-collect="${esc(job.jobId)}"
+          title="Download this scene's rendered frames">Collect frames…</button>
+        <button class="btn sm danger" data-job-cancel="${esc(job.jobId)}"
+          title="Cancel every account rendering this scene">Cancel</button>
+      </div>
+    </div>
+    <div class="instances">${instances.map(instanceCard).join('')}</div>
+    ${renderFrameGrid(job, instances)}
+  </section>`;
+}
+
+function idleSectionHtml(instances) {
+  if (!instances.length) return '';
+  return `<section class="job-group idle">
+    <div class="job-head">
+      <h3 class="job-title">Idle</h3>
+      <span class="job-sub">not currently rendering</span>
+    </div>
+    <div class="instances">${instances.map(instanceCard).join('')}</div>
+  </section>`;
 }
 
 /* Status icons for the instance cards. Inline SVG, matching index.html's
@@ -567,8 +631,16 @@ function populateBlenderVersions(json) {
   ).join('');
 }
 
+/* `labels` is left OFF entirely unless the user has actually touched a
+   checkbox in #assign-list -- launch()'s own contract (bridge.py) is that
+   ABSENT means every free account, while an explicitly EMPTY list is
+   REFUSED outright (Fix round 1, Critical: unticking every box must not
+   fall back to rendering on everybody). assignTouched is what tells
+   these two "nobody chosen yet" and "chose nobody on purpose" apart. */
+let assignTouched = false;
+
 function renderOptions() {
-  return {
+  const options = {
     startFrame: +document.getElementById('f-start').value,
     endFrame: +document.getElementById('f-end').value,
     resX: +document.getElementById('f-rx').value,
@@ -577,6 +649,97 @@ function renderOptions() {
     format: document.getElementById('f-fmt').value,
     blenderVersion: document.getElementById('sel-blender').value,
   };
+  if (assignTouched) {
+    options.labels = Array.from(
+      document.querySelectorAll('#assign-list input[data-assign]:checked')
+    ).map(el => el.dataset.assign);
+  }
+  return options;
+}
+
+/* One checkbox per configured account, in the render panel. A FREE
+   account defaults to checked -- unticking one is an active choice to
+   leave it out, never the default state. An account already rendering
+   another scene is shown disabled, with the reason in its title: ticking
+   it would spend that account's quota twice for the same output, which
+   this app never offers as an option. */
+function renderAssignList(state) {
+  const el = document.getElementById('assign-list');
+  if (!el) return;
+  if (!state.instances.length) {
+    el.innerHTML = '<div class="dz-sub" style="padding:6px 2px">No accounts yet — add one under Instances.</div>';
+    return;
+  }
+  const jobsById = new Map((state.jobs || []).map(j => [j.jobId, j]));
+  el.innerHTML = state.instances.map(inst => {
+    const busy = !!inst.jobId;
+    const job = busy ? jobsById.get(inst.jobId) : null;
+    const scene = job ? job.scene : 'another scene';
+    const title = busy
+      ? `${esc(inst.label)} is already rendering ${esc(scene)} — starting `
+        + 'a second render on it would spend this account\'s quota twice '
+        + 'for the same output.'
+      : '';
+    return `<label class="assign-opt"${title ? ` title="${title}"` : ''}>
+      <input type="checkbox" data-assign="${esc(inst.label)}"${busy ? ' disabled' : ' checked'}>
+      <span class="an">${esc(inst.label)}</span>
+      ${busy ? `<span class="ad">rendering ${esc(scene)}</span>` : ''}
+    </label>`;
+  }).join('');
+}
+document.getElementById('assign-list').addEventListener('change', e => {
+  if (e.target.matches('[data-assign]')) assignTouched = true;
+});
+
+/* Job records this app could no longer read at all -- see
+   Fleet.unreadable_jobs and bridge.py's _unreadable_jobs_payload(). Never
+   silently dropped: any kernels named in `message` may still be running
+   on Kaggle and billing quota, with nothing here able to cancel or
+   collect them any more. "Forget this record" is explicit that it is NOT
+   a cancel -- it only stops this app from being able to warn about it. */
+function renderUnreadable(state) {
+  const el = document.getElementById('unreadable-banner');
+  const entries = state.unreadableJobs || [];
+  el.classList.toggle('show', entries.length > 0);
+  if (!entries.length) { el.innerHTML = ''; return; }
+  el.innerHTML = entries.map(u => `<div class="unreadable-row">
+      <span class="warn-ico">${ICON.warning}</span>
+      <div class="unreadable-body">
+        <div>${esc(u.message)}</div>
+        ${u.kernelUrls && u.kernelUrls.length
+          ? `<div class="unreadable-links">${u.kernelUrls.map(url =>
+              `<a href="${esc(url)}" target="_blank" rel="noopener">${esc(url)}</a>`
+            ).join(' ')}</div>`
+          : ''}
+      </div>
+      <button class="btn sm danger" data-forget-unreadable="${u.index}"
+        data-fingerprint="${esc(u.fingerprint)}"
+        title="Stops this app from warning about this record. Does NOT cancel anything still running on Kaggle.">Forget this record</button>
+    </div>`).join('');
+}
+document.getElementById('unreadable-banner').addEventListener('click', e => {
+  const btn = e.target.closest('[data-forget-unreadable]');
+  if (btn && backend) {
+    backend.forgetUnreadableJob(Number(btn.dataset.forgetUnreadable),
+                                btn.dataset.fingerprint);
+  }
+});
+
+/* Accounts the LAST scene upload could not be shared with (bridge.py's
+   `unshared`). `note` always travels with it, because this is a snapshot
+   of that one upload -- never a live check of the dataset in use right
+   now -- and showing the accounts without that scope would read as a
+   current, ongoing failure. */
+function renderUnshared(state) {
+  const el = document.getElementById('unshared-banner');
+  const unshared = state.unshared;
+  const accounts = unshared ? (unshared.accounts || {}) : {};
+  const names = Object.keys(accounts);
+  el.classList.toggle('show', names.length > 0);
+  if (!names.length) { el.innerHTML = ''; return; }
+  el.innerHTML = `<div class="unshared-head"><b>Not everyone can see the last uploaded scene.</b></div>`
+    + names.map(name => `<div class="unshared-row"><b>${esc(name)}</b>: ${esc(accounts[name])}</div>`).join('')
+    + `<div class="unshared-note">${esc(unshared.note)}</div>`;
 }
 
 function refreshEta() {
@@ -742,26 +905,24 @@ document.getElementById('btn-render').onclick = () =>
 document.getElementById('btn-cancel').onclick = () => backend && backend.cancelAll();
 document.getElementById('btn-collect').onclick = () => backend && backend.collect('');
 
-function renderFrameGrid(state) {
-  const grid = document.getElementById('fgrid');
-  const meta = document.getElementById('fg-meta');
-  if (!state.job) {
-    grid.innerHTML = '';
-    meta.textContent = 'no job yet';
-    return;
-  }
+/* One job's own frame grid, as an HTML fragment -- never the whole page's
+   state. Pure, like instanceCard(): it reads only the ONE job and the
+   instances already known to belong to it (the caller, renderJobSections,
+   is what does that filtering), so two concurrent scenes can never bleed
+   frames into each other's grid. */
+function renderFrameGrid(job, instances) {
   /* Which frames are done is INFERRED, not reported: each account is
      assumed to have finished the first N of its own stride. That holds
      until a frame fails, which is why the legend says approximate. */
   const done = new Set();
-  state.instances.forEach(i => {
+  instances.forEach(i => {
     if (!i.worker) return;
     const n = i.live && i.live.framesTotal ? i.live.framesDone
             : i.worker.framesDone;
     i.worker.frames.slice(0, n).forEach(f => done.add(f));
   });
   const cells = [];
-  for (let f = state.job.startFrame; f <= state.job.endFrame; f++) {
+  for (let f = job.startFrame; f <= job.endFrame; f++) {
     /* A finished frame is clickable: one image is fetched on demand
        rather than collecting the whole job to look at a picture. An
        unfinished one is not -- there is nothing on Kaggle to fetch. */
@@ -770,9 +931,17 @@ function renderFrameGrid(state) {
       isDone ? ` data-frame="${f}" role="button" tabindex="0"` : ''
     } title="frame ${f}${isDone ? ' — click to preview' : ''}"></div>`);
   }
-  grid.innerHTML = cells.join('');
-  const total = state.job.endFrame - state.job.startFrame + 1;
-  meta.textContent = `${done.size}/${total} frames · ${esc(state.job.blend)}`;
+  const total = job.endFrame - job.startFrame + 1;
+  return `<div class="fgrid-wrap show">
+    <div class="fgrid" data-job="${esc(job.jobId || '')}">${cells.join('')}</div>
+    <div class="fgrid-legend">
+      <span><i style="background:var(--accent)"></i>done <b>(approximate)</b></span>
+      <span><i style="background:var(--fill)"></i>not yet</span>
+    </div>
+    <div class="fg-meta">${done.size}/${total} frames · ${esc(job.blend)}
+      — a failed frame shifts every later cell for that account; Collect
+      frames is the authoritative list of what exists.</div>
+  </div>`;
 }
 
 /* ---------------- instances page ---------------------------------------- */
@@ -907,13 +1076,34 @@ document.addEventListener('keydown', e => {
   }
 });
 
-/* Delegated, because the grid is rebuilt on every state tick and a
-   listener bound to a cell would not survive it. */
-document.getElementById('fgrid').addEventListener('click', e => {
+/* Delegated on #instances, not on any one grid: renderJobSections rebuilds
+   its whole innerHTML on every state tick, and with several scenes running
+   there is no longer a single static #fgrid to bind to -- a listener
+   attached to a grid div would not survive the very next tick, or the
+   very next SECOND job either. #instances itself is never replaced, only
+   its contents, so a listener bound here outlives every repaint. */
+document.getElementById('instances').addEventListener('click', e => {
   const cell = e.target.closest('[data-frame]');
-  if (cell && backend) backend.previewFrame(Number(cell.dataset.frame));
+  if (cell && backend) { backend.previewFrame(Number(cell.dataset.frame)); return; }
+  const collectBtn = e.target.closest('[data-job-collect]');
+  if (collectBtn && backend) {
+    backend.collect('', collectBtn.dataset.jobCollect);
+    return;
+  }
+  const cancelBtn = e.target.closest('[data-job-cancel]');
+  if (cancelBtn && backend && lastStateJson) {
+    /* No per-job cancel exists on the bridge (by design -- Kaggle's unit
+       of control is one session, see cancelInstance's own comment), so
+       this cancels exactly the accounts THIS job's own payload names,
+       one cancelInstance() call per account, rather than reaching for
+       cancelAll() and stopping every OTHER running scene too. */
+    const jobId = cancelBtn.dataset.jobCancel;
+    const job = (JSON.parse(lastStateJson).jobs || [])
+      .find(j => j.jobId === jobId);
+    (job ? job.labels : []).forEach(label => backend.cancelInstance(label));
+  }
 });
-document.getElementById('fgrid').addEventListener('keydown', e => {
+document.getElementById('instances').addEventListener('keydown', e => {
   if (e.key !== 'Enter' && e.key !== ' ') return;
   const cell = e.target.closest('[data-frame]');
   if (cell && backend) {

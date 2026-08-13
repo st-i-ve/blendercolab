@@ -563,12 +563,18 @@ def test_a_non_owner_card_is_not_badged(card):
 # ---------------------------------------------------------------------------
 
 def _grid_html(page, job_js, instances_js):
+    """Render one job's own frame grid by calling the page's own
+    renderFrameGrid(job, instances) -- PURE now, like instanceCard(), so
+    the concurrent-scenes rewrite (Task 7) can call it once per job
+    without each call fighting the others over a single shared #fgrid
+    element. Bailed out by a timer as well as by the callback, same as
+    _card_html.
+    """
     out = {}
     loop = QEventLoop()
     page.runJavaScript(
-        "(() => { try {"
-        f" renderFrameGrid({{job: {job_js}, instances: {instances_js}}});"
-        " return document.getElementById('fgrid').innerHTML;"
+        "(() => { try { return String(renderFrameGrid("
+        f"{job_js}, {instances_js}));"
         " } catch (e) { return 'THREW ' + e; } })()",
         lambda r: (out.__setitem__("v", r or ""), loop.quit()))
     QTimer.singleShot(5000, loop.quit)
@@ -601,6 +607,106 @@ def test_a_finished_frame_is_reachable_by_keyboard(loaded_page):
     page, _ = loaded_page
     html = _grid_html(page, FOUR_FRAME_JOB, TWO_DONE)
     assert 'role="button"' in html and 'tabindex="0"' in html
+
+
+# ---------------------------------------------------------------------------
+# Several scenes rendering at once (Task 7).
+#
+# Tasks 3-6 made the backend track several concurrent jobs and put
+# `jobId` on every instance; before this, renderState/renderFrameGrid still
+# only ever read the single, most-recent `state.job`, so a second scene's
+# accounts landed in the SAME flat card grid with no heading saying which
+# scene they belonged to, and its frames were never shown at all.
+# ---------------------------------------------------------------------------
+
+def _state_html(page, payload_js, element_id="instances"):
+    """Drive the real renderState(json) and return one element's innerHTML.
+
+    Mirrors _share_html's own shape: build the state through the page's
+    own function rather than hand-assembling markup, then read back
+    whatever DOM it produced.
+    """
+    out = {}
+    loop = QEventLoop()
+    page.runJavaScript(
+        "(() => { try {"
+        f" renderState(JSON.stringify({payload_js}));"
+        f" return document.getElementById({element_id!r}).innerHTML;"
+        " } catch (e) { return 'THREW ' + e; } })()",
+        lambda r: (out.__setitem__("v", r or ""), loop.quit()))
+    QTimer.singleShot(5000, loop.quit)
+    loop.exec()
+    assert "v" in out and not out["v"].startswith("THREW"), out.get("v")
+    return out["v"]
+
+
+def _two_scene_state(extra_job_fields=""):
+    """Two jobs (alpha/beta), one account each, nothing idle."""
+    return f"""({{
+      job: null,
+      jobs: [
+        {{jobId:'j-alpha', scene:'alpha', blend:'alpha.blend',
+          startFrame:1, endFrame:4, labels:['acct0'],
+          elapsed: 12, finished: false{extra_job_fields}}},
+        {{jobId:'j-beta', scene:'beta', blend:'beta.blend',
+          startFrame:1, endFrame:4, labels:['acct1'],
+          elapsed: 8, finished: false{extra_job_fields}}}
+      ],
+      instances: [
+        {{label:'acct0', username:'acct0', verified:true, revoked:false,
+          owner:false, jobId:'j-alpha', quota:'', hardware:null,
+          worker:{{state:'running', frames:[1,2,3,4], framesDone:2,
+                  message:'', elapsed:12, finished:false}}, live:null}},
+        {{label:'acct1', username:'acct1', verified:true, revoked:false,
+          owner:false, jobId:'j-beta', quota:'', hardware:null,
+          worker:{{state:'running', frames:[1,2,3,4], framesDone:1,
+                  message:'', elapsed:8, finished:false}}, live:null}}
+      ],
+      dataset: null, unshared: null, unreadableJobs: [], blend: null,
+      approximate: true
+    }})"""
+
+
+def test_instances_are_grouped_by_the_scene_they_are_rendering(loaded_page):
+    """Two scenes at once, and no way to tell which card belongs to which,
+    would be worse than not having the feature."""
+    page, _ = loaded_page
+    html = _state_html(page, _two_scene_state())
+    assert "alpha" in html and "beta" in html
+    assert html.index("alpha") < html.index("acct0")
+
+
+def test_each_job_gets_its_own_frame_grid(loaded_page):
+    page, _ = loaded_page
+    html = _state_html(page, _two_scene_state())
+    assert html.count('class="fgrid"') == 2
+
+
+def test_an_account_already_rendering_cannot_be_assigned_to_a_second_scene(
+        loaded_page):
+    """It would spend that account's quota twice for the same output."""
+    page, _ = loaded_page
+    payload = """({
+      job: null, jobs: [{jobId:'j-alpha', scene:'alpha', blend:'alpha.blend',
+        startFrame:1, endFrame:4, labels:['acct0'], elapsed:null,
+        finished:false}],
+      instances: [
+        {label:'acct0', username:'acct0', verified:true, revoked:false,
+         owner:false, jobId:'j-alpha', quota:'', hardware:null,
+         worker:{state:'running', frames:[1,2,3,4], framesDone:1,
+                 message:'', elapsed:5, finished:false}, live:null},
+        {label:'acct1', username:'acct1', verified:true, revoked:false,
+         owner:false, jobId:null, quota:'', hardware:null,
+         worker:null, live:null}
+      ],
+      dataset: null, unshared: null, unreadableJobs: [], blend: null,
+      approximate: true
+    })"""
+    checkbox_html = _state_html(page, payload, element_id="assign-list")
+    assert "disabled" in checkbox_html
+    # The free account must still be OFFERED, not merely absent from the
+    # list -- unticking is a choice the user makes, not one made for them.
+    assert "acct1" in checkbox_html and "checked" in checkbox_html
 
 
 def _preview_state(page, script):

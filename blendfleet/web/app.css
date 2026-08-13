@@ -260,6 +260,28 @@ html,body{background:transparent}
 }
 .offline-banner button.ob-ico:hover{background:color-mix(in srgb,currentColor 12%,transparent)}
 
+/* Same shape as .offline-banner, but WARN severity: a record this app can
+   no longer read, or an account the last upload could not reach -- real
+   problems, but not "Kaggle is unreachable". */
+.unreadable-banner,.unshared-banner{
+  display:none;flex-direction:column;gap:10px;
+  padding:14px 18px;margin:0 0 18px;
+  background:var(--card);
+  border:1px solid color-mix(in srgb,var(--warn-ink) 40%,transparent);
+  border-radius:var(--r-lg);box-shadow:var(--shadow);
+}
+.unreadable-banner.show,.unshared-banner.show{display:flex}
+.unreadable-row{display:flex;gap:12px;align-items:flex-start}
+.unreadable-row:not(:last-child){padding-bottom:10px;border-bottom:1px dashed var(--border)}
+.unreadable-row .warn-ico{width:17px;height:17px;flex:none;margin-top:2px;color:var(--warn-ink)}
+.unreadable-row .warn-ico svg{width:100%;height:100%}
+.unreadable-body{flex:1;min-width:0;font-size:12.5px;line-height:1.5;color:var(--ink)}
+.unreadable-links{font-family:var(--mono);font-size:11px;margin-top:4px;word-break:break-all}
+.unreadable-links a{color:var(--warn-ink)}
+.unshared-head{font-size:13px;color:var(--warn-ink)}
+.unshared-row{font-family:var(--mono);font-size:11.5px;color:var(--ink)}
+.unshared-note{font-family:var(--mono);font-size:10.5px;color:var(--ink-3);margin-top:4px}
+
 /* ============================================================
    GENERIC
    ============================================================ */
@@ -349,6 +371,23 @@ h2.sec .meta{font-family:var(--mono);font-size:11px;font-weight:400;color:var(--
 .dash-grid{display:grid;grid-template-columns:1fr 336px;gap:20px;align-items:start}
 @media(max-width:1080px){.dash-grid{grid-template-columns:1fr}}
 .instances{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:15px}
+/* One section per running scene, stacked (never side by side -- see the
+   comment on #instances in index.html for why this is a separate class
+   from .instances, the CARD grid reused unchanged inside each section). */
+.job-list{display:flex;flex-direction:column;gap:26px}
+.job-group{padding-top:2px}
+.job-head{
+  display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;
+  padding:0 2px 10px;margin-bottom:14px;border-bottom:1px solid var(--border);
+}
+.job-head .job-title{
+  font-family:var(--cond);font-size:13.5px;font-weight:700;
+  letter-spacing:.08em;text-transform:uppercase;color:var(--ink);
+}
+.job-head .job-sub{font-family:var(--mono);font-size:11px;color:var(--ink-3)}
+.job-head .job-actions{margin-left:auto;display:flex;gap:8px}
+.job-group.idle .job-head .job-title{color:var(--ink-3)}
+.job-group .fgrid-wrap{margin-top:16px}
 .inst{border:1px solid var(--border);border-radius:var(--r-lg);background:var(--card);overflow:hidden;box-shadow:var(--shadow)}
 .inst.offline .inst-body{opacity:.4}
 .inst.paused .inst-body{opacity:.65}
@@ -546,6 +585,10 @@ h2.sec .meta{font-family:var(--mono);font-size:11px;font-weight:400;color:var(--
 }
 .fgrid-legend span{display:flex;align-items:center;gap:5px}
 .fgrid-legend i{width:8px;height:8px;border-radius:2px;display:inline-block}
+/* The caveat that used to sit under the (single) Files-page grid, now
+   travelling inside each job's own fragment (renderFrameGrid in app.js)
+   since there can be several grids on screen at once. */
+.fg-meta{font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:8px;line-height:1.5}
 /* ---- rendered frame previews (skeleton loading) ---- */
 @keyframes shimmer{0%{background-position:-200% 0}100%{background-position:200% 0}}
 .skel{
@@ -778,8 +821,19 @@ h2.sec .meta{font-family:var(--mono);font-size:11px;font-weight:400;color:var(--
 .assign-opt:last-child{border-bottom:none}
 .assign-opt input{width:16px;height:16px;accent-color:var(--accent)}
 .assign-opt .an{font-family:var(--mono);font-size:12px;font-weight:700}
-.assign-opt .ad{font-family:var(--mono);font-size:10.5px;color:var(--ink-3)}
+.assign-opt .ad{font-family:var(--mono);font-size:10.5px;color:var(--ink-3);margin-left:auto}
 .assign-opt .busy{margin-left:auto;font-family:var(--mono);font-size:10px;color:var(--accent-ink)}
+/* An account already spending quota on another scene: greyed rather than
+   removed, so it is still visible as PART of the fleet, just not
+   offered as a choice for this one -- see :has()'s existing precedent on
+   .inst-table's own panel below for browser support in this app. */
+.assign-opt:has(input:disabled){opacity:.55}
+/* The render-panel checkbox list (Files page). Its own scroll container so
+   a long fleet cannot push the render button off the bottom of the panel. */
+.assign-list{
+  display:flex;flex-direction:column;max-height:220px;overflow-y:auto;
+  border:1px solid var(--border-2);border-radius:12px;padding:2px 12px;
+}
 .modal-box .mfoot{display:flex;gap:9px;padding:15px 19px;border-top:1px solid var(--border);justify-content:flex-end}
 /* ---- instance file system ---- */
 .fs-disk{font-family:var(--mono);font-size:10.5px;color:var(--ink-3);margin-top:4px}
