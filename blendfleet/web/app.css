@@ -856,3 +856,29 @@ button:focus:not(:focus-visible){outline:none}
 .panel > .inst-table{min-width:720px}
 .setup-grid .panel:has(.inst-table){overflow-x:auto}
 .inst-table td:last-child{white-space:nowrap}
+
+/* ---- who has the scene -------------------------------------------------
+   The upload bar covers one of two steps; this covers the other. One row
+   per account, ticked as that account's own Kaggle client confirms it can
+   see the file -- so "did they ever get it?" is answerable at a glance
+   instead of being inferred from a render that produced nothing. */
+.share-list{list-style:none;margin:10px 0 0;padding:0;display:flex;flex-direction:column;gap:4px}
+.share-row{
+  display:flex;align-items:center;gap:8px;
+  font-family:var(--mono);font-size:10.5px;color:var(--ink-2);
+  padding:4px 8px;border-radius:8px;background:var(--fill);
+}
+.share-mark{display:grid;place-items:center;width:14px;height:14px;flex:none;line-height:0}
+.share-mark svg{width:13px;height:13px}
+.share-row.ok .share-mark{color:var(--active)}
+.share-row.pending .share-mark{color:var(--ink-3)}
+.share-row.bad .share-mark{color:var(--offline)}
+/* The username may be long; the note is what gives way. */
+.share-who{font-weight:700;color:var(--ink-1);flex:none}
+.share-note{margin-left:auto;color:var(--ink-3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* A pending row is genuinely waiting on Kaggle, so it says so rather
+   than sitting inert. */
+.share-row.pending .share-mark svg{animation:spin 3s linear infinite}
+@media (prefers-reduced-motion:reduce){
+  .share-row.pending .share-mark svg{animation:none}
+}

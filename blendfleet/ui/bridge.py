@@ -215,6 +215,12 @@ class Backend(QObject):
         """
         state = self._last_state
         by_label = {w.label: w for w in (state.workers if state else [])}
+        # The scene is uploaded ONCE, by one account, and every other
+        # account reads it from there -- so exactly one instance is the
+        # parent. Derived from the dataset slug ("<owner>/<name>") rather
+        # than tracked separately, which means it cannot disagree with
+        # the dataset actually being used.
+        dataset_owner = (self._dataset or {}).get("slug", "").split("/", 1)[0]
         instances = []
         for account in self.store.list():
             worker = by_label.get(account.label)
@@ -223,6 +229,8 @@ class Backend(QObject):
                 "username": account.username,
                 "verified": bool(account.verified),
                 "revoked": bool(getattr(account, "revoked", False)),
+                "owner": bool(account.username
+                              and account.username == dataset_owner),
                 # Live only while a kernel runs; None means idle, which is
                 # a real state and not an error.
                 "worker": {

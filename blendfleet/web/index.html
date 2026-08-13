@@ -156,6 +156,11 @@
                 <div class="l"><b id="up-name">no upload in progress</b><span id="up-pct"></span></div>
                 <div class="track"><i id="up-bar"></i></div>
               </div>
+              <!-- Uploading the scene and SHARING it with the fleet are two
+                   separate steps, and only the first has ever been visible.
+                   One row per account, ticked as that account's own client
+                   confirms it can see the file. -->
+              <ul id="share-list" class="share-list" hidden></ul>
               <div class="fr-actions" style="margin-top:12px">
                 <button class="btn" id="btn-upload">Upload to Kaggle</button>
                 <span class="dz-sub" id="ds-note">Rendering reuses this if it matches the scene you have chosen.</span>

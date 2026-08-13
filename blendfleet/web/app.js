@@ -412,6 +412,14 @@ function instanceCard(inst) {
         inst.username && inst.username !== inst.label
           ? `<span class="sub">${esc(inst.username)}</span>` : ''}
       <span class="right">
+        ${/* The account holding the upload everyone else reads from.
+              Worth naming: it is the only one that pays the upload, and
+              when a share goes wrong it is the one to check first. */
+          inst.owner
+            ? '<span class="badge accent" title="This account holds the'
+              + ' uploaded scene; the others read it from here">'
+              + '<i></i>owner</span>'
+            : ''}
         ${inst.revoked
           ? '<span class="badge bad"><i></i>token revoked</span>'
           : inst.verified ? '' : '<span class="badge warn"><i></i>not verified</span>'}
@@ -600,7 +608,70 @@ const UPLOAD_STAGES = {
   ready:               d => ['ready', d],
 };
 
+/* Who has the scene, and who is still waiting for it.
+   Two separate steps hid behind one progress bar: the scene is uploaded
+   ONCE by the owner, then every other account is granted READER on that
+   one dataset and has to be confirmed able to actually see it. When two
+   accounts appeared to render nothing (2026-08-12) the first question
+   was "did they ever get the file?", and nothing on screen could answer
+   it. `owner` is the account that holds the upload; everyone else is a
+   row that starts pending and is ticked by its own confirmation. */
+const share = { owner: null, rows: {} };
+
+function resetShare() {
+  share.owner = null;
+  share.rows = {};
+  renderShareList();
+}
+
+function renderShareList() {
+  const list = document.getElementById('share-list');
+  const names = Object.keys(share.rows);
+  if (!share.owner && !names.length) {
+    list.hidden = true;
+    list.innerHTML = '';
+    return;
+  }
+  list.hidden = false;
+  const row = (name, state, isOwner) => `<li class="share-row ${state}">
+      <span class="share-mark">${
+        state === 'ok' ? ICON.tick : state === 'bad' ? ICON.warning : ICON.clock
+      }</span>
+      <span class="share-who">${esc(name)}</span>
+      <span class="share-note">${
+        isOwner ? 'owner — holds the upload'
+                : state === 'ok' ? 'has the scene'
+                : state === 'bad' ? 'cannot see it'
+                : 'waiting for access'
+      }</span>
+    </li>`;
+  list.innerHTML =
+    (share.owner ? row(share.owner, 'ok', true) : '')
+    + names.map(n => row(n, share.rows[n], false)).join('');
+}
+
 function showUploadStage(p) {
+  /* Stage names are the contract with fleet.prepare_dataset's on_stage --
+     see the stage() calls there. */
+  const stageDetail = p.detail || '';
+  if (p.stage === 'checking') resetShare();
+  if (p.stage === 'verifying') {
+    share.owner = stageDetail;       // the account that uploaded
+    renderShareList();
+  }
+  if (p.stage === 'sharing') {
+    stageDetail.split(',').map(s => s.trim()).filter(Boolean)
+      .forEach(name => { share.rows[name] = 'pending'; });
+    renderShareList();
+  }
+  if (p.stage === 'verifying-access') {
+    share.rows[stageDetail] = 'ok';
+    renderShareList();
+  }
+  if (p.stage === 'ready') {
+    Object.keys(share.rows).forEach(n => { share.rows[n] = 'ok'; });
+    renderShareList();
+  }
   const describe = UPLOAD_STAGES[p.stage];
   const [title, detail] = describe ? describe(p.detail || '') : [p.stage, ''];
   const pct = p.total ? Math.round(100 * p.uploaded / p.total) : null;
@@ -895,6 +966,16 @@ new QWebChannel(qt.webChannelTransport, channel => {
     if (key.indexOf('collect:') === 0 && !busy) {
       Object.keys(downloads).forEach(k => delete downloads[k]);
       if (lastStateJson) renderState(lastStateJson);
+    }
+    /* The dataset step has stopped. Anything still waiting was never
+       confirmed -- prepare_dataset raises rather than continuing past an
+       account that cannot see the file -- so it is not still pending, it
+       failed. Leaving it on a clock would say "any moment now" for ever. */
+    if (key === 'dataset' && !busy) {
+      Object.keys(share.rows).forEach(n => {
+        if (share.rows[n] === 'pending') share.rows[n] = 'bad';
+      });
+      renderShareList();
     }
   });
 

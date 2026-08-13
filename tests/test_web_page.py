@@ -470,3 +470,84 @@ def test_a_card_with_no_download_shows_no_download_row(loaded_page):
     QTimer.singleShot(5000, loop.quit)
     loop.exec()
     assert "data-dl=" not in out["v"]
+
+
+# ---------------------------------------------------------------------------
+# Who has the scene.
+#
+# Uploading and SHARING are two steps and only the first was ever visible.
+# When two accounts appeared to render nothing (2026-08-12) the first
+# question was "did they ever get the file?" and nothing on screen could
+# answer it. ("we need the upload process 1, then we need the file sharing
+# process next so we should see a check list of instances with the shared
+# file.")
+# ---------------------------------------------------------------------------
+
+def _share_html(page, stages):
+    """Drive showUploadStage through `stages` and return the checklist."""
+    calls = "".join(
+        f"showUploadStage({{stage: {s!r}, detail: {d!r}}});" for s, d in stages)
+    out = {}
+    loop = QEventLoop()
+    page.runJavaScript(
+        "(() => { try {"
+        f" resetShare(); {calls}"
+        " return document.getElementById('share-list').outerHTML;"
+        " } catch (e) { return 'THREW ' + e; } })()",
+        lambda r: (out.__setitem__("v", r or ""), loop.quit()))
+    QTimer.singleShot(5000, loop.quit)
+    loop.exec()
+    assert "v" in out and not out["v"].startswith("THREW"), out.get("v")
+    return out["v"]
+
+
+def test_the_checklist_names_the_owner_and_everyone_waiting(loaded_page):
+    page, _ = loaded_page
+    html = _share_html(page, [
+        ("checking", "sudao/remember-blend"),
+        ("verifying", "sudaouserwithani"),
+        ("sharing", "worpstudios, johnokadah"),
+    ])
+    assert "sudaouserwithani" in html and "owner" in html
+    assert "worpstudios" in html and "johnokadah" in html
+    assert html.count("waiting for access") == 2
+
+
+def test_each_account_is_ticked_as_it_confirms_it_can_see_the_file(loaded_page):
+    page, _ = loaded_page
+    html = _share_html(page, [
+        ("checking", "x"), ("verifying", "sudaouserwithani"),
+        ("sharing", "worpstudios, johnokadah"),
+        ("verifying-access", "worpstudios"),
+    ])
+    assert "has the scene" in html
+    assert "waiting for access" in html, "johnokadah has not confirmed yet"
+    assert html.count("has the scene") == 1
+
+
+def test_ready_means_every_account_has_it(loaded_page):
+    page, _ = loaded_page
+    html = _share_html(page, [
+        ("checking", "x"), ("verifying", "owner-acct"),
+        ("sharing", "a, b"), ("verifying-access", "a"),
+        ("ready", "owner-acct/remember-blend"),
+    ])
+    assert "waiting for access" not in html
+    assert html.count("has the scene") == 2
+
+
+def test_the_checklist_is_hidden_when_nothing_is_being_shared(loaded_page):
+    page, _ = loaded_page
+    html = _share_html(page, [])
+    assert "hidden" in html
+
+
+def test_the_owner_card_is_badged(card):
+    owned = LIVE_INSTANCE.replace("verified: true", "verified: true, owner: true")
+    html = card(owned)
+    assert ">owner<" in html
+
+
+def test_a_non_owner_card_is_not_badged(card):
+    html = card()
+    assert ">owner<" not in html
