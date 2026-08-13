@@ -177,7 +177,20 @@ function logLine(message, tone_) {
 }
 
 /* ---------------- dashboard --------------------------------------------- */
+/* In-flight downloads, keyed by instance label: {downloaded, total, rate}.
+   A download used to be a single log line ("acct0: downloading 42%"), which
+   scrolled away and told you nothing about size or speed -- so a 36 MB
+   fetch over a slow link was indistinguishable from a stuck one. Cleared
+   when the collect finishes, so a finished card is not left showing a bar
+   at 100% for ever. */
+const downloads = {};
+
+/* The last payload rendered, so a download tick can repaint the cards
+   without waiting for the next 30-second poll. */
+let lastStateJson = null;
+
 function renderState(json) {
+  lastStateJson = json;
   const state = JSON.parse(json);
   const wrap = document.getElementById('instances');
 
@@ -356,6 +369,23 @@ function instanceCard(inst) {
       </div>`
     : '';
 
+  /* A download in flight, shown the way the render is: a bar, a size and
+     a rate. The frames arrive as ONE zip per worker (the notebook builds
+     it as each frame finishes), so this is normally a single file moving,
+     and "12.4 / 36.1 MB · 1.8 MB/s" is what says whether it is moving at
+     all. Bytes, never a bare percentage: a percentage of an unknown total
+     is how a stalled transfer looks healthy. */
+  const dl = downloads[inst.label];
+  const dlRow = dl
+    ? `<div class="gpu-line dl-row" data-dl="${esc(inst.label)}">
+        <span class="tag on">downloading</span>
+        <div class="track rendering"><i data-dl-bar style="width:${
+          dl.total ? Math.min(100, Math.round(100 * dl.downloaded / dl.total)) : 0
+        }%"></i></div>
+        <span class="pct" data-dl-text>${fmtDownload(dl)}</span>
+      </div>`
+    : '';
+
   /* Elapsed time, and after it stops, the total. "finished in 5:20" is
      the benchmark; while it runs the same number is the stopwatch, so
      one field serves both and they cannot disagree. */
@@ -412,6 +442,7 @@ function instanceCard(inst) {
       </div>` : ''}
       ${gpuRows}
       ${sysRow}
+      ${dlRow}
       ${phase}
       ${worker && worker.message ? `<div class="inst-foot"><b>${esc(worker.message)}</b></div>` : ''}
     </div>
@@ -482,6 +513,16 @@ function fmtAge(seconds) {
   if (seconds < 86400) return Math.floor(seconds / 3600) + 'h ago';
   return Math.floor(seconds / 86400) + 'd ago';
 }
+/* "12.4 / 36.1 MB · 1.8 MB/s". The total is omitted rather than faked
+   when Kaggle sends no Content-Length -- "12.4 MB of 0" is worse than
+   "12.4 MB", because one of them is obviously incomplete information and
+   the other looks like a bug. */
+function fmtDownload(d) {
+  const rate = d.rate ? ` · ${fmtBytes(d.rate)}/s` : '';
+  if (!d.total) return `${fmtBytes(d.downloaded)}${rate}`;
+  return `${fmtBytes(d.downloaded)} / ${fmtBytes(d.total)}${rate}`;
+}
+
 /* How long a render took, read the way a person says it. Under an hour
    it is mm:ss, which is how you read a stopwatch; past an hour the bare
    "1:05:20" is ambiguous enough at a glance to be worth spelling out.
@@ -819,8 +860,27 @@ new QWebChannel(qt.webChannelTransport, channel => {
   backend.uploadProgress.connect(json => showUploadStage(JSON.parse(json)));
   backend.downloadProgress.connect(json => {
     const p = JSON.parse(json);
-    const pct = p.total ? Math.round(100 * p.downloaded / p.total) : 0;
-    logLine(`${p.label}: downloading ${pct}%`, '');
+    downloads[p.label] = p;
+    /* Patched in place, not re-rendered: these arrive every megabyte, and
+       rebuilding every card that often would fight the user for the
+       scroll position. The card's own markup is rebuilt on the next state
+       tick anyway, and reads the same `downloads` entry. */
+    /* Matched on the dataset value rather than built into a selector: a
+       label is free text, and a quote or bracket in one would make
+       querySelector throw rather than simply not match. */
+    const row = Array.from(document.querySelectorAll('[data-dl]'))
+      .find(el => el.dataset.dl === p.label);
+    if (row) {
+      const bar = row.querySelector('[data-dl-bar]');
+      const text = row.querySelector('[data-dl-text]');
+      if (bar) {
+        bar.style.width = (p.total
+          ? Math.min(100, Math.round(100 * p.downloaded / p.total)) : 0) + '%';
+      }
+      if (text) text.textContent = fmtDownload(p);
+    } else if (lastStateJson) {
+      renderState(lastStateJson);   // first tick: the row does not exist yet
+    }
   });
 
   backend.busyChanged.connect((key, busy) => {
@@ -829,6 +889,13 @@ new QWebChannel(qt.webChannelTransport, channel => {
     const id = map[key];
     if (id) document.getElementById(id).disabled = busy;
     if (key.indexOf('verify:') === 0) document.getElementById('btn-add').disabled = busy;
+    /* A finished collect must not leave a bar frozen at whatever it
+       reached -- including a failed one, which would otherwise sit at 68%
+       for ever, looking like it was still going. */
+    if (key.indexOf('collect:') === 0 && !busy) {
+      Object.keys(downloads).forEach(k => delete downloads[k]);
+      if (lastStateJson) renderState(lastStateJson);
+    }
   });
 
   backend.state(renderState);

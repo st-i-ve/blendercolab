@@ -403,3 +403,70 @@ def test_a_running_card_shows_the_same_field_as_a_stopwatch(card):
     html = card(running)
     assert "1:35" in html
     assert "finished in" not in html
+
+
+# ---------------------------------------------------------------------------
+# A download you can watch.
+#
+# Progress was emitted all along, but only as a log line that scrolled
+# away ("acct0: downloading 42%") -- so a 36 MB fetch over a slow link was
+# indistinguishable from a stuck one. ("when i download a file i want to
+# see the progress", 2026-08-12.)
+# ---------------------------------------------------------------------------
+
+def _download_html(page, label, entry):
+    """Render a card with `downloads` primed, then clean up after."""
+    out = {}
+    loop = QEventLoop()
+    page.runJavaScript(
+        "(() => { try {"
+        f"  downloads[{label!r}] = {entry};"
+        f"  const html = String(instanceCard({LIVE_INSTANCE}));"
+        f"  delete downloads[{label!r}];"
+        "   return html;"
+        " } catch (e) { return 'THREW ' + e; } })()",
+        lambda r: (out.__setitem__("v", r or ""), loop.quit()))
+    QTimer.singleShot(5000, loop.quit)
+    loop.exec()
+    assert "v" in out, "the page never answered"
+    assert not out["v"].startswith("THREW"), out["v"]
+    return out["v"]
+
+
+def test_a_downloading_card_shows_bytes_and_rate_not_just_a_percent(loaded_page):
+    page, _ = loaded_page
+    html = _download_html(page, "acct0",
+                          "{downloaded: 13002343, total: 37855928, rate: 1887436}")
+    assert "downloading" in html
+    # fmtBytes is the page's shared formatter: one decimal only below ten
+    # units, so 13002343 B reads "12 MB" and a 1.8 MB/s rate keeps its
+    # decimal. Asserted in its terms rather than bending a formatter the
+    # upload display also uses.
+    assert "12 MB" in html and "36 MB" in html, html[-400:]
+    assert "1.8 MB/s" in html, "a rate is what says whether it is still moving"
+
+
+def test_a_download_with_no_declared_total_does_not_invent_one(loaded_page):
+    """Kaggle does not always send Content-Length. "12.4 MB of 0" reads as
+    a bug; "12.4 MB" reads as incomplete information, which is the truth."""
+    page, _ = loaded_page
+    html = _download_html(page, "acct0",
+                          "{downloaded: 13002343, total: 0, rate: 0}")
+    assert "12 MB" in html
+    assert "/ 0" not in html and "0 B" not in html
+    # fmtBytes renders a zero as an em dash; a rate of nothing must be
+    # omitted entirely rather than shown as "· —/s". (Not asserted as
+    # "/s" -- that substring is in every closing </span> on the card.)
+    assert "MB/s" not in html and "B/s" not in html
+
+
+def test_a_card_with_no_download_shows_no_download_row(loaded_page):
+    page, _ = loaded_page
+    out = {}
+    loop = QEventLoop()
+    page.runJavaScript(
+        f"String(instanceCard({LIVE_INSTANCE}))",
+        lambda r: (out.__setitem__("v", r or ""), loop.quit()))
+    QTimer.singleShot(5000, loop.quit)
+    loop.exec()
+    assert "data-dl=" not in out["v"]

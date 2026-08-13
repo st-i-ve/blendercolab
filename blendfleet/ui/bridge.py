@@ -804,6 +804,10 @@ class Backend(QObject):
                         "label": lbl,
                         "downloaded": p.downloaded,
                         "total": p.total,
+                        # Read directly for the same reason as the two
+                        # above: a getattr default would turn a rename
+                        # into a permanent, plausible-looking 0 B/s.
+                        "rate": p.rate_bps,
                     })))
 
         def ok(report) -> None:
