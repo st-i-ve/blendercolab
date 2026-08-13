@@ -42,6 +42,15 @@ def test_a_string_that_is_not_a_version_is_refused(bad):
         "must show a real example"
 
 
+def test_digits_from_another_script_are_not_a_version():
+    """Python's \\d matches any Unicode decimal, so "٥.٢.٠" once passed
+    validation and produced a download URL with no matching file --
+    exactly the 404-inside-a-running-session this module exists to
+    prevent."""
+    with pytest.raises(ValueError):
+        validate_version("٥.٢.٠")
+
+
 def test_the_url_follows_blenders_own_layout():
     # download.blender.org/release/Blender5.2/blender-5.2.0-linux-x64.tar.xz
     url = download_url("5.2.0")

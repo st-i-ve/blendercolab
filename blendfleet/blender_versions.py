@@ -33,7 +33,11 @@ DEFAULT_VERSION = KNOWN_VERSIONS[0]
 # "v5.2.0", a release candidate suffix -- has no matching tarball at
 # download.blender.org, and is also the shape an injected string would
 # take, since this value reaches a shell command inside the notebook.
-_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
+# [0-9] rather than \d: bare \d matches any Unicode decimal digit (e.g.
+# Arabic-Indic "٥"), which would sail through as "digits" and then have
+# no matching file at download.blender.org -- the exact 404-discovered-
+# mid-session failure this module exists to prevent.
+_VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 
 
 def validate_version(version: str) -> str:
