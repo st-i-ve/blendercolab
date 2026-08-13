@@ -312,9 +312,33 @@ def test_dataset_files_is_empty_for_a_dataset_with_no_files():
     assert c.dataset_files("owner/x") == []
 
 
-def test_dataset_files_propagates_when_the_account_cannot_reach_the_dataset():
+def test_dataset_files_wraps_an_unreachable_dataset_with_what_to_do_next():
+    """Fix round 1, Important 3: this used to propagate the raw SDK
+    exception -- exactly the "not one of the problems BlendFleet knows
+    how to explain" fallback in ui/messages.py, for what is actually the
+    MOST LIKELY real-world cause here: a days-old library scene whose
+    dataset was deleted/renamed, or whose grant has lapsed since it was
+    last rendered."""
     c, _ = client(list_files_ok=False)
-    with pytest.raises(RuntimeError, match="Forbidden"):
+    with pytest.raises(KaggleError) as excinfo:
+        c.dataset_files("owner/x")
+    message = str(excinfo.value)
+    assert "deleted or renamed" in message
+    assert "lapsed" in message
+    assert "Forbidden" in message, "the underlying detail must not be lost"
+
+
+def test_dataset_files_raises_revoked_token_error_when_the_token_is_dead():
+    """A 401 (or the ambiguous-403-with-auth-wording case _is_revoked_token
+    covers) must be named as a dead token, exactly like whoami()/status()
+    already are -- not folded into the generic "cannot reach this
+    dataset" explanation above."""
+    class RevokedApi(FakeApi):
+        def dataset_list_files(self, slug):
+            raise RuntimeError("401 Client Error: Unauthorized")
+
+    c, _ = client(api=RevokedApi())
+    with pytest.raises(RevokedTokenError):
         c.dataset_files("owner/x")
 
 
@@ -347,9 +371,12 @@ def test_dataset_file_size_propagates_when_the_account_cannot_reach_the_dataset(
     """A total-unreachable failure (403) is a DIFFERENT problem than 'missing
     from an otherwise-readable listing' -- it must not be swallowed into a
     quiet None here. Callers that need to tell these apart call
-    dataset_reachable() first (fleet.launch does)."""
+    dataset_reachable() first (fleet.launch does). Wrapped as a KaggleError,
+    not a bare RuntimeError, since Fix round 1 (Task 10) -- dataset_files()
+    (which this is now built on) wraps it, and the two must never drift
+    apart."""
     c, _ = client(list_files_ok=False)
-    with pytest.raises(RuntimeError, match="Forbidden"):
+    with pytest.raises(KaggleError, match="Forbidden"):
         c.dataset_file_size("owner/x", "scene.blend")
 
 

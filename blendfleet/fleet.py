@@ -108,8 +108,58 @@ def slug_stem(blend: Path) -> str:
     return stem
 
 
+def _default_stale_message(username: str, filename: str, remote_size: int,
+                           expected_size: int) -> str:
+    """The size-mismatch wording for launch()'s own callers: a LOCAL
+    .blend really is about to be re-uploaded, and "just launch again" is
+    literally what fixes it (the owner always re-uploads). See
+    launch_from_dataset's OWN mismatch wording (below, in that method)
+    for why this specific message is wrong on that path -- there, both
+    of those things are false, and saying so anyway sends the user
+    chasing a fix that cannot work.
+    """
+    return (
+        f"{username}'s copy of {filename!r} is {remote_size} bytes on "
+        f"Kaggle, but the local file about to be rendered is "
+        f"{expected_size} bytes. Nothing has been started. Kaggle "
+        "exposes no content hash for dataset files, so this is a size "
+        "check, not a byte-for-byte comparison -- but a different size "
+        "means this account is looking at a STALE copy left over from "
+        "an earlier upload, not the scene you are about to render. "
+        "Re-upload the current .blend (just launch again -- the owner "
+        "always re-uploads) so every account sees the same, current "
+        "copy before retrying.")
+
+
+def _owner_copy_mismatch_message(username: str, filename: str,
+                                 expected_size: int, remote_size: int) -> str:
+    """launch_from_dataset()'s own size-mismatch wording (Fix round 1,
+    Important 2) -- passed as `_require_matching_dataset`'s
+    `stale_message` hook.
+
+    `_default_stale_message` (above) says "the local file about to be
+    rendered" and "just launch again -- the owner always re-uploads" --
+    both literally false on THIS path: there is no local file at all, and
+    launching launch_from_dataset() again never uploads anything. This
+    says what is actually true instead: two accounts disagree about what
+    Kaggle holds for this scene right now, and what to do about that.
+    """
+    return (
+        f"{username}'s copy of {filename!r} on Kaggle is {remote_size} "
+        f"bytes, but the dataset owner's own copy is {expected_size} "
+        "bytes. Nothing has been started. The accounts disagree about "
+        "what is actually on Kaggle for this scene right now -- launching "
+        "again will not fix this, since there is no local file to "
+        "re-upload here. Re-upload the .blend for this scene from the "
+        "Dashboard so every account is re-shared against the same, "
+        "current copy, or delete this dataset from the library and add "
+        "the scene again, then retry.")
+
+
 def _require_matching_dataset(client, username: str, slug: str,
-                              filename: str, expected_size: int) -> None:
+                              filename: str, expected_size: int, *,
+                              stale_message: Callable[[int], str] | None = None
+                              ) -> None:
     """Raise StaleDatasetError unless `client`'s own view of `filename`
     inside dataset `slug` is exactly `expected_size` bytes.
 
@@ -126,6 +176,16 @@ def _require_matching_dataset(client, username: str, slug: str,
     KaggleClient.dataset_file_size's docstring) -- this is a size check,
     and both messages say so plainly rather than implying a byte-for-byte
     comparison that was never actually performed.
+
+    `stale_message`, when given, REPLACES the size-MISMATCH wording only
+    (called with the remote size actually seen) -- the missing-file
+    wording above is unaffected, since "the file simply is not there" is
+    equally true regardless of what it is being compared against.
+    launch_from_dataset() passes its own version (Fix round 1, Important
+    2): the default wording below talks about "the local file about to be
+    rendered" and says "just launch again -- the owner always re-uploads",
+    both literally false when there is no local file at all, which is
+    exactly launch_from_dataset()'s whole premise.
     """
     remote_size = client.dataset_file_size(slug, filename)
     if remote_size is None:
@@ -138,17 +198,11 @@ def _require_matching_dataset(client, username: str, slug: str,
             "Re-share the dataset with this account (or just retry once "
             "Kaggle has caught up) and launch again.")
     if remote_size != expected_size:
+        if stale_message is not None:
+            raise StaleDatasetError(stale_message(remote_size))
         raise StaleDatasetError(
-            f"{username}'s copy of {filename!r} is {remote_size} bytes on "
-            f"Kaggle, but the local file about to be rendered is "
-            f"{expected_size} bytes. Nothing has been started. Kaggle "
-            "exposes no content hash for dataset files, so this is a size "
-            "check, not a byte-for-byte comparison -- but a different size "
-            "means this account is looking at a STALE copy left over from "
-            "an earlier upload, not the scene you are about to render. "
-            "Re-upload the current .blend (just launch again -- the owner "
-            "always re-uploads) so every account sees the same, current "
-            "copy before retrying.")
+            _default_stale_message(username, filename, remote_size,
+                                   expected_size))
 
 
 def _find_blend_file(client, slug: str) -> tuple[str, int]:
@@ -166,14 +220,15 @@ def _find_blend_file(client, slug: str) -> tuple[str, int]:
     against, not a size read from a local file that, for a scene rendered
     straight from Kaggle, does not exist.
 
-    Every dataset this app itself uploads holds exactly one file, so the
-    first match is returned rather than raising on more than one -- a
-    dataset with two .blend files is not a shape this app's own upload
-    path can produce, only a hand-edited one on kaggle.com, and guessing
-    which of two is "the" scene would be worse than picking either.
+    Every dataset this app itself uploads holds exactly one file, so
+    picking among more than one is not a case this app's own upload path
+    can produce -- only a hand-edited dataset on kaggle.com. Sorted by
+    name (Fix round 1, Minor) so THAT pick is at least reproducible run to
+    run, rather than whatever order Kaggle's own listing happened to
+    return -- not a claim that a sorted pick is somehow "the right one".
     """
-    blends = [(name, size) for name, size in client.dataset_files(slug)
-              if name.lower().endswith(".blend")]
+    blends = sorted((name, size) for name, size in client.dataset_files(slug)
+                    if name.lower().endswith(".blend"))
     if not blends:
         raise NoBlendInDatasetError(
             f"dataset {slug!r} has no .blend file in it. Nothing has been "
@@ -1426,6 +1481,17 @@ class Fleet:
         if not accounts:
             raise ValueError("add at least one account before launching")
 
+        # Reset, not accumulated: a stale entry from a PREVIOUS
+        # prepare_dataset()/launch() call must never be misread as
+        # reflecting THIS one. Unlike those, this method never shares
+        # with accounts outside `accounts` at all (see this method's own
+        # docstring -- sharing here is deliberately scoped to the render
+        # subset), so there is nothing of ITS OWN to record here either;
+        # this exists purely so a caller reading unshared_accounts after
+        # this call does not see a PREVIOUS call's leftovers and mistake
+        # them for current.
+        self.unshared_accounts = {}
+
         # A local check, same as require_free() everywhere else in this
         # module -- done before any network call so a busy fleet fails
         # fast without first paying for a whoami() or a dataset listing.
@@ -1433,33 +1499,47 @@ class Fleet:
 
         clients, usernames = self._resolve_clients(accounts)
 
-        owner = self.accounts[0]
-        if owner.label in usernames:
-            owner_client, owner_username = clients[owner.label], usernames[owner.label]
-        else:
-            owner_clients, owner_usernames = self._resolve_clients([owner])
-            owner_client, owner_username = (owner_clients[owner.label],
-                                            owner_usernames[owner.label])
-
+        # The dataset's real Kaggle owner is NOT always self.accounts[0]:
+        # this library is explicitly cross-account (Scene.owner exists,
+        # and list_scenes() lists every configured account's own
+        # datasets, precisely because a scene can belong to any of them),
+        # so a scene rendered here can be owned by any configured
+        # account. Only that account's own token can grant or re-verify
+        # sharing on it -- Kaggle reserves ADMIN-only actions to the
+        # literal owner, never to a READER grant -- so it is found here
+        # by matching Kaggle USERNAME against every configured account,
+        # not by assuming fleet position.
         dataset_owner = dataset_slug.split("/", 1)[0]
-        if dataset_owner != owner_username:
-            # Only a dataset's real Kaggle owner can grant or re-verify
-            # sharing on it -- Kaggle reserves that to the literal owner,
-            # never to an account holding a READER grant -- and this
-            # module's own upload convention (see its top-of-file
-            # docstring) is that self.accounts[0] is always that owner for
-            # every scene this app manages. A mismatch here means the
-            # fleet's account order no longer agrees with who actually
-            # owns this scene on Kaggle.
+        owner_label = next((label for label, username in usernames.items()
+                            if username == dataset_owner), None)
+        if owner_label is None:
+            # Not among the accounts already resolved for THIS launch's
+            # render subset -- look tolerantly at every other configured
+            # account too: a dead account elsewhere in the fleet, that
+            # this render never asked to use, must not block rendering a
+            # scene it does not even own.
+            others = [a for a in self.accounts if a.label not in usernames]
+            other_clients, other_usernames = self._resolve_clients_tolerant(
+                others)
+            owner_label = next(
+                (label for label, username in other_usernames.items()
+                 if username == dataset_owner), None)
+            if owner_label is not None:
+                clients = {**clients, owner_label: other_clients[owner_label]}
+                usernames = {**usernames,
+                            owner_label: other_usernames[owner_label]}
+
+        if owner_label is None:
             raise ValueError(
                 f"dataset {dataset_slug!r} is owned by {dataset_owner!r} on "
-                "Kaggle, but this fleet's first configured account is "
-                f"{owner_username!r}. Only the account that owns a dataset "
-                "can grant or re-verify access to it, so it must be first "
-                "in the fleet to render this scene. Nothing has been "
-                "started. Reorder the accounts under Manage accounts… so "
-                "the scene's real owner is first, or render this scene "
-                "from a fleet where it already is.")
+                "Kaggle, but no configured account in this fleet has that "
+                "username. Only the account that owns a dataset can grant "
+                "or re-verify sharing on it. Nothing has been started. Add "
+                "that account under Manage accounts…, or confirm its "
+                "stored username matches what Kaggle reports (Instances -> "
+                "Set username), then try again.")
+
+        owner_client, owner_username = clients[owner_label], usernames[owner_label]
 
         # Confirm a .blend genuinely exists BEFORE anything else -- see
         # NoBlendInDatasetError. No point granting access to, or pushing a
@@ -1480,7 +1560,7 @@ class Fleet:
         # rather than slug_stem's "refuse before an upload" one.
         stem = _capped_stem(stem) or "scene"
 
-        friends = [a for a in accounts if a.label != owner.label]
+        friends = [a for a in accounts if a.label != owner_label]
         if friends:
             self._require_real_usernames(friends, usernames, clients)
             sdk = owner_client._sdk_factory(owner_client.token)
@@ -1509,11 +1589,19 @@ class Fleet:
 
         # Every account in THIS launch, including the owner -- see this
         # method's own docstring for why this check now means "matches the
-        # owner's copy" rather than "matches a local file".
+        # owner's copy" rather than "matches a local file". `stale_message`
+        # replaces _require_matching_dataset's default wording (Fix round
+        # 1, Important 2): that default talks about "the local file about
+        # to be rendered" and says launching again re-uploads it -- both
+        # false here, where there is no local file at all.
         for account in accounts:
+            username = usernames[account.label]
             _require_matching_dataset(
-                clients[account.label], usernames[account.label],
-                dataset_slug, blend_name, expected_size)
+                clients[account.label], username, dataset_slug, blend_name,
+                expected_size,
+                stale_message=lambda remote_size, u=username:
+                _owner_copy_mismatch_message(u, blend_name, expected_size,
+                                             remote_size))
 
         st = FleetState(job_id=job_id, blend_name=blend_name,
                         start_frame=start_frame, end_frame=end_frame,

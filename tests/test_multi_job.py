@@ -711,9 +711,85 @@ def test_every_account_is_verified_against_the_owners_copy(fleet):
     message = str(excinfo.value)
     assert "user3" in message, "must name the account with the stale copy"
     assert "999" in message and "100" in message
+    # Fix round 1, Important 2: the default _require_matching_dataset
+    # wording talks about "the local file about to be rendered" and says
+    # launching again re-uploads it -- both false here, where there is no
+    # local file at all. The message must say what is ACTUALLY true.
+    assert "the local file about to be rendered" not in message, \
+        "that claim describes launch()'s world, not this one -- there is no local file here"
+    assert "the owner always re-uploads" not in message, \
+        "launching launch_from_dataset() again never uploads anything"
+    assert "owner's own copy" in message
+    assert "Dashboard" in message, "must say what to do about a genuine disagreement"
     assert all(c.pushed == [] for c in clients.values()), \
         "nothing may be started while one account's copy is stale"
     assert fleet.load() is None
+
+
+def test_a_scene_owned_by_a_non_first_account_still_renders(fleet):
+    """Fix round 1, Important 1: the library is explicitly cross-account
+    (Scene.owner exists precisely because a scene can belong to any
+    configured account, not just the first) -- a scene owned by accounts[2]
+    must still render, using accounts[2]'s own token to grant/re-verify
+    sharing, not self.accounts[0]'s."""
+    clients = {}
+
+    def factory(tok):
+        clients[tok] = FakeDatasetClient(tok)
+        return clients[tok]
+    fleet.client_factory = factory
+
+    st = fleet.launch_from_dataset(
+        "user2/remember-blend", RenderSettings(1920, 1080, 128), 1, 4)
+
+    assert len(st.workers) == 4
+    assert all(c.pushed for c in clients.values())
+    # The grant call must have gone out through accounts[2]'s own sdk --
+    # the only client whose sdk is wired to _FakeDatasetApiClient here.
+    owner_client = clients[fleet.accounts[2].token]
+    assert len(owner_client.sdk.datasets.dataset_api_client.updated) == 1
+
+
+def test_no_configured_account_owns_the_dataset_fails_closed(fleet):
+    """The other half of the same fix: when truly NO configured account
+    has the dataset's Kaggle username, this must refuse with an explained
+    message, not silently guess or crash."""
+    clients = {}
+
+    def factory(tok):
+        clients[tok] = FakeDatasetClient(tok)
+        return clients[tok]
+    fleet.client_factory = factory
+
+    with pytest.raises(ValueError) as excinfo:
+        fleet.launch_from_dataset(
+            "somebody-else/remember-blend",
+            RenderSettings(1920, 1080, 128), 1, 4)
+
+    message = str(excinfo.value)
+    assert "somebody-else" in message
+    assert "no configured account" in message.lower()
+    pushed = [p for c in clients.values() for p in c.pushed]
+    assert pushed == [], "nothing may be started"
+
+
+def test_more_than_one_blend_in_a_dataset_picks_deterministically(fleet):
+    """Fix round 1, Minor: picking the FIRST file as Kaggle's own listing
+    happened to return it was listing-order dependent. Sorted by name, so
+    the (still arbitrary, for a dataset this app itself never produces)
+    choice is at least reproducible."""
+    clients = {}
+
+    def factory(tok):
+        clients[tok] = FakeDatasetClient(
+            tok, files=[("z.blend", 10), ("a.blend", 20)])
+        return clients[tok]
+    fleet.client_factory = factory
+
+    st = fleet.launch_from_dataset(
+        "user0/two-blends-blend", RenderSettings(1920, 1080, 128), 1, 4)
+
+    assert st.blend_name == "a.blend"
 
 
 def test_a_dataset_with_no_blend_in_it_refuses_before_pushing_a_kernel(fleet):

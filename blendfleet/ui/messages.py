@@ -5,20 +5,21 @@ state what happened, why, and what to do next. Never a bare status code,
 never a raw Python exception.
 
 Several of this codebase's own exception types already do that in full --
-FleetBusyError, UnreachableAccountsError, KaggleError, SyncError,
-UploadError, TokenFormatError all carry a complete explanation in their
-message (see their docstrings in fleet.py/kaggle_client.py/dataset_sync.py/
-uploader.py/accounts.py) -- so those are shown close to verbatim, just
-prefixed with the action that failed. Anything else (a bare OSError, an
-unexpected AttributeError from a library internals change, etc.) gets
-wrapped in the same what/why/next-step shape instead of leaking straight
-through to a QMessageBox.
+FleetBusyError, UnreachableAccountsError, KaggleError, StaleDatasetError,
+NoBlendInDatasetError, SyncError, UploadError, TokenFormatError all carry a
+complete explanation in their message (see their docstrings in
+fleet.py/kaggle_client.py/dataset_sync.py/uploader.py/accounts.py) -- so
+those are shown close to verbatim, just prefixed with the action that
+failed. Anything else (a bare OSError, an unexpected AttributeError from a
+library internals change, etc.) gets wrapped in the same what/why/next-step
+shape instead of leaking straight through to a QMessageBox.
 """
 from __future__ import annotations
 
 from blendfleet.accounts import TokenFormatError
 from blendfleet.dataset_sync import SyncError
-from blendfleet.fleet import (FleetBusyError, UnreachableAccountsError,
+from blendfleet.fleet import (FleetBusyError, NoBlendInDatasetError,
+                              StaleDatasetError, UnreachableAccountsError,
                               UnreadableJobChanged, WrongUsernameError)
 from blendfleet.kaggle_client import KaggleError
 from blendfleet.uploader import UploadError
@@ -27,9 +28,16 @@ from blendfleet.uploader import UploadError
 # already explains what happened, why, and what to do next -- see their
 # docstrings. Shown to the user directly (with the failing action
 # prefixed), never re-wrapped.
+#
+# NoBlendInDatasetError/StaleDatasetError (Task 10) were missing here --
+# their own carefully written what/why/next-step messages were getting
+# "BlendFleet does not recognise this failure pattern" appended on top,
+# which contradicts a message that already explains itself in full (Fix
+# round 1, Minor).
 _SELF_EXPLANATORY = (
     FleetBusyError, UnreachableAccountsError, UnreadableJobChanged,
-    WrongUsernameError, KaggleError,
+    WrongUsernameError, KaggleError, NoBlendInDatasetError,
+    StaleDatasetError,
     SyncError, UploadError, TokenFormatError, ValueError,
 )
 

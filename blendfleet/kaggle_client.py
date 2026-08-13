@@ -676,12 +676,35 @@ class KaggleClient:
         dataset is the .blend, since a scene that lives only on Kaggle has
         no local filename to already know that from.
 
-        Raises whatever dataset_list_files raises (e.g. an HTTPError-derived
-        403) when the account cannot reach the dataset at all -- see
-        dataset_reachable()/dataset_file_size() for why that is a
-        deliberately different failure from "reachable but empty".
+        Wraps whatever dataset_list_files raises, the same way whoami()/
+        status()/list_datasets() already wrap their own calls -- this used
+        to propagate the raw SDK exception (a bare HTTPError-derived
+        RuntimeError) straight through, which is exactly the "not one of
+        the problems BlendFleet knows how to explain" fallback in
+        ui/messages.py, for what is actually this module's MOST COMMON
+        real-world failure here: a days-old library scene whose dataset
+        was deleted or renamed on kaggle.com, or whose READER grant has
+        quietly lapsed, since the last time it was rendered. A revoked
+        token is named as such (RevokedTokenError), exactly like every
+        other read in this class; anything else becomes a KaggleError that
+        says what likely happened and what to do about it, never a bare
+        status code.
         """
-        response = self.api.dataset_list_files(slug)
+        try:
+            response = self.api.dataset_list_files(slug)
+        except Exception as e:
+            if _is_revoked_token(e):
+                raise RevokedTokenError(
+                    revoked_token_message(self.label, self.token)) from e
+            raise KaggleError(
+                f"could not list the files in dataset {slug!r}: {e}. The "
+                "most likely cause is that the dataset has since been "
+                "deleted or renamed on kaggle.com, or that this account's "
+                "READER grant on it has lapsed -- refresh the scene "
+                "library and, if the scene is still listed there, "
+                "re-share or re-add it. This can also be a transient "
+                "network or rate-limit problem; retry once before "
+                "assuming the worst.") from e
         files = getattr(response, "dataset_files", None)
         if files is None and isinstance(response, dict):
             files = response.get("datasetFiles")
@@ -717,11 +740,12 @@ class KaggleClient:
         test_installed_kagglesdk_dataset_file_exposes_no_content_hash, which
         fails the day that stops being true).
 
-        Raises whatever dataset_files raises (e.g. an HTTPError-derived 403)
-        when the account cannot reach the dataset at all -- that is a
-        DIFFERENT failure from "reachable but this file isn't in the
-        listing", see dataset_reachable(). Callers that need to tell the two
-        apart (fleet.launch does) call dataset_reachable() first.
+        Raises whatever dataset_files raises (RevokedTokenError for a dead
+        token, KaggleError -- already explaining the likely cause -- for
+        anything else) when the account cannot reach the dataset at all.
+        That is a DIFFERENT failure from "reachable but this file isn't in
+        the listing", see dataset_reachable(). Callers that need to tell
+        the two apart (fleet.launch does) call dataset_reachable() first.
         """
         for name, size in self.dataset_files(slug):
             if name == filename:

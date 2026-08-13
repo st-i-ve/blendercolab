@@ -1,6 +1,6 @@
 import pytest
 
-from blendfleet.fleet import FleetBusyError
+from blendfleet.fleet import FleetBusyError, NoBlendInDatasetError, StaleDatasetError
 from blendfleet.kaggle_client import KaggleError
 from blendfleet.ui.messages import explain, explain_kernel_failure
 
@@ -37,6 +37,35 @@ def test_never_shows_a_bare_empty_message():
     msg = explain("Collecting frames", RuntimeError(""))
     assert "Collecting frames failed:" in msg
     assert "RuntimeError" in msg
+
+
+# ---------------------------------------------------------------------------
+# Task 10, Fix round 1, Minor: NoBlendInDatasetError/StaleDatasetError were
+# missing from _SELF_EXPLANATORY, so their own carefully written
+# what/why/next-step messages got "not one of the problems BlendFleet knows
+# how to explain" appended on top -- contradicting a message that already
+# explains itself in full.
+# ---------------------------------------------------------------------------
+
+def test_no_blend_in_dataset_error_is_shown_verbatim_not_rewrapped():
+    exc = NoBlendInDatasetError(
+        "dataset 'user0/x-blend' has no .blend file in it. Nothing has "
+        "been started -- no kernel has been pushed. Pick a different "
+        "scene from the library.")
+    msg = explain("Starting the render", exc)
+    assert "Starting the render failed:" in msg
+    assert "no .blend file in it" in msg
+    assert "not one of the problems" not in msg
+
+
+def test_stale_dataset_error_is_shown_verbatim_not_rewrapped():
+    exc = StaleDatasetError(
+        "user3's copy of 'remember.blend' on Kaggle is 999 bytes, but the "
+        "dataset owner's own copy is 100 bytes. Nothing has been started.")
+    msg = explain("Starting the render", exc)
+    assert "Starting the render failed:" in msg
+    assert "999 bytes" in msg
+    assert "not one of the problems" not in msg
 
 
 # ---------------------------------------------------------------------------
