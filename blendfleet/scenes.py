@@ -29,17 +29,23 @@ from blendfleet.kaggle_client import DatasetInfo
 # as a pattern rather than a fixed list of known versions for exactly that
 # reason: a generic-shaped pattern here.
 #
-# This is the one check in this module that must never miss. The runtime
-# dataset is not a scene -- it is the renderer itself, ~380 MB, shared with
-# every account in the fleet. Classifying it as a scene would let the Files
-# page offer it for deletion, and deleting it would silently cost every
-# account on the fleet a re-upload the next time anyone renders. It is
-# checked BEFORE the "-blend" convention below, unconditionally, rather
-# than trusted to fail that check on its own merely because "-linux" and
-# "-blend" happen not to overlap today -- see test_scenes.py's dedicated
-# tests, including one that builds real names from Fleet.blender_dataset_name
-# itself so a future change to that format cannot drift out of sync
-# unnoticed.
+# Honest accounting of what actually protects the runtime dataset TODAY:
+# every name this regex matches ends in "-linux", and the ordinary "-blend"
+# suffix check below already excludes anything that doesn't end in
+# "-blend" -- a string cannot end in both, so the suffix filter alone
+# already excludes every runtime name that exists right now. Deleting
+# this regex and its call site changes scenes_from_datasets' output for
+# NO input in the current test suite; a reviewer confirmed exactly that.
+#
+# It is kept anyway, as defence-in-depth against a future rename: if
+# Fleet.blender_dataset_name's format ever changes to something that
+# could end in "-blend" (or the "-blend" convention itself changes),
+# this check -- keyed to the runtime dataset's own naming code, not to
+# the scene convention -- still excludes it while the suffix filter
+# alone would not. test_the_runtime_pattern_matches_what_fleet_actually_builds
+# pins that: it calls Fleet.blender_dataset_name() for real and asserts
+# the result is excluded, so a rename that broke this guarantee would be
+# caught even though today's suite cannot show the guard doing any work.
 RUNTIME_DATASET_RE = re.compile(r"^blender-[0-9]+-[0-9]+-[0-9]+-linux$")
 
 # The suffix Fleet.dataset_slug_for gives every scene dataset this app
@@ -69,7 +75,12 @@ class Scene:
     name: str             # display name: the stem, with "-blend" stripped
     owner: str
     size_bytes: int
-    updated: datetime
+    # datetime, but None is a real possibility, not a defensive-programming
+    # nicety: kaggle_client.list_datasets builds DatasetInfo.last_updated
+    # with getattr(d, "last_updated", None), so a real SDK item lacking the
+    # field flows all the way through as None. The annotation says so
+    # rather than claiming a guarantee this module cannot make.
+    updated: datetime | None
     # GUESSED filename of the .blend inside the dataset, built the same
     # way Fleet.dataset_slug_for derives the dataset name FROM a .blend --
     # run in reverse. Unverified: see this class's own docstring.
@@ -88,9 +99,11 @@ def scenes_from_datasets(datasets: list[DatasetInfo]) -> list[Scene]:
     for dataset in datasets:
         name = dataset.ref.split("/", 1)[-1]
 
-        # See RUNTIME_DATASET_RE's own comment: checked first and
-        # unconditionally, never left to fall through the -blend check
-        # below merely because the two suffixes don't happen to collide.
+        # See RUNTIME_DATASET_RE's own comment: this does not change
+        # today's output (the suffix check below already excludes every
+        # "-linux" name) -- it is defence-in-depth against the runtime
+        # dataset's naming ever changing to something the suffix check
+        # would miss.
         if RUNTIME_DATASET_RE.match(name):
             continue
 
@@ -109,5 +122,16 @@ def scenes_from_datasets(datasets: list[DatasetInfo]) -> list[Scene]:
             blend_name=f"{stem}.blend",
         ))
 
-    scenes.sort(key=lambda scene: scene.updated, reverse=True)
-    return scenes
+    # A plain `scenes.sort(key=lambda s: s.updated, reverse=True)` raises
+    # TypeError the moment ONE scene has updated=None (Python refuses to
+    # compare None to a datetime) -- one dataset Kaggle returned with no
+    # timestamp would then break the WHOLE account's listing, not just
+    # that entry. Splitting dated from undated sorts the dated ones
+    # exactly as before and appends the undated ones after, deliberately:
+    # "we don't know when this changed" is not "newest", so an undated
+    # scene must never be sorted as if it were -- it goes last, not first
+    # by whatever a raw comparison would have decided.
+    dated = sorted((s for s in scenes if s.updated is not None),
+                   key=lambda scene: scene.updated, reverse=True)
+    undated = [s for s in scenes if s.updated is None]
+    return dated + undated

@@ -48,11 +48,16 @@ def test_the_runtime_pattern_matches_any_blender_version_not_just_known_ones(
 
 
 def test_the_runtime_pattern_matches_what_fleet_actually_builds():
-    """Cross-checks against Fleet.blender_dataset_name itself rather than
-    only a hand-written duplicate of its format string, so a future change
-    to that method cannot silently drift out of sync with this regex --
-    the one guard in this module that must never miss (see
-    RUNTIME_DATASET_RE's own comment)."""
+    """Pins the invariant that actually matters, which is NOT the regex in
+    isolation: whatever Fleet.blender_dataset_name(v) produces for real,
+    for every known version, must never come back out of
+    scenes_from_datasets. Cross-checked against the real method rather
+    than only a hand-written duplicate of its format string, so this
+    would fail the day Fleet's naming changed to something that could
+    end in "-blend" -- exactly the rename RUNTIME_DATASET_RE exists to
+    defend against (see its own comment: today, the ordinary "-blend"
+    suffix check already excludes every current runtime name on its
+    own, since a name cannot end in both "-linux" and "-blend")."""
     from blendfleet.blender_versions import KNOWN_VERSIONS
     from blendfleet.fleet import Fleet
 
@@ -109,6 +114,26 @@ def test_a_scene_carries_the_fields_the_files_page_needs():
     assert scene == Scene(slug="stive/remember-blend", name="remember",
                           owner="stive", size_bytes=54_321_000,
                           updated=updated, blend_name="remember.blend")
+
+
+def test_an_undated_dataset_sorts_last_instead_of_crashing_the_whole_list():
+    """DatasetInfo.last_updated is typed datetime, but list_datasets()
+    builds it with getattr(d, "last_updated", None) -- a real SDK item
+    missing the field flows through as None, not as a missing
+    DatasetInfo. Sorting that alongside real timestamps must not raise
+    (one undated dataset breaking the WHOLE account's listing would be
+    far worse than one row showing no age), and "we don't know when"
+    must not be sorted as if it meant "newest" -- it belongs last,
+    deliberately, not wherever a raw comparison would have put it."""
+    undated = DatasetInfo(ref="me/mystery-blend", title="mystery",
+                          total_bytes=1, last_updated=None,
+                          is_private=True, owner="me")
+    older = ds("me/old-scene-blend", updated=datetime(2026, 1, 1))
+    newer = ds("me/new-scene-blend", updated=datetime(2026, 6, 1))
+
+    got = scenes_from_datasets([older, undated, newer])
+
+    assert [s.name for s in got] == ["new-scene", "old-scene", "mystery"]
 
 
 def test_the_guessed_blend_name_is_a_guess_not_a_verified_fact():
