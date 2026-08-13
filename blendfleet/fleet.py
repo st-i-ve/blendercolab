@@ -26,7 +26,8 @@ from blendfleet import sharing
 from blendfleet.accounts import Account
 from blendfleet.assignment import assign_frames
 from blendfleet.dataset_sync import sync_blend
-from blendfleet.kaggle_client import ACTIVE_STATES, RevokedTokenError
+from blendfleet.kaggle_client import (
+    ACTIVE_STATES, RevokedTokenError, revoked_token_message)
 from blendfleet.notebook_builder import RenderSettings, build, build_probe
 from blendfleet.platform_paths import state_dir
 
@@ -1272,7 +1273,30 @@ class Fleet:
         _LaunchWorker run concurrently with no mutual exclusion, and a job
         launched WHILE a poll is in flight must survive being polled at
         the exact moment it is created, or its kernels end up running,
-        uncancellable and uncollectable.
+        uncancellable and uncollectable. Returns the MERGED result (Task 5
+        fix round 2), not the pre-merge snapshot -- poll()'s own "newest
+        job" answer must reflect what was actually just written, not a
+        tick-stale view from before a concurrent launch was folded in.
+
+        A REVOKED token is deliberately NOT swallowed by the tolerant
+        `except Exception` below (Task 5 fix round 2, NEW IMPORTANT): a
+        network blip clears itself on the next poll, but a dead token
+        never does, and leaving the worker's state exactly as it was
+        (this method's usual tolerance, fine for a transient failure)
+        would permanently wedge that worker at "queued" -- busy_labels()/
+        require_free() read w.state straight off disk, so the account
+        could never come free for a new launch again, EVER, and the app
+        would never say a word about why. That is the exact failure this
+        docstring's first paragraph describes, re-entered a third time,
+        except unlike a network blip no retry ever clears it. Handled
+        the same way _resolve_clients()/_resolve_clients_tolerant() (see
+        their own docstrings) already mark a dead account -- caught
+        FIRST, ahead of the generic tolerant branch, precisely because
+        active_workers()'s "unreachable counts as not active" pattern
+        does not apply here: THAT method fails safe (an unreachable
+        worker frees its account); this bare-except would fail unsafe
+        (an unreachable worker LOCKS its account) if a revoked token were
+        left inside it.
         """
         jobs = self.load_jobs()
         if not jobs:
@@ -1285,14 +1309,34 @@ class Fleet:
                     continue
                 try:
                     s = self.client_factory(acct.token).status(w.kernel_slug)
+                except RevokedTokenError:
+                    # Never a transient failure and never something a
+                    # retry fixes -- so, unlike the tolerant branch below,
+                    # this worker's state is NOT left alone: "queued"
+                    # (ACTIVE_STATES) would lock this account out of every
+                    # future launch forever, in total silence. Moved OUT
+                    # of ACTIVE_STATES instead, with a message the
+                    # dashboard can surface, exactly mirroring how
+                    # _resolve_clients() marks the same account dead on
+                    # the launch side.
+                    acct.verified = False
+                    acct.revoked = True
+                    w.state = "error"
+                    w.message = revoked_token_message(w.label, acct.token)
+                    if not w.finished_at:
+                        w.finished_at = time.time()
+                    continue
                 except Exception:
-                    # One worker's status check failing (network blip,
-                    # revoked token) must not abort refreshing every OTHER
-                    # worker in every OTHER job -- that is this method's
-                    # OWN bug (see its first docstring paragraph above) re-
-                    # entered through the other door (Task 5 fix round 1,
-                    # IMPORTANT 1). Left exactly as it was; not fatal, and
-                    # not overwritten with a guess.
+                    # One worker's status check failing for any OTHER
+                    # reason (network blip, rate limit) must not abort
+                    # refreshing every OTHER worker in every OTHER job --
+                    # that is this method's OWN bug (see its first
+                    # docstring paragraph above) re-entered through the
+                    # other door (Task 5 fix round 1, IMPORTANT 1). Left
+                    # exactly as it was; not fatal, and not overwritten
+                    # with a guess -- safe here specifically because a
+                    # transient failure is expected to clear itself on
+                    # the very next poll, unlike RevokedTokenError above.
                     continue
                 w.state, w.message = s.state, s.message
                 # Stamped once, when the worker stops being active. Not
@@ -1306,7 +1350,7 @@ class Fleet:
         updated_by_id = {st.job_id: st for st in jobs}
         merged = [updated_by_id.get(j.job_id, j) for j in current]
         self.save_jobs(merged)
-        return jobs
+        return merged
 
     def poll(self) -> FleetState | None:
         """Kept for every existing caller (bridge.py's timer, the Qt

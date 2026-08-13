@@ -494,3 +494,100 @@ def test_cancel_job_with_a_duplicate_job_id_cancels_both(fleet):
     assert len(results) == 2, results
     assert any("alpha" in s for s in cancelled), cancelled
     assert any("beta" in s for s in cancelled), cancelled
+
+
+# ---------------------------------------------------------------------------
+# Task 5 fix round 2 -- fix round 1's own IMPORTANT 1 fix (a bare
+# `except Exception: continue` around status()) swallowed a revoked
+# token exactly like a network blip. A network blip clears itself on the
+# next poll; a revoked token never does, so leaving the worker's state
+# untouched (fine for a blip) permanently wedges that worker at "queued"
+# -- busy_labels()/require_free() read w.state straight off disk, so the
+# account can never come free for a new launch again, in total silence.
+# ---------------------------------------------------------------------------
+
+def test_a_revoked_token_during_poll_does_not_abort_polling_other_jobs(fleet):
+    from blendfleet.kaggle_client import KernelStatus, RevokedTokenError
+
+    class Client:
+        def __init__(self, token): self.token = token
+        def status(self, slug):
+            if "alpha" in slug:
+                raise RevokedTokenError("dead token")
+            return KernelStatus(state="complete")
+    fleet.client_factory = Client
+    fleet.save_jobs([job("alpha", ["a0"], "j1"), job("beta", ["a1"], "j2")])
+
+    jobs = fleet.poll_all()
+
+    beta = jobs[1]
+    assert beta.workers[0].state == "complete", (
+        "a revoked token on one job must not abort refreshing another")
+
+
+def test_a_revoked_token_during_poll_marks_the_account_revoked(fleet):
+    from blendfleet.kaggle_client import RevokedTokenError
+
+    class Client:
+        def __init__(self, token): self.token = token
+        def status(self, slug):
+            raise RevokedTokenError("dead token")
+    fleet.client_factory = Client
+    fleet.save_jobs([job("alpha", ["a0"], "j1")])
+
+    fleet.poll_all()
+
+    acct0 = next(a for a in fleet.accounts if a.label == "a0")
+    assert acct0.revoked is True, (
+        "a token poll_all() itself discovers is revoked must be marked, "
+        "exactly like _resolve_clients() already marks one on the launch "
+        "side -- this is the only OTHER place that ever learns it")
+    assert acct0.verified is False
+
+
+def test_a_revoked_token_during_poll_does_not_leave_the_account_looking_busy_forever(
+        fleet):
+    """The failure poll_all()'s own docstring says it exists to fix
+    ("they sat queued forever ... those accounts could never come free"),
+    re-entered a third time -- except unlike a network blip, no retry
+    ever clears a revoked token, so this one is permanent unless the
+    worker's state is actually moved off "queued"."""
+    from blendfleet.kaggle_client import RevokedTokenError
+
+    class Client:
+        def __init__(self, token): self.token = token
+        def status(self, slug):
+            raise RevokedTokenError("dead token")
+    fleet.client_factory = Client
+    fleet.save_jobs([job("alpha", ["a0"], "j1")])
+
+    fleet.poll_all()
+
+    assert "a0" not in fleet.busy_labels(), (
+        "a revoked account must never look permanently busy -- every "
+        "future launch on it would be refused with a false "
+        "'already rendering' error, forever, in total silence")
+
+
+def test_poll_returns_the_newest_job_even_when_one_was_launched_mid_poll(fleet):
+    """Small fix (Task 5 fix round 2): poll_all() used to `return jobs`
+    -- its own PRE-merge snapshot -- rather than `merged`, the result it
+    actually wrote to disk. poll()'s "newest job" answer
+    (`poll_all()[-1]`) was therefore a tick stale whenever a job was
+    launched mid-poll: correct on disk, wrong in the very value poll()
+    handed back to its caller (e.g. the dashboard's _last_state)."""
+    fleet.save_jobs([job("alpha", ["a0"], "j1")])
+
+    class Client:
+        def __init__(self, token): self.token = token
+        def status(self, slug):
+            fleet.save_jobs(fleet.load_jobs() + [job("beta", ["a1"], "j2")])
+            from blendfleet.kaggle_client import KernelStatus
+            return KernelStatus(state="complete")
+    fleet.client_factory = Client
+
+    st = fleet.poll()
+
+    assert st.job_id == "j2", (
+        "poll() must answer with the job that is ACTUALLY newest on disk "
+        "after this poll, not a pre-merge snapshot from before it")
