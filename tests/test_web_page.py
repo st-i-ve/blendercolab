@@ -1126,6 +1126,25 @@ ONE_SCENE = """({
   errors: {}
 })"""
 
+# Must-fix 6: a SECOND scene, distinct from the first in every field a
+# handler could plausibly read from -- slug, name, size. A single-row
+# fixture (ONE_SCENE above) makes "the button I clicked" and "the first
+# row" the same element, so a handler rebuilt around a hard-coded first
+# row would still pass every ONE_SCENE-driven test. Tests that must prove
+# ROUTING (not just that render/delete work at all) click the SECOND row
+# here and assert on the SECOND scene's own slug/name -- the same pattern
+# test_frame_preview_is_scoped_to_the_grid_it_was_clicked_in already uses
+# for frame grids.
+TWO_SCENES = """({
+  scenes: [
+    {slug:'user0/remember-blend', name:'remember', owner:'user0',
+     sizeBytes:1048576, updated:null, blendName:'remember.blend'},
+    {slug:'user1/second-scene-blend', name:'second scene', owner:'user1',
+     sizeBytes:2097152, updated:null, blendName:'second-scene.blend'}
+  ],
+  errors: {}
+})"""
+
 
 def test_a_scene_row_offers_render_and_delete(loaded_page):
     page, _ = loaded_page
@@ -1233,19 +1252,24 @@ def test_no_errors_shows_no_error_banner(loaded_page):
 
 
 def test_clicking_render_this_calls_render_scene_with_the_slug(loaded_page):
+    """Two scenes, not one (must-fix 6): with a single-row fixture, "the
+    button that was clicked" and "the first row" are the same element, so
+    a handler rebuilt around a hard-coded first row would still pass this
+    test unnoticed. Clicking the SECOND row's button must reach the
+    SECOND scene's own slug, never the first."""
     page, _ = loaded_page
     result = _preview_state(page,
-        f"renderScenes(JSON.stringify({ONE_SCENE}));"
+        f"renderScenes(JSON.stringify({TWO_SCENES}));"
         " const calls = [];"
         " backend = { renderScene: (slug, opts) => calls.push([slug, opts]) };"
-        " document.querySelector('[data-scene-render]').click();"
+        " document.querySelectorAll('[data-scene-render]')[1].click();"
         " backend = null;"
         " return JSON.stringify(calls);")
     import json as _json
     calls = _json.loads(result)
     assert len(calls) == 1
     slug, opts_json = calls[0]
-    assert slug == "user0/remember-blend"
+    assert slug == "user1/second-scene-blend"
     opts = _json.loads(opts_json)
     assert "startFrame" in opts and "endFrame" in opts
 
@@ -1253,21 +1277,35 @@ def test_clicking_render_this_calls_render_scene_with_the_slug(loaded_page):
 def test_clicking_delete_asks_for_confirmation_first(loaded_page):
     """Deletion is irreversible -- see deleteConfirmMessage's own tests
     above -- so declining must leave deleteScene uncalled, exactly like
-    every other irreversible action on this page (cancel, forget)."""
+    every other irreversible action on this page (cancel, forget).
+
+    Two scenes, not one (must-fix 6): clicking the SECOND row's Delete
+    button must both confirm-and-delete the SECOND scene's own slug and
+    name it (not the first scene's) in the confirmation dialog -- a
+    single-row fixture cannot tell "the row clicked" from "the first
+    row", which is exactly the hole that would let every Delete button
+    silently act on scene #1 with a confirm that confidently names scene
+    #1."""
     page, _ = loaded_page
     result = _preview_state(page,
-        f"renderScenes(JSON.stringify({ONE_SCENE}));"
+        f"renderScenes(JSON.stringify({TWO_SCENES}));"
         " const deleted = [];"
+        " let confirmMessage = '';"
         " backend = { deleteScene: slug => deleted.push(slug) };"
-        " window.confirm = () => false;"
-        " document.querySelector('[data-scene-delete]').click();"
+        " window.confirm = m => { confirmMessage = m; return false; };"
+        " document.querySelectorAll('[data-scene-delete]')[1].click();"
         " const declined = deleted.slice();"
-        " window.confirm = () => true;"
-        " document.querySelector('[data-scene-delete]').click();"
+        " window.confirm = m => { confirmMessage = m; return true; };"
+        " document.querySelectorAll('[data-scene-delete]')[1].click();"
         " const accepted = deleted.slice();"
         " backend = null;"
-        " return JSON.stringify({declined, accepted});")
+        " return JSON.stringify({declined, accepted, confirmMessage});")
     import json as _json
     got = _json.loads(result)
     assert got["declined"] == [], "declining must not delete anything"
-    assert got["accepted"] == ["user0/remember-blend"]
+    assert got["accepted"] == ["user1/second-scene-blend"], (
+        "clicking the SECOND row's Delete button must delete the SECOND "
+        f"scene, not the first: {got['accepted']}")
+    assert "second scene" in got["confirmMessage"], (
+        "the confirmation must name the scene actually clicked, not "
+        f"whichever scene happens to be first: {got['confirmMessage']!r}")
