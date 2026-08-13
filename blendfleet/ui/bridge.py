@@ -45,7 +45,7 @@ from blendfleet.blender_versions import KNOWN_VERSIONS, validate_version
 from blendfleet.fleet import _capped_stem, fingerprint_unreadable_entry
 from blendfleet.instance_state import (GpuSnapshot, InstanceSnapshot,
                                        InstanceStore)
-from blendfleet.kaggle_client import ACTIVE_STATES
+from blendfleet.kaggle_client import PENDING_STATES
 from blendfleet.log_stream import stream_progress
 from blendfleet.notebook_builder import RenderSettings
 from blendfleet.platform_paths import state_dir
@@ -998,10 +998,18 @@ class Backend(QObject):
         stem = (dataset_name[: -len("-blend")]
                 if dataset_name.endswith("-blend") else dataset_name)
         stem = _capped_stem(stem) or "scene"
+        # PENDING_STATES, not ACTIVE_STATES: a kernel that has been pushed
+        # but whose Kaggle session has not started yet reports
+        # "not_started", which still holds this account exactly like
+        # queued/running (see kaggle_client.PENDING_STATES,
+        # Fleet.busy_labels()/require_free(), which this mirrors). This is
+        # the one irreversible action here -- Kaggle has no trash for a
+        # deleted dataset -- so it cannot afford the narrower predicate
+        # that busy_labels()/require_free() themselves moved off of.
         rendering = sorted({
             w.label for job in self.fleet_factory(accounts).load_jobs()
             if job.scene_key == stem
-            for w in job.workers if w.state in ACTIVE_STATES})
+            for w in job.workers if w.state in PENDING_STATES})
         if rendering:
             self.notification.emit(
                 f"Cannot delete {slug!r} -- {', '.join(rendering)} "

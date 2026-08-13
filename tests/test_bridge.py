@@ -1707,6 +1707,44 @@ def test_deleting_refuses_while_a_tracked_job_is_still_rendering_it(
     assert "delete-scene:user_0/remember-blend" not in backend._workers
 
 
+def test_deleting_refuses_while_a_tracked_job_is_not_started_yet(
+        qapp, tmp_path):
+    """A kernel Kaggle has accepted but not yet started a session for
+    reports "not_started" (KaggleClient.status()), not a synonym for
+    "finished" -- it still holds this account exactly like queued/running
+    (see kaggle_client.PENDING_STATES, fleet.busy_labels()/require_free()).
+    deleteScene() previously checked ACTIVE_STATES only, so a scene whose
+    only worker was still "not_started" read as not-rendering and its
+    Kaggle dataset -- which Kaggle has no trash for -- could be deleted out
+    from under a render that had not even started yet."""
+    backend = make_backend(tmp_path, n=1)
+    fleet = backend.fleet_factory(backend.store.list())
+    fleet.save_jobs([FleetState(
+        job_id="job1", blend_name="remember.blend",
+        start_frame=1, end_frame=4,
+        workers=[WorkerState(label="acct0", username="user_0",
+                             kernel_slug="user_0/remember-render-1",
+                             frames=[1, 2], state="not_started")])])
+    calls = []
+
+    class DeleteClient(FakeClient):
+        def delete_dataset(self, slug):
+            calls.append(slug)
+
+    backend.fleet_factory = lambda accts: Fleet(
+        accts, lambda t: DeleteClient(t), tmp_path / "w")
+    notes = []
+    backend.notification.connect(lambda m, t: notes.append((m, t)))
+
+    backend.deleteScene("user_0/remember-blend")
+
+    assert calls == [], \
+        "must not delete while a tracked job's worker is still not_started"
+    assert notes and notes[0][1] == "offline"
+    assert "acct0" in notes[0][0]
+    assert "delete-scene:user_0/remember-blend" not in backend._workers
+
+
 def test_deleting_is_not_blocked_by_a_finished_job_for_the_same_scene(
         qapp, tmp_path):
     """A completed job holds nobody -- Fleet.busy_labels()'s own contract
