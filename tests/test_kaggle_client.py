@@ -291,6 +291,33 @@ def test_dataset_reachable_disagrees_with_dataset_exists_for_a_shared_dataset():
         "dataset_list_files must correctly show the real grant works"
 
 
+# -------------------------------------------------- dataset_files (Task 10) --
+# launch_from_dataset needs to find WHICH file in a dataset is the .blend --
+# there is no local filename to already know that from, for a scene that
+# lives only on Kaggle. dataset_file_size() already parsed this same
+# response for one known name; dataset_files() is that same parse, exposed
+# for every name at once, with dataset_file_size rebuilt on top of it so the
+# two can never drift apart.
+
+def test_dataset_files_lists_every_file_with_its_size():
+    resp = FakeListFilesResponse([FakeDatasetFile("scene.blend", 1048576),
+                                  FakeDatasetFile("readme.txt", 12)])
+    c, _ = client(list_files_response=resp)
+    assert c.dataset_files("owner/x") == [("scene.blend", 1048576),
+                                          ("readme.txt", 12)]
+
+
+def test_dataset_files_is_empty_for_a_dataset_with_no_files():
+    c, _ = client()  # default FakeApi: dataset_list_files -> {"datasetFiles": []}
+    assert c.dataset_files("owner/x") == []
+
+
+def test_dataset_files_propagates_when_the_account_cannot_reach_the_dataset():
+    c, _ = client(list_files_ok=False)
+    with pytest.raises(RuntimeError, match="Forbidden"):
+        c.dataset_files("owner/x")
+
+
 # ---------------------------------------------- dataset_file_size (Task 5) --
 # dataset_reachable() only proves an account can see A copy of the dataset,
 # not that it's the RIGHT one. dataset_file_size() is the size signal fleet

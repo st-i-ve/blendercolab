@@ -13,7 +13,9 @@ import pytest
 
 import blendfleet.fleet as fleet_mod
 from blendfleet.accounts import Account
-from blendfleet.fleet import Fleet, FleetState, WorkerState
+from blendfleet.fleet import (Fleet, FleetState, NoBlendInDatasetError,
+                              StaleDatasetError, WorkerState)
+from blendfleet.notebook_builder import RenderSettings
 
 
 @pytest.fixture
@@ -591,3 +593,142 @@ def test_poll_returns_the_newest_job_even_when_one_was_launched_mid_poll(fleet):
     assert st.job_id == "j2", (
         "poll() must answer with the job that is ACTUALLY newest on disk "
         "after this poll, not a pre-merge snapshot from before it")
+
+
+# ---------------------------------------------------------------------------
+# Task 10 -- launch_from_dataset(): render a scene that lives ONLY on
+# Kaggle, no local .blend at all. The fleet fixture's accounts already
+# carry a real `username` (user0..user3), so the fixture's own owner
+# (a0/user0) is used as dataset_slug's owner throughout.
+# ---------------------------------------------------------------------------
+
+class _FakeDatasetApiClient:
+    """Stands in for sdk.datasets.dataset_api_client -- Task 3 sharing.
+    Correctness of the sharing calls themselves is covered by
+    tests/test_sharing.py; these tests only care that launch_from_dataset
+    re-grants and re-verifies before pushing anything."""
+
+    def __init__(self):
+        self.updated = []
+
+    def get_dataset_metadata(self, request):
+        class Info:
+            title = ""
+            licenses = []
+            collaborators = []
+
+        class Resp:
+            info = Info()
+        return Resp()
+
+    def update_dataset_metadata(self, request):
+        self.updated.append(request)
+
+        class Resp:
+            errors = []
+        return Resp()
+
+
+class _FakeSdk:
+    def __init__(self):
+        self.datasets = type("D", (), {
+            "dataset_api_client": _FakeDatasetApiClient()})()
+
+
+class FakeDatasetClient:
+    """Stands in for KaggleClient for launch_from_dataset()'s tests. No
+    upload path is exercised here at all -- the whole point of Task 10 --
+    so this fake only needs the read/share/push surface that method
+    actually calls: dataset_files (to find the .blend), dataset_file_size
+    (the per-account match check), dataset_reachable, and push_kernel.
+    """
+
+    def __init__(self, token, files=None, reachable=True):
+        self.token = token
+        self.pushed: list = []
+        self._files = (list(files) if files is not None
+                       else [("remember.blend", 100)])
+        self._reachable = reachable
+        self.sdk = _FakeSdk()
+        self._sdk_factory = lambda tok: self.sdk
+
+    def whoami(self):
+        return "user" + self.token[-1]
+
+    def dataset_files(self, slug):
+        return list(self._files)
+
+    def dataset_file_size(self, slug, filename):
+        for name, size in self._files:
+            if name == filename:
+                return size
+        return None
+
+    def dataset_reachable(self, slug):
+        return self._reachable
+
+    def push_kernel(self, folder):
+        self.pushed.append(folder)
+
+
+def test_rendering_an_uploaded_scene_needs_no_local_file(fleet):
+    """The point of the library: a scene from five days ago renders
+    without a 60 MB upload."""
+    clients = {}
+
+    def factory(tok):
+        clients[tok] = FakeDatasetClient(tok)
+        return clients[tok]
+    fleet.client_factory = factory
+
+    st = fleet.launch_from_dataset(
+        "user0/remember-blend", RenderSettings(1920, 1080, 128), 1, 4)
+
+    assert st.blend_name == "remember.blend", \
+        "the real filename found on Kaggle, not a guess"
+    assert len(st.workers) == 4
+    assert all(c.pushed for c in clients.values())
+
+
+def test_every_account_is_verified_against_the_owners_copy(fleet):
+    """The size check changes meaning here -- from "does Kaggle match my
+    local file" to "does every account see the same copy the owner sees",
+    which is the property that actually matters for a fleet render."""
+    stale_token = fleet.accounts[3].token
+    clients = {}
+
+    def factory(tok):
+        files = ([("remember.blend", 999)] if tok == stale_token
+                 else [("remember.blend", 100)])
+        clients[tok] = FakeDatasetClient(tok, files=files)
+        return clients[tok]
+    fleet.client_factory = factory
+
+    with pytest.raises(StaleDatasetError) as excinfo:
+        fleet.launch_from_dataset(
+            "user0/remember-blend", RenderSettings(1920, 1080, 128), 1, 4)
+
+    message = str(excinfo.value)
+    assert "user3" in message, "must name the account with the stale copy"
+    assert "999" in message and "100" in message
+    assert all(c.pushed == [] for c in clients.values()), \
+        "nothing may be started while one account's copy is stale"
+    assert fleet.load() is None
+
+
+def test_a_dataset_with_no_blend_in_it_refuses_before_pushing_a_kernel(fleet):
+    clients = {}
+
+    def factory(tok):
+        clients[tok] = FakeDatasetClient(tok, files=[("readme.txt", 12)])
+        return clients[tok]
+    fleet.client_factory = factory
+
+    with pytest.raises(NoBlendInDatasetError) as excinfo:
+        fleet.launch_from_dataset(
+            "user0/not-a-scene", RenderSettings(1920, 1080, 128), 1, 4)
+
+    assert "no .blend" in str(excinfo.value)
+    pushed = [p for c in clients.values() for p in c.pushed]
+    assert pushed == [], "nothing may be started"
+    assert fleet.load() is None

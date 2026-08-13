@@ -151,6 +151,40 @@ def _require_matching_dataset(client, username: str, slug: str,
             "copy before retrying.")
 
 
+def _find_blend_file(client, slug: str) -> tuple[str, int]:
+    """The (filename, size_bytes) of the .blend inside dataset `slug`, as
+    `client` -- which MUST be the dataset's own OWNER's client -- actually
+    lists it, or raise NoBlendInDatasetError.
+
+    Only the owner's client is used here, for two reasons at once: the
+    owner is the one account certain to be able to list every file (a
+    friend's grant can be partial or lapsed -- see launch_from_dataset's
+    own re-verification), and the owner's listing is also what this app
+    already treats as ground truth for "the current copy"
+    (_require_matching_dataset) -- so the size handed back here is
+    deliberately the same number every OTHER account's copy gets checked
+    against, not a size read from a local file that, for a scene rendered
+    straight from Kaggle, does not exist.
+
+    Every dataset this app itself uploads holds exactly one file, so the
+    first match is returned rather than raising on more than one -- a
+    dataset with two .blend files is not a shape this app's own upload
+    path can produce, only a hand-edited one on kaggle.com, and guessing
+    which of two is "the" scene would be worse than picking either.
+    """
+    blends = [(name, size) for name, size in client.dataset_files(slug)
+              if name.lower().endswith(".blend")]
+    if not blends:
+        raise NoBlendInDatasetError(
+            f"dataset {slug!r} has no .blend file in it. Nothing has been "
+            "started -- no kernel has been pushed. Either this dataset is "
+            "not actually a rendered scene, or its .blend has been removed "
+            "or renamed on kaggle.com. Pick a different scene from the "
+            "library, or re-upload the .blend to this dataset and try "
+            "again.")
+    return blends[0]
+
+
 def _atomic_write(path: Path, text: str) -> None:
     """Write via a temporary file and replace, so an interrupted save can
     never leave a truncated one behind.
@@ -331,6 +365,22 @@ class StaleDatasetError(RuntimeError):
     own just-uploaded copy (checked right after sync_blend, before a single
     friend is even granted access) and every friend's shared view of it
     (checked right after dataset_reachable, before push_kernel).
+    """
+
+
+class NoBlendInDatasetError(RuntimeError):
+    """A dataset that was about to be rendered has no .blend file in it at
+    all.
+
+    scenes.py's Scene.blend_name is a NAME-BASED GUESS -- its own docstring
+    says so explicitly and warns that "Task 10 is what actually confirms a
+    .blend exists, by listing the dataset's real files". This is that
+    confirmation: launch_from_dataset() lists the dataset for real, before
+    a single kernel is pushed, rather than trusting that guess with
+    somebody's GPU quota. Raised for a dataset that merely happens to end
+    in "-blend" (renamed by hand on kaggle.com, or never actually holding a
+    scene) as much as for one that never had a .blend to begin with -- from
+    here, the two look identical.
     """
 
 
@@ -1331,6 +1381,164 @@ class Fleet:
             # and the save above. Skipped while no kernel has been pushed
             # yet -- nothing is running, so the previous job's state (which
             # the user may still want to collect) is left alone.
+            if st.workers:
+                self._save(st)
+        return st
+
+    def launch_from_dataset(self, dataset_slug: str, settings: RenderSettings,
+                            start_frame: int, end_frame: int, *,
+                            accounts: list[Account] | None = None) -> FleetState:
+        """Render a scene that already lives on Kaggle -- no local .blend
+        at all. This is the point of the scene library: a scene uploaded
+        five days ago (or by a session of this app that has since closed)
+        renders again without re-sending a single byte of a possibly
+        60 MB file.
+
+        launch() needs a local .blend for exactly three things, and each is
+        replaced here by something Kaggle itself can answer instead:
+          - slug_stem(blend), for the kernel slug -> the dataset slug's own
+            stem. Already Kaggle-legal: it went through slug_stem() at
+            upload time (see dataset_slug_for), so it needs no re-slugifying.
+          - blend.name, for which file to verify -> the .blend actually
+            found by LISTING the dataset's real files (_find_blend_file),
+            never guessed from the dataset's name the way scenes.py's
+            Scene.blend_name is (see that module's own docstring on why it
+            calls itself a guess).
+          - blend.stat().st_size, for the expected size -> the OWNER's own
+            reported size for that file. This is a deliberate change of
+            what the check MEANS, not an incidental one: it stops being
+            "does Kaggle match my local file" (there is no local file to
+            match) and becomes "does every account see the same copy the
+            owner sees" -- which is the property that actually matters for
+            a fleet render, and arguably what the check was always really
+            enforcing.
+
+        Sharing is RE-VERIFIED here for every account in `accounts`, never
+        assumed from whatever sharing happened at the original upload:
+        accounts can be added to the fleet after a scene was last rendered,
+        and a READER grant can lapse. sharing.grant_readers() is idempotent
+        (a username already on the collaborator list is left alone), so
+        re-granting on every call is harmless, and dataset_reachable()/
+        _require_matching_dataset() are both live Kaggle calls made fresh
+        here, never a cached "this worked once".
+        """
+        accounts = self.accounts if accounts is None else accounts
+        if not accounts:
+            raise ValueError("add at least one account before launching")
+
+        # A local check, same as require_free() everywhere else in this
+        # module -- done before any network call so a busy fleet fails
+        # fast without first paying for a whoami() or a dataset listing.
+        self.require_free(accounts)
+
+        clients, usernames = self._resolve_clients(accounts)
+
+        owner = self.accounts[0]
+        if owner.label in usernames:
+            owner_client, owner_username = clients[owner.label], usernames[owner.label]
+        else:
+            owner_clients, owner_usernames = self._resolve_clients([owner])
+            owner_client, owner_username = (owner_clients[owner.label],
+                                            owner_usernames[owner.label])
+
+        dataset_owner = dataset_slug.split("/", 1)[0]
+        if dataset_owner != owner_username:
+            # Only a dataset's real Kaggle owner can grant or re-verify
+            # sharing on it -- Kaggle reserves that to the literal owner,
+            # never to an account holding a READER grant -- and this
+            # module's own upload convention (see its top-of-file
+            # docstring) is that self.accounts[0] is always that owner for
+            # every scene this app manages. A mismatch here means the
+            # fleet's account order no longer agrees with who actually
+            # owns this scene on Kaggle.
+            raise ValueError(
+                f"dataset {dataset_slug!r} is owned by {dataset_owner!r} on "
+                "Kaggle, but this fleet's first configured account is "
+                f"{owner_username!r}. Only the account that owns a dataset "
+                "can grant or re-verify access to it, so it must be first "
+                "in the fleet to render this scene. Nothing has been "
+                "started. Reorder the accounts under Manage accounts… so "
+                "the scene's real owner is first, or render this scene "
+                "from a fleet where it already is.")
+
+        # Confirm a .blend genuinely exists BEFORE anything else -- see
+        # NoBlendInDatasetError. No point granting access to, or pushing a
+        # kernel against, a dataset that was never actually a scene.
+        blend_name, expected_size = _find_blend_file(owner_client, dataset_slug)
+
+        job_id = uuid.uuid4().hex[:8]
+        buckets = assign_frames(start_frame, end_frame, len(accounts))
+
+        dataset_name = dataset_slug.split("/", 1)[-1]
+        stem = (dataset_name[: -len("-blend")] if dataset_name.endswith("-blend")
+                else dataset_name)
+        # Defensive, not load-bearing: every dataset this app itself
+        # uploads already has a capped stem baked into its slug (slug_stem
+        # ran at upload time), so this only matters for a dataset that got
+        # onto Kaggle some other way -- never raises here, matching
+        # scene_key's own "describes an ALREADY-existing thing" philosophy
+        # rather than slug_stem's "refuse before an upload" one.
+        stem = _capped_stem(stem) or "scene"
+
+        friends = [a for a in accounts if a.label != owner.label]
+        if friends:
+            self._require_real_usernames(friends, usernames, clients)
+            sdk = owner_client._sdk_factory(owner_client.token)
+            current = sharing.get_settings(sdk, owner_username, dataset_name)
+            try:
+                sharing.grant_readers(sdk, owner_username, dataset_name,
+                                      [usernames[a.label] for a in friends],
+                                      current)
+            except Exception as e:
+                raise _explain_bad_collaborators(e, friends, usernames) from e
+
+            # Proves access actually landed, not just that the grant call
+            # returned cleanly -- see UnreachableAccountsError. Every
+            # account in THIS launch is required here (there is no
+            # optional/best-effort split the way prepare_dataset's
+            # `required` has -- everyone in `accounts` is about to have a
+            # kernel pushed).
+            unreachable = [usernames[a.label] for a in friends
+                          if not clients[a.label].dataset_reachable(dataset_slug)]
+            if unreachable:
+                raise UnreachableAccountsError(
+                    "granted READER access but the dataset is still not "
+                    f"reachable for: {', '.join(unreachable)}. Nothing has "
+                    "been started -- retry once Kaggle's grant has "
+                    "propagated.")
+
+        # Every account in THIS launch, including the owner -- see this
+        # method's own docstring for why this check now means "matches the
+        # owner's copy" rather than "matches a local file".
+        for account in accounts:
+            _require_matching_dataset(
+                clients[account.label], usernames[account.label],
+                dataset_slug, blend_name, expected_size)
+
+        st = FleetState(job_id=job_id, blend_name=blend_name,
+                        start_frame=start_frame, end_frame=end_frame,
+                        workers=[], started_at=time.time())
+
+        # Same incremental-persist contract as launch(): push_kernel ALWAYS
+        # starts a run, so whatever has been pushed already spends quota
+        # and must be on disk, cancellable and collectable, even if a later
+        # account in this same loop fails.
+        try:
+            for account, frames in zip(accounts, buckets):
+                client = clients[account.label]
+                username = usernames[account.label]
+                kernel_slug = f"{username}/{stem}-render-{job_id}"
+
+                kern_dir = self.work_dir / f"kern_{account.label}"
+                build(frames, settings, dataset_slug, kern_dir, kernel_slug)
+                client.push_kernel(kern_dir)
+
+                st.workers.append(WorkerState(
+                    label=account.label, username=username,
+                    kernel_slug=kernel_slug, frames=frames,
+                    started_at=time.time()))
+                self._save(st)
+        finally:
             if st.workers:
                 self._save(st)
         return st

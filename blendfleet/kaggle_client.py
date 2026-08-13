@@ -664,35 +664,28 @@ class KaggleClient:
         except Exception:
             return False
 
-    def dataset_file_size(self, slug: str, filename: str) -> int | None:
-        """The byte size Kaggle reports for `filename` inside dataset `slug`,
-        or None if this account's file listing for that dataset has no file
-        by that name at all (never uploaded, wrong name, or a grant that
-        covers the dataset but not yet its files).
+    def dataset_files(self, slug: str) -> list[tuple[str, int]]:
+        """Every (filename, size_bytes) pair this account's own listing of
+        dataset `slug` currently reports.
 
-        Built on dataset_list_files -- the exact call dataset_reachable()
-        already uses -- rather than any new API surface. Checked against the
-        installed kagglesdk (kagglesdk.datasets.types.dataset_api_service.
-        ApiDatasetFile): its fields are ref, dataset_ref, owner_ref, name,
-        creation_date, description, file_type, url, total_bytes, columns --
-        there is no hash/checksum/etag field anywhere on it. So this is a
-        SIZE comparison, not a checksum, and it must never be described as
-        one: two different .blend files that happen to be exactly the same
-        number of bytes would pass this check. If a future kagglesdk release
-        adds a content hash, this should be upgraded to use it instead (see
-        test_installed_kagglesdk_dataset_file_exposes_no_content_hash, which
-        fails the day that stops being true).
+        The one place that actually parses ApiListDatasetFilesResponse (see
+        dataset_file_size's own docstring for its shape and the two
+        dict-vs-attribute forms handled below) -- dataset_file_size is now
+        built on this rather than duplicating the parse, and Task 10's
+        launch_from_dataset uses it directly to find which file in a
+        dataset is the .blend, since a scene that lives only on Kaggle has
+        no local filename to already know that from.
 
         Raises whatever dataset_list_files raises (e.g. an HTTPError-derived
-        403) when the account cannot reach the dataset at all -- that is a
-        DIFFERENT failure from "reachable but this file isn't in the
-        listing", see dataset_reachable(). Callers that need to tell the two
-        apart (fleet.launch does) call dataset_reachable() first.
+        403) when the account cannot reach the dataset at all -- see
+        dataset_reachable()/dataset_file_size() for why that is a
+        deliberately different failure from "reachable but empty".
         """
         response = self.api.dataset_list_files(slug)
         files = getattr(response, "dataset_files", None)
         if files is None and isinstance(response, dict):
             files = response.get("datasetFiles")
+        result = []
         for f in files or []:
             if isinstance(f, dict):
                 name = f.get("name")
@@ -700,6 +693,37 @@ class KaggleClient:
             else:
                 name = getattr(f, "name", None)
                 size = getattr(f, "total_bytes", None)
+            if name is not None:
+                result.append((name, size))
+        return result
+
+    def dataset_file_size(self, slug: str, filename: str) -> int | None:
+        """The byte size Kaggle reports for `filename` inside dataset `slug`,
+        or None if this account's file listing for that dataset has no file
+        by that name at all (never uploaded, wrong name, or a grant that
+        covers the dataset but not yet its files).
+
+        Built on dataset_files() -- itself built on dataset_list_files, the
+        exact call dataset_reachable() already uses -- rather than any new
+        API surface. Checked against the installed kagglesdk
+        (kagglesdk.datasets.types.dataset_api_service.ApiDatasetFile): its
+        fields are ref, dataset_ref, owner_ref, name, creation_date,
+        description, file_type, url, total_bytes, columns -- there is no
+        hash/checksum/etag field anywhere on it. So this is a SIZE
+        comparison, not a checksum, and it must never be described as one:
+        two different .blend files that happen to be exactly the same
+        number of bytes would pass this check. If a future kagglesdk release
+        adds a content hash, this should be upgraded to use it instead (see
+        test_installed_kagglesdk_dataset_file_exposes_no_content_hash, which
+        fails the day that stops being true).
+
+        Raises whatever dataset_files raises (e.g. an HTTPError-derived 403)
+        when the account cannot reach the dataset at all -- that is a
+        DIFFERENT failure from "reachable but this file isn't in the
+        listing", see dataset_reachable(). Callers that need to tell the two
+        apart (fleet.launch does) call dataset_reachable() first.
+        """
+        for name, size in self.dataset_files(slug):
             if name == filename:
                 return size
         return None
