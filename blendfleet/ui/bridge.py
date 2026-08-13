@@ -119,6 +119,15 @@ class Backend(QObject):
         # it is never a guess -- an empty value means we have not put this
         # scene up during this session, not that Kaggle has nothing.
         self._dataset: dict | None = None
+        # label -> why, from the LAST prepare_dataset() call (syncDataset()
+        # or a launch() that had to upload). None means no upload has run
+        # this session -- never {}, which would read as "shared with
+        # everyone" rather than "nothing recorded yet". Fleet.
+        # unshared_accounts lives on a Fleet object this app rebuilds per
+        # call and throws away, so it has to be copied out HERE, right
+        # after the call that populated it, or it is lost the moment that
+        # Fleet is garbage collected.
+        self._unshared_accounts: dict[str, str] | None = None
         self._last_poll_ms: int | None = None
         self._last_poll_at: str | None = None
         self._online = True
@@ -211,13 +220,39 @@ class Backend(QObject):
         worker-keyed payload silently drops quota and last-known hardware
         for every idle account, which is most of them most of the time.
 
+        Reads `load_jobs()` -- EVERY tracked job -- fresh off disk on every
+        call, rather than a single cached FleetState. Several scenes can be
+        rendering at once (Tasks 3-5), and a payload built from only the
+        most recently launched or polled job would silently stop showing
+        every OTHER one the moment a second render started. A fresh Fleet
+        also means self.unreadable_jobs below is always this call's own
+        read, never a stale one from whichever job happened to poll last.
+
         Deliberately includes `approximate: True` on the frame data. The
         notebook reports how many frames succeeded, not which, so a failed
         frame shifts every later cell for that account -- the UI has to be
         able to say so rather than presenting a green cell as proof.
         """
-        state = self._last_state
-        by_label = {w.label: w for w in (state.workers if state else [])}
+        fleet = self.fleet_factory(self.store.list())
+        jobs = fleet.load_jobs()
+        # "Most recent job" -- load()'s own definition -- kept as the
+        # singular `job` key so the page (not ported to `jobs` until Task
+        # 7) keeps working unchanged.
+        newest = jobs[-1] if jobs else None
+
+        # One entry per label, built from EVERY tracked job rather than
+        # just `newest` -- an account rendering an older, still-active job
+        # must still show that worker on its card. Jobs are visited oldest
+        # first (load_jobs()'s own order), so a label that appears in more
+        # than one job (finished once, launched again) ends up pointing at
+        # its most recent job, which is the one still worth showing.
+        worker_by_label = {}
+        job_by_label = {}
+        for job in jobs:
+            for worker in job.workers:
+                worker_by_label[worker.label] = worker
+                job_by_label[worker.label] = job.job_id
+
         # The scene is uploaded ONCE, by one account, and every other
         # account reads it from there -- so exactly one instance is the
         # parent. Derived from the dataset slug ("<owner>/<name>") rather
@@ -226,7 +261,7 @@ class Backend(QObject):
         dataset_owner = (self._dataset or {}).get("slug", "").split("/", 1)[0]
         instances = []
         for account in self.store.list():
-            worker = by_label.get(account.label)
+            worker = worker_by_label.get(account.label)
             instances.append({
                 "label": account.label,
                 "username": account.username,
@@ -234,6 +269,9 @@ class Backend(QObject):
                 "revoked": bool(getattr(account, "revoked", False)),
                 "owner": bool(account.username
                               and account.username == dataset_owner),
+                # Which tracked job this account's worker belongs to, or
+                # None for an idle account -- a real state, not a gap.
+                "jobId": job_by_label.get(account.label),
                 # Live only while a kernel runs; None means idle, which is
                 # a real state and not an error.
                 "worker": {
@@ -262,12 +300,28 @@ class Backend(QObject):
             })
         return {
             "job": {
-                "blend": state.blend_name,
-                "startFrame": state.start_frame,
-                "endFrame": state.end_frame,
-            } if state else None,
+                "blend": newest.blend_name,
+                "startFrame": newest.start_frame,
+                "endFrame": newest.end_frame,
+            } if newest else None,
+            "jobs": [_job_payload(job) for job in jobs],
             "instances": instances,
             "dataset": self._dataset,
+            # Sharing failures from the LAST upload only -- see
+            # self._unshared_accounts' own comment in __init__. Explicit
+            # about that scope here so the page cannot mistake a stale
+            # report for something true of the CURRENT dataset.
+            "unshared": {
+                "accounts": self._unshared_accounts,
+                "note": ("who the last scene upload could not be shared "
+                         "with -- not a live check, and not necessarily "
+                         "about the dataset in use right now"),
+            } if self._unshared_accounts is not None else None,
+            # Jobs whose record on disk could not be parsed at all. Never
+            # erased (see Fleet.unreadable_jobs) because it may be the only
+            # surviving trace of kernels still running and billing on
+            # Kaggle that this app can no longer cancel or collect.
+            "unreadableJobs": _unreadable_jobs_payload(fleet.unreadable_jobs),
             "blend": {"path": str(self.blend), "name": self.blend.name}
                      if self.blend else None,
             "approximate": True,
@@ -568,9 +622,14 @@ class Backend(QObject):
         accounts = self.store.list()
         blend = self.blend
         owner = accounts[0].label
+        # Built here, on the UI thread, so `ok` below can still read
+        # fleet.unshared_accounts once prepare_dataset() returns -- a
+        # Fleet built and discarded INSIDE work() would take that dict
+        # with it the moment the worker thread's closure goes out of
+        # scope.
+        fleet = self.fleet_factory(accounts)
 
         def work():
-            fleet = self.fleet_factory(accounts)
             return fleet.prepare_dataset(
                 blend,
                 # uploader.UploadProgress calls them `uploaded` and
@@ -594,6 +653,9 @@ class Backend(QObject):
                 "sizeBytes": blend.stat().st_size,
                 "at": time.strftime("%H:%M:%S"),
             }
+            # Copied out now -- see self._unshared_accounts' comment in
+            # __init__ for why this is the only moment that is possible.
+            self._unshared_accounts = dict(fleet.unshared_accounts)
             self.logLine.emit(f"dataset ready: {slug}", "active")
             self.notification.emit(f"Uploaded {blend.name} to {slug}", "active")
             self._emit_state()
@@ -602,11 +664,13 @@ class Backend(QObject):
 
     @Slot(str)
     def launch(self, options_json: str) -> None:
-        """Start a render across every account.
+        """Start a render on chosen accounts (every FREE account when none
+        are named).
 
         Refuses rather than guesses when the request cannot be honoured --
-        no accounts, no file, or a backwards frame range. The page shows
-        the reason; it does not get to proceed with a default.
+        no accounts, no file, a backwards frame range, an unknown label, or
+        nobody free. The page shows the reason; it does not get to proceed
+        with a default.
         """
         options = json.loads(options_json)
         start = int(options.get("startFrame", 1))
@@ -630,9 +694,42 @@ class Backend(QObject):
             blender_version=validate_version(
                 options.get("blenderVersion") or self.settings.blender_version),
             min_gpus=self.settings.min_gpus)
-        accounts = self.store.list()
+        all_accounts = self.store.list()
         blend = self.blend
-        owner = accounts[0].label
+        # Built once, here, so both the free-accounts check below and
+        # `ok` afterwards (which needs fleet.unshared_accounts) share the
+        # exact same Fleet -- a second Fleet built inside work() would
+        # re-read the same jobs file but throw away its own
+        # unshared_accounts the moment that call returns.
+        fleet = self.fleet_factory(all_accounts)
+
+        # No "labels" used to mean "every configured account", because
+        # only one job could ever be running. With several jobs possible
+        # at once (Tasks 3-5), that default has to mean "whatever is free"
+        # instead -- otherwise a second launch with nothing selected would
+        # ask to render on an account the first launch is still using.
+        requested = options.get("labels") or []
+        if requested:
+            by_label = {a.label: a for a in all_accounts}
+            unknown = [label for label in requested if label not in by_label]
+            if unknown:
+                self.notification.emit(
+                    f"No account is configured with label(s): "
+                    f"{', '.join(unknown)}. Nothing has been started -- "
+                    "reselect accounts and try again.", "offline")
+                return
+            accounts = [by_label[label] for label in requested]
+        else:
+            accounts = fleet.free_accounts()
+            if not accounts:
+                self.notification.emit(
+                    "Every configured account is already rendering "
+                    "something else. Choose specific accounts to render "
+                    "on, wait for a job to finish, or cancel one first.",
+                    "offline")
+                return
+
+        owner = all_accounts[0].label
 
         # Reuse the dataset only when it is THIS scene. A slug left over
         # from a different .blend would render the wrong thing on somebody
@@ -643,8 +740,9 @@ class Backend(QObject):
                     and self._dataset["blendName"] == blend.name else None)
 
         def work():
-            return self.fleet_factory(accounts).launch(
+            return fleet.launch(
                 blend, settings, start, end, dataset_slug=prepared,
+                accounts=accounts,
                 on_progress=lambda p: self.uploadProgress.emit(json.dumps({
                     "label": owner,
                     "stage": "uploading",
@@ -654,6 +752,13 @@ class Backend(QObject):
 
         def ok(state) -> None:
             self._last_state = state
+            if prepared is None:
+                # prepare_dataset() actually ran as part of THIS launch --
+                # see self._unshared_accounts' comment in __init__ for why
+                # this is the only moment it can be captured. Left alone
+                # (not overwritten with an empty dict) when the dataset
+                # was reused and no sharing was attempted this time.
+                self._unshared_accounts = dict(fleet.unshared_accounts)
             self._start_streams(state)
             self.logLine.emit(
                 f"render started on {len(accounts)} account(s)", "active")
@@ -872,8 +977,19 @@ class Backend(QObject):
 
     @Slot(str)
     def collect(self, label: str = "") -> None:
-        """Download rendered frames -- the whole fleet, or one account."""
+        """Download rendered frames -- every tracked job, or one account.
+
+        `fleet.load()` -- the single newest job -- used to be the whole
+        answer here. With several jobs able to run at once (Tasks 3-5),
+        that quietly stopped collecting from any job except the most
+        recently launched or polled one: an older scene's finished frames
+        would simply never come down through this button again. Every
+        tracked job is collected from now (each into its own scene_key
+        subfolder -- see collector.collect), and their reports are merged
+        into one so the notification still reads as a single outcome.
+        """
         from PySide6.QtWidgets import QFileDialog
+        from blendfleet.collector import CollectReport
         from blendfleet.collector import collect as collect_frames
 
         destination = QFileDialog.getExistingDirectory(None, "Save frames to")
@@ -884,26 +1000,42 @@ class Backend(QObject):
 
         def work():
             fleet = self.fleet_factory(accounts)
-            state = fleet.load()
-            if state is None:
+            jobs = fleet.load_jobs()
+            if label:
+                # Scoped to whichever job actually has this worker -- a
+                # label is unique to one account, and an account renders
+                # in at most one job at a time, so at most one job ever
+                # matches.
+                jobs = [j for j in jobs
+                        if any(w.label == label for w in j.workers)]
+            if not jobs:
                 return None
-            return collect_frames(
-                state, accounts, fleet.client_factory, Path(destination),
-                worker_label=label or None,
-                # downloader.DownloadProgress calls them `downloaded` and
-                # `total` -- the same mistake as the upload side, which a
-                # getattr default turned into a permanent 0 of 0 instead of
-                # an error. Read directly so a rename fails loudly.
-                on_progress=lambda lbl, p: self.downloadProgress.emit(
-                    json.dumps({
-                        "label": lbl,
-                        "downloaded": p.downloaded,
-                        "total": p.total,
-                        # Read directly for the same reason as the two
-                        # above: a getattr default would turn a rename
-                        # into a permanent, plausible-looking 0 B/s.
-                        "rate": p.rate_bps,
-                    })))
+            combined = CollectReport()
+            for job in jobs:
+                report = collect_frames(
+                    job, accounts, fleet.client_factory, Path(destination),
+                    worker_label=label or None,
+                    # downloader.DownloadProgress calls them `downloaded`
+                    # and `total` -- the same mistake as the upload side,
+                    # which a getattr default turned into a permanent 0 of
+                    # 0 instead of an error. Read directly so a rename
+                    # fails loudly.
+                    on_progress=lambda lbl, p: self.downloadProgress.emit(
+                        json.dumps({
+                            "label": lbl,
+                            "downloaded": p.downloaded,
+                            "total": p.total,
+                            # Read directly for the same reason as the two
+                            # above: a getattr default would turn a rename
+                            # into a permanent, plausible-looking 0 B/s.
+                            "rate": p.rate_bps,
+                        })))
+                combined.copied += report.copied
+                combined.missing_frames.extend(report.missing_frames)
+                combined.per_worker.update(report.per_worker)
+                combined.archive_errors.update(report.archive_errors)
+                combined.worker_errors.update(report.worker_errors)
+            return combined
 
         def ok(report) -> None:
             if report is None:
@@ -1303,6 +1435,71 @@ def _elapsed(worker) -> float | None:
         return None
     finished = getattr(worker, "finished_at", 0.0) or 0.0
     return (finished or time.time()) - started
+
+
+def _job_payload(job) -> dict:
+    """One tracked job, for the `jobs` list.
+
+    `elapsed`/`finished` mirror `_elapsed`'s own contract at the JOB level:
+    frozen once every worker has reached a terminal state, rather than
+    recomputed from "now" at display time, or a finished job would keep
+    ageing every time the dashboard repainted.
+    """
+    finished = bool(job.workers) and all(w.finished_at for w in job.workers)
+    started = getattr(job, "started_at", 0.0) or 0.0
+    if not started:
+        elapsed = None      # never recorded -- see _elapsed's own docstring
+    elif finished:
+        elapsed = max(w.finished_at for w in job.workers) - started
+    else:
+        elapsed = time.time() - started
+    return {
+        "jobId": job.job_id,
+        "scene": job.scene_key,
+        "blend": job.blend_name,
+        "startFrame": job.start_frame,
+        "endFrame": job.end_frame,
+        "labels": [w.label for w in job.workers],
+        "elapsed": elapsed,
+        "finished": finished,
+    }
+
+
+def _unreadable_jobs_payload(raw_entries: list) -> list[dict]:
+    """Job records `load_jobs()` could not parse, translated into
+    something a person can act on.
+
+    Never silently absent: a job this app cannot read may still have
+    kernels running on Kaggle that it can no longer cancel or collect (see
+    Fleet.unreadable_jobs). Names the kernels when the raw entry still has
+    them to recover -- most likely for a per-job parse failure, where only
+    one field was malformed -- and says plainly when it cannot, rather
+    than guessing a slug that might not exist.
+    """
+    payload = []
+    for entry in raw_entries:
+        kernels = []
+        if isinstance(entry, dict):
+            for w in entry.get("workers") or []:
+                if isinstance(w, dict):
+                    slug = w.get("kernel_slug")
+                    if slug:
+                        kernels.append(slug)
+        if kernels:
+            message = (
+                "A job's record could not be read, so BlendFleet can no "
+                "longer track, cancel, or collect it here. If any of "
+                f"these kernels are still running, they keep spending "
+                f"quota: {', '.join(kernels)}. Check kaggle.com and stop "
+                "them by hand if needed.")
+        else:
+            message = (
+                "A job's record could not be read at all, so BlendFleet "
+                "cannot say which kernels (if any) it belongs to. If a "
+                "render is still running, it will not show up here -- "
+                "check kaggle.com for anything still active.")
+        payload.append({"kernels": kernels, "message": message})
+    return payload
 
 
 def _snapshot_payload(snapshot) -> dict | None:

@@ -12,7 +12,7 @@ import time
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QFileDialog
 
 from blendfleet.accounts import Account, AccountStore
 from blendfleet.fleet import Fleet, FleetState, WorkerState
@@ -144,11 +144,16 @@ def test_frame_counts_are_flagged_approximate(qapp, tmp_path):
 
 def test_a_running_worker_is_attached_to_its_account(qapp, tmp_path):
     backend = make_backend(tmp_path, n=2)
-    backend._last_state = FleetState(
+    # _state_payload() now reads every tracked job fresh off disk (see its
+    # own docstring), rather than a single cached FleetState -- so the job
+    # has to actually be SAVED through a Fleet, not just poked onto the
+    # Backend in memory.
+    fleet = backend.fleet_factory(backend.store.list())
+    fleet.save_jobs([FleetState(
         job_id="job", blend_name="scene.blend", start_frame=1, end_frame=8,
         workers=[WorkerState(label="acct1", username="user_1",
                              kernel_slug="user_1/k", frames=[1, 3, 5],
-                             state="running", frames_done=2)])
+                             state="running", frames_done=2)])])
     payload = json.loads(backend.state())
     by_label = {i["label"]: i for i in payload["instances"]}
     assert by_label["acct0"]["worker"] is None
@@ -274,7 +279,7 @@ def test_a_synced_dataset_is_reused_when_the_scene_matches(qapp, tmp_path):
 
     class RecordingFleet(Fleet):
         def launch(self, blend, settings, start_frame, end_frame,
-                   on_progress=None, dataset_slug=None):
+                   on_progress=None, dataset_slug=None, accounts=None):
             seen["slug"] = dataset_slug
             return FleetState(job_id="j", blend_name=blend.name,
                               start_frame=start_frame, end_frame=end_frame,
@@ -302,7 +307,7 @@ def test_a_dataset_for_a_different_scene_is_not_reused(qapp, tmp_path):
 
     class RecordingFleet(Fleet):
         def launch(self, blend, settings, start_frame, end_frame,
-                   on_progress=None, dataset_slug=None):
+                   on_progress=None, dataset_slug=None, accounts=None):
             seen["slug"] = dataset_slug
             return FleetState(job_id="j", blend_name=blend.name,
                               start_frame=start_frame, end_frame=end_frame,
@@ -615,3 +620,286 @@ def test_a_frame_nobody_was_assigned_says_so(qapp, tmp_path, monkeypatch):
     backend.previewFrame(99)
     _LIVE_BACKENDS.remove(backend)
     assert notes and "not assigned" in notes[0]
+
+
+# ---------------------------------------------------------------------------
+# Several jobs at once (Task 6). The payload used to be built from a single
+# cached FleetState -- one job, full stop -- so a second concurrent scene
+# had nowhere to appear at all.
+# ---------------------------------------------------------------------------
+
+def _two_job_backend(tmp_path):
+    """4 accounts, two jobs already tracked on disk: "alpha" rendering on
+    acct0+acct1, "beta" on acct2 alone. acct3 is rendering nothing."""
+    backend = make_backend(tmp_path, n=4)
+    fleet = backend.fleet_factory(backend.store.list())
+    fleet.save_jobs([
+        FleetState(job_id="job-alpha", blend_name="alpha.blend",
+                   start_frame=1, end_frame=6,
+                   workers=[
+                       WorkerState(label="acct0", username="user_0",
+                                  kernel_slug="user_0/alpha-render-1",
+                                  frames=[1, 2, 3], state="running"),
+                       WorkerState(label="acct1", username="user_1",
+                                  kernel_slug="user_1/alpha-render-1",
+                                  frames=[4, 5, 6], state="running"),
+                   ]),
+        FleetState(job_id="job-beta", blend_name="beta.blend",
+                   start_frame=1, end_frame=5,
+                   workers=[
+                       WorkerState(label="acct2", username="user_2",
+                                  kernel_slug="user_2/beta-render-1",
+                                  frames=[1, 2, 3, 4, 5], state="running"),
+                   ]),
+    ])
+    return backend
+
+
+def test_the_payload_lists_every_job(qapp, tmp_path):
+    """One job per scene, each naming the accounts rendering it."""
+    backend = _two_job_backend(tmp_path)
+    payload = json.loads(backend.state())
+    assert [j["scene"] for j in payload["jobs"]] == ["alpha", "beta"]
+    assert payload["jobs"][0]["labels"] == ["acct0", "acct1"]
+    assert payload["jobs"][1]["labels"] == ["acct2"]
+
+
+def test_an_instance_says_which_job_it_belongs_to(qapp, tmp_path):
+    backend = _two_job_backend(tmp_path)
+    payload = json.loads(backend.state())
+    by_label = {i["label"]: i for i in payload["instances"]}
+    assert by_label["acct0"]["jobId"] != by_label["acct2"]["jobId"]
+    assert by_label["acct0"]["jobId"] == by_label["acct1"]["jobId"]
+
+
+def test_an_idle_account_belongs_to_no_job(qapp, tmp_path):
+    backend = _two_job_backend(tmp_path)
+    payload = json.loads(backend.state())
+    by_label = {i["label"]: i for i in payload["instances"]}
+    assert by_label["acct3"]["jobId"] is None
+    assert by_label["acct3"]["worker"] is None
+
+
+# ---------------------------------------------------------------------------
+# Jobs this app can no longer read at all (beyond the brief, per the task's
+# own instructions): a broken record may still be a kernel running and
+# billing on Kaggle that nothing here can cancel or collect any more.
+# ---------------------------------------------------------------------------
+
+def test_an_unreadable_job_names_its_kernels_and_points_at_kaggle(
+        qapp, tmp_path):
+    backend = make_backend(tmp_path, n=1)
+    fleet = backend.fleet_factory(backend.store.list())
+    # A field FleetState(**parsed) does not accept makes load_jobs() give
+    # up on this entry -- and preserve it VERBATIM on unreadable_jobs
+    # rather than dropping it (see Fleet.load_jobs()'s own docstring).
+    fleet._state_path().write_text(json.dumps({"jobs": [{
+        "job_id": "bad", "blend_name": "x.blend",
+        "workers": [{"label": "acct9", "username": "u9",
+                     "kernel_slug": "u9/x-render-1", "frames": [1]}],
+        "not_a_real_field": 1,
+    }]}), encoding="utf-8")
+
+    entries = json.loads(backend.state())["unreadableJobs"]
+    assert len(entries) == 1
+    assert entries[0]["kernels"] == ["u9/x-render-1"]
+    assert "kaggle.com" in entries[0]["message"]
+
+
+def test_a_totally_unparseable_state_file_says_so_without_a_kernel_list(
+        qapp, tmp_path):
+    """The raw text itself couldn't be read as JSON at all -- there is
+    nothing here to recover a kernel slug from, and the message must not
+    invent one."""
+    backend = make_backend(tmp_path, n=1)
+    fleet = backend.fleet_factory(backend.store.list())
+    fleet._state_path().write_text("{not json at all", encoding="utf-8")
+
+    entries = json.loads(backend.state())["unreadableJobs"]
+    assert len(entries) == 1
+    assert entries[0]["kernels"] == []
+    assert "kaggle.com" in entries[0]["message"]
+
+
+def test_no_unreadable_jobs_when_the_state_file_is_clean(qapp, tmp_path):
+    backend = _two_job_backend(tmp_path)
+    assert json.loads(backend.state())["unreadableJobs"] == []
+
+
+# ---------------------------------------------------------------------------
+# unshared_accounts (beyond the brief): Fleet.unshared_accounts lives on a
+# Fleet object this app builds and discards per call, and only ever
+# describes the LAST upload -- both facts have to survive into the payload.
+# ---------------------------------------------------------------------------
+
+def test_unshared_accounts_reach_the_payload_as_last_upload_info(
+        qapp, tmp_path):
+    backend = make_backend(tmp_path, n=1)
+    blend = tmp_path / "scene.blend"
+    blend.write_bytes(b"x" * 8)
+    backend.blend = blend
+
+    class UnshareableFleet(Fleet):
+        def prepare_dataset(self, blend, on_progress=None, *, clients=None,
+                            usernames=None, on_stage=None):
+            self.unshared_accounts = {
+                "friend_1": "could not be reached to share the scene with"}
+            return "me/scene-blend"
+
+    backend.fleet_factory = lambda accounts: UnshareableFleet(
+        accounts, lambda t: FakeClient(t), tmp_path / "w")
+    backend.syncDataset()
+    _settle(backend)
+
+    unshared = json.loads(backend.state())["unshared"]
+    assert unshared["accounts"] == {
+        "friend_1": "could not be reached to share the scene with"}
+    # Its meaning has to be explicit -- the page must not be able to
+    # present this as a live, current-dataset check.
+    assert "last" in unshared["note"] or "not" in unshared["note"]
+
+
+def test_no_unshared_block_before_any_upload_this_session(qapp, tmp_path):
+    backend = make_backend(tmp_path, n=1)
+    assert json.loads(backend.state())["unshared"] is None
+
+
+# ---------------------------------------------------------------------------
+# launch() onto chosen accounts (the brief's own interface change).
+# ---------------------------------------------------------------------------
+
+def _account_workers_fleet():
+    class RecordingFleet(Fleet):
+        def launch(self, blend, settings, start_frame, end_frame,
+                   on_progress=None, dataset_slug=None, accounts=None):
+            RecordingFleet.seen_labels = [a.label for a in accounts]
+            return FleetState(
+                job_id="j", blend_name=blend.name,
+                start_frame=start_frame, end_frame=end_frame,
+                workers=[WorkerState(label=a.label, username=a.label,
+                                     kernel_slug=f"{a.label}/k", frames=[1])
+                         for a in accounts])
+    return RecordingFleet
+
+
+def test_launch_uses_only_the_chosen_labels(qapp, tmp_path):
+    RecordingFleet = _account_workers_fleet()
+    backend = make_backend(tmp_path, n=3)
+    backend.fleet_factory = lambda accounts: RecordingFleet(
+        accounts, lambda t: FakeClient(t), tmp_path / "w")
+    blend = tmp_path / "scene.blend"
+    blend.write_bytes(b"x" * 8)
+    backend.blend = blend
+
+    backend.launch(json.dumps({"startFrame": 1, "endFrame": 4,
+                              "labels": ["acct1"]}))
+    _settle(backend)
+    assert RecordingFleet.seen_labels == ["acct1"]
+
+
+def test_launch_with_no_labels_only_uses_free_accounts(qapp, tmp_path):
+    """A second launch with nothing selected must never ask to render on
+    an account a first launch is still using."""
+    backend = make_backend(tmp_path, n=2)
+    fleet = backend.fleet_factory(backend.store.list())
+    fleet.save_jobs([FleetState(
+        job_id="job1", blend_name="other.blend", start_frame=1, end_frame=5,
+        workers=[WorkerState(label="acct0", username="user_0",
+                             kernel_slug="user_0/other-render-1",
+                             frames=[1, 2], state="running")])])
+
+    RecordingFleet = _account_workers_fleet()
+    backend.fleet_factory = lambda accounts: RecordingFleet(
+        accounts, lambda t: FakeClient(t), tmp_path / "w")
+    blend = tmp_path / "scene.blend"
+    blend.write_bytes(b"x" * 8)
+    backend.blend = blend
+
+    backend.launch(json.dumps({"startFrame": 1, "endFrame": 4}))
+    _settle(backend)
+    assert RecordingFleet.seen_labels == ["acct1"]
+
+
+def test_launch_refuses_an_unknown_label(qapp, tmp_path):
+    backend = make_backend(tmp_path, n=2)
+    blend = tmp_path / "scene.blend"
+    blend.write_bytes(b"x" * 8)
+    backend.blend = blend
+    notes = []
+    backend.notification.connect(lambda m, t: notes.append((m, t)))
+
+    backend.launch(json.dumps({"startFrame": 1, "endFrame": 4,
+                              "labels": ["ghost"]}))
+    assert notes and notes[0][1] == "offline"
+    assert "ghost" in notes[0][0]
+    assert "launch" not in backend._workers
+
+
+def test_launch_refuses_when_every_account_is_already_busy(qapp, tmp_path):
+    backend = make_backend(tmp_path, n=1)
+    fleet = backend.fleet_factory(backend.store.list())
+    fleet.save_jobs([FleetState(
+        job_id="job1", blend_name="other.blend", start_frame=1, end_frame=5,
+        workers=[WorkerState(label="acct0", username="user_0",
+                             kernel_slug="user_0/other-render-1",
+                             frames=[1, 2], state="running")])])
+    blend = tmp_path / "scene.blend"
+    blend.write_bytes(b"x" * 8)
+    backend.blend = blend
+    notes = []
+    backend.notification.connect(lambda m, t: notes.append((m, t)))
+
+    backend.launch(json.dumps({"startFrame": 1, "endFrame": 4}))
+    assert notes and notes[0][1] == "offline"
+    assert "busy" in notes[0][0].lower() or "rendering" in notes[0][0].lower()
+    assert "launch" not in backend._workers
+
+
+# ---------------------------------------------------------------------------
+# collect() across every tracked job.
+# ---------------------------------------------------------------------------
+
+def test_collect_merges_frames_from_every_tracked_job(
+        qapp, tmp_path, monkeypatch):
+    """Two scenes can render at once -- collecting "the whole fleet" must
+    not silently skip whichever job was not the most recently launched or
+    polled."""
+    import blendfleet.collector as collector_mod
+    from blendfleet.collector import CollectReport
+
+    backend = make_backend(tmp_path, n=2)
+    fleet = backend.fleet_factory(backend.store.list())
+    fleet.save_jobs([
+        FleetState(job_id="job-a", blend_name="alpha.blend",
+                   start_frame=1, end_frame=3,
+                   workers=[WorkerState(label="acct0", username="user_0",
+                                        kernel_slug="user_0/alpha-render-1",
+                                        frames=[1, 2, 3], state="complete")]),
+        FleetState(job_id="job-b", blend_name="beta.blend",
+                   start_frame=1, end_frame=2,
+                   workers=[WorkerState(label="acct1", username="user_1",
+                                        kernel_slug="user_1/beta-render-1",
+                                        frames=[1, 2], state="complete")]),
+    ])
+
+    seen_job_ids = []
+
+    def fake_collect(state, accounts, client_factory, dest, *,
+                     worker_label=None, on_progress=None):
+        seen_job_ids.append(state.job_id)
+        return CollectReport(copied=len(state.workers[0].frames),
+                             per_worker={state.workers[0].label:
+                                        len(state.workers[0].frames)})
+
+    monkeypatch.setattr(collector_mod, "collect", fake_collect)
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory",
+                        lambda *a, **kw: str(tmp_path / "out"))
+
+    notes = []
+    backend.notification.connect(lambda m, t: notes.append((m, t)))
+    backend.collect("")
+    _settle(backend)
+
+    assert sorted(seen_job_ids) == ["job-a", "job-b"], \
+        "must collect from every tracked job, not just the newest"
+    assert notes and "Collected 5 frame(s)" in notes[0][0]
