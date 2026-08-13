@@ -1248,6 +1248,41 @@ def test_collect_with_a_label_finds_its_job_even_if_not_the_newest(
     assert seen_job_ids == ["job-a"]
 
 
+def test_collect_with_a_label_in_two_jobs_reaches_the_newer_one(
+        qapp, tmp_path, monkeypatch):
+    """Must-fix 4: `label` used to take the FIRST match over an
+    oldest-first list (`load_jobs()`'s own order), so once an account had
+    rendered twice, every per-instance Download button silently collected
+    the OLDER job's frames forever -- the docstring's own justification
+    ("an account belongs to at most one job at a time") stopped being
+    true the moment the job list became append-only. The test above
+    (disjoint labels) cannot see this at all; this one puts acct0 in
+    BOTH jobs."""
+    backend = make_backend(tmp_path, n=2)
+    fleet = backend.fleet_factory(backend.store.list())
+    fleet.save_jobs([
+        FleetState(job_id="job-old", blend_name="alpha.blend",
+                  start_frame=1, end_frame=3,
+                  workers=[WorkerState(label="acct0", username="user_0",
+                                       kernel_slug="user_0/alpha-render-1",
+                                       frames=[1, 2, 3], state="complete")]),
+        FleetState(job_id="job-new", blend_name="beta.blend",
+                  start_frame=1, end_frame=2,
+                  workers=[WorkerState(label="acct0", username="user_0",
+                                       kernel_slug="user_0/beta-render-1",
+                                       frames=[1, 2], state="complete")]),
+    ])
+    seen_job_ids = []
+    _stub_collect_frames(monkeypatch, tmp_path, seen_job_ids)
+
+    backend.collect("acct0")
+    _settle(backend)
+
+    assert seen_job_ids == ["job-new"], (
+        "acct0 rendered twice -- Download must reach the NEWER job "
+        f"(job-new), not the older one it silently found instead: {seen_job_ids}")
+
+
 def test_collect_with_an_explicit_job_id_reaches_that_job(
         qapp, tmp_path, monkeypatch):
     """Task 7's per-job collect button will carry a job id directly --

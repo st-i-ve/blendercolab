@@ -1401,12 +1401,17 @@ class Backend(QObject):
         removes both problems by construction rather than by merging
         better -- this is exactly `Fleet.load()`'s own pre-Task-6 answer
         (the newest job) when neither `label` nor `job_id` narrows it.
-        `label` continues to search every tracked job, unchanged: an
-        account belongs to at most one job at a time, so that search is
-        never ambiguous and was never the part that grew unbounded.
-        `job_id` is unused by the page today; Task 7 wires it to a
-        per-job collect button, which is the right way to reach a
-        specific older job -- a fleet-wide button should not guess.
+        `label` continues to search every tracked job, but takes the LAST
+        (most recent) match, not the first (must-fix 4): the job list is
+        append-only, so once an account has rendered twice, `label` names
+        TWO jobs, not one -- the claim that "an account belongs to at
+        most one job at a time, so that search is never ambiguous" stopped
+        being true the moment a second job could be tracked at all, and
+        searching oldest-first silently collected the OLDER scene's
+        frames while the notification named the account as if nothing was
+        wrong. `job_id` is wired to Task 7's per-job collect button, which
+        is the right way to reach a specific older job on purpose -- a
+        fleet-wide button should not guess.
         """
         from PySide6.QtWidgets import QFileDialog
         from blendfleet.collector import collect as collect_frames
@@ -1423,7 +1428,12 @@ class Backend(QObject):
             if job_id:
                 job = next((j for j in jobs if j.job_id == job_id), None)
             elif label:
-                job = next((j for j in jobs
+                # reversed(): the NEWEST job this label appears in, not
+                # the oldest (must-fix 4) -- load_jobs() is oldest-first,
+                # so a plain forward search over an append-only list
+                # always finds the FIRST job an account ever rendered,
+                # never the one it is rendering now.
+                job = next((j for j in reversed(jobs)
                            if any(w.label == label for w in j.workers)),
                           None)
             else:
