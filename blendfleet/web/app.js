@@ -748,7 +748,13 @@ function renderFrameGrid(state) {
   });
   const cells = [];
   for (let f = state.job.startFrame; f <= state.job.endFrame; f++) {
-    cells.push(`<div class="fcell${done.has(f) ? ' d' : ''}" title="frame ${f}"></div>`);
+    /* A finished frame is clickable: one image is fetched on demand
+       rather than collecting the whole job to look at a picture. An
+       unfinished one is not -- there is nothing on Kaggle to fetch. */
+    const isDone = done.has(f);
+    cells.push(`<div class="fcell${isDone ? ' d' : ''}"${
+      isDone ? ` data-frame="${f}" role="button" tabindex="0"` : ''
+    } title="frame ${f}${isDone ? ' — click to preview' : ''}"></div>`);
   }
   grid.innerHTML = cells.join('');
   const total = state.job.endFrame - state.job.startFrame + 1;
@@ -852,6 +858,49 @@ document.getElementById('btn-add').onclick = () => {
   backend.addAccount(label, token);
   document.getElementById('ni-token').value = '';
 };
+
+/* ---------------- one rendered frame ------------------------------------ */
+function openPreview(frame, url, label) {
+  document.getElementById('lb-title').textContent = `frame ${frame}`;
+  document.getElementById('lb-sub').textContent = label ? `rendered by ${label}` : '';
+  const img = document.getElementById('lb-img');
+  img.src = url;
+  img.alt = `Rendered frame ${frame}`;
+  document.getElementById('lightbox').hidden = false;
+  document.getElementById('lb-close').focus();
+}
+
+function closePreview() {
+  document.getElementById('lightbox').hidden = true;
+  /* Dropped so the next open cannot flash the previous frame while the
+     new one decodes. */
+  document.getElementById('lb-img').removeAttribute('src');
+}
+
+document.getElementById('lb-close').addEventListener('click', closePreview);
+document.getElementById('lightbox').addEventListener('click', e => {
+  if (e.target.id === 'lightbox') closePreview();   // click the backdrop
+});
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && !document.getElementById('lightbox').hidden) {
+    closePreview();
+  }
+});
+
+/* Delegated, because the grid is rebuilt on every state tick and a
+   listener bound to a cell would not survive it. */
+document.getElementById('fgrid').addEventListener('click', e => {
+  const cell = e.target.closest('[data-frame]');
+  if (cell && backend) backend.previewFrame(Number(cell.dataset.frame));
+});
+document.getElementById('fgrid').addEventListener('keydown', e => {
+  if (e.key !== 'Enter' && e.key !== ' ') return;
+  const cell = e.target.closest('[data-frame]');
+  if (cell && backend) {
+    e.preventDefault();
+    backend.previewFrame(Number(cell.dataset.frame));
+  }
+});
 
 /* ---------------- logs page --------------------------------------------- */
 function renderFailures(state) {
@@ -977,6 +1026,11 @@ new QWebChannel(qt.webChannelTransport, channel => {
       });
       renderShareList();
     }
+  });
+
+  backend.framePreview.connect(json => {
+    const p = JSON.parse(json);
+    openPreview(p.frame, p.path, p.label);
   });
 
   backend.state(renderState);

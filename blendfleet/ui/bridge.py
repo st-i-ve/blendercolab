@@ -45,6 +45,7 @@ from blendfleet.instance_state import (GpuSnapshot, InstanceSnapshot,
                                        InstanceStore)
 from blendfleet.log_stream import stream_progress
 from blendfleet.notebook_builder import RenderSettings
+from blendfleet.platform_paths import state_dir
 from blendfleet.settings import Settings
 from blendfleet.ui.messages import explain
 
@@ -93,6 +94,7 @@ class Backend(QObject):
     telemetry = Signal(str)         # one GPU sample
     uploadProgress = Signal(str)
     downloadProgress = Signal(str)
+    framePreview = Signal(str)      # one fetched frame, ready to show
     logLine = Signal(str, str)      # (message, tone)
     notification = Signal(str, str)
     healthChanged = Signal(str)
@@ -330,6 +332,75 @@ class Backend(QObject):
             "basis": (f"at {SECONDS_PER_FRAME_DEFAULT:.0f}s/frame measured "
                       "on a P100 at 1920x1080/128spp — your scene will differ"),
         })
+
+    @Slot(int)
+    def previewFrame(self, frame: int) -> None:
+        """Fetch ONE rendered frame and show it, without collecting the job.
+
+        Looking at a frame should not mean choosing a folder and pulling
+        forty megabytes of everybody's output. The notebook writes loose
+        per-frame images alongside the archive, so exactly one file is
+        downloaded -- about 2 MB for a 1080p PNG.
+
+        Cached under the app's own state directory: clicking the same
+        frame twice must not pay for it twice, and the cache is keyed by
+        job id so a re-render of the same frame number is not served the
+        previous run's picture.
+        """
+        fleet = self.fleet_factory(self.store.list())
+        state = fleet.load()
+        if state is None:
+            self.notification.emit(
+                "There is no render job to preview a frame from.", "idle")
+            return
+        owner = next((w for w in state.workers if frame in w.frames), None)
+        if owner is None:
+            self.notification.emit(
+                f"Frame {frame} was not assigned to any account in this job.",
+                "idle")
+            return
+        account = next((a for a in self.store.list()
+                        if a.label == owner.label
+                        or a.username == owner.username), None)
+        if account is None:
+            self.notification.emit(
+                f"Frame {frame} was rendered by {owner.username}, which is "
+                "no longer a configured account — re-add it to preview or "
+                "download that frame.", "offline")
+            return
+
+        cache = state_dir() / "previews" / state.job_id
+        # The notebook names loose frames f_<4 digits>.<ext>; the extension
+        # follows the render format, so both are tried rather than assuming
+        # PNG and silently failing on a JPEG render.
+        names = [f"f_{frame:04d}.png", f"f_{frame:04d}.jpg"]
+        existing = next((cache / n for n in names if (cache / n).exists()), None)
+        if existing is not None:
+            self.framePreview.emit(json.dumps(
+                {"frame": frame, "path": existing.as_uri(),
+                 "label": owner.label}))
+            return
+
+        def work():
+            client = fleet.client_factory(account.token)
+            for name in names:
+                got = client.fetch_one_output(owner.kernel_slug, name, cache)
+                if got is not None:
+                    return got
+            return None
+
+        def ok(path) -> None:
+            if path is None:
+                self.notification.emit(
+                    f"Frame {frame} is not on Kaggle yet — {owner.username} "
+                    "has not finished it, or the session's output has "
+                    "already expired.", "idle")
+                return
+            self.framePreview.emit(json.dumps(
+                {"frame": frame, "path": Path(path).as_uri(),
+                 "label": owner.label}))
+
+        self._start(f"preview:{frame}", work, f"Fetching frame {frame}", ok)
 
     @Slot(result=str)
     def health(self) -> str:

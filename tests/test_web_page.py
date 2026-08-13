@@ -551,3 +551,97 @@ def test_the_owner_card_is_badged(card):
 def test_a_non_owner_card_is_not_badged(card):
     html = card()
     assert ">owner<" not in html
+
+
+# ---------------------------------------------------------------------------
+# Previewing one frame.
+#
+# "can we see one rendered image in our app instead of having to download
+# it" (2026-08-12). The notebook writes loose per-frame images alongside
+# the archive, and Kaggle gives a URL per file, so exactly one ~2 MB PNG is
+# fetched rather than the whole job's output.
+# ---------------------------------------------------------------------------
+
+def _grid_html(page, job_js, instances_js):
+    out = {}
+    loop = QEventLoop()
+    page.runJavaScript(
+        "(() => { try {"
+        f" renderFrameGrid({{job: {job_js}, instances: {instances_js}}});"
+        " return document.getElementById('fgrid').innerHTML;"
+        " } catch (e) { return 'THREW ' + e; } })()",
+        lambda r: (out.__setitem__("v", r or ""), loop.quit()))
+    QTimer.singleShot(5000, loop.quit)
+    loop.exec()
+    assert "v" in out and not out["v"].startswith("THREW"), out.get("v")
+    return out["v"]
+
+
+FOUR_FRAME_JOB = "{blend:'x.blend', startFrame:1, endFrame:4}"
+TWO_DONE = ("[{worker:{state:'running', frames:[1,2,3,4], framesDone:2},"
+            " live:{framesDone:2, framesTotal:4}}]")
+
+
+def test_a_finished_frame_is_clickable(loaded_page):
+    page, _ = loaded_page
+    html = _grid_html(page, FOUR_FRAME_JOB, TWO_DONE)
+    assert 'data-frame="1"' in html and 'data-frame="2"' in html
+    assert "click to preview" in html
+
+
+def test_an_unfinished_frame_is_not_clickable(loaded_page):
+    """There is nothing on Kaggle to fetch for a frame that has not been
+    rendered, so it must not offer."""
+    page, _ = loaded_page
+    html = _grid_html(page, FOUR_FRAME_JOB, TWO_DONE)
+    assert 'data-frame="3"' not in html and 'data-frame="4"' not in html
+
+
+def test_a_finished_frame_is_reachable_by_keyboard(loaded_page):
+    page, _ = loaded_page
+    html = _grid_html(page, FOUR_FRAME_JOB, TWO_DONE)
+    assert 'role="button"' in html and 'tabindex="0"' in html
+
+
+def _preview_state(page, script):
+    out = {}
+    loop = QEventLoop()
+    page.runJavaScript(
+        "(() => { try { " + script + " } catch (e) { return 'THREW ' + e; } })()",
+        lambda r: (out.__setitem__("v", r or ""), loop.quit()))
+    QTimer.singleShot(5000, loop.quit)
+    loop.exec()
+    assert "v" in out and not str(out["v"]).startswith("THREW"), out.get("v")
+    return out["v"]
+
+
+def test_opening_a_preview_shows_the_frame_and_who_rendered_it(loaded_page):
+    page, _ = loaded_page
+    result = _preview_state(page,
+        "openPreview(7, 'file:///tmp/f_0007.png', 'stive');"
+        " return JSON.stringify({"
+        "  hidden: document.getElementById('lightbox').hidden,"
+        "  title: document.getElementById('lb-title').textContent,"
+        "  sub: document.getElementById('lb-sub').textContent,"
+        "  src: document.getElementById('lb-img').getAttribute('src')});")
+    import json as _json
+    got = _json.loads(result)
+    assert got["hidden"] is False
+    assert got["title"] == "frame 7"
+    assert "stive" in got["sub"]
+    assert got["src"].endswith("f_0007.png")
+
+
+def test_closing_a_preview_drops_the_image(loaded_page):
+    """Left in place, the previous frame flashes up while the next one is
+    still decoding -- which reads as the wrong frame having been fetched."""
+    page, _ = loaded_page
+    result = _preview_state(page,
+        "openPreview(7, 'file:///tmp/f_0007.png', 'stive'); closePreview();"
+        " return JSON.stringify({"
+        "  hidden: document.getElementById('lightbox').hidden,"
+        "  src: document.getElementById('lb-img').getAttribute('src')});")
+    import json as _json
+    got = _json.loads(result)
+    assert got["hidden"] is True
+    assert got["src"] is None

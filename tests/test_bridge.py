@@ -467,3 +467,118 @@ def test_download_progress_carries_real_byte_counts(qapp, tmp_path):
 
     progress = DownloadProgress(downloaded=10, total=20, rate_bps=512.0)
     assert progress.downloaded == 10 and progress.total == 20
+
+
+# ---------------- previewing one frame ----------------
+#
+# "can we see one rendered image in our app instead of having to download
+# it" (2026-08-12). Exactly one file is fetched, from the account that
+# actually rendered that frame.
+
+class PreviewClient(FakeClient):
+    """Records what was asked for, and hands back a file that exists."""
+
+    calls: list = []
+
+    def __init__(self, token, label=None):
+        super().__init__(token, label)
+        self.token = token
+
+    def fetch_one_output(self, slug, filename, dest):
+        PreviewClient.calls.append((self.token, slug, filename))
+        if not filename.endswith(".png"):
+            return None          # the JPEG probe, on a PNG render
+        from pathlib import Path
+        Path(dest).mkdir(parents=True, exist_ok=True)
+        path = Path(dest) / filename
+        path.write_bytes(b"\x89PNG fake")
+        return path
+
+
+def _preview_backend(tmp_path, monkeypatch, frames_by_label):
+    """A Backend with a saved job, whose fleet hands out PreviewClients."""
+    import blendfleet.ui.bridge as bridge_mod
+    monkeypatch.setattr(bridge_mod, "state_dir", lambda: tmp_path / "state")
+
+    store = AccountStore([
+        Account(label=label, token=f"KGAT_{i:032x}", username=f"user_{label}",
+                verified=True)
+        for i, label in enumerate(frames_by_label)])
+    fleet_dir = tmp_path / "w"
+
+    def factory(accounts):
+        fleet = Fleet(accounts, lambda t: PreviewClient(t), fleet_dir)
+        fleet.load = lambda: FleetState(
+            job_id="job1", blend_name="remember.blend",
+            start_frame=1, end_frame=6,
+            workers=[WorkerState(label=label, username=f"user_{label}",
+                                 kernel_slug=f"user_{label}/remember-render-1",
+                                 frames=frames, state="complete",
+                                 frames_done=len(frames))
+                     for label, frames in frames_by_label.items()])
+        return fleet
+
+    backend = Backend(store, factory, lambda t: "someone", Settings())
+    _LIVE_BACKENDS.append(backend)
+    return backend
+
+
+def test_a_preview_fetches_one_file_from_the_account_that_rendered_it(
+        qapp, tmp_path, monkeypatch):
+    PreviewClient.calls = []
+    backend = _preview_backend(tmp_path, monkeypatch,
+                               {"a": [1, 3, 5], "b": [2, 4, 6]})
+    seen = []
+    backend.framePreview.connect(lambda j: seen.append(json.loads(j)))
+
+    backend.previewFrame(4)          # b's frame
+    _settle(backend)
+    _LIVE_BACKENDS.remove(backend)
+
+    assert seen, "no preview was emitted"
+    assert seen[0]["frame"] == 4
+    assert seen[0]["label"] == "b"
+    slugs = {slug for _tok, slug, _name in PreviewClient.calls}
+    assert slugs == {"user_b/remember-render-1"}, \
+        "must ask the account that rendered the frame, not the first one"
+    assert any(name == "f_0004.png" for _t, _s, name in PreviewClient.calls)
+
+
+def test_a_preview_never_downloads_the_whole_job(qapp, tmp_path, monkeypatch):
+    """The point of the feature: one file, not everyone's output."""
+    PreviewClient.calls = []
+    backend = _preview_backend(tmp_path, monkeypatch,
+                               {"a": [1, 3, 5], "b": [2, 4, 6]})
+    backend.previewFrame(1)
+    _settle(backend)
+    _LIVE_BACKENDS.remove(backend)
+
+    names = [name for _t, _s, name in PreviewClient.calls]
+    assert names == ["f_0001.png"], names
+
+
+def test_a_second_look_at_the_same_frame_is_served_from_cache(
+        qapp, tmp_path, monkeypatch):
+    PreviewClient.calls = []
+    backend = _preview_backend(tmp_path, monkeypatch, {"a": [1, 2]})
+    seen = []
+    backend.framePreview.connect(lambda j: seen.append(json.loads(j)))
+
+    backend.previewFrame(1)
+    _settle(backend)
+    before = len(PreviewClient.calls)
+    backend.previewFrame(1)          # again
+    _LIVE_BACKENDS.remove(backend)
+
+    assert len(PreviewClient.calls) == before, \
+        "clicking the same frame twice must not pay for it twice"
+    assert len(seen) == 2, "but it must still be shown the second time"
+
+
+def test_a_frame_nobody_was_assigned_says_so(qapp, tmp_path, monkeypatch):
+    backend = _preview_backend(tmp_path, monkeypatch, {"a": [1, 2]})
+    notes = []
+    backend.notification.connect(lambda m, t: notes.append(m))
+    backend.previewFrame(99)
+    _LIVE_BACKENDS.remove(backend)
+    assert notes and "not assigned" in notes[0]

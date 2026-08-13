@@ -824,6 +824,51 @@ class KaggleClient:
         return sorted(p for p in dest.rglob("*")
                       if p.is_file() and p.suffix.lower() in _OUTPUT_SUFFIXES)
 
+    def fetch_one_output(self, slug: str, filename: str, dest: Path,
+                         transport: Transport | None = None) -> Path | None:
+        """Download exactly ONE of a kernel's output files, or None.
+
+        For previewing a single frame without collecting the whole render.
+        The notebook writes loose per-frame images to /kaggle/working as
+        well as the zip archive (deliberately -- see notebook_builder's
+        ARCHIVE comment), and Kaggle hands out a URL per file, so one
+        2 MB frame can be fetched on its own rather than pulling a 40 MB
+        archive to look at a picture.
+
+        Returns None when the kernel has no file of that name: a frame
+        that has not been rendered yet is a normal state here, not an
+        error.
+        """
+        from kagglesdk.kernels.types.kernels_api_service import (
+            ApiListKernelSessionOutputRequest)
+
+        dest = Path(dest)
+        dest.mkdir(parents=True, exist_ok=True)
+        owner, name = slug.split("/", 1)
+        sdk = self._sdk_factory(self.token)
+
+        page_token = ""
+        while True:
+            request = ApiListKernelSessionOutputRequest()
+            request.user_name = owner
+            request.kernel_slug = name
+            if page_token:
+                request.page_token = page_token
+            response = sdk.kernels.kernels_api_client.list_kernel_session_output(
+                request)
+            for f in (response.files or []):
+                if Path(f.file_name).name != filename:
+                    continue
+                safe_dest = _safe_dest(dest, f.file_name)
+                if safe_dest is None:
+                    return None     # see _safe_dest: refuses a path escape
+                fetch_files([(f.url, safe_dest)],
+                            transport or _RequestsGetTransport())
+                return safe_dest
+            page_token = getattr(response, "next_page_token", "") or ""
+            if not page_token:
+                return None
+
     def fetch_log_tail(self, slug: str, dest: Path, max_lines: int = 200) -> str:
         """The last `max_lines` lines of `slug`'s kernel log.
 

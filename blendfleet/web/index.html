@@ -327,6 +327,18 @@
 
 <div class="toast-stack" id="toast-stack"></div>
 
+<!-- One rendered frame, fetched on demand. Looking at a frame should not
+     mean choosing a folder and downloading everybody's output. -->
+<div class="lightbox" id="lightbox" hidden role="dialog" aria-modal="true"
+     aria-label="Rendered frame">
+  <div class="lb-bar">
+    <b id="lb-title">frame</b>
+    <span id="lb-sub"></span>
+    <button class="btn sm" id="lb-close" aria-label="Close preview">Close</button>
+  </div>
+  <div class="lb-stage"><img id="lb-img" alt=""></div>
+</div>
+
 <script src="app.js"></script>
 </body>
 </html>
