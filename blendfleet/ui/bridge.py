@@ -401,7 +401,8 @@ class Backend(QObject):
         })
 
     @Slot(int)
-    def previewFrame(self, frame: int) -> None:
+    @Slot(int, str)
+    def previewFrame(self, frame: int, job_id: str = "") -> None:
         """Fetch ONE rendered frame and show it, without collecting the job.
 
         Looking at a frame should not mean choosing a folder and pulling
@@ -413,9 +414,23 @@ class Backend(QObject):
         frame twice must not pay for it twice, and the cache is keyed by
         job id so a re-render of the same frame number is not served the
         previous run's picture.
+
+        `job_id` (Task 7 fix round 1, IMPORTANT) scopes the search to ONE
+        tracked job. Frame numbers are not unique across jobs -- two
+        scenes both rendering frames 1-4 is the ordinary case -- and
+        addressing by number alone used to resolve through `fleet.load()`
+        ("the most recent job"), so clicking one scene's frame silently
+        previewed a DIFFERENT scene's frame of the same number whenever
+        that other scene happened to be the more recently launched one.
+        An empty string falls back to that same "most recent" behaviour,
+        unchanged, for any caller that still only knows a frame number.
         """
         fleet = self.fleet_factory(self.store.list())
-        state = fleet.load()
+        if job_id:
+            state = next((j for j in fleet.load_jobs() if j.job_id == job_id),
+                         None)
+        else:
+            state = fleet.load()
         if state is None:
             self.notification.emit(
                 "There is no render job to preview a frame from.", "idle")

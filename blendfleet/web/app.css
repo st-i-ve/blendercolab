@@ -281,6 +281,10 @@ html,body{background:transparent}
 .unshared-head{font-size:13px;color:var(--warn-ink)}
 .unshared-row{font-family:var(--mono);font-size:11.5px;color:var(--ink)}
 .unshared-note{font-family:var(--mono);font-size:10.5px;color:var(--ink-3);margin-top:4px}
+/* A REAL confirmation ("shared with everyone"), not a warning -- distinct
+   tokens so it cannot be mistaken for the same severity as the row above. */
+.unshared-banner.ok{border-color:color-mix(in srgb,var(--active) 40%,transparent)}
+.unshared-banner.ok .unshared-head{color:var(--active-ink)}
 
 /* ============================================================
    GENERIC

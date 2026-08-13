@@ -624,6 +624,71 @@ def test_a_frame_nobody_was_assigned_says_so(qapp, tmp_path, monkeypatch):
     assert notes and "not assigned" in notes[0]
 
 
+def test_preview_frame_is_scoped_to_the_named_job(qapp, tmp_path):
+    """Task 7 fix round 1, IMPORTANT: two jobs both rendering frame 2 --
+    without a job id, previewFrame() resolved through fleet.load(), "the
+    most recent job", so asking for scene ALPHA's frame 2 could silently
+    fetch scene BETA's frame 2 instead whenever beta happened to be the
+    more recently launched of the two. job_id must pick the job it
+    actually names, never by recency."""
+    PreviewClient.calls = []
+    store = AccountStore([
+        Account(label="acct-alpha", token=f"KGAT_{0:032x}",
+                username="user_alpha", verified=True),
+        Account(label="acct-beta", token=f"KGAT_{1:032x}",
+                username="user_beta", verified=True),
+    ])
+    fleet_dir = tmp_path / "w"
+    factory = lambda accounts: Fleet(  # noqa: E731
+        accounts, lambda t: PreviewClient(t), fleet_dir)
+    factory(store.list()).save_jobs([
+        FleetState(job_id="job-alpha", blend_name="alpha.blend",
+                   start_frame=1, end_frame=4,
+                   workers=[WorkerState(
+                       label="acct-alpha", username="user_alpha",
+                       kernel_slug="user_alpha/alpha-render-1",
+                       frames=[1, 2, 3, 4], state="complete",
+                       frames_done=4)]),
+        FleetState(job_id="job-beta", blend_name="beta.blend",
+                   start_frame=1, end_frame=4,
+                   workers=[WorkerState(
+                       label="acct-beta", username="user_beta",
+                       kernel_slug="user_beta/beta-render-1",
+                       frames=[1, 2, 3, 4], state="complete",
+                       frames_done=4)]),
+    ])
+
+    backend = Backend(store, factory, lambda t: "someone", Settings())
+    _LIVE_BACKENDS.append(backend)
+    seen = []
+    backend.framePreview.connect(lambda j: seen.append(json.loads(j)))
+
+    backend.previewFrame(2, "job-alpha")
+    _settle(backend)
+    backend.previewFrame(2, "job-beta")
+    _settle(backend)
+    _LIVE_BACKENDS.remove(backend)
+
+    assert [s["label"] for s in seen] == ["acct-alpha", "acct-beta"], seen
+    slugs = {slug for _tok, slug, _name in PreviewClient.calls}
+    assert "user_alpha/alpha-render-1" in slugs
+    assert "user_beta/beta-render-1" in slugs
+
+
+def test_preview_frame_falls_back_to_the_most_recent_job_when_unscoped(
+        qapp, tmp_path):
+    """An empty job id (a caller that only knows a frame number) must keep
+    working exactly as before -- resolving through fleet.load()'s own
+    "most recent" answer, unchanged."""
+    backend = _preview_backend(tmp_path, {"a": [1, 3, 5], "b": [2, 4, 6]})
+    seen = []
+    backend.framePreview.connect(lambda j: seen.append(json.loads(j)))
+    backend.previewFrame(4)          # no job_id at all
+    _settle(backend)
+    _LIVE_BACKENDS.remove(backend)
+    assert seen and seen[0]["label"] == "b"
+
+
 # ---------------------------------------------------------------------------
 # Several jobs at once (Task 6). The payload used to be built from a single
 # cached FleetState -- one job, full stop -- so a second concurrent scene

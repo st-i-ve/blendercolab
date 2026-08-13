@@ -799,3 +799,218 @@ def test_closing_a_preview_drops_the_image(loaded_page):
     got = _json.loads(result)
     assert got["hidden"] is True
     assert got["src"] is None
+
+
+# ---------------------------------------------------------------------------
+# Task 7, Fix round 1: two Criticals, two Importants, two Minors caught by
+# review. Each test below reassigns the module-level `backend` (a plain
+# `let` at the top of app.js, reachable from any later runJavaScript call
+# in the same page realm -- confirmed empirically before writing these) to
+# a recorder, so the real click handlers run for real without needing an
+# actual QWebChannel connection.
+# ---------------------------------------------------------------------------
+
+def _idle_pair_state():
+    return """({
+      job: null, jobs: [],
+      instances: [
+        {label:'acct0', username:'acct0', verified:true, revoked:false,
+         owner:false, jobId:null, quota:'', hardware:null, worker:null,
+         live:null},
+        {label:'acct1', username:'acct1', verified:true, revoked:false,
+         owner:false, jobId:null, quota:'', hardware:null, worker:null,
+         live:null}
+      ],
+      dataset: null, unshared: null, unreadableJobs: [], blend: null,
+      approximate: true
+    })"""
+
+
+def test_an_unticked_account_stays_unticked_across_a_state_tick(loaded_page):
+    """CRITICAL: renderAssignList used to rebuild #assign-list from
+    scratch on every stateChanged (the 30s poll among them) with every
+    free account hard-coded `checked`, so a deliberate untick survived
+    only until the next tick and launch() would then render on an
+    account the user had just excluded."""
+    page, _ = loaded_page
+    state = _idle_pair_state()
+    result = _preview_state(page,
+        f"renderState(JSON.stringify({state}));"
+        " const box = document.querySelector("
+        "   '#assign-list input[data-assign=\"acct0\"]');"
+        " box.checked = false;"
+        " box.dispatchEvent(new Event('change', {bubbles: true}));"
+        # A later poll tick, re-rendering from an identical payload.
+        f" renderState(JSON.stringify({state}));"
+        " const after = document.querySelector("
+        "   '#assign-list input[data-assign=\"acct0\"]');"
+        " return JSON.stringify({"
+        "   checked: after.checked, labels: renderOptions().labels});")
+    import json as _json
+    got = _json.loads(result)
+    assert got["checked"] is False, "the untick did not survive the next tick"
+    assert "acct0" not in got["labels"]
+    assert "acct1" in got["labels"]
+
+
+def test_a_finished_jobs_accounts_are_not_shown_as_busy(loaded_page):
+    """CRITICAL: fleet.py's ACTIVE_STATES is {queued, running} and
+    free_accounts() says a completed job holds nobody -- but the render
+    panel used to treat `!!inst.jobId` as busy, which stays true long
+    after the job behind it finished (jobId is only cleared by forgetting
+    the job). A completed render's accounts showed disabled with a false
+    "already rendering" title, and there was no tickable account left to
+    fix it with."""
+    page, _ = loaded_page
+    # A label not used by any other test in this module: assignUnchecked
+    # (the fix for the CRITICAL above) is page-side state that persists
+    # for the whole module-scoped fixture, so reusing "acct0" here would
+    # pick up whatever an earlier test left unticked and fail for a
+    # reason unrelated to what THIS test checks.
+    payload = """({
+      job: null,
+      jobs: [{jobId:'j-alpha', scene:'alpha', blend:'alpha.blend',
+        startFrame:1, endFrame:4, labels:['acct-finished'], elapsed:20,
+        finished:true}],
+      instances: [
+        {label:'acct-finished', username:'acct-finished', verified:true,
+         revoked:false, owner:false, jobId:'j-alpha', quota:'',
+         hardware:null,
+         worker:{state:'complete', frames:[1,2,3,4], framesDone:4,
+                 message:'', elapsed:20, finished:true}, live:null}
+      ],
+      dataset: null, unshared: null, unreadableJobs: [], blend: null,
+      approximate: true
+    })"""
+    html = _state_html(page, payload, element_id="assign-list")
+    assert "disabled" not in html
+    assert "already rendering" not in html
+    assert "checked" in html
+
+
+def test_frame_preview_is_scoped_to_the_grid_it_was_clicked_in(loaded_page):
+    """IMPORTANT: previewFrame() used to take only a frame number, which
+    the bridge resolved via Fleet.load() -- "the most recent job". With
+    two jobs both showing a done frame 2, clicking scene alpha's cell
+    must record alpha's own job id, not whichever job happens to be more
+    recent -- the grid has carried data-job since this task's first
+    draft; only the click handler was never taught to read it."""
+    page, _ = loaded_page
+    payload = """({
+      job: null,
+      jobs: [
+        {jobId:'j-alpha', scene:'alpha', blend:'alpha.blend',
+         startFrame:1, endFrame:4, labels:['acct0'], elapsed:null,
+         finished:false},
+        {jobId:'j-beta', scene:'beta', blend:'beta.blend',
+         startFrame:1, endFrame:4, labels:['acct1'], elapsed:null,
+         finished:false}
+      ],
+      instances: [
+        {label:'acct0', username:'acct0', verified:true, revoked:false,
+         owner:false, jobId:'j-alpha', quota:'', hardware:null,
+         worker:{state:'running', frames:[1,2,3,4], framesDone:2,
+                 message:'', elapsed:null, finished:false}, live:null},
+        {label:'acct1', username:'acct1', verified:true, revoked:false,
+         owner:false, jobId:'j-beta', quota:'', hardware:null,
+         worker:{state:'running', frames:[1,2,3,4], framesDone:2,
+                 message:'', elapsed:null, finished:false}, live:null}
+      ],
+      dataset: null, unshared: null, unreadableJobs: [], blend: null,
+      approximate: true
+    })"""
+    result = _preview_state(page,
+        f"renderState(JSON.stringify({payload}));"
+        " const calls = [];"
+        " backend = { previewFrame: (f, j) => calls.push([f, j]) };"
+        " document.querySelectorAll('.fgrid[data-job]').forEach("
+        "   g => g.querySelector('[data-frame=\"2\"]').click());"
+        " backend = null;"
+        " return JSON.stringify(calls);")
+    import json as _json
+    calls = _json.loads(result)
+    assert [2, "j-alpha"] in calls, calls
+    assert [2, "j-beta"] in calls, calls
+
+
+def test_cancelling_a_job_asks_for_confirmation_first(loaded_page):
+    """IMPORTANT: several identical red Cancel buttons sit in a list that
+    reshuffles every 30 seconds; one misclick used to end work other
+    people's quota already paid for, immediately, with no undo.
+    btn-forget confirms for an action that is strictly LESS destructive
+    (forgetting stops nothing) -- this must confirm too."""
+    page, _ = loaded_page
+    state = _two_scene_state()
+    result = _preview_state(page,
+        f"renderState(JSON.stringify({state}));"
+        " const cancelled = [];"
+        " backend = { cancelInstance: label => cancelled.push(label) };"
+        " window.confirm = () => false;"
+        " document.querySelector('[data-job-cancel=\"j-alpha\"]').click();"
+        " const declined = cancelled.slice();"
+        " window.confirm = () => true;"
+        " document.querySelector('[data-job-cancel=\"j-alpha\"]').click();"
+        " const accepted = cancelled.slice();"
+        " backend = null;"
+        " return JSON.stringify({declined, accepted});")
+    import json as _json
+    got = _json.loads(result)
+    assert got["declined"] == [], "declining must not cancel anything"
+    assert got["accepted"] == ["acct0"], \
+        "accepting must cancel exactly this job's own accounts"
+
+
+def test_confirmed_shared_and_never_checked_are_not_the_same_banner(
+        loaded_page):
+    """Minor: `unshared: null` (nothing recorded this session) and
+    `unshared: {accounts: {}}` (a real upload that reached everyone) used
+    to both render as no banner at all, so "we do not know" and "we
+    checked and it is fine" were indistinguishable -- on a page whose own
+    rule is that an unknown must never read as fine."""
+    page, _ = loaded_page
+    common = ("job: null, jobs: [], instances: [], unreadableJobs: [], "
+              "blend: null, approximate: true, dataset: null")
+    never_checked = _state_html(
+        page, "({" + common + ", unshared: null})",
+        element_id="unshared-banner")
+    confirmed_fine = _state_html(
+        page,
+        "({" + common + ", unshared: {accounts: {}, "
+        "note: 'the last upload reached everyone'}})",
+        element_id="unshared-banner")
+    assert never_checked.strip() == ""
+    assert "shared with every account" in confirmed_fine
+    assert never_checked != confirmed_fine
+
+
+def test_forgetting_an_unreadable_record_asks_for_confirmation_first(
+        loaded_page):
+    """Minor: this used to fire on the first click, with the "not a
+    cancel" honesty confined to a hover title nobody has to read. It
+    permanently discards what may be the only surviving trace of kernels
+    still billing on Kaggle -- the same stakes as btn-forget's own
+    confirm."""
+    page, _ = loaded_page
+    payload = """({
+      job: null, jobs: [], instances: [],
+      unreadableJobs: [{index:0, jobId:'j1', blend:'x.blend',
+        kernels:['a/b'], kernelUrls:['https://www.kaggle.com/code/a/b'],
+        message:'could not read it', fingerprint:'fp1'}],
+      blend: null, approximate: true, dataset: null, unshared: null
+    })"""
+    result = _preview_state(page,
+        f"renderState(JSON.stringify({payload}));"
+        " const forgotten = [];"
+        " backend = { forgetUnreadableJob: (i, fp) => forgotten.push([i, fp]) };"
+        " window.confirm = () => false;"
+        " document.querySelector('[data-forget-unreadable]').click();"
+        " const declined = forgotten.slice();"
+        " window.confirm = () => true;"
+        " document.querySelector('[data-forget-unreadable]').click();"
+        " const accepted = forgotten.slice();"
+        " backend = null;"
+        " return JSON.stringify({declined, accepted});")
+    import json as _json
+    got = _json.loads(result)
+    assert got["declined"] == [], "declining must not forget the record"
+    assert got["accepted"] == [[0, "fp1"]]

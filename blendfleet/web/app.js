@@ -638,6 +638,17 @@ function populateBlenderVersions(json) {
    fall back to rendering on everybody). assignTouched is what tells
    these two "nobody chosen yet" and "chose nobody on purpose" apart. */
 let assignTouched = false;
+/* Fix round 1, CRITICAL: renderAssignList used to rebuild #assign-list
+   from scratch on every stateChanged (the 30s poll among them) with
+   every free account hard-coded ` checked`, so a deliberate untick
+   survived only until the NEXT tick -- measured, it silently came back
+   ticked and launch() would then render on an account the user had just
+   excluded. This set is the user's own choice, kept independent of
+   whatever renderAssignList paints next: a label in it stays unticked
+   across every re-render until the user ticks it again themselves. A
+   label never added here (including one that only just became free)
+   still defaults to ticked. */
+const assignUnchecked = new Set();
 
 function renderOptions() {
   const options = {
@@ -657,12 +668,27 @@ function renderOptions() {
   return options;
 }
 
+/* An account holds a real, ACTIVE session only while its worker is
+   queued or running -- fleet.py's own ACTIVE_STATES, and free_accounts()
+   says in as many words that a FINISHED job holds nobody. Fix round 1,
+   CRITICAL: this used to be `!!inst.jobId`, which stays true long after
+   the job behind it finished (a jobId is only cleared by forgetting the
+   job) -- so a completed render's accounts showed disabled with a false
+   "already rendering" title, and ticking the box anyway still produced
+   labels: [], which launch() then refused with "no machines selected"
+   and left no tickable account to fix it with. */
+function isActivelyRendering(inst) {
+  return !!(inst.worker
+    && (inst.worker.state === 'running' || inst.worker.state === 'queued'));
+}
+
 /* One checkbox per configured account, in the render panel. A FREE
-   account defaults to checked -- unticking one is an active choice to
-   leave it out, never the default state. An account already rendering
-   another scene is shown disabled, with the reason in its title: ticking
-   it would spend that account's quota twice for the same output, which
-   this app never offers as an option. */
+   account defaults to checked unless the user has UNticked it (tracked
+   in assignUnchecked, independent of this function's own re-renders --
+   see that set's own comment for the bug this fixes). An account
+   actively rendering another scene is shown disabled, with the reason in
+   its title: ticking it would spend that account's quota twice for the
+   same output, which this app never offers as an option. */
 function renderAssignList(state) {
   const el = document.getElementById('assign-list');
   if (!el) return;
@@ -672,7 +698,7 @@ function renderAssignList(state) {
   }
   const jobsById = new Map((state.jobs || []).map(j => [j.jobId, j]));
   el.innerHTML = state.instances.map(inst => {
-    const busy = !!inst.jobId;
+    const busy = isActivelyRendering(inst);
     const job = busy ? jobsById.get(inst.jobId) : null;
     const scene = job ? job.scene : 'another scene';
     const title = busy
@@ -680,15 +706,20 @@ function renderAssignList(state) {
         + 'a second render on it would spend this account\'s quota twice '
         + 'for the same output.'
       : '';
+    const checked = !busy && !assignUnchecked.has(inst.label);
     return `<label class="assign-opt"${title ? ` title="${title}"` : ''}>
-      <input type="checkbox" data-assign="${esc(inst.label)}"${busy ? ' disabled' : ' checked'}>
+      <input type="checkbox" data-assign="${esc(inst.label)}"${busy ? ' disabled' : ''}${checked ? ' checked' : ''}>
       <span class="an">${esc(inst.label)}</span>
       ${busy ? `<span class="ad">rendering ${esc(scene)}</span>` : ''}
     </label>`;
   }).join('');
 }
 document.getElementById('assign-list').addEventListener('change', e => {
-  if (e.target.matches('[data-assign]')) assignTouched = true;
+  if (!e.target.matches('[data-assign]')) return;
+  assignTouched = true;
+  const label = e.target.dataset.assign;
+  if (e.target.checked) assignUnchecked.delete(label);
+  else assignUnchecked.add(label);
 });
 
 /* Job records this app could no longer read at all -- see
@@ -719,24 +750,54 @@ function renderUnreadable(state) {
 }
 document.getElementById('unreadable-banner').addEventListener('click', e => {
   const btn = e.target.closest('[data-forget-unreadable]');
-  if (btn && backend) {
-    backend.forgetUnreadableJob(Number(btn.dataset.forgetUnreadable),
-                                btn.dataset.fingerprint);
-  }
+  if (!btn || !backend) return;
+  /* Fix round 1, Minor: this used to fire on the first click, with the
+     "not a cancel" honesty confined to a hover title nobody has to read.
+     It permanently discards what may be the only surviving trace of
+     kernels still billing on Kaggle -- the same stakes as btn-forget's
+     own confirm, worded the same way. */
+  const ok = window.confirm(
+    'Forget this record?\n\n'
+    + 'This does NOT cancel anything. If it named any kernels and they '
+    + 'are still running on Kaggle, they keep running and keep spending '
+    + 'quota, and this app will no longer be able to warn about them.\n\n'
+    + 'Check kaggle.com and stop them by hand first if you have not.');
+  if (!ok) return;
+  backend.forgetUnreadableJob(Number(btn.dataset.forgetUnreadable),
+                              btn.dataset.fingerprint);
 });
 
 /* Accounts the LAST scene upload could not be shared with (bridge.py's
    `unshared`). `note` always travels with it, because this is a snapshot
    of that one upload -- never a live check of the dataset in use right
    now -- and showing the accounts without that scope would read as a
-   current, ongoing failure. */
+   current, ongoing failure.
+
+   Fix round 1, Minor: `null` (nothing recorded this session -- no upload
+   has happened yet) and `{accounts:{}}` (a real upload that reached
+   EVERY account) used to both render as no banner at all, so "we do not
+   know" and "we checked and it is fine" were indistinguishable -- on a
+   page whose whole rule is that an unknown must never read as a fine.
+   `null` still shows nothing (there is genuinely nothing to report);
+   `{accounts:{}}` now shows a real, positive confirmation instead of
+   silence standing in for one. */
 function renderUnshared(state) {
   const el = document.getElementById('unshared-banner');
   const unshared = state.unshared;
-  const accounts = unshared ? (unshared.accounts || {}) : {};
+  if (unshared == null) {
+    el.className = 'unshared-banner';
+    el.innerHTML = '';
+    return;
+  }
+  const accounts = unshared.accounts || {};
   const names = Object.keys(accounts);
-  el.classList.toggle('show', names.length > 0);
-  if (!names.length) { el.innerHTML = ''; return; }
+  if (!names.length) {
+    el.className = 'unshared-banner show ok';
+    el.innerHTML = `<div class="unshared-head"><b>Last upload was shared with every account.</b></div>
+      <div class="unshared-note">${esc(unshared.note)}</div>`;
+    return;
+  }
+  el.className = 'unshared-banner show';
   el.innerHTML = `<div class="unshared-head"><b>Not everyone can see the last uploaded scene.</b></div>`
     + names.map(name => `<div class="unshared-row"><b>${esc(name)}</b>: ${esc(accounts[name])}</div>`).join('')
     + `<div class="unshared-note">${esc(unshared.note)}</div>`;
@@ -1082,9 +1143,26 @@ document.addEventListener('keydown', e => {
    attached to a grid div would not survive the very next tick, or the
    very next SECOND job either. #instances itself is never replaced, only
    its contents, so a listener bound here outlives every repaint. */
+/* The jobId a clicked frame cell belongs to, from the .fgrid it lives in
+   -- Fix round 1, IMPORTANT: frame numbers are not unique across jobs
+   (two scenes both rendering frames 1-4 is the ordinary case, not an
+   edge case), and previewFrame() used to take only a number, which the
+   bridge resolved via Fleet.load() -- "the most recent job" -- so
+   clicking scene A's frame 2 silently previewed scene B's frame 2
+   whenever B was the more recently launched of the two. The grid has
+   carried data-job since this task's first draft; only the click
+   handler was never taught to read it. */
+function jobIdOfCell(cell) {
+  const grid = cell.closest('.fgrid');
+  return (grid && grid.dataset.job) || '';
+}
+
 document.getElementById('instances').addEventListener('click', e => {
   const cell = e.target.closest('[data-frame]');
-  if (cell && backend) { backend.previewFrame(Number(cell.dataset.frame)); return; }
+  if (cell && backend) {
+    backend.previewFrame(Number(cell.dataset.frame), jobIdOfCell(cell));
+    return;
+  }
   const collectBtn = e.target.closest('[data-job-collect]');
   if (collectBtn && backend) {
     backend.collect('', collectBtn.dataset.jobCollect);
@@ -1100,7 +1178,21 @@ document.getElementById('instances').addEventListener('click', e => {
     const jobId = cancelBtn.dataset.jobCancel;
     const job = (JSON.parse(lastStateJson).jobs || [])
       .find(j => j.jobId === jobId);
-    (job ? job.labels : []).forEach(label => backend.cancelInstance(label));
+    const labels = job ? job.labels : [];
+    if (!labels.length) return;
+    /* Fix round 1, IMPORTANT: several identical red Cancel buttons now
+       sit in a list that reshuffles every 30 seconds, and one misclick
+       ends work other people's quota already paid for, with no undo --
+       restarting spends that quota again. btn-forget confirms for an
+       action that is strictly LESS destructive (forgetting stops
+       nothing); this is strictly more, so it must confirm too, and name
+       exactly who is about to be stopped. */
+    const ok = window.confirm(
+      `Cancel ${job.scene}?\n\n`
+      + `This stops ${labels.length} account(s) rendering it: `
+      + `${labels.join(', ')}.\n`
+      + 'Restarting later spends that quota again.');
+    if (ok) labels.forEach(label => backend.cancelInstance(label));
   }
 });
 document.getElementById('instances').addEventListener('keydown', e => {
@@ -1108,7 +1200,7 @@ document.getElementById('instances').addEventListener('keydown', e => {
   const cell = e.target.closest('[data-frame]');
   if (cell && backend) {
     e.preventDefault();
-    backend.previewFrame(Number(cell.dataset.frame));
+    backend.previewFrame(Number(cell.dataset.frame), jobIdOfCell(cell));
   }
 });
 
