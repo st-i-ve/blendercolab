@@ -85,7 +85,7 @@ class FakeApi:
     def __init__(self, status="COMPLETE", dataset_ok=True, kernels=None,
                  create_error=None, version_error=None, list_files_ok=True,
                  list_files_response=None, datasets=None,
-                 dataset_delete_error=None):
+                 dataset_delete_error=None, dataset_delete_result=True):
         self._status = status
         self._dataset_ok = dataset_ok
         self._list_files_ok = list_files_ok
@@ -96,6 +96,10 @@ class FakeApi:
         self._version_error = version_error
         self._datasets = datasets if datasets is not None else []
         self._dataset_delete_error = dataset_delete_error
+        # dataset_delete's own docstring: "Returns True if deleted, False
+        # if cancelled." Defaults to True (a normal successful delete);
+        # tests override this to reproduce the falsy-but-no-exception case.
+        self._dataset_delete_result = dataset_delete_result
         self.pushed = []
         self.created = []
         self.versioned = []
@@ -181,7 +185,7 @@ class FakeApi:
             (owner_slug, dataset_slug, no_confirm))
         if self._dataset_delete_error is not None:
             raise self._dataset_delete_error
-        return True
+        return self._dataset_delete_result
 
 
 def client(api=None, **kw):
@@ -475,6 +479,28 @@ def test_deleting_reports_other_failures_without_claiming_permission(tmp_path):
     assert "permission" not in message.lower()
     assert "connection reset" in message
     assert "Nothing was" in message
+
+
+def test_deleting_raises_when_kaggle_reports_it_as_cancelled_not_deleted():
+    """Fix round 1: dataset_delete's own docstring says 'Returns True if
+    deleted, False if cancelled' -- a falsy return used to be discarded,
+    so delete_dataset returned cleanly (success) even though Kaggle says
+    nothing happened. Not reachable through the installed SDK today (this
+    call passes no_confirm=True, leaving nothing to cancel) but this is
+    the single most consequential path in the module: it must never read
+    a falsy result as success, whatever future SDK route produces one."""
+    c, api = client(dataset_delete_result=False)
+
+    with pytest.raises(KaggleError) as excinfo:
+        c.delete_dataset("stivestivewithani/old-scene-blend")
+
+    message = str(excinfo.value)
+    assert "cancelled" in message.lower()
+    assert "Nothing was deleted" in message
+    # the call still happened -- this is about the RESULT, not a refusal
+    # to even try
+    assert api.dataset_delete_calls == [
+        ("stivestivewithani", "old-scene-blend", True)]
 
 
 # ------------------------------------------------------- upload preflight --
@@ -1228,8 +1254,39 @@ class NoKernelsAndNoDatasetCallApi(_AuthenticatingApi):
     # dataset_list deliberately absent: older/newer SDKs differ.
 
 
+class RealSignatureDatasetListApi(_AuthenticatingApi):
+    """dataset_list with the SDK's REAL installed signature -- page/
+    max_size, no page_size, and no **kwargs catch-all to hide a wrong
+    argument name. Pins the regression fixed in Fix round 1: whoami()'s
+    dataset fallback used to call dataset_list(mine=True, page_size=1),
+    which the real API has no such parameter for and rejects with
+    TypeError -- silently swallowed by the surrounding
+    `except (AttributeError, TypeError): datasets = []`, so this fallback
+    returned nothing in production, every time, for exactly the account it
+    exists to serve (one with datasets but no notebooks yet -- see the
+    commit "An account with no notebooks can now render")."""
+
+    def kernels_list(self, **kwargs):
+        return []
+
+    def dataset_list(self, sort_by=None, size=None, file_type=None,
+                     license_name=None, tag_ids=None, search=None,
+                     user=None, mine=False, page=1, max_size=None,
+                     min_size=None):
+        return [_Ref("friendly/some-dataset")]
+
+
 def test_whoami_falls_back_to_datasets_when_there_are_no_notebooks(monkeypatch):
     _install_fake_kaggle_package(monkeypatch, NoKernelsButOneDatasetApi())
+    assert KaggleClient(TOKEN).whoami() == "friendly"
+
+
+def test_whoami_dataset_fallback_works_against_the_real_sdk_signature(monkeypatch):
+    """Fix round 1: before the fix, this raised KaggleError('no notebooks
+    or datasets') instead of resolving 'friendly' -- the old
+    page_size=1 argument doesn't exist on the real dataset_list(), so it
+    always TypeError'd and the fallback silently produced []."""
+    _install_fake_kaggle_package(monkeypatch, RealSignatureDatasetListApi())
     assert KaggleClient(TOKEN).whoami() == "friendly"
 
 

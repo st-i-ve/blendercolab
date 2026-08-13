@@ -589,8 +589,16 @@ class KaggleClient:
         # having the call at all -- by the time we are here the token has
         # already proved itself above, so the only question left is whether
         # this account owns anything a handle can be read from.
+        #
+        # No page_size= here: the installed SDK's dataset_list() takes
+        # page/max_size, not page_size (confirmed live, Task 8, 2026-08-12).
+        # Passing page_size used to raise TypeError on every call, which the
+        # except clause below swallowed -- silently making this fallback
+        # return nothing in production, every time, for exactly the account
+        # it exists to serve (one with datasets but no notebooks yet; see
+        # "An account with no notebooks can now render").
         try:
-            datasets = self.api.dataset_list(mine=True, page_size=1) or []
+            datasets = self.api.dataset_list(mine=True) or []
         except (AttributeError, TypeError):
             datasets = []
         for item in datasets:
@@ -784,10 +792,21 @@ class KaggleClient:
         hang forever or silently default to "no". The real confirmation is
         BlendFleet's own, in its UI, at the point where the irreversible
         consequence can actually be explained to whoever clicks the button.
+
+        The underlying call's own docstring is explicit that it "Returns
+        True if deleted, False if cancelled" -- so a falsy return is NOT
+        an edge case to shrug off, it is the one signal this call has for
+        "nothing happened". Not reachable through the installed SDK with
+        `no_confirm=True` (there is no prompt left for it to cancel), but
+        this is the single most consequential path in the module: a
+        future SDK version finding some other route to False, silently
+        ignored here, would report a dataset as deleted while it still
+        sits on Kaggle -- exactly the lie this whole method exists to
+        prevent.
         """
         owner, name = slug.split("/", 1)
         try:
-            self.api.dataset_delete(owner, name, no_confirm=True)
+            deleted = self.api.dataset_delete(owner, name, no_confirm=True)
         except Exception as e:
             if _is_revoked_token(e):
                 raise RevokedTokenError(
@@ -805,6 +824,14 @@ class KaggleClient:
                 "deleted. Retry, and if it keeps happening confirm this "
                 "account still has a valid token under Manage "
                 "accounts…") from e
+        if not deleted:
+            raise KaggleError(
+                f"could not delete dataset {slug!r}: Kaggle reported the "
+                "deletion as cancelled rather than completed, even though "
+                "no confirmation was requested. Nothing was deleted -- "
+                "retry, and if it keeps happening report this as a bug "
+                "(this app never asks Kaggle to prompt, so a cancellation "
+                "here should not be possible).")
 
     # ---------------- kernels ----------------
     def push_kernel(self, folder: Path) -> None:
