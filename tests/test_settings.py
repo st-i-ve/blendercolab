@@ -182,3 +182,50 @@ def test_a_settings_file_from_before_this_field_still_loads(tmp_path,
     loaded = Settings.load()
     assert loaded.blender_version == "5.2.0"
     assert loaded.accent == "blue", "the rest of the file must survive"
+
+
+# ---------------- malformed blender_version values -- same principle as
+# accent and min_gpus above: a hand-edited or forward-dated config, or a
+# malformed value relayed from the page through setPreference, must fall
+# back rather than raising out of __post_init__ with no UI left to fix it
+# from (bridge.py's blenderVersions()/launch() slots call validate_version
+# directly on this field, with nothing else standing between a bad value
+# and an unhandled ValueError from inside a @Slot).
+
+@pytest.mark.parametrize("bad_version", [
+    None,
+    42,
+    3.5,
+    True,
+    [1, 2],
+    {"x": 1},
+    "latest",          # well-formed string, wrong shape
+    "5.2",              # missing patch
+    "v5.2.0",
+])
+def test_malformed_blender_version_falls_back_rather_than_raising(bad_version):
+    s = Settings(blender_version=bad_version)
+    assert s.blender_version == "5.2.0"
+
+
+def test_load_with_malformed_blender_version_in_file_falls_back():
+    p = pp.config_dir() / "settings.json"
+    p.write_text(json.dumps({"blender_version": "latest"}), encoding="utf-8")
+    s = Settings.load()
+    assert s.blender_version == "5.2.0"
+
+
+def test_an_unlisted_but_well_formed_blender_version_is_kept():
+    """blender_version is a menu, not a gate (see blender_versions.py) --
+    __post_init__ must not narrow it down to KNOWN_VERSIONS."""
+    s = Settings(blender_version="3.6.14")
+    assert s.blender_version == "3.6.14"
+
+
+def test_a_blender_version_with_stray_whitespace_is_normalised():
+    """validate_version's own return value is stripped -- __post_init__
+    must keep that normalisation rather than storing the raw string, or
+    notebook_builder's URL and the embedded BLENDER_VERSION could diverge
+    (see notebook_builder.build's own note on this)."""
+    s = Settings(blender_version=" 4.2.9 ")
+    assert s.blender_version == "4.2.9"

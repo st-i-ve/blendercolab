@@ -633,7 +633,6 @@ def test_opening_a_preview_shows_the_frame_and_who_rendered_it(loaded_page):
 
 
 def test_the_page_offers_a_blender_version_picker(loaded_page):
-    _, result = loaded_page
     page, _ = loaded_page
     out = {}
     loop = QEventLoop()
@@ -643,6 +642,42 @@ def test_the_page_offers_a_blender_version_picker(loaded_page):
     QTimer.singleShot(5000, loop.quit)
     loop.exec()
     assert out["v"] == "true"
+
+
+def test_the_picker_is_populated_from_the_bridge_payload(loaded_page):
+    """A static <select> proves nothing on its own: the element could
+    exist while the code that fills it from the bridge had been deleted
+    entirely, and this same fixture (loaded without the QWebChannel shim)
+    would still show it as present. Calling the page's own
+    populateBlenderVersions() with a hand-built payload is what actually
+    exercises that code."""
+    page, _ = loaded_page
+    result = _preview_state(page,
+        "populateBlenderVersions(JSON.stringify({"
+        "  versions: ['5.2.0', '4.5.3', '4.2.9'], current: '4.2.9'}));"
+        " const sel = document.getElementById('sel-blender');"
+        " return JSON.stringify({"
+        "  options: Array.from(sel.options).map(o => o.value),"
+        "  value: sel.value});")
+    import json as _json
+    got = _json.loads(result)
+    assert got["options"] == ["5.2.0", "4.5.3", "4.2.9"]
+    assert got["value"] == "4.2.9", "the current version must be preselected"
+
+
+def test_the_launch_options_carry_the_chosen_blender_version(loaded_page):
+    """renderOptions() is what launch() and sendJob() both read -- if it
+    never picked up the select's value, the version chosen on the page
+    would never reach a render."""
+    page, _ = loaded_page
+    result = _preview_state(page,
+        "populateBlenderVersions(JSON.stringify({"
+        "  versions: ['5.2.0', '4.2.9'], current: '5.2.0'}));"
+        " document.getElementById('sel-blender').value = '4.2.9';"
+        " return JSON.stringify(renderOptions());")
+    import json as _json
+    got = _json.loads(result)
+    assert got["blenderVersion"] == "4.2.9"
 
 
 def test_closing_a_preview_drops_the_image(loaded_page):

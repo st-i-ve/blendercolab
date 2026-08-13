@@ -445,7 +445,7 @@ class Backend(QObject):
             decoded = value
         mapping = {"accent": "accent", "theme": "theme",
                    "translucent": "translucent", "sound": "sound",
-                   "minGpus": "min_gpus"}
+                   "minGpus": "min_gpus", "blenderVersion": "blender_version"}
         field = mapping.get(key)
         if field is None:
             return
@@ -692,8 +692,10 @@ class Backend(QObject):
 
         accounts = self.store.list()
         slug = self._dataset["slug"]
-        settings = RenderSettings(1920, 1080, 128,
-                                  min_gpus=self.settings.min_gpus)
+        settings = RenderSettings(
+            1920, 1080, 128,
+            blender_version=validate_version(self.settings.blender_version),
+            min_gpus=self.settings.min_gpus)
 
         def work():
             return self.fleet_factory(accounts).start_workers(

@@ -4,7 +4,8 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from blendfleet.blender_versions import download_url, validate_version
+from blendfleet.blender_versions import (DEFAULT_VERSION, download_url,
+                                          validate_version)
 
 # THE SCENE IS LOADED ONCE, AND EVERY FRAME IS RENDERED INSIDE THIS ONE
 # PROCESS.
@@ -178,7 +179,7 @@ class RenderSettings:
     resolution_y: int
     samples: int
     file_format: str = "PNG"
-    blender_version: str = "5.2.0"
+    blender_version: str = DEFAULT_VERSION
     # 0 = no minimum-hardware gate (today's behaviour). Kaggle's GPU
     # allocation is not guaranteed even with a valid machine_shape request
     # (see docs/machine-shape-findings.md) -- a caller that genuinely needs
@@ -372,10 +373,16 @@ def build(frames: list[int], settings: RenderSettings, dataset_slug: str,
     producing a notebook that would come up and wait forever for a job it
     has no way to hear about.
     """
-    # Validated HERE, not in the notebook: a bad version otherwise 404s
-    # inside a running Kaggle session, costing that session's startup to
-    # discover what is really a typo.
-    validate_version(settings.blender_version)
+    # Validated AND NORMALISED here, not in the notebook: a bad version
+    # otherwise 404s inside a running Kaggle session, costing that
+    # session's startup to discover what is really a typo. The return
+    # value is assigned back rather than discarded: c1 embeds
+    # settings.blender_version verbatim (BLENDER_VERSION = ...repr...) and
+    # c2's fallback URL is built from the same value via download_url() --
+    # if those two ever read something different (e.g. an un-stripped
+    # " 4.2.9 "), the download URL and the extracted tarball name would
+    # disagree, and BLENDER_VERSION would land in the notebook un-stripped.
+    settings.blender_version = validate_version(settings.blender_version)
     if mode not in ("render", "worker"):
         raise ValueError(f"unknown notebook mode {mode!r}")
     # Kaggle mounts a dataset at /kaggle/input/<name>, without the owner
@@ -440,7 +447,6 @@ print("FRAMES =", FRAMES)
     c2 = f'''
 import os, glob, subprocess, time
 V = BLENDER_VERSION
-S = ".".join(V.split(".")[:2])
 T = f"blender-{{V}}-linux-x64.tar.xz"
 BBIN = f"/kaggle/tmp/blender-{{V}}-linux-x64/blender"
 BLENDER_DATASET = {blender_dataset_name!r}
@@ -478,10 +484,11 @@ if not os.path.exists(BBIN):
     if tarball is None:
         # No dataset: fall back to downloading, which only works on a
         # phone-verified account. Says so, so a failure here is not a
-        # mystery. The URL itself is baked in at BUILD time via
-        # blender_versions.download_url -- the exact same layout the
-        # runtime S/T above already produce, but pinned in one place
-        # instead of reconstructed from V a second time.
+        # mystery. The URL is baked in at BUILD time via
+        # blender_versions.download_url, matching the same
+        # major.minor/full-version layout T (above) builds at runtime from
+        # V -- pinned in one place rather than reconstructed a second time
+        # from a runtime string split.
         URL = {download_url(settings.blender_version)!r}
         print("no blender dataset attached -- downloading, which requires "
               "this Kaggle account to be phone-verified for internet access",

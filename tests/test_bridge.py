@@ -189,6 +189,38 @@ def test_a_malformed_preference_from_the_page_falls_back(qapp, tmp_path):
     assert settings.accent == "orange"
 
 
+def test_the_chosen_blender_version_round_trips_through_the_bridge(qapp, tmp_path):
+    """test_the_blender_version_is_remembered (test_settings.py) exercises
+    Settings directly and never the UI path, so it can pass while the page
+    never actually sends the choice anywhere. This drives it the way the
+    page does: through setPreference, then back out through the same
+    blenderVersions() slot the picker reads on load."""
+    settings = Settings()
+    backend = make_backend(tmp_path, settings=settings)
+    assert json.loads(backend.blenderVersions())["current"] == "5.2.0"
+
+    backend.setPreference("blenderVersion", json.dumps("4.2.9"))
+
+    assert settings.blender_version == "4.2.9"
+    assert json.loads(backend.blenderVersions())["current"] == "4.2.9"
+    # setPreference's own save() is what makes it durable across a
+    # relaunch -- test_the_blender_version_is_remembered (test_settings.py)
+    # already pins that disk round trip at the Settings layer; this test's
+    # job is the wiring on top of it: that the page's setPreference call
+    # actually reaches settings.blender_version and is reflected back out
+    # through blenderVersions().
+
+
+def test_a_malformed_blender_version_from_the_page_falls_back(qapp, tmp_path):
+    """Same defensive path as every other preference: the page is HTML
+    that anyone can edit, so a bad value must fall back rather than
+    bricking the app or reaching a Kaggle 404 later."""
+    settings = Settings()
+    backend = make_backend(tmp_path, settings=settings)
+    backend.setPreference("blenderVersion", json.dumps("latest"))
+    assert settings.blender_version == "5.2.0"
+
+
 def test_an_unknown_preference_key_is_ignored_not_set(qapp, tmp_path):
     settings = Settings()
     backend = make_backend(tmp_path, settings=settings)

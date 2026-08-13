@@ -666,15 +666,31 @@ def test_the_notebook_downloads_the_version_it_was_given(tmp_path):
         "the release directory is major.minor, not the full version"
 
 
-def test_an_unusable_version_is_refused_before_a_kernel_is_built(tmp_path):
+def test_an_unusable_version_is_refused_before_a_kernel_is_built(tmp_path,
+                                                                  monkeypatch):
     """A 404 inside a running session costs that session's startup and
-    reads like a network fault rather than a typo."""
+    reads like a network fault rather than a typo.
+
+    download_url() is stubbed to never raise on its own -- it is also
+    called (via the c2 template) while cell text is being built, so
+    without this stub a build() that had LOST its own explicit
+    validate_version() guard would still happen to raise from inside
+    download_url and pass this test for the wrong reason. Stubbing it out
+    means the only thing left that can raise is the guard this test
+    exists to pin.
+    """
     import pytest
+    import blendfleet.notebook_builder as nb_mod
     from blendfleet.notebook_builder import RenderSettings, build
+    monkeypatch.setattr(nb_mod, "download_url",
+                        lambda v: "https://example.invalid/never-reached.tar.xz")
     settings = RenderSettings(64, 36, 1, "PNG", blender_version="latest")
     with pytest.raises(ValueError) as excinfo:
         build([1], settings, "me/x", tmp_path, "me/r")
     assert "major.minor.patch" in str(excinfo.value)
+    # Refused before a kernel is built: nothing was written.
+    assert not (tmp_path / "render.ipynb").exists()
+    assert not (tmp_path / "kernel-metadata.json").exists()
 
 
 def test_setup_is_identical_between_render_and_worker_modes(tmp_path):

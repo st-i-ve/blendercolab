@@ -554,6 +554,19 @@ setInterval(() => {
 }, 1000);
 
 /* ---------------- files page -------------------------------------------- */
+/* Offered as a menu, not a gate -- an unlisted-but-valid version typed by
+   hand elsewhere still renders; this list is only what the picker shows
+   by default. A named function (not an inline callback) so it can be
+   exercised directly with a hand-built payload, the same way instanceCard
+   and renderFrameGrid are. */
+function populateBlenderVersions(json) {
+  const v = JSON.parse(json);
+  const sel = document.getElementById('sel-blender');
+  sel.innerHTML = v.versions.map(x =>
+    `<option value="${esc(x)}"${x === v.current ? ' selected' : ''}>${esc(x)}</option>`
+  ).join('');
+}
+
 function renderOptions() {
   return {
     startFrame: +document.getElementById('f-start').value,
@@ -955,6 +968,12 @@ document.getElementById('swatches').addEventListener('click', e => {
 document.getElementById('min-gpus').addEventListener('change', e => {
   backend && backend.setPreference('minGpus', JSON.stringify(+e.target.value));
 });
+document.getElementById('sel-blender').addEventListener('change', e => {
+  // Remembered the same way every other preference is -- picking it once
+  // and having it reset next launch would be worse than not offering the
+  // choice at all.
+  backend && backend.setPreference('blenderVersion', JSON.stringify(e.target.value));
+});
 
 function syncSettingsControls() {
   document.querySelectorAll('#seg-theme button').forEach(b =>
@@ -975,16 +994,7 @@ new QWebChannel(qt.webChannelTransport, channel => {
   backend.preferences(json => { applyPrefs(JSON.parse(json)); syncSettingsControls(); });
   backend.settingsChanged.connect(json => { applyPrefs(JSON.parse(json)); syncSettingsControls(); });
 
-  /* Offered as a menu, not a gate -- an unlisted-but-valid version typed
-     by hand elsewhere still renders; this list is only what the picker
-     shows by default. */
-  backend.blenderVersions(json => {
-    const v = JSON.parse(json);
-    const sel = document.getElementById('sel-blender');
-    sel.innerHTML = v.versions.map(x =>
-      `<option value="${esc(x)}"${x === v.current ? ' selected' : ''}>${esc(x)}</option>`
-    ).join('');
-  });
+  backend.blenderVersions(populateBlenderVersions);
 
   /* Upload and download report as bytes, not as a spinner: a 400 MB
      .blend on a slow line is the one moment the app looks frozen, and a

@@ -14,7 +14,7 @@ import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from blendfleet.blender_versions import DEFAULT_VERSION
+from blendfleet.blender_versions import DEFAULT_VERSION, validate_version
 from blendfleet.platform_paths import config_dir
 from blendfleet.ui.theme import (ACCENTS, DEFAULT_ACCENT, DEFAULT_THEME,
                                   THEMES)
@@ -88,6 +88,20 @@ class Settings:
         if (not isinstance(self.min_gpus, int) or isinstance(self.min_gpus, bool)
                 or self.min_gpus < 0):
             self.min_gpus = DEFAULT_MIN_GPUS
+        # Same principle as accent above: a hand-edited or forward-dated
+        # config, or a malformed value sent through setPreference from the
+        # page, must never brick the app. Not a whitelist check -- see
+        # blender_versions.py for why an unlisted-but-valid version is
+        # allowed -- only a shape check, and normalised (stripped) at the
+        # same time so this is the one place blender_version can diverge
+        # from what validate_version would accept downstream.
+        if not isinstance(self.blender_version, str):
+            self.blender_version = DEFAULT_VERSION
+        else:
+            try:
+                self.blender_version = validate_version(self.blender_version)
+            except ValueError:
+                self.blender_version = DEFAULT_VERSION
 
     def _path(self) -> Path:
         return config_dir() / FILENAME
