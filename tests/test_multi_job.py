@@ -193,6 +193,69 @@ def test_launching_onto_an_account_that_is_already_rendering_is_refused(fleet):
     assert "alpha.blend" in message, "must name what it is already doing"
 
 
+# ---------------------------------------------------------------------------
+# Must-fix 7: the test above -- named for "a0/a1 render one scene while
+# a2/a3 render another" -- never calls launch(), launch_from_dataset() or
+# require_free(); it asserts only on busy_labels()/free_accounts() against
+# a job saved by hand. Verified by execution: reverting require_free() to
+# iterate self.accounts (instead of the accounts asked for) AND
+# busy_labels() to load_jobs()[-1:] (instead of every tracked job) --
+# undoing the core of Tasks 3 and 4, so any live job blocks every launch
+# again and an older job's accounts read free -- left 203/203 green
+# across this file, test_fleet.py and test_bridge.py. These two tests
+# really call launch_from_dataset() (FakeDatasetClient/_FakeSdk are
+# defined further down this module, in the launch_from_dataset() section)
+# while an older job is genuinely live on disk.
+# ---------------------------------------------------------------------------
+
+def test_launching_a_second_scene_really_renders_on_the_free_half_of_the_fleet(
+        fleet):
+    """a0/a1 already render job-alpha. A REAL launch_from_dataset() call
+    for a2/a3 -- not require_free()/busy_labels() asserted directly --
+    must succeed and push exactly two kernels."""
+    fleet.save_jobs([job("alpha", ["a0", "a1"], "j1")])
+    clients = {}
+
+    def factory(tok):
+        clients[tok] = FakeDatasetClient(tok)
+        return clients[tok]
+    fleet.client_factory = factory
+
+    st = fleet.launch_from_dataset(
+        "user0/remember-blend", RenderSettings(1920, 1080, 128), 1, 4,
+        accounts=[fleet.accounts[2], fleet.accounts[3]])
+
+    assert [w.label for w in st.workers] == ["a2", "a3"], (
+        "the headline feature itself: a second scene rendering on the "
+        "free half of the fleet while the first keeps going")
+    assert clients[fleet.accounts[2].token].pushed
+    assert clients[fleet.accounts[3].token].pushed
+
+
+def test_launching_onto_a_busy_sibling_is_really_refused_by_launch_from_dataset(
+        fleet):
+    """The negative twin: a1 is mid-render in job-alpha (alongside a0), so
+    a REAL launch_from_dataset() call that also asks for a1 must be
+    refused before a single client is even resolved -- not merely
+    asserted against require_free() called by hand."""
+    fleet.save_jobs([job("alpha", ["a0", "a1"], "j1")])
+    clients = {}
+
+    def factory(tok):
+        clients[tok] = FakeDatasetClient(tok)
+        return clients[tok]
+    fleet.client_factory = factory
+
+    with pytest.raises(FleetBusyError, match="a1"):
+        fleet.launch_from_dataset(
+            "user0/remember-blend", RenderSettings(1920, 1080, 128), 1, 4,
+            accounts=[fleet.accounts[1], fleet.accounts[2]])
+
+    assert clients == {}, (
+        "require_free() must refuse before resolving a single client, so "
+        "nothing is pushed")
+
+
 def test_a_finished_job_does_not_hold_its_accounts(fleet):
     finished = job("alpha", ["a0"], "j1")
     finished.workers[0].state = "complete"
