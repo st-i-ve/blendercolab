@@ -173,10 +173,10 @@ def test_check_hardware_refuses_an_unknown_account(tmp_path):
 def test_check_hardware_does_not_touch_the_job_state(tmp_path, monkeypatch):
     """A probe is not a job.
 
-    fleet.json holds ONE job. Writing a probe there would overwrite the
-    record of a running render, leaving its kernels uncancellable and
-    uncollectable -- exactly what launch()'s single-slot guard exists to
-    prevent.
+    fleet.json can hold a LIST of jobs (Task 3). Writing a probe there
+    would insert it among them, where load()/active_workers() could then
+    mistake it for a real render -- exactly what launch()'s busy guard
+    exists to catch correctly, not be confused by.
     """
     import blendfleet.fleet as fleet_mod
     state = tmp_path / "state"

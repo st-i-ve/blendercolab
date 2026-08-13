@@ -235,9 +235,16 @@ class CancelResult:
 class FleetBusyError(RuntimeError):
     """A job with live kernels is already running.
 
-    State is a single slot on disk, so launching over the top of a live job
-    would orphan its kernels: nothing left on disk to cancel or collect them
-    with, while they keep spending other people's GPU quota.
+    The state file can hold a LIST of jobs (Task 3), but the guard this
+    backs -- active_workers() -- still only inspects the MOST RECENT one
+    (load(), not load_jobs()). So this correctly refuses a second launch
+    while today's single latest job is live, but it does not yet see any
+    OLDER job that might also still be running. Until active_workers()
+    (and everything built on load() below it: poll, cancel_all,
+    cancel_worker, fetch_failure_log) becomes job-aware, launching past
+    this guard would leave an earlier job's kernels unreachable from
+    here: nothing on this path can cancel or collect them, while they
+    keep spending other people's GPU quota.
     """
 
 
@@ -289,6 +296,14 @@ class Fleet:
         self.client_factory = client_factory
         self.work_dir = Path(work_dir)
         self.work_dir.mkdir(parents=True, exist_ok=True)
+        # Raw (unparsed) job entries the last load_jobs() call could not
+        # reconstruct into a FleetState -- e.g. a hand-edited or
+        # partially-upgraded file. Kept verbatim, and re-included by
+        # save_jobs() on every write, precisely so that a load-then-save
+        # round trip (which is what _save/poll/forget_job all do) cannot
+        # silently ERASE the one thing a user would need to go cancel that
+        # job's kernels by hand at kaggle.com. See load_jobs().
+        self.unreadable_jobs: list = []
 
     def _state_path(self) -> Path:
         return state_dir() / STATE_FILE
@@ -296,21 +311,38 @@ class Fleet:
     def save_jobs(self, jobs: list[FleetState]) -> None:
         """Persist every tracked job, oldest first.
 
+        Also re-writes self.unreadable_jobs verbatim, alongside the parsed
+        jobs -- a raw entry load_jobs() could not parse must never be
+        dropped just because something else on the fleet triggered a save
+        (poll() runs on an unattended 30s timer). Losing it here would
+        permanently destroy the only record of that job's kernel_slugs,
+        the one thing a user needs to go cancel them by hand at
+        kaggle.com.
+
         Written atomically for the same reason as before: a half-written
         state file reads back as an unrelated error from wherever it is
         next parsed, and with two jobs it would now orphan twice as many
         running kernels.
         """
+        entries = [asdict(j) for j in jobs] + list(self.unreadable_jobs)
         _atomic_write(self._state_path(),
-                      json.dumps({"jobs": [asdict(j) for j in jobs]}, indent=2))
+                      json.dumps({"jobs": entries}, indent=2))
 
     def load_jobs(self) -> list[FleetState]:
-        """Every tracked job. Empty when there is nothing running.
+        """Every tracked job that could be parsed. Empty when there is
+        nothing running.
 
         Tolerates the pre-multi-job format -- one FleetState at the top
         level -- because an in-flight render must survive the upgrade;
         dropping it would orphan kernels that are running right now.
+
+        An entry that fails to parse is skipped here (one bad entry must
+        not hide every other job) but is never discarded: it is recorded
+        verbatim on self.unreadable_jobs, which save_jobs() carries
+        through on every subsequent write, so it survives round trips
+        instead of being erased the next time anything saves.
         """
+        self.unreadable_jobs = []
         p = self._state_path()
         if not p.exists():
             return []
@@ -327,15 +359,23 @@ class Fleet:
         except json.JSONDecodeError:
             return []
         raw_jobs = d.get("jobs") if isinstance(d, dict) and "jobs" in d else [d]
+        if not isinstance(raw_jobs, list):
+            # {"jobs": null} / {"jobs": 5} / etc: not a shape this format
+            # has ever produced. Every other malformed shape above already
+            # degrades to "no tracked jobs" rather than raising; this one
+            # must too, not escape as an uncaught TypeError from the loop
+            # below.
+            return []
         jobs = []
         for entry in raw_jobs:
             try:
-                entry = dict(entry)
-                entry["workers"] = [WorkerState(**w)
-                                    for w in entry.get("workers", [])]
-                jobs.append(FleetState(**entry))
+                parsed = dict(entry)
+                parsed["workers"] = [WorkerState(**w)
+                                     for w in parsed.get("workers", [])]
+                jobs.append(FleetState(**parsed))
             except (TypeError, ValueError):
-                continue    # one unreadable job must not hide the others
+                # Preserved, not dropped -- see self.unreadable_jobs above.
+                self.unreadable_jobs.append(entry)
         return jobs
 
     def load(self) -> FleetState | None:
@@ -349,9 +389,23 @@ class Fleet:
         return jobs[-1] if jobs else None
 
     def _save(self, st: FleetState) -> None:
-        """Replace `st` among the tracked jobs, matched by job_id."""
-        jobs = [j for j in self.load_jobs() if j.job_id != st.job_id]
-        jobs.append(st)
+        """Replace `st` among the tracked jobs, matched by job_id, IN
+        PLACE -- appending only if no job with this id exists yet.
+
+        load() answers with the LAST job in the list, and every one of
+        active_workers/poll/cancel_all/cancel_worker/fetch_failure_log and
+        forget_job()'s default all go through load(). Re-appending a
+        re-saved job (rather than replacing it where it already sits)
+        would silently move it to the end and repoint every one of those
+        at the wrong job the moment more than one job is tracked at once.
+        """
+        jobs = self.load_jobs()
+        for i, j in enumerate(jobs):
+            if j.job_id == st.job_id:
+                jobs[i] = st
+                break
+        else:
+            jobs.append(st)
         self.save_jobs(jobs)
 
     def forget_job(self, job_id: str | None = None) -> list[WorkerState]:
@@ -368,6 +422,11 @@ class Fleet:
         forgetting one stuck job does not force forgetting a different one
         that is fine.
 
+        Drops exactly ONE job by position, not by filtering on job_id:
+        job_id is only 32 bits of uuid4, and save_jobs() does not itself
+        forbid a duplicate, so matching by equality could silently drop
+        two jobs for the price of one.
+
         This is deliberately NOT a cancel and must never be worded as one.
         Whatever is running on Kaggle keeps running, and keeps spending
         quota; all that changes is that this app stops tracking it -- which
@@ -379,11 +438,15 @@ class Fleet:
         jobs = self.load_jobs()
         if not jobs:
             return []
-        target = (jobs[-1] if job_id is None
-                  else next((j for j in jobs if j.job_id == job_id), None))
-        if target is None:
+        if job_id is None:
+            index = len(jobs) - 1
+        else:
+            index = next((i for i, j in enumerate(jobs)
+                         if j.job_id == job_id), None)
+        if index is None:
             return []
-        self.save_jobs([j for j in jobs if j.job_id != target.job_id])
+        target = jobs.pop(index)
+        self.save_jobs(jobs)
         return list(target.workers)
 
     def active_workers(self) -> list[WorkerState]:
@@ -848,9 +911,13 @@ class Fleet:
         # i.e. only after the entire .blend had finished uploading.
         stem = slug_stem(blend)
 
-        # Single-slot state file: launching over a live job would overwrite
-        # the only record of the running kernels, leaving them uncancellable
-        # and uncollectable while they spend other people's GPU quota.
+        # active_workers() only inspects the MOST RECENT tracked job
+        # (load(), not load_jobs()) -- so this still refuses a second
+        # launch while THAT job is live, but does not yet see any OLDER
+        # job that might also still be running. Relying on this before
+        # active_workers() is made job-aware would leave an earlier job's
+        # kernels unreachable from here: uncancellable and uncollectable
+        # while they keep spending other people's GPU quota.
         busy = self.active_workers()
         if busy:
             raise FleetBusyError(
