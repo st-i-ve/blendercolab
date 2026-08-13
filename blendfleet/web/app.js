@@ -76,6 +76,10 @@ document.querySelectorAll('.nav-btn').forEach(button => {
     document.querySelectorAll('.nav-btn').forEach(b => b.classList.toggle('on', b === button));
     document.querySelectorAll('.page').forEach(p => p.classList.toggle('on', p.id === 'page-' + page));
     document.getElementById('page-title').textContent = button.querySelector('.nav-txt').textContent;
+    // The scene library has no polling timer of its own -- refreshed on
+    // every visit instead, so it is never more stale than "since you last
+    // looked", not "since the app started".
+    if (page === 'files' && backend) backend.scenes();
   });
 });
 
@@ -966,6 +970,110 @@ document.getElementById('btn-render').onclick = () =>
 document.getElementById('btn-cancel').onclick = () => backend && backend.cancelAll();
 document.getElementById('btn-collect').onclick = () => backend && backend.collect('');
 
+/* ---------------- scene library (Files page) ----------------------------
+   Browse scenes already on Kaggle, re-render one without re-uploading, or
+   delete one for good. Every figure here comes from bridge.py's scenes()
+   -- nothing is invented, and nothing here may claim a listed scene is
+   confirmed to hold a .blend: that "-blend" suffix is only ever a naming
+   CONVENTION (scenes.py's own docstring), proven true or false only once
+   renderScene() actually lists the dataset's real files. */
+
+/* Kaggle reports last_updated as an ISO string, or not at all
+   (Scene.updated: datetime | None) -- fmtAge already says "an age, never
+   a missing reading is a zero" for hardware; reused here for the same
+   reason, with its own honest text for the genuinely-unknown case rather
+   than falling through to some default date. */
+function fmtSceneUpdated(iso) {
+  if (!iso) return 'unknown — Kaggle reported no timestamp for it';
+  return fmtAge(Math.max((Date.now() - new Date(iso).getTime()) / 1000, 0));
+}
+
+/* Pure, like instanceCard()/renderFrameGrid() -- reads only the one scene
+   handed to it, so test_web_page.py can drive it directly with a
+   hand-built payload. */
+function sceneRowHtml(scene) {
+  return `<div class="fs-row">
+    <div class="fi scene">.blend</div>
+    <div class="grow">
+      <div class="fn2">${esc(scene.name)}</div>
+      <div class="fs2">${esc(scene.owner)} · ${fmtBytes(scene.sizeBytes)}
+        · updated ${fmtSceneUpdated(scene.updated)}
+        · guessed file ${esc(scene.blendName)}
+        <span class="lock" title="The '-blend' name is a naming convention this app applies to its own uploads, not proof this dataset actually contains a .blend. That is only confirmed by listing its real files, which happens automatically right before rendering it.">(unverified)</span>
+      </div>
+    </div>
+    <button class="btn sm" data-scene-render="${esc(scene.slug)}"
+      title="Renders this scene straight from Kaggle, with no re-upload. Sharing is re-checked for every account before anything starts.">Render this</button>
+    <button class="btn sm danger" data-scene-delete="${esc(scene.slug)}"
+      data-scene-name="${esc(scene.name)}" data-scene-size="${scene.sizeBytes}"
+      title="Permanently deletes this dataset from Kaggle.">Delete…</button>
+  </div>`;
+}
+
+/* Accounts scenes() could not reach -- their error is attached, and every
+   OTHER account's scenes are still shown (bridge.py's own discipline,
+   mirroring CollectReport.worker_errors: one worker's failure never hides
+   the rest). Reuses .unshared-banner's own markup shape (WARN severity, a
+   list of account: reason rows) rather than inventing a second one. */
+function renderScenes(json) {
+  const payload = JSON.parse(json);
+  const scenes = payload.scenes || [];
+  const errors = payload.errors || {};
+  const errNames = Object.keys(errors);
+
+  const errBox = document.getElementById('scene-errors');
+  errBox.classList.toggle('show', errNames.length > 0);
+  errBox.innerHTML = errNames.length
+    ? '<div class="unshared-head"><b>Could not reach every account.</b></div>'
+      + errNames.map(name =>
+          `<div class="unshared-row"><b>${esc(name)}</b>: ${esc(errors[name])}</div>`
+        ).join('')
+      + '<div class="unshared-note">Scenes owned by the account(s) above '
+        + 'may be missing from the list below — every other account\'s '
+        + 'own scenes are still shown.</div>'
+    : '';
+
+  const list = document.getElementById('scene-list');
+  list.innerHTML = scenes.length
+    ? scenes.map(sceneRowHtml).join('')
+    : '<div class="empty">No scenes on Kaggle yet — upload a .blend above to add one.</div>';
+}
+
+/* The delete confirmation, factored out so it can be exercised directly
+   (test_web_page.py) without simulating a click. Names the scene and its
+   size, and says plainly that deleting is permanent and that any account
+   this scene was shared with loses access -- Kaggle has no undo, trash or
+   recycle bin for a deleted dataset (KaggleClient.delete_dataset's own
+   docstring). */
+function deleteConfirmMessage(scene) {
+  return `Delete "${scene.name}"?\n\n`
+    + `This permanently deletes the ${fmtBytes(scene.sizeBytes)} dataset `
+    + `${scene.slug} from Kaggle. This cannot be undone — Kaggle keeps no `
+    + `undo, trash or recycle bin for a deleted dataset — and remember: `
+    + 'any account this scene was shared with loses access to it the '
+    + 'moment it is gone.';
+}
+
+document.getElementById('scene-list').addEventListener('click', e => {
+  const renderBtn = e.target.closest('[data-scene-render]');
+  if (renderBtn && backend) {
+    backend.renderScene(renderBtn.dataset.sceneRender,
+                        JSON.stringify(renderOptions()));
+    return;
+  }
+  const delBtn = e.target.closest('[data-scene-delete]');
+  if (delBtn && backend) {
+    const scene = {
+      name: delBtn.dataset.sceneName,
+      slug: delBtn.dataset.sceneDelete,
+      sizeBytes: Number(delBtn.dataset.sceneSize),
+    };
+    if (window.confirm(deleteConfirmMessage(scene))) {
+      backend.deleteScene(delBtn.dataset.sceneDelete);
+    }
+  }
+});
+
 /* One job's own frame grid, as an HTML fragment -- never the whole page's
    state. Pure, like instanceCard(): it reads only the ONE job and the
    instances already known to belong to it (the caller, renderJobSections,
@@ -1336,6 +1444,22 @@ new QWebChannel(qt.webChannelTransport, channel => {
       });
       renderShareList();
     }
+    /* Per-scene buttons, matched on the slug carried in the button's own
+       dataset value -- same idiom as the download-row match above, since
+       a slug is free text ("owner/name") and could contain a character a
+       hand-built CSS selector would choke on. */
+    if (key.indexOf('launch-scene:') === 0) {
+      const slug = key.slice('launch-scene:'.length);
+      const btn = Array.from(document.querySelectorAll('[data-scene-render]'))
+        .find(el => el.dataset.sceneRender === slug);
+      if (btn) btn.disabled = busy;
+    }
+    if (key.indexOf('delete-scene:') === 0) {
+      const slug = key.slice('delete-scene:'.length);
+      const btn = Array.from(document.querySelectorAll('[data-scene-delete]'))
+        .find(el => el.dataset.sceneDelete === slug);
+      if (btn) btn.disabled = busy;
+    }
   });
 
   backend.framePreview.connect(json => {
@@ -1354,6 +1478,9 @@ new QWebChannel(qt.webChannelTransport, channel => {
     if (tone_ === 'active' && message.indexOf('reconnected') === 0) sfx.reconnect();
   });
   backend.notification.connect(notify);
+
+  backend.scenesChanged.connect(renderScenes);
+  backend.scenes();
 
   backend.refreshQuota();
   backend.poll();

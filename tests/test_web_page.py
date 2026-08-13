@@ -1014,3 +1014,166 @@ def test_forgetting_an_unreadable_record_asks_for_confirmation_first(
     got = _json.loads(result)
     assert got["declined"] == [], "declining must not forget the record"
     assert got["accepted"] == [[0, "fp1"]]
+
+
+# ---------------------------------------------------------------------------
+# The scene library (Task 11): browse scenes already on Kaggle, re-render
+# one with no re-upload, or delete one for good.
+# ---------------------------------------------------------------------------
+
+def _scene_confirm_html(page, scene_js):
+    """Drive the page's own deleteConfirmMessage(scene) and return it."""
+    out = {}
+    loop = QEventLoop()
+    page.runJavaScript(
+        "(() => { try { return String(deleteConfirmMessage("
+        + scene_js + ")); } catch (e) { return 'THREW ' + e; } })()",
+        lambda r: (out.__setitem__("v", r or ""), loop.quit()))
+    QTimer.singleShot(5000, loop.quit)
+    loop.exec()
+    assert "v" in out and not out["v"].startswith("THREW"), out.get("v")
+    return out["v"]
+
+
+def test_the_delete_confirm_names_the_scene_and_says_it_is_permanent(
+        loaded_page):
+    page, _ = loaded_page
+    html = _scene_confirm_html(
+        page,
+        "{name:'remember', slug:'user0/remember-blend', sizeBytes:52428800}")
+    assert "remember" in html and "cannot be undone" in html
+
+
+def test_the_delete_confirm_says_sharing_accounts_lose_access(loaded_page):
+    page, _ = loaded_page
+    html = _scene_confirm_html(
+        page,
+        "{name:'remember', slug:'user0/remember-blend', sizeBytes:1024}")
+    assert "loses access" in html or "lose access" in html
+
+
+def test_the_delete_confirm_names_the_size(loaded_page):
+    page, _ = loaded_page
+    html = _scene_confirm_html(
+        page,
+        "{name:'remember', slug:'user0/remember-blend', sizeBytes:1048576}")
+    assert "1 MB" in html or "1.0 MB" in html
+
+
+def _scenes_html(page, payload_js, element_id="scene-list"):
+    """Drive the page's own renderScenes(json) and return one element's
+    innerHTML. Mirrors _state_html's own shape."""
+    out = {}
+    loop = QEventLoop()
+    page.runJavaScript(
+        "(() => { try {"
+        f" renderScenes(JSON.stringify({payload_js}));"
+        f" return document.getElementById({element_id!r}).innerHTML;"
+        " } catch (e) { return 'THREW ' + e; } })()",
+        lambda r: (out.__setitem__("v", r or ""), loop.quit()))
+    QTimer.singleShot(5000, loop.quit)
+    loop.exec()
+    assert "v" in out and not out["v"].startswith("THREW"), out.get("v")
+    return out["v"]
+
+
+ONE_SCENE = """({
+  scenes: [{slug:'user0/remember-blend', name:'remember', owner:'user0',
+            sizeBytes:1048576, updated:null, blendName:'remember.blend'}],
+  errors: {}
+})"""
+
+
+def test_a_scene_row_offers_render_and_delete(loaded_page):
+    page, _ = loaded_page
+    html = _scenes_html(page, ONE_SCENE)
+    assert 'data-scene-render="user0/remember-blend"' in html
+    assert 'data-scene-delete="user0/remember-blend"' in html
+    assert "Render this" in html
+    assert "Delete" in html
+
+
+def test_an_undated_scene_never_shows_a_default_date(loaded_page):
+    """Scene.updated is datetime | None -- absent must read as unknown,
+    never as some default (e.g. epoch) date standing in for it."""
+    page, _ = loaded_page
+    html = _scenes_html(page, ONE_SCENE)
+    assert "unknown" in html
+    assert "1970" not in html and "Jan 1" not in html
+
+
+def test_a_scene_never_claims_to_be_verified(loaded_page):
+    """The "-blend" suffix is a naming CONVENTION, not proof (scenes.py's
+    own docstring) -- the page must say so, not present it as confirmed."""
+    page, _ = loaded_page
+    html = _scenes_html(page, ONE_SCENE)
+    assert "unverified" in html
+
+
+def test_no_scenes_shows_an_empty_state_not_a_blank_panel(loaded_page):
+    page, _ = loaded_page
+    html = _scenes_html(page, "({scenes: [], errors: {}})")
+    assert "No scenes" in html
+
+
+def test_one_unreachable_account_does_not_hide_the_others_scenes_on_the_page(
+        loaded_page):
+    """The same payload drives both halves of the page: the reachable
+    scene must still show even though one account's own listing failed."""
+    page, _ = loaded_page
+    payload = """({
+      scenes: [{slug:'user0/remember-blend', name:'remember', owner:'user0',
+                sizeBytes:1024, updated:null, blendName:'remember.blend'}],
+      errors: {acct1: 'could not list datasets: rate limited'}
+    })"""
+    list_html = _scenes_html(page, payload, element_id="scene-list")
+    err_html = _scenes_html(page, payload, element_id="scene-errors")
+    assert "remember" in list_html
+    assert "acct1" in err_html and "rate limited" in err_html
+
+
+def test_no_errors_shows_no_error_banner(loaded_page):
+    page, _ = loaded_page
+    err_html = _scenes_html(page, ONE_SCENE, element_id="scene-errors")
+    assert err_html.strip() == ""
+
+
+def test_clicking_render_this_calls_render_scene_with_the_slug(loaded_page):
+    page, _ = loaded_page
+    result = _preview_state(page,
+        f"renderScenes(JSON.stringify({ONE_SCENE}));"
+        " const calls = [];"
+        " backend = { renderScene: (slug, opts) => calls.push([slug, opts]) };"
+        " document.querySelector('[data-scene-render]').click();"
+        " backend = null;"
+        " return JSON.stringify(calls);")
+    import json as _json
+    calls = _json.loads(result)
+    assert len(calls) == 1
+    slug, opts_json = calls[0]
+    assert slug == "user0/remember-blend"
+    opts = _json.loads(opts_json)
+    assert "startFrame" in opts and "endFrame" in opts
+
+
+def test_clicking_delete_asks_for_confirmation_first(loaded_page):
+    """Deletion is irreversible -- see deleteConfirmMessage's own tests
+    above -- so declining must leave deleteScene uncalled, exactly like
+    every other irreversible action on this page (cancel, forget)."""
+    page, _ = loaded_page
+    result = _preview_state(page,
+        f"renderScenes(JSON.stringify({ONE_SCENE}));"
+        " const deleted = [];"
+        " backend = { deleteScene: slug => deleted.push(slug) };"
+        " window.confirm = () => false;"
+        " document.querySelector('[data-scene-delete]').click();"
+        " const declined = deleted.slice();"
+        " window.confirm = () => true;"
+        " document.querySelector('[data-scene-delete]').click();"
+        " const accepted = deleted.slice();"
+        " backend = null;"
+        " return JSON.stringify({declined, accepted});")
+    import json as _json
+    got = _json.loads(result)
+    assert got["declined"] == [], "declining must not delete anything"
+    assert got["accepted"] == ["user0/remember-blend"]

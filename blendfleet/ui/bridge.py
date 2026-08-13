@@ -48,6 +48,7 @@ from blendfleet.instance_state import (GpuSnapshot, InstanceSnapshot,
 from blendfleet.log_stream import stream_progress
 from blendfleet.notebook_builder import RenderSettings
 from blendfleet.platform_paths import state_dir
+from blendfleet.scenes import Scene, scenes_from_datasets
 from blendfleet.settings import Settings
 from blendfleet.ui.messages import explain
 
@@ -101,6 +102,7 @@ class Backend(QObject):
     notification = Signal(str, str)
     healthChanged = Signal(str)
     busyChanged = Signal(str, bool)  # (action key, in flight)
+    scenesChanged = Signal(str)     # {"scenes": [...], "errors": {label: why}}
 
     def __init__(self, store: AccountStore, fleet_factory, verifier,
                  settings: Settings, parent: QObject | None = None) -> None:
@@ -499,6 +501,59 @@ class Backend(QObject):
             "accountsTotal": len(self.store.list()),
         })
 
+    @Slot()
+    def scenes(self) -> None:
+        """List every scene already on Kaggle -- across EVERY configured
+        account, not just the first one.
+
+        scenes.py's scenes_from_datasets() is a pure filter over whatever
+        DatasetInfo values it is handed; it does not know which account
+        anything came from, so every account's own list_datasets() is
+        called here and the results are pooled BEFORE filtering/sorting --
+        a scene can be owned by any configured account (Scene.owner
+        exists precisely because of this).
+
+        One account's own listing failing (revoked token, rate limit, a
+        network blip) must never empty the WHOLE library -- the same
+        discipline CollectReport.worker_errors already follows for
+        collecting frames: that account's error is recorded in `errors`
+        and every OTHER account's scenes are still returned. This is not
+        best-effort by accident; a single `except` around the whole loop
+        would let the one unreachable account hide every scene anyone
+        else owns.
+        """
+        accounts = self.store.list()
+
+        def work():
+            try:
+                client_factory = self.fleet_factory(accounts).client_factory
+            except Exception as e:      # noqa: BLE001 -- turned into text
+                # Could not even build a Fleet (e.g. a bad work_dir). Every
+                # account fails identically, but each still gets its own
+                # named entry rather than one bare exception aborting the
+                # whole call and leaving `errors` looking empty.
+                message = explain("Loading the scene library", e)
+                return [], {a.label: message for a in accounts}
+            datasets = []
+            errors: dict[str, str] = {}
+            for account in accounts:
+                try:
+                    datasets.extend(
+                        client_factory(account.token).list_datasets())
+                except Exception as e:      # noqa: BLE001
+                    errors[account.label] = explain(
+                        f"Listing {account.label}'s Kaggle datasets", e)
+            return scenes_from_datasets(datasets), errors
+
+        def ok(result) -> None:
+            found, errors = result
+            self.scenesChanged.emit(json.dumps({
+                "scenes": [_scene_payload(s) for s in found],
+                "errors": errors,
+            }))
+
+        self._start("scenes", work, "Loading the scene library", ok)
+
     # ---- JS -> Python: writes -----------------------------------------
     @Slot(str, str)
     def setPreference(self, key: str, value: str) -> None:
@@ -800,6 +855,146 @@ class Backend(QObject):
             self.refreshQuota()
 
         self._start("launch", work, "Starting the render", ok)
+
+    @Slot(str, str)
+    def renderScene(self, slug: str, options_json: str) -> None:
+        """Render a scene that is already on Kaggle -- no local .blend,
+        and no re-upload.
+
+        Goes straight through Fleet.launch_from_dataset, which confirms a
+        .blend genuinely exists (by LISTING the dataset's real files --
+        the scene library's own listing only ever GUESSES the filename,
+        see Scene's own docstring) and RE-VERIFIES sharing for every
+        account in this launch. Neither check is repeated or
+        short-circuited here.
+
+        Mirrors launch()'s own ABSENT-vs-EXPLICITLY-EMPTY contract for
+        `options.labels` (see that slot's own long comment): absent means
+        every free account, refused if none are free; an explicitly empty
+        list means every checkbox was unticked on purpose and is refused
+        outright, never silently widened back out to "everyone".
+        """
+        options = json.loads(options_json)
+        start = int(options.get("startFrame", 1))
+        end = int(options.get("endFrame", 1))
+        if not self.store.list():
+            self.notification.emit(
+                "Add at least one Kaggle account before rendering.", "offline")
+            return
+        if end < start:
+            self.notification.emit(
+                f"End frame ({end}) is before the start frame ({start}).",
+                "offline")
+            return
+
+        settings = RenderSettings(
+            int(options.get("resX", 1920)), int(options.get("resY", 1080)),
+            int(options.get("samples", 128)), options.get("format", "PNG"),
+            blender_version=validate_version(
+                options.get("blenderVersion") or self.settings.blender_version),
+            min_gpus=self.settings.min_gpus)
+        all_accounts = self.store.list()
+        fleet = self.fleet_factory(all_accounts)
+
+        # See launch()'s own comment on this exact pattern -- `is None`,
+        # not `or`: an explicitly empty "labels": [] must never collapse
+        # into "labels absent" and widen back out to every free account.
+        requested = options.get("labels")
+        if requested is None:
+            accounts = fleet.free_accounts()
+            if not accounts:
+                self.notification.emit(
+                    "Every configured account is already rendering "
+                    "something else. Choose specific accounts to render "
+                    "on, wait for a job to finish, or cancel one first.",
+                    "offline")
+                return
+        elif not requested:
+            self.notification.emit(
+                "No machines selected — tick at least one instance to "
+                "render on.", "offline")
+            return
+        else:
+            by_label = {a.label: a for a in all_accounts}
+            unknown = [label for label in requested if label not in by_label]
+            if unknown:
+                self.notification.emit(
+                    f"No account is configured with label(s): "
+                    f"{', '.join(unknown)}. Nothing has been started -- "
+                    "reselect accounts and try again.", "offline")
+                return
+            accounts = [by_label[label] for label in requested]
+
+        def work():
+            return fleet.launch_from_dataset(slug, settings, start, end,
+                                             accounts=accounts)
+
+        def ok(state) -> None:
+            self._last_state = state
+            # Deliberately NOT copied into self._unshared_accounts, unlike
+            # launch()'s own ok(): launch_from_dataset scopes sharing to
+            # only the accounts in THIS render (its own docstring), so its
+            # fleet.unshared_accounts is always {} on this path -- copying
+            # that in would read as "the last upload reached everyone",
+            # a positive claim nothing here actually checked for accounts
+            # outside this render. Leaving it alone keeps whatever an
+            # earlier prepare_dataset()/launch() call last recorded, which
+            # is still an honest answer to "the last upload", just not
+            # about this call.
+            self._start_streams(state)
+            self.logLine.emit(
+                f"render started on {len(accounts)} account(s) from "
+                f"{slug}", "active")
+            self.notification.emit(f"Render started from {slug}", "active")
+            self._emit_state()
+            self.refreshQuota()
+
+        self._start(f"launch-scene:{slug}", work, "Starting the render", ok)
+
+    @Slot(str)
+    def deleteScene(self, slug: str) -> None:
+        """Permanently delete a Kaggle dataset -- using the OWNER's own
+        token, never a friend's.
+
+        Kaggle rejects a delete from any account other than the literal
+        owner, even one this dataset has been explicitly shared with as a
+        READER (see KaggleClient.delete_dataset's own docstring) -- read
+        access and delete access are different permissions. The owner is
+        resolved from `slug` itself ("owner/name"), the same way
+        Fleet.launch_from_dataset resolves it, never guessed from fleet
+        position -- a friend's token must never even be tried here.
+
+        The irreversible confirmation -- naming the scene, its size, and
+        that sharing accounts lose access -- happens in the page, before
+        this is ever called; this slot trusts that already happened and
+        does not ask again.
+        """
+        accounts = self.store.list()
+        owner_username = slug.split("/", 1)[0] if "/" in slug else ""
+        owner = next((a for a in accounts if a.username == owner_username),
+                     None)
+        if owner is None:
+            self.notification.emit(
+                f"Cannot delete {slug!r} -- no configured account has the "
+                f"Kaggle username {owner_username!r}, so BlendFleet has no "
+                "token that could delete it. Nothing has been deleted. Add "
+                "that account under Manage accounts…, or confirm its "
+                "stored username matches what Kaggle reports (Instances -> "
+                "Set username), then try again.", "offline")
+            return
+
+        def work():
+            self.fleet_factory([owner]).client_factory(
+                owner.token).delete_dataset(slug)
+
+        def ok(_result) -> None:
+            self.logLine.emit(f"deleted {slug}", "warn")
+            self.notification.emit(f"Deleted {slug} from Kaggle.", "idle")
+            # The library must stop showing what is now gone rather than
+            # waiting for the user to stumble onto it stale.
+            self.scenes()
+
+        self._start(f"delete-scene:{slug}", work, f"Deleting {slug}", ok)
 
     @Slot(str)
     def startInstances(self, labels_json: str) -> None:
@@ -1698,6 +1893,27 @@ def _unreadable_jobs_payload(raw_entries: list) -> list[dict]:
             "fingerprint": fingerprint_unreadable_entry(entry),
         })
     return payload
+
+
+def _scene_payload(scene: Scene) -> dict:
+    """One Scene, ready for the page.
+
+    `updated` is an ISO string when Kaggle reported one, and exactly
+    `None` when it did not (Scene.updated: datetime | None) -- never a
+    default date standing in for "we don't know". `blendName` carries
+    Scene.blend_name's own GUESSED filename verbatim: this payload must
+    never dress it up as confirmed, because nothing on this path has
+    listed the dataset's real files -- that only happens inside
+    Fleet.launch_from_dataset, immediately before rendering it.
+    """
+    return {
+        "slug": scene.slug,
+        "name": scene.name,
+        "owner": scene.owner,
+        "sizeBytes": scene.size_bytes,
+        "updated": scene.updated.isoformat() if scene.updated else None,
+        "blendName": scene.blend_name,
+    }
 
 
 def _snapshot_payload(snapshot) -> dict | None:

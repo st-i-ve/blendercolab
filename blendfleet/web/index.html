@@ -224,6 +224,17 @@
             </div>
           </div>
         </div>
+
+        <h2 class="sec" style="margin-top:26px">Scene library <span class="meta">already on Kaggle · every configured account</span></h2>
+        <!-- Accounts scenes() could not reach -- their error is shown
+             here, but their absence must never be mistaken for "nothing
+             on Kaggle": every OTHER account's scenes are still listed
+             below (bridge.py's own discipline, mirroring
+             CollectReport.worker_errors). Reuses .unshared-banner's own
+             styling -- a different id, the same "real problem, WARN
+             severity" shape. -->
+        <div class="unshared-banner" id="scene-errors"></div>
+        <div class="panel" id="scene-list"></div>
       </div>
 
       <!-- ============ INSTANCES ============ -->

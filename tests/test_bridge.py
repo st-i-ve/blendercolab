@@ -17,7 +17,7 @@ from PySide6.QtWidgets import QApplication, QFileDialog
 from blendfleet.accounts import Account, AccountStore
 from blendfleet.fleet import Fleet, FleetState, WorkerState
 from blendfleet.instance_state import GpuSnapshot, InstanceSnapshot
-from blendfleet.kaggle_client import Quota
+from blendfleet.kaggle_client import DatasetInfo, KaggleError, Quota
 from blendfleet.settings import Settings
 from blendfleet.ui.bridge import Backend
 
@@ -1427,3 +1427,314 @@ def test_send_job_refuses_a_label_that_is_not_currently_warm(qapp, tmp_path):
     assert not published
     assert notes and notes[0][1] == "offline"
     assert "ghost" in notes[0][0]
+
+
+# ---------------------------------------------------------------------------
+# The scene library: scenes(), renderScene(), deleteScene() (Task 11).
+#
+# scenes_from_datasets() (blendfleet/scenes.py) is a pure filter with no
+# idea which account anything came from -- it is handed a flat list of
+# DatasetInfo. Pooling every configured account's own list_datasets()
+# before handing them to it is this bridge's own job, and so is making
+# sure one account's failure never hides everyone else's scenes.
+# ---------------------------------------------------------------------------
+
+class SceneListingClient(FakeClient):
+    """A FakeClient whose list_datasets() answers per-account, keyed by
+    the token it was constructed with (make_backend gives every fake
+    account a distinct token) -- an Exception value is raised instead of
+    returned, so one entry can simulate an unreachable account."""
+
+    def __init__(self, token, datasets_by_token, label=None):
+        super().__init__(token)
+        self._by_token = datasets_by_token
+
+    def list_datasets(self):
+        entry = self._by_token.get(self.token, [])
+        if isinstance(entry, Exception):
+            raise entry
+        return entry
+
+
+def _dataset(owner, stem, size=1000, updated=None):
+    return DatasetInfo(ref=f"{owner}/{stem}-blend", title=f"{stem}-blend",
+                       total_bytes=size, last_updated=updated,
+                       is_private=True, owner=owner)
+
+
+def test_one_unreachable_account_does_not_empty_the_library(qapp, tmp_path):
+    """Its error is attached and the rest still show -- the same
+    discipline CollectReport.worker_errors already follows."""
+    backend = make_backend(tmp_path, n=3)
+    accounts = backend.store.list()
+    by_token = {
+        accounts[0].token: [_dataset("user_0", "remember")],
+        accounts[1].token: KaggleError("could not list datasets: rate limited"),
+        accounts[2].token: [_dataset("user_2", "another")],
+    }
+    backend.fleet_factory = lambda accts: Fleet(
+        accts, lambda t: SceneListingClient(t, by_token), tmp_path / "w")
+
+    payloads = []
+    backend.scenesChanged.connect(lambda j: payloads.append(json.loads(j)))
+    backend.scenes()
+    _settle(backend)
+
+    assert len(payloads) == 1
+    payload = payloads[0]
+    names = {s["name"] for s in payload["scenes"]}
+    # acct1's failure must not have hidden acct0's or acct2's own scenes.
+    assert names == {"remember", "another"}
+    assert "acct1" in payload["errors"]
+    assert "rate limited" in payload["errors"]["acct1"]
+
+
+def test_scenes_payload_never_invents_an_update_date(qapp, tmp_path):
+    """Scene.updated is datetime | None -- an undated scene must reach
+    the page as `null`, never as some default timestamp standing in for
+    'we don't know'."""
+    backend = make_backend(tmp_path, n=1)
+    accounts = backend.store.list()
+    by_token = {accounts[0].token: [_dataset("user_0", "remember", size=999)]}
+    backend.fleet_factory = lambda accts: Fleet(
+        accts, lambda t: SceneListingClient(t, by_token), tmp_path / "w")
+
+    payloads = []
+    backend.scenesChanged.connect(lambda j: payloads.append(json.loads(j)))
+    backend.scenes()
+    _settle(backend)
+
+    scene = payloads[0]["scenes"][0]
+    assert scene["updated"] is None
+    assert scene["owner"] == "user_0"
+    assert scene["sizeBytes"] == 999
+    # A GUESS, carried through verbatim -- never dressed up as confirmed.
+    assert scene["blendName"] == "remember.blend"
+
+
+def test_deleting_uses_the_owners_token_never_a_friends(qapp, tmp_path):
+    """A friend's token cannot delete another account's dataset, and
+    trying produces a permission error that reads like a bug."""
+    backend = make_backend(tmp_path, n=2)
+    accounts = backend.store.list()   # user_0 (owner), user_1 (friend)
+    calls = []
+
+    class DeleteClient(FakeClient):
+        def delete_dataset(self, slug):
+            calls.append(self.token)
+            if self.token != accounts[0].token:
+                # What Kaggle itself does to a non-owner's token -- see
+                # KaggleClient.delete_dataset's own docstring. Only
+                # reachable here if the bridge picked the wrong account.
+                raise KaggleError(
+                    f"could not delete dataset {slug!r}: Kaggle refused "
+                    "with a permission error. Only the dataset's OWNER "
+                    "can delete it -- a collaborator's token is refused "
+                    "even with full read access.")
+
+    backend.fleet_factory = lambda accts: Fleet(
+        accts, lambda t: DeleteClient(t), tmp_path / "w")
+    notes = []
+    backend.notification.connect(lambda m, t: notes.append((m, t)))
+
+    backend.deleteScene("user_0/remember-blend")
+    _settle(backend)
+
+    assert calls == [accounts[0].token], \
+        "must call delete_dataset with the OWNER's token, never a friend's"
+    assert notes and notes[0][1] == "idle"
+    assert "Deleted" in notes[0][0]
+
+
+def test_deleting_refuses_when_no_configured_account_owns_it(qapp, tmp_path):
+    """Never guessed -- Scene.owner (here, the slug's own owner segment)
+    is what decides whose token to use, and if nobody configured matches
+    it this must refuse rather than try some other account's token."""
+    backend = make_backend(tmp_path, n=1)
+    notes = []
+    backend.notification.connect(lambda m, t: notes.append((m, t)))
+
+    backend.deleteScene("somebody_else/remember-blend")
+
+    assert notes and notes[0][1] == "offline"
+    assert "somebody_else" in notes[0][0]
+    assert "delete-scene:somebody_else/remember-blend" not in backend._workers
+
+
+def test_deleting_surfaces_kaggles_real_permission_error(qapp, tmp_path):
+    """Even when the owner IS resolved correctly, Kaggle itself may still
+    refuse (e.g. the account's own token was revoked) -- that failure must
+    reach the user verbatim, not as a generic 'something went wrong'."""
+    backend = make_backend(tmp_path, n=1)
+
+    class RefusingClient(FakeClient):
+        def delete_dataset(self, slug):
+            raise KaggleError(
+                f"could not delete dataset {slug!r}: Kaggle refused with "
+                "a permission error. Only the dataset's OWNER can delete "
+                "it.")
+
+    backend.fleet_factory = lambda accts: Fleet(
+        accts, lambda t: RefusingClient(t), tmp_path / "w")
+    notes = []
+    backend.notification.connect(lambda m, t: notes.append((m, t)))
+
+    backend.deleteScene("user_0/remember-blend")
+    _settle(backend)
+
+    assert notes and notes[0][1] == "offline"
+    assert "OWNER" in notes[0][0]
+
+
+def test_deleting_refreshes_the_library_so_the_gone_scene_stops_showing(
+        qapp, tmp_path):
+    backend = make_backend(tmp_path, n=1)
+    accounts = backend.store.list()
+    list_calls = []
+
+    class DeleteAndListClient(FakeClient):
+        def delete_dataset(self, slug):
+            pass
+
+        def list_datasets(self):
+            list_calls.append(self.token)
+            return []
+
+    backend.fleet_factory = lambda accts: Fleet(
+        accts, lambda t: DeleteAndListClient(t), tmp_path / "w")
+
+    backend.deleteScene(f"{accounts[0].username}/remember-blend")
+    _settle(backend)
+
+    assert list_calls == [accounts[0].token]
+
+
+# ---------------------------------------------------------------------------
+# renderScene(): a scene that is already on Kaggle, rendered with NO local
+# .blend and no re-upload -- must go through Fleet.launch_from_dataset, and
+# must not bypass it.
+# ---------------------------------------------------------------------------
+
+def _account_workers_fleet_from_dataset():
+    class RecordingFleet(Fleet):
+        def launch_from_dataset(self, dataset_slug, settings, start_frame,
+                                end_frame, *, accounts=None):
+            RecordingFleet.seen_slug = dataset_slug
+            RecordingFleet.seen_labels = [a.label for a in accounts]
+            return FleetState(
+                job_id="j", blend_name="remember.blend",
+                start_frame=start_frame, end_frame=end_frame,
+                workers=[WorkerState(label=a.label, username=a.label,
+                                     kernel_slug=f"{a.label}/k", frames=[1])
+                         for a in accounts])
+    return RecordingFleet
+
+
+def test_render_scene_goes_through_launch_from_dataset(qapp, tmp_path):
+    """No local .blend is ever set on the backend here -- proving this
+    path needs none."""
+    RecordingFleet = _account_workers_fleet_from_dataset()
+    backend = make_backend(tmp_path, n=2)
+    backend.fleet_factory = lambda accounts: RecordingFleet(
+        accounts, lambda t: FakeClient(t), tmp_path / "w")
+    assert backend.blend is None
+
+    backend.renderScene("user_0/remember-blend",
+                        json.dumps({"startFrame": 1, "endFrame": 4}))
+    _settle(backend)
+
+    assert RecordingFleet.seen_slug == "user_0/remember-blend"
+    assert set(RecordingFleet.seen_labels) == {"acct0", "acct1"}
+
+
+def test_render_scene_with_no_labels_only_uses_free_accounts(qapp, tmp_path):
+    backend = make_backend(tmp_path, n=2)
+    fleet = backend.fleet_factory(backend.store.list())
+    fleet.save_jobs([FleetState(
+        job_id="job1", blend_name="other.blend", start_frame=1, end_frame=5,
+        workers=[WorkerState(label="acct0", username="user_0",
+                             kernel_slug="user_0/other-render-1",
+                             frames=[1, 2], state="running")])])
+
+    RecordingFleet = _account_workers_fleet_from_dataset()
+    backend.fleet_factory = lambda accounts: RecordingFleet(
+        accounts, lambda t: FakeClient(t), tmp_path / "w")
+
+    backend.renderScene("user_0/remember-blend",
+                        json.dumps({"startFrame": 1, "endFrame": 4}))
+    _settle(backend)
+
+    assert RecordingFleet.seen_labels == ["acct1"]
+
+
+def test_render_scene_refuses_when_every_account_is_already_busy(
+        qapp, tmp_path):
+    backend = make_backend(tmp_path, n=1)
+    fleet = backend.fleet_factory(backend.store.list())
+    fleet.save_jobs([FleetState(
+        job_id="job1", blend_name="other.blend", start_frame=1, end_frame=5,
+        workers=[WorkerState(label="acct0", username="user_0",
+                             kernel_slug="user_0/other-render-1",
+                             frames=[1, 2], state="running")])])
+    notes = []
+    backend.notification.connect(lambda m, t: notes.append((m, t)))
+
+    backend.renderScene("user_0/remember-blend",
+                        json.dumps({"startFrame": 1, "endFrame": 4}))
+
+    assert notes and notes[0][1] == "offline"
+    assert "busy" in notes[0][0].lower() or "rendering" in notes[0][0].lower()
+    assert "launch-scene:user_0/remember-blend" not in backend._workers
+
+
+def test_render_scene_refuses_an_explicitly_empty_label_list(qapp, tmp_path):
+    """Same Critical-fix discipline as launch(): `"labels": []` must never
+    be widened back out to every free account."""
+    RecordingFleet = _account_workers_fleet_from_dataset()
+    backend = make_backend(tmp_path, n=2)
+    backend.fleet_factory = lambda accounts: RecordingFleet(
+        accounts, lambda t: FakeClient(t), tmp_path / "w")
+    notes = []
+    backend.notification.connect(lambda m, t: notes.append((m, t)))
+
+    backend.renderScene("user_0/remember-blend",
+                        json.dumps({"startFrame": 1, "endFrame": 4,
+                                   "labels": []}))
+    _settle(backend)
+
+    assert getattr(RecordingFleet, "seen_labels", None) is None, \
+        "must not render on ANY account when labels is explicitly empty"
+    assert notes and notes[0][1] == "offline"
+
+
+def test_render_scene_refuses_an_unknown_label(qapp, tmp_path):
+    backend = make_backend(tmp_path, n=2)
+    notes = []
+    backend.notification.connect(lambda m, t: notes.append((m, t)))
+
+    backend.renderScene("user_0/remember-blend",
+                        json.dumps({"startFrame": 1, "endFrame": 4,
+                                   "labels": ["ghost"]}))
+
+    assert notes and notes[0][1] == "offline"
+    assert "ghost" in notes[0][0]
+
+
+def test_render_scene_does_not_overwrite_the_last_uploads_sharing_report(
+        qapp, tmp_path):
+    """launch_from_dataset scopes sharing to only the accounts in THIS
+    render, so its fleet.unshared_accounts is always {} on this path --
+    copying that into self._unshared_accounts would read as a positive
+    "shared with everyone" claim about accounts this call never checked.
+    Whatever the last real upload recorded must be left alone."""
+    RecordingFleet = _account_workers_fleet_from_dataset()
+    backend = make_backend(tmp_path, n=1)
+    backend._unshared_accounts = {"friend_1": "could not be reached"}
+    backend.fleet_factory = lambda accounts: RecordingFleet(
+        accounts, lambda t: FakeClient(t), tmp_path / "w")
+
+    backend.renderScene("acct0/remember-blend",
+                        json.dumps({"startFrame": 1, "endFrame": 2}))
+    _settle(backend)
+
+    assert backend._unshared_accounts == {"friend_1": "could not be reached"}
