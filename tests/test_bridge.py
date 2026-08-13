@@ -770,9 +770,10 @@ def test_forgetting_an_unreadable_job_clears_it_from_the_payload(
                      "kernel_slug": "u9/x-render-1", "frames": [1]}],
         "not_a_real_field": 1,
     }]}), encoding="utf-8")
-    assert len(json.loads(backend.state())["unreadableJobs"]) == 1
+    entries = json.loads(backend.state())["unreadableJobs"]
+    assert len(entries) == 1
 
-    backend.forgetUnreadableJob(0)
+    backend.forgetUnreadableJob(0, entries[0]["fingerprint"])
     _settle(backend)
 
     assert json.loads(backend.state())["unreadableJobs"] == []
@@ -802,7 +803,7 @@ def test_forgetting_an_unreadable_job_does_not_touch_a_real_one(
     assert len(before["jobs"]) == 2
     assert len(before["unreadableJobs"]) == 1
 
-    backend.forgetUnreadableJob(0)
+    backend.forgetUnreadableJob(0, before["unreadableJobs"][0]["fingerprint"])
     _settle(backend)
 
     after = json.loads(backend.state())
@@ -815,9 +816,45 @@ def test_forgetting_an_already_gone_unreadable_index_says_so(
     backend = make_backend(tmp_path, n=1)
     notes = []
     backend.notification.connect(lambda m, t: notes.append((m, t)))
-    backend.forgetUnreadableJob(0)      # nothing tracked at all
+    backend.forgetUnreadableJob(0, "")   # nothing tracked at all
     _settle(backend)
     assert notes and notes[0][1] == "idle"
+
+
+def test_forgetting_an_unreadable_job_refuses_when_the_list_has_changed(
+        qapp, tmp_path):
+    """Fix round 2: save_jobs() writes unreadable entries LAST, so a
+    DIFFERENT job going unreadable between the page reading its payload
+    and the user clicking "forget" can shift every later unreadable
+    entry's position by one. Forgetting by `index` alone would then
+    silently drop the WRONG record -- along with the one kernel slug the
+    user actually needed. A stale fingerprint must refuse, not guess."""
+    backend = make_backend(tmp_path, n=1)
+    fleet = backend.fleet_factory(backend.store.list())
+    fleet._state_path().write_text(json.dumps({"jobs": [
+        {"job_id": "first", "blend_name": "a.blend", "workers": [],
+         "not_a_real_field": 1},
+    ]}), encoding="utf-8")
+    entries = json.loads(backend.state())["unreadableJobs"]
+    stale_fingerprint = entries[0]["fingerprint"]
+
+    # A SECOND job goes unreadable before the user clicks "forget" --
+    # inserted at position 0, pushing "first" to position 1.
+    raw = json.loads(fleet._state_path().read_text(encoding="utf-8"))
+    raw["jobs"].insert(0, {"job_id": "second", "blend_name": "b.blend",
+                           "workers": [], "not_a_real_field": 1})
+    fleet._state_path().write_text(json.dumps(raw), encoding="utf-8")
+
+    notes = []
+    backend.notification.connect(lambda m, t: notes.append((m, t)))
+    backend.forgetUnreadableJob(0, stale_fingerprint)   # still index 0
+    _settle(backend)
+
+    assert notes and notes[0][1] == "offline"
+    assert "changed" in notes[0][0].lower()
+    # Nothing was dropped -- both records must still be there.
+    still_there = json.loads(backend.state())["unreadableJobs"]
+    assert {e["jobId"] for e in still_there} == {"first", "second"}
 
 
 # ---------------------------------------------------------------------------
@@ -1099,3 +1136,229 @@ def test_collect_does_not_leak_worker_errors_between_jobs(
     _settle(backend)
 
     assert notes and "could not reach acct0" in notes[0][0]
+
+
+# ---------------------------------------------------------------------------
+# Fix round 2: the collect() busy key is BUTTON identity, not call
+# identity. app.js matches it by an EXACT string ("collect:" for the
+# fleet-wide button); folding job_id into the key broke that match.
+# ---------------------------------------------------------------------------
+
+def test_collect_busy_key_for_the_fleet_wide_button_is_exactly_collect(
+        qapp, tmp_path, monkeypatch):
+    backend = _two_job_collect_backend(tmp_path)
+    seen_job_ids = []
+    _stub_collect_frames(monkeypatch, tmp_path, seen_job_ids)
+    keys = []
+    backend.busyChanged.connect(lambda key, busy: keys.append(key))
+
+    backend.collect("")
+    _settle(backend)
+
+    assert "collect:" in keys, \
+        f"app.js matches this key by exact string 'collect:'; saw {keys}"
+
+
+def test_collect_busy_key_for_one_account_carries_only_its_label(
+        qapp, tmp_path, monkeypatch):
+    backend = _two_job_collect_backend(tmp_path)
+    seen_job_ids = []
+    _stub_collect_frames(monkeypatch, tmp_path, seen_job_ids)
+    keys = []
+    backend.busyChanged.connect(lambda key, busy: keys.append(key))
+
+    backend.collect("acct0")
+    _settle(backend)
+
+    assert "collect:acct0" in keys, \
+        f"job_id must not be folded into the busy key; saw {keys}"
+
+
+# ---------------------------------------------------------------------------
+# Fix round 2: startInstances() had the SAME absent-vs-explicitly-empty
+# collapse the launch() Critical fixed. A warm machine spends quota from
+# the moment it starts, so this is the same class of harm.
+# ---------------------------------------------------------------------------
+
+def test_start_instances_with_no_argument_starts_every_account(
+        qapp, tmp_path):
+    """Today's "Start all" button's own call (an empty STRING) must keep
+    meaning "every configured account", unchanged."""
+    backend = make_backend(tmp_path, n=2)
+    backend._dataset = {"slug": "owner/scene-blend", "blendName": "scene.blend",
+                        "sizeBytes": 8, "at": "10:00:00"}
+    seen = {}
+
+    class RecordingFleet(Fleet):
+        def start_workers(self, labels, settings, dataset_slug,
+                          blender_slug=None):
+            seen["labels"] = list(labels)
+            return FleetState(job_id="j", blend_name="", start_frame=0,
+                              end_frame=0,
+                              workers=[WorkerState(label=l, username=l,
+                                                   kernel_slug=f"{l}/k",
+                                                   frames=[])
+                                       for l in labels])
+
+    backend.fleet_factory = lambda accounts: RecordingFleet(
+        accounts, lambda t: FakeClient(t), tmp_path / "w")
+
+    backend.startInstances("")
+    _settle(backend)
+
+    assert sorted(seen["labels"]) == ["acct0", "acct1"]
+
+
+def test_start_instances_refuses_an_explicitly_empty_label_list(
+        qapp, tmp_path):
+    """`"[]"` means every per-instance checkbox was unticked -- the same
+    request `launch()`'s Critical fix already refuses, not "start
+    everyone". A warm machine spends quota from the moment it starts, so
+    silently widening this is the same class of harm."""
+    backend = make_backend(tmp_path, n=2)
+    backend._dataset = {"slug": "owner/scene-blend", "blendName": "scene.blend",
+                        "sizeBytes": 8, "at": "10:00:00"}
+    seen = {}
+
+    class RecordingFleet(Fleet):
+        def start_workers(self, labels, settings, dataset_slug,
+                          blender_slug=None):
+            seen["labels"] = list(labels)
+            return FleetState(job_id="j", blend_name="", start_frame=0,
+                              end_frame=0, workers=[])
+
+    backend.fleet_factory = lambda accounts: RecordingFleet(
+        accounts, lambda t: FakeClient(t), tmp_path / "w")
+    notes = []
+    backend.notification.connect(lambda m, t: notes.append((m, t)))
+
+    backend.startInstances(json.dumps([]))
+    _settle(backend)
+
+    assert "labels" not in seen, \
+        "must not start ANY machine when the selection is explicitly empty"
+    assert notes and notes[0][1] == "offline"
+    assert "start" not in backend._workers
+
+
+def test_start_instances_with_named_labels_starts_only_those(
+        qapp, tmp_path):
+    backend = make_backend(tmp_path, n=3)
+    backend._dataset = {"slug": "owner/scene-blend", "blendName": "scene.blend",
+                        "sizeBytes": 8, "at": "10:00:00"}
+    seen = {}
+
+    class RecordingFleet(Fleet):
+        def start_workers(self, labels, settings, dataset_slug,
+                          blender_slug=None):
+            seen["labels"] = list(labels)
+            return FleetState(job_id="j", blend_name="", start_frame=0,
+                              end_frame=0,
+                              workers=[WorkerState(label=l, username=l,
+                                                   kernel_slug=f"{l}/k",
+                                                   frames=[])
+                                       for l in labels])
+
+    backend.fleet_factory = lambda accounts: RecordingFleet(
+        accounts, lambda t: FakeClient(t), tmp_path / "w")
+
+    backend.startInstances(json.dumps(["acct1"]))
+    _settle(backend)
+
+    assert seen["labels"] == ["acct1"]
+
+
+# ---------------------------------------------------------------------------
+# Fix round 2: sendJob() silently ignored `options["labels"]` -- a
+# parameter that looked respected (launch() reads the identical key out
+# of the identical shape of `options`) but was not.
+# ---------------------------------------------------------------------------
+
+def _warm_backend(tmp_path, labels):
+    backend = make_backend(tmp_path, n=len(labels))
+    backend._last_state = FleetState(
+        job_id="warm", blend_name="", start_frame=0, end_frame=0,
+        workers=[WorkerState(label=l, username=l, kernel_slug=f"{l}/k",
+                             frames=[]) for l in labels])
+    return backend
+
+
+def test_send_job_with_no_labels_reaches_every_warm_machine(qapp, tmp_path):
+    backend = _warm_backend(tmp_path, ["acct0", "acct1"])
+    published = []
+
+    class RecordingFleet(Fleet):
+        def publish_job(self, job):
+            published.append(dict(job))
+
+    backend.fleet_factory = lambda accounts: RecordingFleet(
+        accounts, lambda t: FakeClient(t), tmp_path / "w")
+
+    backend.sendJob(json.dumps({"startFrame": 1, "endFrame": 4}))
+    _settle(backend)
+
+    assert {j["workers"][0] for j in published} == {"acct0", "acct1"}
+
+
+def test_send_job_honours_an_explicit_label_selection(qapp, tmp_path):
+    """The Minor this round's review flagged: `labels` must actually be
+    respected, not silently ignored while looking like it is (launch()
+    reads the exact same key out of the exact same `options` shape)."""
+    backend = _warm_backend(tmp_path, ["acct0", "acct1"])
+    published = []
+
+    class RecordingFleet(Fleet):
+        def publish_job(self, job):
+            published.append(dict(job))
+
+    backend.fleet_factory = lambda accounts: RecordingFleet(
+        accounts, lambda t: FakeClient(t), tmp_path / "w")
+
+    backend.sendJob(json.dumps({"startFrame": 1, "endFrame": 4,
+                               "labels": ["acct0"]}))
+    _settle(backend)
+
+    assert {j["workers"][0] for j in published} == {"acct0"}
+
+
+def test_send_job_refuses_an_explicitly_empty_label_list(qapp, tmp_path):
+    backend = _warm_backend(tmp_path, ["acct0", "acct1"])
+    published = []
+
+    class RecordingFleet(Fleet):
+        def publish_job(self, job):
+            published.append(dict(job))
+
+    backend.fleet_factory = lambda accounts: RecordingFleet(
+        accounts, lambda t: FakeClient(t), tmp_path / "w")
+    notes = []
+    backend.notification.connect(lambda m, t: notes.append((m, t)))
+
+    backend.sendJob(json.dumps({"startFrame": 1, "endFrame": 4,
+                               "labels": []}))
+    _settle(backend)
+
+    assert not published
+    assert notes and notes[0][1] == "offline"
+
+
+def test_send_job_refuses_a_label_that_is_not_currently_warm(qapp, tmp_path):
+    backend = _warm_backend(tmp_path, ["acct0", "acct1"])
+    published = []
+
+    class RecordingFleet(Fleet):
+        def publish_job(self, job):
+            published.append(dict(job))
+
+    backend.fleet_factory = lambda accounts: RecordingFleet(
+        accounts, lambda t: FakeClient(t), tmp_path / "w")
+    notes = []
+    backend.notification.connect(lambda m, t: notes.append((m, t)))
+
+    backend.sendJob(json.dumps({"startFrame": 1, "endFrame": 4,
+                               "labels": ["acct0", "ghost"]}))
+    _settle(backend)
+
+    assert not published
+    assert notes and notes[0][1] == "offline"
+    assert "ghost" in notes[0][0]

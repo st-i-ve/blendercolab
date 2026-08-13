@@ -19,7 +19,7 @@ from __future__ import annotations
 from blendfleet.accounts import TokenFormatError
 from blendfleet.dataset_sync import SyncError
 from blendfleet.fleet import (FleetBusyError, UnreachableAccountsError,
-                              WrongUsernameError)
+                              UnreadableJobChanged, WrongUsernameError)
 from blendfleet.kaggle_client import KaggleError
 from blendfleet.uploader import UploadError
 
@@ -28,7 +28,8 @@ from blendfleet.uploader import UploadError
 # docstrings. Shown to the user directly (with the failing action
 # prefixed), never re-wrapped.
 _SELF_EXPLANATORY = (
-    FleetBusyError, UnreachableAccountsError, WrongUsernameError, KaggleError,
+    FleetBusyError, UnreachableAccountsError, UnreadableJobChanged,
+    WrongUsernameError, KaggleError,
     SyncError, UploadError, TokenFormatError, ValueError,
 )
 

@@ -13,6 +13,7 @@ access up front, and polls each account independently.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import time
@@ -333,6 +334,41 @@ class StaleDatasetError(RuntimeError):
     """
 
 
+class UnreadableJobChanged(RuntimeError):
+    """forget_unreadable() was asked to drop an entry that is no longer
+    the one the caller was shown (Fix round 2).
+
+    Raised instead of silently forgetting whatever now happens to sit at
+    `index`: save_jobs() writes parsed jobs first and unreadable entries
+    LAST (see its own docstring), so a DIFFERENT job going unreadable
+    between the moment a payload named this index and the moment the
+    user clicks "forget" can shift every later unreadable entry's
+    position by one. Forgetting by position alone, with no check, would
+    then silently destroy the WRONG record -- along with the one kernel
+    slug the user actually needed to go stop by hand at kaggle.com, while
+    leaving the one they meant to dismiss still on screen.
+    """
+
+
+def fingerprint_unreadable_entry(entry: object) -> str:
+    """A short, stable identifier for one raw, possibly-unparseable job
+    entry -- see UnreadableJobChanged's own docstring for what this
+    guards against.
+
+    Hashes the entry's own canonical bytes rather than trusting job_id:
+    a whole-file JSON failure entry (see load_jobs()) is a bare string
+    with no job_id to read at all, and a per-entry failure's job_id is
+    only 32 bits of uuid4 -- neither is safe as "this is genuinely the
+    same broken record", but the bytes of the entry itself always are.
+    Truncated to 16 hex characters: this is a same-process, same-session
+    identity check against accidental drift, not a cryptographic
+    guarantee, and the full 64 would tell a caller nothing more useful.
+    """
+    canonical = (entry if isinstance(entry, str)
+                else json.dumps(entry, sort_keys=True, default=str))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
 class Fleet:
     def __init__(self, accounts: list[Account],
                  client_factory: Callable, work_dir: Path) -> None:
@@ -509,7 +545,8 @@ class Fleet:
         self.save_jobs(jobs)
         return list(target.workers)
 
-    def forget_unreadable(self, index: int) -> object | None:
+    def forget_unreadable(self, index: int,
+                          fingerprint: str | None = None) -> object | None:
         """Drop ONE entry from self.unreadable_jobs by its position,
         without touching anything on Kaggle -- forget_job()'s counterpart
         for a job record broken badly enough that it was never turned into
@@ -529,6 +566,16 @@ class Fleet:
         fields to match on), and even when one is present it is only 32
         bits of uuid4, so equality could drop two for the price of one.
 
+        `fingerprint`, when given, must match
+        fingerprint_unreadable_entry() of whatever is CURRENTLY at
+        `index` (Fix round 2) -- see UnreadableJobChanged's own docstring
+        for the race this closes: a caller's copy of the list can go
+        stale between reading a payload and clicking "forget" if some
+        OTHER job goes unreadable in between, shifting positions.
+        Optional so a caller with no payload to check against (an
+        internal one, or a future one) can still forget by bare position,
+        matching forget_job()'s own unchecked contract.
+
         Returns the dropped raw entry (whatever shape it had -- a dict, or
         the literal raw text for a whole-file failure), or None if `index`
         no longer exists: already forgotten, or the file changed since
@@ -543,7 +590,15 @@ class Fleet:
         jobs = self.load_jobs()
         if not (0 <= index < len(self.unreadable_jobs)):
             return None
-        target = self.unreadable_jobs.pop(index)
+        target = self.unreadable_jobs[index]
+        if (fingerprint is not None
+                and fingerprint_unreadable_entry(target) != fingerprint):
+            raise UnreadableJobChanged(
+                "The list of unreadable job records changed since this "
+                "one was shown -- a different record may now be at this "
+                "position, so nothing has been forgotten. Refresh and "
+                "look again before forgetting one.")
+        self.unreadable_jobs.pop(index)
         self.save_jobs(jobs)
         return target
 

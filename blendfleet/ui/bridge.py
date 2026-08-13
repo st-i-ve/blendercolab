@@ -42,6 +42,7 @@ from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
 from blendfleet.accounts import AccountStore
 from blendfleet.assignment import estimate
 from blendfleet.blender_versions import KNOWN_VERSIONS, validate_version
+from blendfleet.fleet import fingerprint_unreadable_entry
 from blendfleet.instance_state import (GpuSnapshot, InstanceSnapshot,
                                        InstanceStore)
 from blendfleet.log_stream import stream_progress
@@ -798,10 +799,29 @@ class Backend(QObject):
         worker's own idle timeout is what bounds that -- see
         notebook_builder.IDLE_TIMEOUT_S -- and it shuts itself down rather
         than relying on this app still being here.
+
+        Fix round 2: mirrors launch()'s own ABSENT-vs-EXPLICITLY-EMPTY
+        distinction (see that slot's own comment) instead of collapsing
+        both into "start everyone" with a bare `if not labels`. A warm
+        machine spends quota from the moment it starts, so an empty
+        selection silently widened back out to the whole fleet is the
+        same class of harm the launch() Critical fixed, not a lesser one
+        just because it warms machines instead of rendering. An EMPTY
+        STRING (no argument content at all -- today's "start every
+        configured account" button's own call, unchanged) means absent;
+        a non-empty string that decodes to `[]` means the caller
+        explicitly asked for nobody and is refused.
         """
-        labels = json.loads(labels_json or "[]")
-        if not labels:
+        requested = json.loads(labels_json) if labels_json else None
+        if requested is None:
             labels = [a.label for a in self.store.list()]
+        elif not requested:
+            self.notification.emit(
+                "No machines selected — tick at least one instance to "
+                "start.", "offline")
+            return
+        else:
+            labels = requested
         if not labels:
             self.notification.emit("No accounts to start.", "offline")
             return
@@ -840,11 +860,25 @@ class Backend(QObject):
 
     @Slot(str)
     def sendJob(self, options_json: str) -> None:
-        """Give work to machines that are already warm.
+        """Give work to machines that are already warm -- every warm
+        machine, or a chosen subset of them.
 
         Publishes a job descriptor the running workers pick up on their
         next poll, instead of pushing new kernels. No setup cost, and no
         second session per account.
+
+        Fix round 2: `options.get("labels")` used to be silently ignored
+        -- a parameter that LOOKED respected (launch() reads the same key
+        out of the same shape of `options`) but was not, which is worse
+        than not having it, since a caller relying on it to scope a job
+        would have it sent to every warm machine instead with no warning
+        at all. Honoured now, with the same absent-vs-explicitly-empty
+        distinction as launch()/startInstances(): absent means every warm
+        machine (today's only caller, app.js's renderOptions(), never
+        sends this key, so that caller is unaffected); an explicitly
+        empty list refuses; a named machine that is not currently warm
+        refuses by name rather than silently sending to fewer machines
+        than asked.
         """
         options = json.loads(options_json)
         start = int(options.get("startFrame", 1))
@@ -854,13 +888,32 @@ class Backend(QObject):
                 f"End frame ({end}) is before the start frame ({start}).",
                 "offline")
             return
-        warm = [w.label for w in (self._last_state.workers
-                                  if self._last_state else [])]
-        if not warm:
+        all_warm = [w.label for w in (self._last_state.workers
+                                      if self._last_state else [])]
+        if not all_warm:
             self.notification.emit(
                 "No warm machines — start some first, or use Render across "
                 "fleet to push a one-shot job.", "offline")
             return
+
+        requested = options.get("labels")
+        if requested is None:
+            warm = all_warm
+        elif not requested:
+            self.notification.emit(
+                "No machines selected — tick at least one warm instance "
+                "to send this job to.", "offline")
+            return
+        else:
+            cold_or_unknown = [label for label in requested
+                               if label not in all_warm]
+            if cold_or_unknown:
+                self.notification.emit(
+                    f"Not currently warm: {', '.join(cold_or_unknown)}. "
+                    "Nothing has been sent -- start them first, or "
+                    "reselect only warm machines.", "offline")
+                return
+            warm = requested
 
         from blendfleet.assignment import assign_frames
         buckets = assign_frames(start, end, len(warm))
@@ -966,8 +1019,8 @@ class Backend(QObject):
 
         self._start("forget", work, "Forgetting the job", ok)
 
-    @Slot(int)
-    def forgetUnreadableJob(self, index: int) -> None:
+    @Slot(int, str)
+    def forgetUnreadableJob(self, index: int, fingerprint: str) -> None:
         """Acknowledge ONE entry from `unreadableJobs`, so a warning the
         user has already resolved by hand at kaggle.com does not sit on
         the page forever with no way to clear it (Fix round 1,
@@ -976,8 +1029,20 @@ class Backend(QObject):
         `index` is that entry's position in the `unreadableJobs` list the
         payload just handed the page -- see _unreadable_jobs_payload()'s
         own docstring for why position, not job_id, is the stable key
-        here. Exactly like forgetJob(), this is NOT a cancel: whatever the
-        raw entry might have been tracking (if anything) keeps running on
+        here. `fingerprint` is that SAME entry's `unreadableJobs[i].
+        fingerprint` from that same payload (Fix round 2): save_jobs()
+        writes parsed jobs first and unreadable entries last, so a
+        DIFFERENT job going unreadable between the page being drawn and
+        this being clicked can shift every later unreadable entry's
+        position by one -- `index` alone could then silently forget the
+        WRONG record. Fleet.forget_unreadable() refuses (via
+        UnreadableJobChanged) when the fingerprint no longer matches
+        whatever is actually at `index` right now, and that refusal
+        reaches the page as a normal, named failure through the usual
+        `_start`/`explain` path below, not a silent no-op.
+
+        Exactly like forgetJob(), this is NOT a cancel: whatever the raw
+        entry might have been tracking (if anything) keeps running on
         Kaggle and keeps spending quota. All this does is stop this app
         from being able to warn about it -- said here as plainly as
         forgetJob() already says it for a parsed job.
@@ -985,7 +1050,8 @@ class Backend(QObject):
         accounts = self.store.list()
 
         def work():
-            return self.fleet_factory(accounts).forget_unreadable(index)
+            return self.fleet_factory(accounts).forget_unreadable(
+                index, fingerprint)
 
         def ok(entry) -> None:
             if entry is None:
@@ -1118,7 +1184,19 @@ class Backend(QObject):
                 message += f". Could not reach: {detail}"
             self.notification.emit(message, tone)
 
-        self._start(f"collect:{label}:{job_id}", work,
+        # Fix round 2: the busy key is BUTTON identity, not call identity.
+        # `job_id` was folded into this key alongside `label`, but app.js
+        # (btn-collect's own disable/re-enable, keyed by an EXACT match on
+        # "collect:") only ever sends "" for both on the fleet-wide button
+        # -- so the key it now saw was "collect::", which nothing in that
+        # map matches, and the button never disabled while a collect ran.
+        # A second click then re-opened the folder picker with the first
+        # collect still in flight. `job_id` never needs to be part of this
+        # key: collect() is scoped to one job either way, and the UI has
+        # exactly one button per label (never per job), so `label` alone
+        # is the right granularity -- exactly as it was before job_id
+        # existed.
+        self._start(f"collect:{label}", work,
                     f"Collecting frames from {who}", ok)
 
     @Slot(str, str)
@@ -1547,6 +1625,15 @@ def _unreadable_jobs_payload(raw_entries: list) -> list[dict]:
     is always present and never ambiguous (Fix round 1, Critical fix's
     sibling problem, Important 3).
 
+    `fingerprint` (Fix round 2) is forgetUnreadableJob()'s staleness
+    guard: `index` alone can point at the WRONG entry by the time a
+    click reaches the backend, if some OTHER job went unreadable in
+    between and shifted every later position by one (save_jobs() writes
+    unreadable entries last -- see UnreadableJobChanged's own docstring
+    in fleet.py). The page must send this back unchanged alongside
+    `index`; Fleet.forget_unreadable() refuses rather than guessing if it
+    no longer matches what is actually at that position.
+
     Fix round 1, Minor 1: a per-job parse failure (as opposed to a
     whole-file one) usually still HAS `job_id`/`blend_name` -- discarding
     them made every such entry read as the identical generic sentence,
@@ -1593,6 +1680,7 @@ def _unreadable_jobs_payload(raw_entries: list) -> list[dict]:
         payload.append({
             "index": index, "jobId": job_id, "blend": blend_name,
             "kernels": kernels, "kernelUrls": urls, "message": message,
+            "fingerprint": fingerprint_unreadable_entry(entry),
         })
     return payload
 

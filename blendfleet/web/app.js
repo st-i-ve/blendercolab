@@ -840,8 +840,14 @@ document.getElementById('inst-tbody').addEventListener('click', e => {
   if (button.dataset.remove) backend.removeAccount(button.dataset.remove);
 });
 
+/* Fix round 2: startInstances('') -- an empty STRING, not '[]' -- now
+   means "every configured account". '[]' means the caller explicitly
+   asked for nobody and is refused, matching launch()'s own
+   absent-vs-explicitly-empty distinction (bridge.py). This button
+   still means "start everyone", unchanged; only the wire signal for
+   that moved. */
 document.getElementById('btn-start-all').onclick = () =>
-  backend && backend.startInstances(JSON.stringify([]));
+  backend && backend.startInstances('');
 document.getElementById('btn-stop-all').onclick = () =>
   backend && backend.cancelAll();
 document.getElementById('btn-send-job').onclick = () =>
