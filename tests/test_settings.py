@@ -7,12 +7,18 @@ from blendfleet.settings import DEFAULT_MIN_GPUS, Settings
 from blendfleet.ui.theme import ACCENTS, DEFAULT_ACCENT
 
 
-@pytest.fixture(autouse=True)
-def tmp_config(tmp_path, monkeypatch):
-    monkeypatch.setattr(pp.sys, "platform", "linux")
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-
-
+# No per-module config_dir redirect needed here: conftest.py's autouse
+# redirect_app_dirs already patches both platform_paths.config_dir and
+# settings.config_dir (the name Settings.load()/save() resolve through)
+# to the same fake directory, so the `pp.config_dir()` calls sprinkled
+# through this module's tests agree with what Settings itself reads/
+# writes without this module repeating the redirect itself. The two tests
+# below that still monkeypatch settings_mod.config_dir directly (rather
+# than relying on that fixture) need something the fixture does not give
+# them: an exact, literal directory they can also write to/read from by
+# hand (`tmp_path / settings_mod.FILENAME`) -- the fixture's fake
+# directory is a subpath of tmp_path, not tmp_path itself, so those two
+# keep their own override.
 def test_load_with_no_file_returns_defaults():
     s = Settings.load()
     assert s.accent == DEFAULT_ACCENT

@@ -1,7 +1,8 @@
 """Suite-wide safety nets.
 
-Three of them, all autouse, all there for the same reason: the merge gate
-must be deterministic and must never hang or touch the network.
+Five of them, all autouse, all there for the same reason: the merge gate
+must be deterministic and must never hang, touch the network, or touch
+the user's real data.
 
 The first two guards' bug was real. tests/test_dashboard.py's
 launch-success test did not stub `stream_progress`, so Dashboard's
@@ -24,6 +25,19 @@ module's ~20 launch tests stubbed message boxes; the other ~17 relied on
 the success path never failing. `no_unstubbed_dialogs` below turns the
 NEXT such gap into an immediate, named assertion failure instead of a
 repeat of that hang.
+
+The fourth and fifth guards exist because of a fourth real bug, found
+during Task 5's own triage rather than caused by it: tests/test_dashboard.py's
+`_seed_job` helper drives a real `Fleet.launch()` -> `Fleet._save()` ->
+`state_dir()/"fleet.json"`, and that module's per-test isolation happened
+to cover every OTHER call site but not that one reliably enough -- a
+suite run left a synthetic `alpha.blend` job sitting in the user's REAL
+`%APPDATA%\\BlendFleet\\state\\fleet.json`, overwriting the only record of
+which Kaggle kernels this app had actually started (real jobs, still
+billing someone's GPU quota, become uncancellable and uncollectable from
+the app the moment that file no longer names them). `redirect_app_dirs`
+fixes the cause; `guard_real_app_dir_untouched` fails the whole session,
+loudly, if any test -- this one or a future one -- ever does it again.
 """
 from __future__ import annotations
 
@@ -33,6 +47,13 @@ import time
 
 import pytest
 from PySide6.QtWidgets import QMessageBox
+
+import blendfleet.accounts as accounts_mod
+import blendfleet.fleet as fleet_mod
+import blendfleet.instance_state as instance_state_mod
+import blendfleet.platform_paths as platform_paths_mod
+import blendfleet.settings as settings_mod
+import blendfleet.ui.bridge as bridge_mod
 
 
 class NetworkAccessInTestError(RuntimeError):
@@ -191,3 +212,112 @@ def stub_message_boxes(monkeypatch):
     monkeypatch.setattr(QMessageBox, "question",
                         lambda *a, **kw: QMessageBox.StandardButton.Yes)
     return calls
+
+
+# ---------------------------------------------------------------------------
+# state_dir()/config_dir() isolation. See this module's docstring for the
+# fleet.json corruption that made this necessary.
+# ---------------------------------------------------------------------------
+
+# tests/test_platform_paths.py exercises _base()/state_dir()/config_dir()
+# themselves (via sys.platform and the real APPDATA/XDG_CONFIG_HOME/HOME
+# env vars) -- pre-redirecting those functions here, before that module's
+# own test body runs, would make it assert against THIS fixture's fake
+# path instead of the production _base() logic it exists to cover.
+_EXEMPT_MODULES = frozenset({"test_platform_paths"})
+
+
+@pytest.fixture(autouse=True)
+def redirect_app_dirs(request, tmp_path, monkeypatch):
+    """Force every state_dir()/config_dir() call in the process to resolve
+    under this test's own tmp_path, never under the user's real
+    %APPDATA%\\BlendFleet (or ~/.config/blendfleet).
+
+    Patching blendfleet.platform_paths.state_dir/config_dir alone is not
+    enough: `from blendfleet.platform_paths import state_dir` -- used by
+    fleet.py, instance_state.py and ui/bridge.py, same for config_dir in
+    accounts.py and settings.py -- binds a name in THAT module's own
+    namespace at import time. Patching platform_paths.state_dir never
+    touches fleet.state_dir once fleet.py has already imported it, so
+    every one of those already-bound aliases has to be patched too, or
+    exactly the gap that once let a test overwrite the user's real
+    fleet.json reopens the moment a new call site is added.
+    """
+    if request.module.__name__ in _EXEMPT_MODULES:
+        yield
+        return
+
+    fake_config = tmp_path / "blendfleet-appdata"
+    fake_state = fake_config / "state"
+
+    def fake_config_dir():
+        fake_config.mkdir(parents=True, exist_ok=True)
+        return fake_config
+
+    def fake_state_dir():
+        fake_state.mkdir(parents=True, exist_ok=True)
+        return fake_state
+
+    for module, name, fake in (
+        (platform_paths_mod, "config_dir", fake_config_dir),
+        (platform_paths_mod, "state_dir", fake_state_dir),
+        (accounts_mod, "config_dir", fake_config_dir),
+        (settings_mod, "config_dir", fake_config_dir),
+        (fleet_mod, "state_dir", fake_state_dir),
+        (instance_state_mod, "state_dir", fake_state_dir),
+        (bridge_mod, "state_dir", fake_state_dir),
+    ):
+        monkeypatch.setattr(module, name, fake)
+
+    yield
+
+
+def _snapshot_real_app_dir():
+    """(path -> (size, mtime_ns)) for every file already on disk under the
+    genuine, UNPATCHED BlendFleet base directory.
+
+    config_dir() IS that base -- state_dir() and cache_dir() both nest
+    under it -- so one recursive walk from here already covers every real
+    call site redirect_app_dirs above patches. Must only ever be called
+    outside any test's monkeypatch (session fixture setup/teardown, never
+    mid-test), or it would snapshot the redirected tmp path instead of the
+    real one and this guard would pass no matter what a test did.
+    """
+    base = platform_paths_mod.config_dir()
+    snapshot = {}
+    for path in base.rglob("*"):
+        if path.is_file():
+            stat = path.stat()
+            snapshot[str(path)] = (stat.st_size, stat.st_mtime_ns)
+    return snapshot
+
+
+@pytest.fixture(scope="session", autouse=True)
+def guard_real_app_dir_untouched():
+    """Fail the whole session, loudly, if any test -- this one or a future
+    one that forgets redirect_app_dirs applies to it -- wrote to the real
+    BlendFleet config/state directory.
+
+    Session-scoped so its setup runs before the first test's function-
+    scoped fixtures (redirect_app_dirs included) and its teardown runs
+    after the last test's have already been undone -- both snapshots see
+    the real, unpatched directory, never a redirected tmp path.
+    """
+    before = _snapshot_real_app_dir()
+    yield
+    after = _snapshot_real_app_dir()
+    assert after == before, (
+        "a test just wrote to the REAL BlendFleet config/state directory "
+        f"({platform_paths_mod.config_dir()}) instead of a redirected "
+        "tmp path -- this is the exact defect that once overwrote the "
+        "user's only record of which Kaggle kernels were actually "
+        "running with a synthetic test job. Find whichever test "
+        "constructed a Fleet/Settings/AccountStore/InstanceStore/Backend "
+        "without redirect_app_dirs in effect for it (e.g. via a session- "
+        "or module-scoped fixture that runs before autouse function-"
+        "scoped fixtures do) and make it go through the normal per-test "
+        "tmp_path instead. Do NOT clear this failure by deleting or "
+        "overwriting the real files it points at -- back them up first, "
+        "the same way the previous occurrence was recovered (see "
+        ".superpowers/sdd/2026-08-12-scene-library-and-multi-scene/"
+        "state-isolation-report.md).")

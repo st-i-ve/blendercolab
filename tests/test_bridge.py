@@ -527,11 +527,14 @@ class PreviewClient(FakeClient):
         return path
 
 
-def _preview_backend(tmp_path, monkeypatch, frames_by_label):
-    """A Backend with a saved job, whose fleet hands out PreviewClients."""
-    import blendfleet.ui.bridge as bridge_mod
-    monkeypatch.setattr(bridge_mod, "state_dir", lambda: tmp_path / "state")
+def _preview_backend(tmp_path, frames_by_label):
+    """A Backend with a saved job, whose fleet hands out PreviewClients.
 
+    Preview caching (bridge.py's only state_dir() call site) just needs a
+    writable, per-test directory -- conftest.py's autouse redirect_app_dirs
+    already gives bridge_mod.state_dir() exactly that, so this no longer
+    needs its own override.
+    """
     store = AccountStore([
         Account(label=label, token=f"KGAT_{i:032x}", username=f"user_{label}",
                 verified=True)
@@ -558,8 +561,7 @@ def _preview_backend(tmp_path, monkeypatch, frames_by_label):
 def test_a_preview_fetches_one_file_from_the_account_that_rendered_it(
         qapp, tmp_path, monkeypatch):
     PreviewClient.calls = []
-    backend = _preview_backend(tmp_path, monkeypatch,
-                               {"a": [1, 3, 5], "b": [2, 4, 6]})
+    backend = _preview_backend(tmp_path, {"a": [1, 3, 5], "b": [2, 4, 6]})
     seen = []
     backend.framePreview.connect(lambda j: seen.append(json.loads(j)))
 
@@ -579,8 +581,7 @@ def test_a_preview_fetches_one_file_from_the_account_that_rendered_it(
 def test_a_preview_never_downloads_the_whole_job(qapp, tmp_path, monkeypatch):
     """The point of the feature: one file, not everyone's output."""
     PreviewClient.calls = []
-    backend = _preview_backend(tmp_path, monkeypatch,
-                               {"a": [1, 3, 5], "b": [2, 4, 6]})
+    backend = _preview_backend(tmp_path, {"a": [1, 3, 5], "b": [2, 4, 6]})
     backend.previewFrame(1)
     _settle(backend)
     _LIVE_BACKENDS.remove(backend)
@@ -592,7 +593,7 @@ def test_a_preview_never_downloads_the_whole_job(qapp, tmp_path, monkeypatch):
 def test_a_second_look_at_the_same_frame_is_served_from_cache(
         qapp, tmp_path, monkeypatch):
     PreviewClient.calls = []
-    backend = _preview_backend(tmp_path, monkeypatch, {"a": [1, 2]})
+    backend = _preview_backend(tmp_path, {"a": [1, 2]})
     seen = []
     backend.framePreview.connect(lambda j: seen.append(json.loads(j)))
 
@@ -608,7 +609,7 @@ def test_a_second_look_at_the_same_frame_is_served_from_cache(
 
 
 def test_a_frame_nobody_was_assigned_says_so(qapp, tmp_path, monkeypatch):
-    backend = _preview_backend(tmp_path, monkeypatch, {"a": [1, 2]})
+    backend = _preview_backend(tmp_path, {"a": [1, 2]})
     notes = []
     backend.notification.connect(lambda m, t: notes.append(m))
     backend.previewFrame(99)

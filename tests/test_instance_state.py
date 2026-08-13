@@ -1,17 +1,17 @@
 import json
 
-import pytest
-
 import blendfleet.platform_paths as pp
 from blendfleet.instance_state import (DEFAULT_STALE_AFTER_SECONDS,
                                        FILENAME, GpuSnapshot,
                                        InstanceSnapshot, InstanceStore)
 
 
-@pytest.fixture(autouse=True)
-def tmp_state(tmp_path, monkeypatch):
-    monkeypatch.setattr(pp.sys, "platform", "linux")
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+# No per-module state_dir redirect needed here: conftest.py's autouse
+# redirect_app_dirs already patches both platform_paths.state_dir/
+# config_dir and instance_state.state_dir (the name this module's own
+# `pp.state_dir()`/`pp.config_dir()` calls below resolve through) to the
+# same fake directory, so InstanceStore.save()/load() and the assertions
+# below agree without this module repeating the redirect itself.
 
 
 def make_snapshot(username="stive", gpus=None, observed_at=1000.0):
