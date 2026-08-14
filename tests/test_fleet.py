@@ -1410,3 +1410,99 @@ def test_start_workers_refuses_an_account_busy_in_an_older_job(blend, tmp_path):
 
     st = f.start_workers(["a1"], RenderSettings(1920, 1080, 128), "u/scene")
     assert [w.label for w in st.workers] == ["a1"]
+
+
+# ---------------------------------------------------------------------------
+# A 403 from ListDatasetFiles is a PROPAGATION DELAY, not a failed upload.
+#
+# Reported from the field: the first Upload of a scene reported
+#
+#     Uploading the scene failed: could not list the files in dataset
+#     'sudaouserwithani/stranger-blend': 403 Client Error: Forbidden
+#
+# and pressing Upload a second time succeeded with no other change. That is
+# the signature of Kaggle accepting the READER grant but not yet exposing
+# the dataset's FILE LISTING to the friend account -- the same delay the
+# reachability check one call earlier already tolerates. Only
+# StaleDatasetError was caught around the per-friend verification, so the
+# KaggleError carrying that 403 escaped and failed the whole upload.
+# ---------------------------------------------------------------------------
+
+class ForbiddenListingClient(FakeClient):
+    """A friend whose READER grant has landed but whose file listing Kaggle
+    still answers 403 for -- exactly what KaggleClient.list_dataset_files
+    turns into a KaggleError."""
+    def dataset_file_size(self, slug, filename):
+        raise KaggleError(
+            f"could not list the files in dataset {slug!r}: 403 Client "
+            "Error: Forbidden for url: https://api.kaggle.com/v1/"
+            "datasets.DatasetApiService/ListDatasetFiles.")
+
+
+def test_a_friends_403_listing_does_not_fail_an_upload_that_needs_only_the_owner(
+        blend, tmp_path):
+    """The reported bug. The bytes are on Kaggle and the owner has verified
+    them; a friend whose listing has not caught up is not a failed
+    upload."""
+    accts = accounts(3)
+
+    def factory(tok):
+        if tok == accts[1].token:
+            return ForbiddenListingClient(tok)
+        return FakeClient(tok)
+
+    f = Fleet(accts, factory, tmp_path / "w")
+
+    slug = f.prepare_dataset(blend, required=[accts[0]])   # must not raise
+
+    assert slug.endswith("-blend")
+    assert "a1" in f.unshared_accounts, (
+        "an upload that could not verify a friend's copy must name that "
+        "friend, or a later render on it fails for no visible reason")
+    assert "403" in f.unshared_accounts["a1"]
+
+
+def test_a_403_still_blocks_an_account_that_is_about_to_render(blend, tmp_path):
+    """The other half of the split, unchanged: an account inside the launch
+    subset that cannot see the scene must still stop the launch, because
+    its kernel is about to be pushed and would burn quota failing."""
+    accts = accounts(3)
+
+    def factory(tok):
+        if tok == accts[1].token:
+            return ForbiddenListingClient(tok)
+        return FakeClient(tok)
+
+    f = Fleet(accts, factory, tmp_path / "w")
+
+    with pytest.raises(KaggleError, match="403"):
+        f.prepare_dataset(blend, required=[accts[0], accts[1]])
+
+
+class RevokedListingClient(FakeClient):
+    """RevokedTokenError SUBCLASSES KaggleError, so the new tolerant branch
+    must not quietly relabel a dead token as a timing problem."""
+    def dataset_file_size(self, slug, filename):
+        raise RevokedTokenError(
+            "this account's Kaggle token has been revoked. Go to "
+            "kaggle.com -> Settings -> API -> Generate New Token.")
+
+
+def test_a_revoked_token_is_never_reported_as_a_propagation_delay(blend,
+                                                                  tmp_path):
+    """Telling someone to wait for a grant that will never arrive is worse
+    than telling them nothing."""
+    accts = accounts(3)
+
+    def factory(tok):
+        if tok == accts[1].token:
+            return RevokedListingClient(tok)
+        return FakeClient(tok)
+
+    f = Fleet(accts, factory, tmp_path / "w")
+    f.prepare_dataset(blend, required=[accts[0]])
+
+    reason = f.unshared_accounts["a1"]
+    assert "revoked" in reason
+    assert "has not made" not in reason, (
+        "a revoked token was described as a propagation delay")

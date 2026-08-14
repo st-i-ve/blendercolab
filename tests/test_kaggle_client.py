@@ -1372,3 +1372,97 @@ def test_a_bad_token_still_reports_ITS_error_not_the_owns_nothing_one(monkeypatc
         KaggleClient(TOKEN, label="james").whoami()
     assert "owns nothing" not in str(excinfo.value)
     assert "no notebooks or datasets" not in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# Previewing ONE frame. Reported from the field: clicking a frame said
+# "Frame 1 is not on Kaggle yet" even though the render had finished and
+# Download collected the frames fine. fetch_one_output returned None for
+# three different reasons and the caller could not tell them apart.
+# ---------------------------------------------------------------------------
+
+def test_fetch_one_output_keeps_looking_past_a_path_escaping_name(tmp_path):
+    """A single refused file_name used to `return None`, abandoning the
+    whole search -- so one odd entry hid every later match and the frame
+    read as "not rendered yet". fetch_output_with_progress already skips
+    rather than aborts; this now matches it."""
+    class FakeSdk:
+        class kernels:
+            class kernels_api_client:
+                @staticmethod
+                def list_kernel_session_output(request):
+                    return FakeListOutputResponse([
+                        FakeOutputFile("https://x/evil.png", "../../f_0001.png"),
+                        FakeOutputFile("https://x/good.png", "frames/f_0001.png"),
+                    ])
+
+    c = KaggleClient(TOKEN, api_factory=lambda t: FakeApi(),
+                     sdk_factory=lambda t: FakeSdk())
+    transport = FakeGetTransport({"https://x/good.png": b"GOOD",
+                                  "https://x/evil.png": b"EVIL"})
+
+    out = tmp_path / "out"
+    got = c.fetch_one_output("x/y", "f_0001.png", out, transport=transport)
+
+    assert got is not None, (
+        "the escaping entry must be skipped, not end the search")
+    assert got.read_bytes() == b"GOOD"
+    assert transport.urls == ["https://x/good.png"]
+    assert list(tmp_path.rglob("evil.png")) == []
+
+
+def test_fetch_one_output_finds_a_frame_in_a_subdirectory(tmp_path):
+    """The notebook writes loose frames to /kaggle/working/frames/, so the
+    listing carries 'frames/f_0001.png' while the caller only knows the
+    bare name."""
+    class FakeSdk:
+        class kernels:
+            class kernels_api_client:
+                @staticmethod
+                def list_kernel_session_output(request):
+                    return FakeListOutputResponse([
+                        FakeOutputFile("https://x/z", "kernel-name.zip"),
+                        FakeOutputFile("https://x/f", "frames/f_0007.png"),
+                    ])
+
+    c = KaggleClient(TOKEN, api_factory=lambda t: FakeApi(),
+                     sdk_factory=lambda t: FakeSdk())
+    transport = FakeGetTransport({"https://x/f": b"FRAME", "https://x/z": b"ZIP"})
+
+    got = c.fetch_one_output("x/y", "f_0007.png", tmp_path / "out",
+                             transport=transport)
+
+    assert got is not None and got.read_bytes() == b"FRAME"
+
+
+def test_a_missing_frame_records_what_kaggle_actually_listed(tmp_path,
+                                                             monkeypatch):
+    """"Not rendered yet" and "rendered, but this listing has no loose
+    files" look identical to the user. Only the log can tell them apart,
+    so it must carry the listing."""
+    from blendfleet import crash_log
+
+    written = []
+    monkeypatch.setattr(crash_log, "record",
+                        lambda message, **kw: written.append(message))
+
+    class FakeSdk:
+        class kernels:
+            class kernels_api_client:
+                @staticmethod
+                def list_kernel_session_output(request):
+                    return FakeListOutputResponse([
+                        FakeOutputFile("https://x/z", "kernel-name.zip")])
+
+    c = KaggleClient(TOKEN, api_factory=lambda t: FakeApi(),
+                     sdk_factory=lambda t: FakeSdk())
+
+    got = c.fetch_one_output("x/y", "f_0001.png", tmp_path / "out",
+                             transport=FakeGetTransport({}))
+
+    assert got is None
+    assert written, "a missing frame recorded nothing to diagnose it with"
+    assert "kernel-name.zip" in written[0], (
+        "the log must name what Kaggle DID list, or it cannot distinguish "
+        "'not rendered yet' from 'loose frames are not listed'")
+    assert "f_0001.png" in written[0]

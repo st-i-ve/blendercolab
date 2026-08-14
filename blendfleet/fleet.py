@@ -28,8 +28,8 @@ from blendfleet.accounts import Account
 from blendfleet.assignment import assign_frames
 from blendfleet.dataset_sync import sync_blend
 from blendfleet.kaggle_client import (
-    ACTIVE_STATES, PENDING_STATES, TERMINAL_STATES, RevokedTokenError,
-    revoked_token_message)
+    ACTIVE_STATES, PENDING_STATES, TERMINAL_STATES, KaggleError,
+    RevokedTokenError, revoked_token_message)
 from blendfleet.notebook_builder import RenderSettings, build, build_probe
 from blendfleet.platform_paths import state_dir
 
@@ -1164,6 +1164,32 @@ class Fleet:
                     if account.label in required_labels:
                         raise
                     self.unshared_accounts[account.label] = str(e)
+                except RevokedTokenError as e:
+                    # Caught BEFORE KaggleError below, which it subclasses.
+                    # A revoked token is a definite, actionable fact, not a
+                    # timing problem -- recording it with the propagation
+                    # wording would tell the user to wait for something
+                    # that will never happen. Its own message already says
+                    # what to do.
+                    if account.label in required_labels:
+                        raise
+                    self.unshared_accounts[account.label] = str(e)
+                except KaggleError as e:
+                    # A 403 from ListDatasetFiles here is the SAME
+                    # propagation delay the reachability check above
+                    # already tolerates, arriving one call later: Kaggle
+                    # has accepted the READER grant but has not yet made
+                    # the file listing visible to this account. Only
+                    # StaleDatasetError was caught before, so that 403
+                    # escaped and failed the whole upload -- which is
+                    # exactly why pressing Upload a second time "worked",
+                    # the grant having propagated in between. Same
+                    # required/optional split as every other check here.
+                    if account.label in required_labels:
+                        raise
+                    self.unshared_accounts[account.label] = (
+                        "granted READER access, but Kaggle has not made the "
+                        f"dataset's file listing visible yet ({e})")
         stage("ready", dataset_slug)
         return dataset_slug
 

@@ -508,11 +508,13 @@ QLabel[tertiary="true"] {{
     color: {t.ink_3};
 }}
 
-/* Qt's default link blue is the one colour in the app that belongs to
-nobody -- links take the accent's text variant like every other emphasis. */
-QLabel {{
-    qproperty-linkColor: {accent.ink()};
-}}
+/* No qproperty-linkColor here. QLabel has no `linkColor` property -- link
+colour is a QPalette role (QPalette::Link), not a widget property -- so Qt
+rejected the rule and warned "QLabel(...) does not have a property named
+linkColor" once per label per polish. It never coloured anything; it only
+produced noise, and once the diagnostic log existed (see crash_log.py) it
+was that log's single largest source of it. Removed rather than ported to
+the palette because nothing in this UI renders a link today. */
 
 /* ---------------- surfaces ---------------- */
 #card, #panel {{

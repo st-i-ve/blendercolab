@@ -570,7 +570,10 @@ class Backend(QObject):
                 self.notification.emit(
                     f"Frame {frame} is not on Kaggle yet — {owner.username} "
                     "has not finished it, or the session's output has "
-                    "already expired.", "idle")
+                    "already expired. If the render has finished, use "
+                    "Download to collect the frames instead; the diagnostic "
+                    "log (Settings → Diagnostics) records exactly which "
+                    "files Kaggle listed for this session.", "idle")
                 return
             self.framePreview.emit(json.dumps(
                 {"frame": frame, "path": Path(path).as_uri(),
@@ -795,6 +798,20 @@ class Backend(QObject):
         def work():
             return fleet.prepare_dataset(
                 blend,
+                # Only the OWNER is required for a standalone upload.
+                #
+                # Omitting `required` means "every configured account is
+                # mandatory", which is right for a launch -- an account
+                # about to have a kernel pushed to it must be able to see
+                # the scene, or it burns quota failing. But an upload
+                # starts nothing and costs no quota, so a friend whose
+                # READER grant Kaggle has not finished propagating is not
+                # a failed upload: the bytes are on Kaggle, and the grant
+                # lands moments later. Treating it as fatal is what made
+                # the first Upload report failure and a second, identical
+                # Upload succeed. Anything not shared yet comes back on
+                # fleet.unshared_accounts and is reported below.
+                required=[accounts[0]],
                 # uploader.UploadProgress calls them `uploaded` and
                 # `total`. Reading sent_bytes/total_bytes through getattr
                 # defaults meant every tick reported 0 of 0 and the bar
@@ -820,7 +837,22 @@ class Backend(QObject):
             # __init__ for why this is the only moment that is possible.
             self._unshared_accounts = dict(fleet.unshared_accounts)
             self.logLine.emit(f"dataset ready: {slug}", "active")
-            self.notification.emit(f"Uploaded {blend.name} to {slug}", "active")
+            # Say so when the upload landed but the sharing has not caught
+            # up. Making a propagation delay non-fatal (see `required`
+            # above) must not also make it invisible -- the user would
+            # start a render on an account that still cannot see the
+            # scene, and only find out when it failed.
+            pending = sorted(fleet.unshared_accounts)
+            if pending:
+                self.notification.emit(
+                    f"Uploaded {blend.name} to {slug}, but Kaggle has not "
+                    f"finished sharing it with {', '.join(pending)} yet. "
+                    "The upload itself is done and does not need repeating; "
+                    "wait a moment and press Upload again to re-check "
+                    "before rendering on those accounts.", "idle")
+            else:
+                self.notification.emit(
+                    f"Uploaded {blend.name} to {slug}", "active")
             self._emit_state()
 
         self._start("dataset", work, "Uploading the scene", ok)

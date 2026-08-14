@@ -452,7 +452,7 @@ def test_upload_progress_carries_real_byte_counts(qapp, tmp_path):
 
     class ProgressFleet(Fleet):
         def prepare_dataset(self, blend, on_progress=None, *, clients=None,
-                            usernames=None, on_stage=None):
+                            usernames=None, on_stage=None, required=None):
             on_stage("uploading", "me/scene-blend")
             on_progress(UploadProgress(uploaded=32, total=64,
                                        rate_bps=1024.0, retries=0,
@@ -486,7 +486,7 @@ def test_every_upload_stage_is_reported_not_just_the_bytes(qapp, tmp_path):
 
     class StagedFleet(Fleet):
         def prepare_dataset(self, blend, on_progress=None, *, clients=None,
-                            usernames=None, on_stage=None):
+                            usernames=None, on_stage=None, required=None):
             for key in ("uploading", "verifying", "sharing",
                         "verifying-access", "ready"):
                 on_stage(key, "detail")
@@ -939,7 +939,7 @@ def test_unshared_accounts_reach_the_payload_as_last_upload_info(
 
     class UnshareableFleet(Fleet):
         def prepare_dataset(self, blend, on_progress=None, *, clients=None,
-                            usernames=None, on_stage=None):
+                            usernames=None, on_stage=None, required=None):
             self.unshared_accounts = {
                 "friend_1": "could not be reached to share the scene with"}
             return "me/scene-blend"
@@ -2156,3 +2156,88 @@ def test_a_worker_that_stops_in_time_is_never_orphaned(qapp, tmp_path):
     backend._start("probe", lambda: "done", "probing", lambda _r: None)
     backend.stop()
     assert bridge_mod.orphaned_workers() == []
+
+
+# ---------------- a standalone Upload requires only the OWNER -------------
+#
+# Field report: the first Upload of a scene failed with a 403 from Kaggle's
+# ListDatasetFiles for a friend account, and pressing Upload again -- with
+# nothing else changed -- succeeded. Omitting `required` makes EVERY
+# configured account mandatory, so a friend whose READER grant had not
+# finished propagating failed the whole upload. An upload starts nothing
+# and costs no quota, so only the owner is genuinely required here; the
+# strict, all-accounts treatment belongs to launch(), which is about to
+# push kernels.
+
+def test_a_standalone_upload_requires_only_the_owner(qapp, tmp_path):
+    backend = make_backend(tmp_path, n=3)
+    blend = tmp_path / "scene.blend"
+    blend.write_bytes(b"x" * 8)
+    backend.blend = blend
+    captured = {}
+
+    class RecordingFleet(Fleet):
+        def prepare_dataset(self, blend, on_progress=None, *, clients=None,
+                            usernames=None, on_stage=None, required=None):
+            captured["required"] = required
+            return "me/scene-blend"
+
+    backend.fleet_factory = lambda accounts: RecordingFleet(
+        accounts, lambda t: FakeClient(t), tmp_path / "w")
+    backend.syncDataset()
+    _settle(backend)
+
+    assert captured["required"] is not None, (
+        "None means 'every account is mandatory' -- which is what made a "
+        "friend's propagation delay fail the whole upload")
+    assert [a.label for a in captured["required"]] == ["acct0"]
+
+
+def test_an_upload_that_could_not_share_says_so(qapp, tmp_path):
+    """Making a propagation delay non-fatal must not make it invisible --
+    the user would render on an account that cannot see the scene."""
+    backend = make_backend(tmp_path, n=2)
+    blend = tmp_path / "scene.blend"
+    blend.write_bytes(b"x" * 8)
+    backend.blend = blend
+    notes = []
+    backend.notification.connect(lambda m, t: notes.append(m))
+
+    class PartlySharedFleet(Fleet):
+        def prepare_dataset(self, blend, on_progress=None, *, clients=None,
+                            usernames=None, on_stage=None, required=None):
+            self.unshared_accounts = {"acct1": "grant has not propagated"}
+            return "me/scene-blend"
+
+    backend.fleet_factory = lambda accounts: PartlySharedFleet(
+        accounts, lambda t: FakeClient(t), tmp_path / "w")
+    backend.syncDataset()
+    _settle(backend)
+
+    assert notes, "the upload said nothing at all"
+    message = notes[-1]
+    assert "acct1" in message, "the account left unshared must be named"
+    assert "does not need repeating" in message, (
+        "the user must be told the upload itself succeeded, or they will "
+        "re-upload the whole .blend for nothing")
+
+
+def test_a_fully_shared_upload_still_reports_plain_success(qapp, tmp_path):
+    backend = make_backend(tmp_path, n=2)
+    blend = tmp_path / "scene.blend"
+    blend.write_bytes(b"x" * 8)
+    backend.blend = blend
+    notes = []
+    backend.notification.connect(lambda m, t: notes.append((m, t)))
+
+    class CleanFleet(Fleet):
+        def prepare_dataset(self, blend, on_progress=None, *, clients=None,
+                            usernames=None, on_stage=None, required=None):
+            return "me/scene-blend"
+
+    backend.fleet_factory = lambda accounts: CleanFleet(
+        accounts, lambda t: FakeClient(t), tmp_path / "w")
+    backend.syncDataset()
+    _settle(backend)
+
+    assert notes[-1] == ("Uploaded scene.blend to me/scene-blend", "active")

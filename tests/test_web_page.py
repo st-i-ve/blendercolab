@@ -1331,3 +1331,96 @@ def test_clicking_delete_asks_for_confirmation_first(loaded_page):
     assert "second scene" in got["confirmMessage"], (
         "the confirmation must name the scene actually clicked, not "
         f"whichever scene happens to be first: {got['confirmMessage']!r}")
+
+
+# ---------------------------------------------------------------------------
+# Long messages must WRAP, not get cut off.
+#
+# Reported from the field with a screenshot: the notification panel showed
+#
+#     Uploading the scene failed: could not list the files in datase|
+#     'sudaouserwithani/stranger-blend': 403 Client Error: Forbid|
+#
+# with the right-hand side of every line sliced off. The cause is a flex
+# item's default min-width:auto -- the text column refused to shrink below
+# its longest unbreakable word, and our error messages quote Kaggle URLs
+# like api.kaggle.com/v1/datasets.DatasetApiService/ListDatasetFiles. That
+# one token pushed the column wider than the panel, which is
+# overflow:hidden.
+#
+# Measured in the real Chromium layout rather than asserted against the CSS
+# text, because the property that matters is whether anything overflows.
+# ---------------------------------------------------------------------------
+
+_CLIPPING_MESSAGE = (
+    "Uploading the scene failed: could not list the files in dataset "
+    "'sudaouserwithani/stranger-blend': 403 Client Error: Forbidden for "
+    "url: https://api.kaggle.com/v1/datasets.DatasetApiService/"
+    "ListDatasetFiles. The most likely cause is that the dataset has since "
+    "been deleted or renamed on kaggle.com.")
+
+
+def _js_string(text):
+    """A JS string literal. repr() is not one: the message itself quotes a
+    dataset slug, and swapping quote characters breaks the literal."""
+    import json
+    return json.dumps(text)
+
+
+def _overflow_of(page, js):
+    out = {}
+    loop = QEventLoop()
+
+    def done(result):
+        out["v"] = result or ""
+        loop.quit()
+
+    page.runJavaScript(
+        "(() => { try { return String(" + js + "); }"
+        " catch (e) { return 'THREW ' + e; } })()", done)
+    QTimer.singleShot(5000, loop.quit)
+    loop.exec()
+    assert "v" in out, "the page never answered runJavaScript"
+    assert not out["v"].startswith("THREW"), out["v"]
+    return out["v"]
+
+
+def test_a_long_notification_does_not_overflow_its_panel(loaded_page):
+    page, _ = loaded_page
+    js = (
+        "(() => {"
+        "  notify(" + _js_string(_CLIPPING_MESSAGE) + ", 'offline');"
+        "  const panel = document.getElementById('notif-panel');"
+        "  panel.classList.add('show');"
+        "  const item = document.querySelector('#notif-list .notif-item');"
+        "  const msg = item.querySelector('.ni-m');"
+        "  const over = msg.getBoundingClientRect().right"
+        "               - panel.getBoundingClientRect().right;"
+        "  panel.classList.remove('show');"
+        "  return Math.round(over);"
+        "})()")
+    overflow = int(_overflow_of(page, js))
+    assert overflow <= 0, (
+        f"the message runs {overflow}px past the right edge of the "
+        "notification panel, which is overflow:hidden -- so that much of "
+        "every long error is invisible to the user")
+
+
+def test_a_long_notification_wraps_to_several_lines(loaded_page):
+    """The other half: not overflowing could also be achieved by clipping
+    the text to one line, which would be just as unreadable."""
+    page, _ = loaded_page
+    js = (
+        "(() => {"
+        "  notify(" + _js_string(_CLIPPING_MESSAGE) + ", 'offline');"
+        "  const panel = document.getElementById('notif-panel');"
+        "  panel.classList.add('show');"
+        "  const msg = document.querySelector('#notif-list .ni-m');"
+        "  const lines = msg.getBoundingClientRect().height"
+        "                / parseFloat(getComputedStyle(msg).lineHeight);"
+        "  panel.classList.remove('show');"
+        "  return Math.round(lines);"
+        "})()")
+    assert int(_overflow_of(page, js)) >= 5, (
+        "a 250-character message that fits in fewer than five lines of a "
+        "330px panel is being truncated, not wrapped")

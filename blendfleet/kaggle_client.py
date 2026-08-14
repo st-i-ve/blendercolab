@@ -18,6 +18,7 @@ from typing import Callable
 import requests
 from requests.exceptions import HTTPError
 
+from blendfleet import crash_log
 from blendfleet.downloader import Transport, fetch_files
 from blendfleet.notebook_builder import ARCHIVE_SUFFIX
 from blendfleet.uploader import UploadError, upload_file
@@ -1068,6 +1069,7 @@ class KaggleClient:
         sdk = self._sdk_factory(self.token)
 
         page_token = ""
+        seen: list[str] = []
         while True:
             request = ApiListKernelSessionOutputRequest()
             request.user_name = owner
@@ -1077,17 +1079,38 @@ class KaggleClient:
             response = sdk.kernels.kernels_api_client.list_kernel_session_output(
                 request)
             for f in (response.files or []):
+                seen.append(f.file_name)
                 if Path(f.file_name).name != filename:
                     continue
                 safe_dest = _safe_dest(dest, f.file_name)
                 if safe_dest is None:
-                    return None     # see _safe_dest: refuses a path escape
+                    # `continue`, not `return None`. A single refused
+                    # file_name used to abandon the whole search, so one
+                    # odd entry made every later match unreachable and the
+                    # caller could not tell "Kaggle refused the name" from
+                    # "the frame is not rendered yet".
+                    # fetch_output_with_progress already skips rather than
+                    # aborts for exactly this reason.
+                    continue
                 fetch_files([(f.url, safe_dest)],
                             transport or _RequestsGetTransport())
                 return safe_dest
             page_token = getattr(response, "next_page_token", "") or ""
             if not page_token:
-                return None
+                break
+
+        # Nothing matched. "Not rendered yet" and "rendered, but this
+        # listing does not expose loose files" look identical to the
+        # caller, and the second is a real possibility: the notebook
+        # writes frames into /kaggle/working/frames/ and also zips them,
+        # so a listing that only carried the top-level archive would show
+        # exactly this symptom while Collect kept working. Record what
+        # Kaggle actually returned so one click settles which it is.
+        crash_log.record(
+            f"fetch_one_output({slug!r}, {filename!r}) found no match. "
+            f"Kaggle listed {len(seen)} output file(s): "
+            f"{seen[:12]}{' ...' if len(seen) > 12 else ''}")
+        return None
 
     def fetch_log_tail(self, slug: str, dest: Path, max_lines: int = 200) -> str:
         """The last `max_lines` lines of `slug`'s kernel log.

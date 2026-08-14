@@ -755,8 +755,10 @@ h2.sec .meta{font-family:var(--mono);font-size:11px;font-weight:400;color:var(--
 .toast .td{width:9px;height:9px;border-radius:50%;background:var(--accent);margin-top:5px;flex:none}
 .toast.ok .td{background:var(--active)}
 .toast.err .td{background:var(--offline)}
+/* Same clipping as .notif-item above -- the same long messages come here. */
+.toast>div{min-width:0}
 .toast .tt{font-size:12.5px;font-weight:700}
-.toast .tm{font-size:11.5px;color:var(--ink-2);margin-top:1px}
+.toast .tm{font-size:11.5px;color:var(--ink-2);margin-top:1px;overflow-wrap:anywhere}
 .toast .tx{margin-left:auto;background:none;border:none;color:var(--ink-3);font-size:15px;line-height:1;padding:2px;cursor:pointer}
 @keyframes toastIn{from{transform:translateY(8px);opacity:0}to{transform:none;opacity:1}}
 
@@ -771,8 +773,17 @@ h2.sec .meta{font-family:var(--mono);font-size:11px;font-weight:400;color:var(--
 .notif-item .ni-dot{width:7px;height:7px;border-radius:50%;background:var(--accent);margin-top:6px;flex:none}
 .notif-item.ok .ni-dot{background:var(--active)}
 .notif-item.err .ni-dot{background:var(--offline)}
+/* min-width:0 on the text column, overflow-wrap on the text itself. A flex
+   item defaults to min-width:auto, so it refuses to shrink below its
+   longest unbreakable word -- and our error messages quote Kaggle URLs
+   like api.kaggle.com/v1/datasets.DatasetApiService/ListDatasetFiles.
+   That one token pushed the column wider than the panel, which is
+   overflow:hidden, so the right-hand half of every long message was
+   simply cut off. Both properties are needed: the first lets the column
+   shrink, the second lets the URL break. */
+.notif-item>div{min-width:0}
 .notif-item .ni-t{font-size:12px;font-weight:700}
-.notif-item .ni-m{font-size:11.5px;color:var(--ink-2)}
+.notif-item .ni-m{font-size:11.5px;color:var(--ink-2);overflow-wrap:anywhere}
 .notif-item .ni-time{font-family:var(--mono);font-size:10px;color:var(--ink-4);margin-top:2px}
 
 /* ============================================================
