@@ -1430,6 +1430,14 @@ new QWebChannel(qt.webChannelTransport, channel => {
 
   backend.blenderVersions(populateBlenderVersions);
 
+  /* Asked for once at startup: the path is fixed for the life of the run,
+     and a user only goes looking for it after something has gone wrong. */
+  backend.diagnostics(json => {
+    const d = JSON.parse(json);
+    const el = document.getElementById('log-path');
+    if (el) el.textContent = d.logFile || d.logDir || 'not available';
+  });
+
   /* Upload and download report as bytes, not as a spinner: a 400 MB
      .blend on a slow line is the one moment the app looks frozen, and a
      percentage is the difference between waiting and worrying. */

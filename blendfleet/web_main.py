@@ -12,6 +12,7 @@ import sys
 
 from PySide6.QtWidgets import QApplication
 
+from blendfleet import crash_log
 from blendfleet.accounts import AccountStore
 from blendfleet.fleet import Fleet
 from blendfleet.kaggle_client import KaggleClient, verify_token
@@ -23,6 +24,16 @@ from blendfleet.ui.web_host import WebHost
 
 
 def main() -> int:
+    # First thing, before QApplication exists: this app has died three
+    # times mid-render leaving nothing behind but a Windows Event Viewer
+    # entry, because the packaged build is windowed (console=False) and so
+    # Qt's own fatal message had no stderr to reach anyone through. Every
+    # line Qt prints now lands in the file named below, and it survives
+    # the process dying. Installed before Qt is constructed so a failure
+    # inside QApplication itself is captured too.
+    crash_log.install()
+    crash_log.announce()
+
     app = QApplication(sys.argv)
     settings = Settings.load()
     # Still applied, even though the pages are HTML: the window chrome

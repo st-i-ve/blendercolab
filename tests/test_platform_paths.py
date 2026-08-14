@@ -27,3 +27,13 @@ def test_dirs_are_created(tmp_path, monkeypatch):
     assert pp.config_dir().is_dir()
     assert pp.state_dir().is_dir()
     assert pp.cache_dir().is_dir()
+    assert pp.log_dir().is_dir()
+
+
+def test_log_dir_sits_beside_state_and_cache(tmp_path, monkeypatch):
+    """Crash logs live under the user's own data directory, never inside
+    the PyInstaller bundle -- the bundle's temp directory is deleted by
+    the very process exit a crash log has to outlive."""
+    monkeypatch.setattr(pp.sys, "platform", "linux")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    assert pp.log_dir() == tmp_path / "blendfleet" / "logs"

@@ -49,6 +49,7 @@ import pytest
 from PySide6.QtWidgets import QMessageBox
 
 import blendfleet.accounts as accounts_mod
+import blendfleet.crash_log as crash_log_mod
 import blendfleet.fleet as fleet_mod
 import blendfleet.instance_state as instance_state_mod
 import blendfleet.platform_paths as platform_paths_mod
@@ -249,6 +250,7 @@ def redirect_app_dirs(request, tmp_path, monkeypatch):
 
     fake_config = tmp_path / "blendfleet-appdata"
     fake_state = fake_config / "state"
+    fake_logs = fake_config / "logs"
 
     def fake_config_dir():
         fake_config.mkdir(parents=True, exist_ok=True)
@@ -258,14 +260,21 @@ def redirect_app_dirs(request, tmp_path, monkeypatch):
         fake_state.mkdir(parents=True, exist_ok=True)
         return fake_state
 
+    def fake_log_dir():
+        fake_logs.mkdir(parents=True, exist_ok=True)
+        return fake_logs
+
     for module, name, fake in (
         (platform_paths_mod, "config_dir", fake_config_dir),
         (platform_paths_mod, "state_dir", fake_state_dir),
+        (platform_paths_mod, "log_dir", fake_log_dir),
         (accounts_mod, "config_dir", fake_config_dir),
         (settings_mod, "config_dir", fake_config_dir),
         (fleet_mod, "state_dir", fake_state_dir),
         (instance_state_mod, "state_dir", fake_state_dir),
         (bridge_mod, "state_dir", fake_state_dir),
+        (bridge_mod, "log_dir", fake_log_dir),
+        (crash_log_mod, "log_dir", fake_log_dir),
     ):
         monkeypatch.setattr(module, name, fake)
 

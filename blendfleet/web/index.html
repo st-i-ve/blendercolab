@@ -335,6 +335,20 @@
             <input id="min-gpus" type="number" min="0" max="8" style="width:90px">
           </div>
         </div>
+
+        <!-- The app has closed itself mid-render with no message. Every
+             run now writes a log; this is how a user finds it without
+             being read a %APPDATA% path over the phone. -->
+        <h2 class="sec">Diagnostics</h2>
+        <div class="panel set-card">
+          <div class="set-row">
+            <div class="st">
+              <h4>Diagnostic log</h4>
+              <p>Every launch writes what the app and Qt report to a file here. If BlendFleet closes on its own, this file records the reason — send the newest one with your report. The last few runs are kept.</p>
+              <p class="mono" id="log-path" style="user-select:text">—</p>
+            </div>
+          </div>
+        </div>
       </div>
 
     </div>

@@ -48,7 +48,7 @@ from blendfleet.instance_state import (GpuSnapshot, InstanceSnapshot,
 from blendfleet.kaggle_client import PENDING_STATES
 from blendfleet.log_stream import stream_progress
 from blendfleet.notebook_builder import RenderSettings
-from blendfleet.platform_paths import state_dir
+from blendfleet.platform_paths import log_dir, state_dir
 from blendfleet.scenes import Scene, scenes_from_datasets
 from blendfleet.settings import Settings
 from blendfleet.ui.messages import explain
@@ -374,6 +374,21 @@ class Backend(QObject):
             "sound": self.settings.sound,
             "minGpus": self.settings.min_gpus,
             "fullscreen": self.settings.fullscreen,
+        })
+
+    @Slot(result=str)
+    def diagnostics(self) -> str:
+        """Where this run's crash log lives.
+
+        Surfaced in Settings because the alternative is reading a
+        %APPDATA% path down a phone line to someone whose app just
+        vanished -- which is exactly the situation this log exists for.
+        """
+        from blendfleet import crash_log
+        path = crash_log.current_log_path()
+        return json.dumps({
+            "logFile": str(path) if path is not None else "",
+            "logDir": str(log_dir()),
         })
 
     @Slot(result=str)
