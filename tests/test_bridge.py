@@ -20,6 +20,7 @@ from blendfleet.fleet import Fleet, FleetState, WorkerState
 from blendfleet.instance_state import GpuSnapshot, InstanceSnapshot
 from blendfleet.kaggle_client import DatasetInfo, KaggleError, Quota
 from blendfleet.settings import Settings
+from blendfleet.ui import bridge as bridge_mod
 from blendfleet.ui.bridge import Backend
 
 
@@ -2060,3 +2061,98 @@ def test_stop_clears_its_tracking_so_it_can_be_called_twice(qapp, tmp_path):
     backend.stop()
     assert backend._running_workers == set()
     backend.stop()      # closeEvent can fire more than once; must not raise
+
+
+# ---------------- a worker that will NOT stop (crash log, run 2) ----------
+#
+# The tracking fix above was necessary but not sufficient. The next run
+# logged both halves of what was left:
+#
+#     21:40:09.318 a background worker did not stop within 5s ...
+#     21:40:09.437 Qt FATAL: QThread: Destroyed while thread '' is still running
+#
+# poll() is a Kaggle round-trip per account through kagglesdk, which
+# exposes no timeout and no cancellation. Closing the window during an
+# in-flight poll is therefore a thread that CANNOT be stopped -- and the
+# poll timer fires every 30s, so during a render there is almost always
+# one in flight. stop() now cuts such a worker loose instead of letting Qt
+# destroy it.
+
+@pytest.fixture(autouse=True)
+def _no_orphans_leak_between_tests():
+    """_ORPHANED_WORKERS is module state that deliberately never empties in
+    production. A test that fills it must not leave it filled, or a later
+    test reads another test's orphan."""
+    yield
+    for worker in bridge_mod._ORPHANED_WORKERS:
+        worker.wait(5000)
+    bridge_mod._ORPHANED_WORKERS.clear()
+
+
+def _unstoppable(backend, release):
+    """Start a worker that blocks until `release` is set, as an
+    uncancellable network call does."""
+    entered = threading.Event()
+
+    def body():
+        entered.set()
+        release.wait(30.0)
+        return "eventually"
+
+    backend._start("probe", body, "probing", lambda _r: None)
+    assert entered.wait(5.0), "the worker never started"
+    return backend._workers["probe"]
+
+
+def test_stop_cuts_loose_a_worker_that_will_not_stop(qapp, tmp_path,
+                                                     monkeypatch):
+    """Qt aborts the instant it destroys a running QThread, and a Kaggle
+    request that has not answered cannot be cancelled. Cutting the thread
+    loose is what turns that abort into an ordinary exit."""
+    monkeypatch.setattr(bridge_mod, "_STOP_GRACE_MS", 200)
+    backend = make_backend(tmp_path, n=1)
+    release = threading.Event()
+    worker = _unstoppable(backend, release)
+    try:
+        backend.stop()
+
+        assert worker in bridge_mod.orphaned_workers(), (
+            "a worker that outlasted stop() must be cut loose; leaving it "
+            "parented to the Backend is the qFatal abort")
+        assert worker.parent() is None, (
+            "still a child of the Backend -- Qt would delete it during "
+            "teardown and abort")
+    finally:
+        release.set()
+        worker.wait(5000)
+
+
+def test_an_orphaned_worker_cannot_call_back_into_the_backend(qapp, tmp_path,
+                                                              monkeypatch):
+    """Its signals fire while the window is already tearing down, into
+    handlers that touch timers and emit on a half-dead object."""
+    monkeypatch.setattr(bridge_mod, "_STOP_GRACE_MS", 200)
+    backend = make_backend(tmp_path, n=1)
+    release = threading.Event()
+    worker = _unstoppable(backend, release)
+    try:
+        backend.stop()
+        release.set()
+        worker.wait(5000)
+        for _ in range(30):
+            QApplication.processEvents()
+
+        assert backend._workers == {}
+        assert backend._running_workers == set()
+    finally:
+        release.set()
+        worker.wait(5000)
+
+
+def test_a_worker_that_stops_in_time_is_never_orphaned(qapp, tmp_path):
+    """The normal path must stay normal: nothing is leaked just because
+    the app closed."""
+    backend = make_backend(tmp_path, n=1)
+    backend._start("probe", lambda: "done", "probing", lambda _r: None)
+    backend.stop()
+    assert bridge_mod.orphaned_workers() == []

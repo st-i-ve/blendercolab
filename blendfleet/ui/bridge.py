@@ -58,6 +58,12 @@ SECONDS_PER_FRAME_DEFAULT = 57.1     # measured: 1920x1080, 128spp, P100
 POLL_INTERVAL_MS = 30_000            # real network calls: kernel status
 LIVE_INTERVAL_MS = 2_000             # cheap: drain the in-memory queues
 
+# How long the closing window waits for an in-flight worker before cutting
+# it loose. Long enough for a Kaggle poll that is simply slow; short enough
+# that closing the app never feels hung, since the wait blocks the UI
+# thread. Past it, see _orphan.
+_STOP_GRACE_MS = 5_000
+
 
 class _Worker(QThread):
     """One off-thread call, answered on the UI thread.
@@ -82,6 +88,56 @@ class _Worker(QThread):
             self.failed.emit(explain(self._action, e))
         else:
             self.succeeded.emit(result)
+
+
+# Workers that would not stop in time, kept alive on purpose. See _orphan.
+_ORPHANED_WORKERS: list[_Worker] = []
+
+
+def orphaned_workers() -> list[_Worker]:
+    """Workers still running after stop() gave up waiting.
+
+    Non-empty means this process cannot shut down through Python's normal
+    finalisation without Qt aborting -- see web_main.main().
+    """
+    return list(_ORPHANED_WORKERS)
+
+
+def _orphan(worker: _Worker) -> None:
+    """Let a worker that will not stop outlive the app, instead of taking
+    the app down with it.
+
+    A poll is a Kaggle round-trip per account through kagglesdk, which
+    exposes no timeout and no cancellation -- so "the user closed the
+    window while a poll was in flight" is a thread that genuinely cannot
+    be stopped, not a thread anyone forgot to join. Qt's answer to that is
+    qFatal the moment it destroys the QThread, which is the abort this
+    whole investigation started from.
+
+    So the thread is cut loose instead: signals disconnected so it cannot
+    call back into a half-torn-down Backend, unparented so Qt will not
+    delete it as a child, and held here so Python will not collect it.
+    Nothing destroys it, so ~QThread never runs, so there is no abort. The
+    OS reclaims it when the process ends, moments later.
+    """
+    try:
+        worker.succeeded.disconnect()
+        worker.failed.disconnect()
+        worker.finished.disconnect()
+    except (RuntimeError, TypeError):
+        pass                # nothing was connected, or C++ side already gone
+    try:
+        worker.setParent(None)
+    except RuntimeError:
+        pass
+    _ORPHANED_WORKERS.append(worker)
+    crash_log.record(
+        f"a background worker did not stop within {_STOP_GRACE_MS}ms of the "
+        "window closing (most likely a Kaggle request that had not "
+        "answered yet). It has "
+        "been cut loose rather than destroyed, so Qt will not abort; the "
+        "process will exit without waiting for it.",
+        critical=True)
 
 
 class Backend(QObject):
@@ -1891,14 +1947,8 @@ class Backend(QObject):
         pending += [w for w in self._workers.values() if w not in self._running_workers]
         for worker in pending:
             try:
-                if not worker.wait(5000):
-                    # Recorded rather than swallowed: if a worker ever does
-                    # outlast this, the destructor abort comes straight
-                    # back and this line is the only warning of it.
-                    crash_log.record(
-                        "a background worker did not stop within 5s of the "
-                        "window closing; Qt may abort on teardown",
-                        critical=True)
+                if not worker.wait(_STOP_GRACE_MS):
+                    _orphan(worker)
             except RuntimeError:
                 pass            # already finished and deleted
         self._workers.clear()

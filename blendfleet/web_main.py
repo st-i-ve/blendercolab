@@ -8,6 +8,7 @@ and this file goes away along with the widget UI.
 """
 from __future__ import annotations
 
+import os
 import sys
 
 from PySide6.QtWidgets import QApplication
@@ -18,6 +19,7 @@ from blendfleet.fleet import Fleet
 from blendfleet.kaggle_client import KaggleClient, verify_token
 from blendfleet.platform_paths import cache_dir
 from blendfleet.settings import Settings
+from blendfleet.ui import bridge
 from blendfleet.ui.setup_dialog import SetupDialog
 from blendfleet.ui.theme import apply
 from blendfleet.ui.web_host import WebHost
@@ -64,7 +66,29 @@ def main() -> int:
 
     host = WebHost(store, fleet_factory, verify_token, settings)
     host.show_at_startup()
-    return app.exec()
+    code = app.exec()
+
+    # If a worker had to be cut loose (see bridge._orphan), this process
+    # cannot finish shutting down the ordinary way. Interpreter
+    # finalisation clears module globals, which drops the last reference
+    # to that orphaned QThread and runs ~QThread on a thread that is still
+    # inside a Kaggle request -- the same qFatal abort, arriving a second
+    # later instead. Python finalising while a foreign thread is still
+    # executing Python is its own abort risk on top of that.
+    #
+    # So skip finalisation entirely. Everything that had to be durable is
+    # already on disk: settings and fleet state are written when they
+    # change, and the diagnostic log is flushed line by line precisely
+    # because the interesting exits are the abrupt ones.
+    if bridge.orphaned_workers():
+        crash_log.record(
+            f"exiting immediately with code {code}: a background request "
+            "never came back, and waiting for it would abort instead of "
+            "closing", critical=True)
+        if sys.stdout is not None:
+            sys.stdout.flush()
+        os._exit(code)
+    return code
 
 
 if __name__ == "__main__":
