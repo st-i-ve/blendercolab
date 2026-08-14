@@ -122,6 +122,34 @@ def test_web_spec_ships_every_file_the_page_loads():
         f"{sorted(p.name for p in missing)}")
 
 
+def test_web_spec_stays_onedir_so_launch_does_not_unpack_228_mb():
+    """A onefile EXE re-extracts the whole ~228 MB bundle into %TEMP% on
+    every single launch before the first window can appear, which is what
+    made this app take tens of seconds to open on a 16 GB laptop. onedir
+    lays those files down once at build time instead.
+
+    Asserted on the spec's text rather than by running a build: a build
+    takes minutes and needs PyInstaller present, and the mistake this
+    guards against (someone folding a.binaries back into EXE(...)) is
+    visible in the source.
+    """
+    text = WEB_SPEC_PATH.read_text(encoding="utf-8")
+    assert "COLLECT(" in text, (
+        "packaging/blendfleetweb.spec has no COLLECT(...) -- it has been "
+        "turned back into a onefile build, which re-extracts the entire "
+        "bundle to a temp directory on every launch")
+    assert "exclude_binaries=True" in text, (
+        "packaging/blendfleetweb.spec's EXE(...) is missing "
+        "exclude_binaries=True, so the binaries are packed into the exe "
+        "itself and COLLECT only duplicates them")
+    _, _, exe_call = text.partition("exe = EXE(")
+    exe_args, _, _ = exe_call.partition(")")
+    for packed in ("a.binaries", "a.zipfiles", "a.datas"):
+        assert packed not in exe_args, (
+            f"{packed} is passed to EXE(...) -- that is the onefile form. "
+            "It belongs in COLLECT(...) instead.")
+
+
 def test_web_assets_land_where_the_stylesheet_expects_them():
     """app.css reaches the vendored fonts and the brand mark with
     ../../assets/..., which only resolves if the web files are bundled at

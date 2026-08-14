@@ -45,7 +45,25 @@ a = Analysis(["../blendfleet/web_main.py"], pathex=[".."], binaries=[],
              hookspath=[], runtime_hooks=[], excludes=[],
              cipher=block_cipher)
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
-exe = EXE(pyz, a.scripts, a.binaries, a.zipfiles, a.datas, [],
+
+# ONEDIR, not onefile, and the difference is the whole startup cost.
+#
+# A onefile EXE (binaries/zipfiles/datas passed straight into EXE(...)) is a
+# self-extracting archive: every single launch unpacks ~228 MB of Qt,
+# Chromium and Python into a fresh %TEMP%\_MEIxxxxx directory BEFORE the
+# first window can appear, then deletes it on exit. On a 16 GB laptop with
+# ordinary disk that is tens of seconds of nothing happening, repeated in
+# full on every start, and none of it is cached between runs.
+#
+# exclude_binaries=True keeps those out of the EXE and COLLECT lays them
+# down next to it once, at build time. sys._MEIPASS then points at the
+# install folder instead of a temp dir, which every asset lookup here
+# already tolerates (blendfleet/ui/web_host.py's WEB_DIR resolves relative
+# to the package, blendfleet/__main__.py's _icon_path() checks _MEIPASS
+# first) -- so the layout below deliberately mirrors the source tree.
+exe = EXE(pyz, a.scripts, [], exclude_binaries=True,
           name="blendfleetweb", debug=False, strip=False, upx=False,
           console=False, disable_windowed_traceback=False,
           icon=str(_HERE / "../assets/logo/blendfleet.ico"))
+coll = COLLECT(exe, a.binaries, a.zipfiles, a.datas,
+               strip=False, upx=False, name="blendfleetweb")
