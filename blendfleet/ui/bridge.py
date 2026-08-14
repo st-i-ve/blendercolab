@@ -39,6 +39,7 @@ from typing import Callable
 
 from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
 
+from blendfleet import crash_log
 from blendfleet.accounts import AccountStore
 from blendfleet.assignment import estimate
 from blendfleet.blender_versions import KNOWN_VERSIONS, validate_version
@@ -118,6 +119,20 @@ class Backend(QObject):
         self._quota: dict[str, str] = {}
         self._failures: dict[str, str] = {}
         self._workers: dict[str, _Worker] = {}
+        # Every _Worker whose run() has not returned yet.
+        #
+        # Separate from _workers because the two answer different
+        # questions. _workers answers "is a call under this key already in
+        # flight?" and is emptied by the succeeded/failed handler -- which
+        # runs while run() is STILL ON THE STACK, since those signals are
+        # emitted from inside run(). For the window between that emit and
+        # run() returning, the thread is alive but no longer in _workers,
+        # so stop() found nothing to wait for and Qt then destroyed a
+        # running QThread. That is qFatal("QThread: Destroyed while thread
+        # is still running") -> abort() -> the c0000409 the packaged app
+        # died of. This set is emptied by `finished` instead, which Qt
+        # emits only after run() has returned.
+        self._running_workers: set[_Worker] = set()
         # What is on Kaggle right now, as far as this session knows:
         # {slug, blendName, sizeBytes, at}. Set only by syncDataset(), so
         # it is never a guess -- an empty value means we have not put this
@@ -183,6 +198,7 @@ class Backend(QObject):
             return False
         worker = _Worker(fn, action, self)
         self._workers[key] = worker
+        self._running_workers.add(worker)
         self.busyChanged.emit(key, True)
 
         def done(result) -> None:
@@ -201,6 +217,11 @@ class Backend(QObject):
 
         worker.succeeded.connect(done)
         worker.failed.connect(failed)
+        # Connected BEFORE deleteLater so the set has already released the
+        # worker by the time the C++ object goes; and holding the worker
+        # in that set is also what keeps a strong Python reference to it
+        # for the whole of run(), so it cannot be collected mid-flight.
+        worker.finished.connect(lambda w=worker: self._running_workers.discard(w))
         worker.finished.connect(worker.deleteLater)
         worker.start()
         return True
@@ -384,7 +405,6 @@ class Backend(QObject):
         %APPDATA% path down a phone line to someone whose app just
         vanished -- which is exactly the situation this log exists for.
         """
-        from blendfleet import crash_log
         path = crash_log.current_log_path()
         return json.dumps({
             "logFile": str(path) if path is not None else "",
@@ -1862,13 +1882,27 @@ class Backend(QObject):
         self._poll_timer.stop()
         self._live_timer.stop()
         self._stop.set()        # tells the SSE threads to unwind
-        for worker in list(self._workers.values()):
+        # _running_workers first, and it is the one that matters: see its
+        # comment in __init__ for why _workers alone was empty at exactly
+        # the moment this needed it not to be. _workers is still drained
+        # too, so a worker that somehow never reached `finished` is not
+        # skipped just because the set had let go of it.
+        pending = list(self._running_workers)
+        pending += [w for w in self._workers.values() if w not in self._running_workers]
+        for worker in pending:
             try:
-                if worker.isRunning():
-                    worker.wait(5000)
+                if not worker.wait(5000):
+                    # Recorded rather than swallowed: if a worker ever does
+                    # outlast this, the destructor abort comes straight
+                    # back and this line is the only warning of it.
+                    crash_log.record(
+                        "a background worker did not stop within 5s of the "
+                        "window closing; Qt may abort on teardown",
+                        critical=True)
             except RuntimeError:
                 pass            # already finished and deleted
         self._workers.clear()
+        self._running_workers.clear()
         # A daemon thread still inside SSL when the process tears down is
         # what produces "Fatal Python error: Aborted" -- daemon=True hides
         # that, it does not prevent it.

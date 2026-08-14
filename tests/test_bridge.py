@@ -7,6 +7,7 @@ a guarantee matters, it has to hold here.
 """
 import json
 import os
+import threading
 import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -1966,3 +1967,96 @@ def test_render_scene_does_not_overwrite_the_last_uploads_sharing_report(
     _settle(backend)
 
     assert backend._unshared_accounts == {"friend_1": "could not be reached"}
+
+
+# ---------------- the QThread destructor abort (crash log, 2026-08-14) -----
+#
+# The packaged app aborted three times with BEX64 / c0000409 sub-code 7 in
+# Qt6Core.dll and no message. Once blendfleet/crash_log.py was installing a
+# Qt message handler, the very first run wrote the reason:
+#
+#     Qt FATAL: QThread: Destroyed while thread '' is still running
+#
+# _Worker emits succeeded/failed from INSIDE run(), and the handler for
+# those signals pops the worker out of _workers immediately. Between that
+# emit and run() actually returning, the thread is alive and untracked --
+# so stop() waited for nothing, Qt destroyed a running QThread, and
+# ~QThread called qFatal. These pin the tracking, not the abort: provoking
+# the real one would take the test process down with it.
+
+def test_a_worker_stays_tracked_until_run_has_actually_returned(qapp, tmp_path):
+    """The exact window the crash lived in: succeeded has been delivered
+    and _workers is already empty, but run() has not returned yet."""
+    backend = make_backend(tmp_path, n=1)
+    released = threading.Event()
+    seen_during_handler = {}
+
+    def slow_tail():
+        released.wait(5.0)
+        return "done"
+
+    def on_ok(_result):
+        # Runs on the UI thread from inside run(): this is the moment the
+        # old code stopped tracking the still-running thread.
+        seen_during_handler["workers"] = dict(backend._workers)
+        seen_during_handler["running"] = set(backend._running_workers)
+
+    backend._start("probe", slow_tail, "probing", on_ok)
+    worker = backend._workers["probe"]
+    released.set()
+    worker.wait(5000)
+    for _ in range(30):
+        QApplication.processEvents()
+
+    assert seen_during_handler, "the success handler never ran"
+    assert seen_during_handler["workers"] == {}, (
+        "precondition: _workers is emptied by the handler -- if this ever "
+        "stops being true, this test is no longer covering the real bug")
+    assert worker in seen_during_handler["running"], (
+        "the worker was untracked while its run() was still on the stack. "
+        "That is what let Qt destroy a running QThread and abort.")
+
+
+def test_finished_is_what_untracks_a_worker(qapp, tmp_path):
+    backend = make_backend(tmp_path, n=1)
+    backend._start("probe", lambda: "done", "probing", lambda _r: None)
+    worker = backend._workers.get("probe") or next(iter(backend._running_workers))
+    worker.wait(5000)
+    for _ in range(30):
+        QApplication.processEvents()
+
+    assert backend._running_workers == set(), (
+        "`finished` must release the worker, or the set grows for the "
+        "lifetime of the app")
+
+
+def test_stop_waits_for_a_worker_that_is_no_longer_in_workers(qapp, tmp_path):
+    """stop() is called from the host window's closeEvent. By then every
+    handler has long since emptied _workers, which is precisely why the
+    old stop() had nothing to wait on."""
+    backend = make_backend(tmp_path, n=1)
+    entered = threading.Event()
+
+    def body():
+        entered.set()
+        time.sleep(0.2)
+        return "done"
+
+    backend._start("probe", body, "probing", lambda _r: None)
+    worker = backend._workers["probe"]
+    assert entered.wait(5.0), "the worker never started"
+    backend._workers.clear()        # what the succeeded handler does
+
+    backend.stop()
+
+    assert worker.isFinished(), (
+        "stop() returned while the QThread was still running -- Qt would "
+        "abort when it destroyed it")
+
+
+def test_stop_clears_its_tracking_so_it_can_be_called_twice(qapp, tmp_path):
+    backend = make_backend(tmp_path, n=1)
+    backend._start("probe", lambda: "done", "probing", lambda _r: None)
+    backend.stop()
+    assert backend._running_workers == set()
+    backend.stop()      # closeEvent can fire more than once; must not raise
