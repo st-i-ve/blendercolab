@@ -1601,3 +1601,53 @@ def test_a_download_tick_still_repaints_the_cards(loaded_page):
     assert got["rebuilt"], (
         "repaintCards() was skipped as an unchanged payload -- a download "
         "bar would then never appear until the state happened to change")
+
+
+# ---------------------------------------------------------------------------
+# Reopening the app on a render that never stopped.
+#
+# The reported symptom was a card that showed nothing at all -- "all we see
+# is loading" -- for a job Kaggle was still rendering. While the resumed
+# log stream replays that session's log, the card has to say so, and the
+# frame count it shows in the meantime is the SAVED one, not a reading.
+# ---------------------------------------------------------------------------
+
+RECONNECTING_INSTANCE = """({
+  label:'acct0', username:'acct0', verified:true, quota:'2.0 / 30.0 h',
+  worker:{ state:'running', frames:[1,2,3,4], framesDone:2,
+           framesDoneAge:900, message:'', elapsed:1200, finished:false },
+  hardware:null, live:null, reconnecting:true
+})"""
+
+
+def test_a_reconnecting_card_says_what_is_happening(card):
+    html = card(RECONNECTING_INSTANCE)
+    assert "reconnecting" in html
+    assert "replaying" in html, "the card must say why there is nothing yet"
+    assert "nothing to restart" in html, (
+        "a user staring at a stalled-looking card needs to be told there "
+        "is no action to take")
+
+
+def test_a_reconnecting_card_shows_the_saved_count_as_saved(card):
+    """The count is the newest this app could have -- the render carried on
+    after it was written -- so it carries its age, exactly like the cached
+    hardware line does."""
+    html = card(RECONNECTING_INSTANCE)
+    assert "2 / 4" in html
+    assert "saved 15m ago" in html
+
+
+def test_a_reconnecting_card_invents_no_live_reading(card):
+    html = card(RECONNECTING_INSTANCE)
+    assert "GPU 0" not in html, "invented a live GPU row with no live data"
+    assert "System RAM" not in html
+    assert "This session" not in html
+
+
+def test_a_live_frame_count_is_never_labelled_saved(card):
+    """Once the stream reports, the number IS live and must not be
+    hedged."""
+    html = card()
+    assert "saved" not in html
+    assert "reconnecting" not in html

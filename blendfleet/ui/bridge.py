@@ -275,6 +275,19 @@ class Backend(QObject):
         # that reports the same number again writes nothing. See
         # _persist_progress for why that matters.
         self._persisted_done: dict[str, int] = {}
+        # label -> the live stream thread currently watching it. Separate
+        # from _stream_threads (which is a flat list used only for joining
+        # at shutdown) because resuming has to answer a question that list
+        # cannot: "does THIS label already have a stream?" Starting a
+        # second one for the same worker would double every PROGRESS line
+        # it reports and open a second Kaggle connection for no gain.
+        self._stream_by_label: dict[str, threading.Thread] = {}
+        # Labels whose stream was resumed at startup and has not yet
+        # reported anything. While a label is in here the card is told it
+        # is reconnecting, so a persisted frame count is never presented
+        # as a live one. See _resume_streams and ready().
+        self._resumed_labels: set[str] = set()
+        self._resumed = False
 
         # A status poll is infrequent and costs a network call per account;
         # the live drain is cheap and purely in-memory. Two timers, two
@@ -440,6 +453,16 @@ class Backend(QObject):
                     "state": worker.state,
                     "frames": list(worker.frames),
                     "framesDone": worker.frames_done,
+                    # How old that count is, in seconds, or None if it was
+                    # never recorded. It is a SAVED reading, not a live
+                    # one: after a restart it is whatever the last stream
+                    # managed to write before the window closed, and the
+                    # render has kept going since. Same rule as the cached
+                    # hardware line -- a number without its age is a claim
+                    # this app is not entitled to make.
+                    "framesDoneAge": (
+                        max(time.time() - worker.frames_done_at, 0.0)
+                        if getattr(worker, "frames_done_at", 0.0) else None),
                     "message": (worker.message
                                 or self._failures.get(worker.label) or ""),
                     # Seconds this worker has been going, or took. Frozen
@@ -459,6 +482,13 @@ class Backend(QObject):
                 # session actually got. None until a stream reports --
                 # never a cached value dressed up as live.
                 "live": self._live_payload(account.label),
+                # True only in the window between resuming this worker's
+                # stream at startup and that stream reporting anything.
+                # The card uses it to say "reconnecting, catching up"
+                # rather than showing the saved frame count as though it
+                # were current -- an empty card in that window reads as a
+                # render that has stalled.
+                "reconnecting": self._is_reconnecting(account.label),
             })
         return {
             "job": {
@@ -488,6 +518,23 @@ class Backend(QObject):
                      if self.blend else None,
             "approximate": True,
         }
+
+    def _is_reconnecting(self, label: str) -> bool:
+        """Is this label's resumed stream still catching up?
+
+        Three conditions, all required. It was resumed at startup rather
+        than launched here; nothing live has arrived yet (_slot clears the
+        label the instant anything does); and the thread is genuinely still
+        trying. That last one matters: a resumed stream that died on its
+        first connection would otherwise leave the card promising a
+        reconnection that is never coming, which is a worse lie than the
+        blank it replaced. When it drops out, the card falls back to the
+        saved frame count carrying its age -- still honest, just older.
+        """
+        if label not in self._resumed_labels:
+            return False
+        thread = self._stream_by_label.get(label)
+        return thread is not None and thread.is_alive()
 
     def _live_payload(self, label: str) -> dict | None:
         """What the SSE stream has reported for `label` this run.
@@ -522,6 +569,38 @@ class Backend(QObject):
     @Slot(result=str)
     def state(self) -> str:
         return json.dumps(self._state_payload())
+
+    @Slot()
+    def ready(self) -> None:
+        """The page has connected AND wired up every signal handler.
+
+        Called once, as the very last line of app.js's QWebChannel
+        callback. That position is the whole point of having this slot at
+        all:
+
+          - Backend.__init__ runs while the page is still loading. There is
+            no channel yet, so anything emitted there reaches nobody.
+          - state() is not safe either, even though the page calls it on
+            connect: app.js calls `backend.state(...)` BEFORE it connects
+            stateChanged, logLine and notification (three lines further
+            down). A resume hooked there would emit into handlers that do
+            not exist yet, and the "reconnecting" message would be lost
+            exactly when it mattered.
+
+        Called last, after every connect, there is nothing left to race:
+        QWebChannel delivers the page's messages in the order they were
+        sent, so by the time this runs, every signal this resume touches
+        already has a listener.
+
+        One-shot. The page only calls it on connect, but a reload must not
+        start a second set of streams -- and _stream_worker's own duplicate
+        guard is the backstop for that rather than the only defence.
+        """
+        if self._resumed:
+            return
+        self._resumed = True
+        if self._resume_streams():
+            self._emit_state()      # so the cards say "reconnecting" now
 
     @Slot(result=str)
     def preferences(self) -> str:
@@ -1974,44 +2053,136 @@ class Backend(QObject):
             account = by_label.get(worker.label)
             if account is None:
                 continue        # removed mid-launch: no token, so no stream
+            self._stream_worker(account, worker)
 
-            def run(account=account, worker=worker):
-                label = account.label
+    def _stream_worker(self, account, worker) -> None:
+        """Start one worker's SSE log stream, unless it already has one.
 
-                def progress(done, total):
-                    self._progress_q.put((label, done, total))
+        Shared by _start_streams (a launch) and _resume_streams (a
+        restart), so the two can never watch a kernel differently. The
+        duplicate guard is the reason this is one function: a resume that
+        raced a launch, or a second call of either, would otherwise open a
+        second connection for the same kernel and deliver every PROGRESS
+        line twice.
+        """
+        label = account.label
+        existing = self._stream_by_label.get(label)
+        if existing is not None and existing.is_alive():
+            return
 
-                try:
-                    stream_progress(
-                        account.token, worker.username,
-                        worker.kernel_slug.split("/", 1)[1], progress,
-                        self._stop,
-                        on_telemetry=lambda r: self._telemetry_q.put((label, r)),
-                        on_system=lambda r: self._system_q.put((label, r)),
-                        on_hardware=lambda r: self._hardware_q.put((label, r)),
-                        on_preflight=lambda r: self._preflight_q.put((label, r)))
-                except Exception as e:      # noqa: BLE001
-                    # Still swallowed -- a dead stream must never kill the
-                    # render, which keeps going on Kaggle regardless of
-                    # whether anyone is watching it. But this is the exact
-                    # shape of "the progress bar froze at 3/15 and nothing
-                    # said why": from here on that account simply reports
-                    # nothing, forever, and the traceback was the only
-                    # evidence of it. Recorded, not raised.
-                    crash_log.record(self._scrub(
-                        f"the live log stream for {label} "
-                        f"({worker.kernel_slug}) stopped and will not "
-                        "reconnect, so this account's progress and telemetry "
-                        "freeze at whatever they last showed. The render "
-                        f"itself is unaffected. {type(e).__name__}: {e}\n"
-                        + "".join(traceback.format_exception(
-                            type(e), e, e.__traceback__))),
-                        critical=True)
+        def run():
+            def progress(done, total):
+                self._progress_q.put((label, done, total))
 
-            thread = threading.Thread(target=run, daemon=True,
-                                      name=f"blendfleet-stream-{worker.label}")
-            self._stream_threads.append(thread)
-            thread.start()
+            try:
+                stream_progress(
+                    account.token, worker.username,
+                    worker.kernel_slug.split("/", 1)[1], progress,
+                    self._stop,
+                    on_telemetry=lambda r: self._telemetry_q.put((label, r)),
+                    on_system=lambda r: self._system_q.put((label, r)),
+                    on_hardware=lambda r: self._hardware_q.put((label, r)),
+                    on_preflight=lambda r: self._preflight_q.put((label, r)))
+            except Exception as e:      # noqa: BLE001
+                # Still swallowed -- a dead stream must never kill the
+                # render, which keeps going on Kaggle regardless of
+                # whether anyone is watching it. But this is the exact
+                # shape of "the progress bar froze at 3/15 and nothing
+                # said why": from here on that account simply reports
+                # nothing, forever, and the traceback was the only
+                # evidence of it. Recorded, not raised.
+                crash_log.record(self._scrub(
+                    f"the live log stream for {label} "
+                    f"({worker.kernel_slug}) stopped and will not "
+                    "reconnect, so this account's progress and telemetry "
+                    "freeze at whatever they last showed. The render "
+                    f"itself is unaffected. {type(e).__name__}: {e}\n"
+                    + "".join(traceback.format_exception(
+                        type(e), e, e.__traceback__))),
+                    critical=True)
+
+        thread = threading.Thread(target=run, daemon=True,
+                                  name=f"blendfleet-stream-{label}")
+        self._stream_by_label[label] = thread
+        self._stream_threads.append(thread)
+        thread.start()
+
+    def _resume_streams(self) -> int:
+        """Re-attach a log stream to every worker still running on Kaggle.
+
+        The gap this closes: _start_streams is only ever called from the
+        success callback of a launch. Nothing called it when the app
+        started, so a render that was still going on Kaggle when the window
+        closed got no stream at all when the window reopened -- no phase,
+        no frame counter, no GPU telemetry, no system RAM. The job showed
+        as "running" with nothing behind it, which is indistinguishable
+        from stuck. The renders were fine; the app had simply stopped
+        looking.
+
+        PENDING_STATES, not ACTIVE_STATES: a kernel that has been pushed
+        but whose Kaggle session has not started yet reports "not_started"
+        (and one whose session has not run a cell yet, "new_script").
+        Neither is running, but both are about to be -- and a render pushed
+        moments before the app closed is exactly the case where the user
+        has seen no progress at all and most needs it to appear. Kaggle's
+        own stream endpoint waits for the log URL rather than failing, so
+        the stream is already built to be started before there is anything
+        to read. This is also the predicate busy_labels()/require_free()
+        and deleteScene already use for "this account is still occupied",
+        so a worker that holds an account is now exactly a worker that gets
+        watched.
+
+        TERMINAL_STATES get nothing, deliberately: a finished kernel's log
+        is fixed, replaying it would rebuild a "rendering 15/15" phase for
+        a job that ended hours ago, and it costs a Kaggle connection per
+        account to learn nothing.
+
+        Nothing is invented for the reconnecting window -- see
+        _resumed_labels and _state_payload's "reconnecting" flag.
+        """
+        by_label = {a.label: a for a in self.store.list()}
+        resumed: list[str] = []
+        try:
+            jobs = self.fleet_factory(self.store.list()).load_jobs()
+        except Exception as e:      # noqa: BLE001
+            # A jobs file that cannot even be read is already reported to
+            # the page through unreadableJobs; failing to resume on top of
+            # that must not stop the app starting.
+            crash_log.record(self._scrub(
+                "could not read the tracked jobs at startup, so no render "
+                "already running on Kaggle will show live progress until "
+                f"the next launch. {type(e).__name__}: {e}"), critical=True)
+            return 0
+        for job in jobs:
+            for worker in job.workers:
+                if worker.state not in PENDING_STATES:
+                    continue
+                account = by_label.get(worker.label)
+                if account is None:
+                    continue    # account removed since: no token, no stream
+                before = self._stream_by_label.get(worker.label)
+                if before is not None and before.is_alive():
+                    continue    # already watched; never open a second one
+                self._stream_worker(account, worker)
+                # Seeded from what is on disk so the first replayed
+                # PROGRESS line, which re-reports numbers already saved,
+                # does not trigger a pointless rewrite of the jobs file.
+                self._persisted_done[worker.label] = worker.frames_done
+                self._resumed_labels.add(worker.label)
+                resumed.append(worker.label)
+        if resumed:
+            # Queued, not emitted: _notify_q is drained by _live_tick on
+            # the UI thread, and going through it means this sentence
+            # cannot be emitted into a page that has not finished
+            # connecting its signal handlers. See ready().
+            self._notify_q.put((
+                f"Reconnecting to {len(resumed)} render(s) still running on "
+                f"Kaggle ({', '.join(sorted(resumed))}). Kaggle replays each "
+                "session's log from the start, so the phase, frame count and "
+                "GPU readings rebuild themselves over the next few moments — "
+                "nothing needs restarting, and no quota is being spent on "
+                "this.", "idle"))
+        return len(resumed)
 
     def _persist_progress(self, advanced: dict[str, int]) -> None:
         """Write the frame counts this tick learned through to the jobs file.
@@ -2024,14 +2195,13 @@ class Backend(QObject):
 
           - Only PROGRESS moves this. Telemetry, system RAM and the phase
             string arrive every few seconds and are deliberately NOT
-            persisted: they are live-only readings, and they are rebuilt
-            from a replayed log rather than from disk. A frame line
+            persisted: they are live-only readings, and a resumed stream
+            rebuilds all of them by replaying the log anyway. A frame line
             arrives once per finished frame -- about once a minute at the
             57s/frame this app measures.
           - Only a CHANGE writes. _persisted_done remembers what is
-            already on disk, so a re-delivered line (Kaggle replays a log
-            from the top on every reconnect) and an idle fleet both write
-            nothing.
+            already on disk, so a replayed log (a reconnect re-delivers
+            every line from the top) and an idle fleet both write nothing.
           - The whole tick is batched into ONE call. Four accounts each
             finishing a frame in the same 2-second window is one file
             write, not four.
@@ -2062,6 +2232,11 @@ class Backend(QObject):
         self._persisted_done.update(advanced)
 
     def _slot(self, label: str) -> dict:
+        # Anything arriving live means this label is no longer merely
+        # reconnecting -- it is reporting. Cleared here rather than at each
+        # queue drain so a stream that comes back with telemetry before its
+        # first PROGRESS line still clears it.
+        self._resumed_labels.discard(label)
         return self._live.setdefault(label, {
             "phase": "", "framesDone": 0, "framesTotal": 0,
             "gpus": {}, "cpuCount": None, "ramTotal": None, "preflight": None,

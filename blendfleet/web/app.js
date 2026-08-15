@@ -396,11 +396,25 @@ function instanceCard(inst) {
      returns no logs until a kernel COMPLETES. The SSE stream can, so when
      it has reported, its numbers are the ones shown. */
   const live = inst.live;
-  const done = live && live.framesTotal ? live.framesDone
+  const liveFrames = !!(live && live.framesTotal);
+  const done = liveFrames ? live.framesDone
              : (worker ? worker.framesDone : 0);
-  const total = live && live.framesTotal ? live.framesTotal
+  const total = liveFrames ? live.framesTotal
               : (worker ? worker.frames.length : 0);
   const progress = total ? Math.round(100 * done / total) : 0;
+
+  /* Where that number came from, said out loud whenever it is NOT live.
+     After a restart the count is whatever the last stream managed to save
+     before the window closed -- the render kept going on Kaggle in the
+     meantime, so it is a floor, not a reading. Presenting it bare, next
+     to a bar, would claim a measurement nobody took. It carries its age,
+     the same way the cached hardware line does. */
+  const savedFrames = (!liveFrames && worker && worker.framesDoneAge != null)
+    ? `<span class="frange dim" title="Saved by the last live connection.${
+         ''} Kaggle's status API reports no frame count, so this is the${
+         ''} newest number this app could have; the render has carried on${
+         ''} since.">saved ${fmtAge(worker.framesDoneAge)}</span>`
+    : '';
 
   /* The hardware this session ACTUALLY got, reported seconds after start
      -- distinct from the cached "last known" line above it, which may be
@@ -490,8 +504,17 @@ function instanceCard(inst) {
     ? `<span class="elapsed">${worker.finished ? 'finished in ' : ''}${
         fmtDuration(worker.elapsed)}</span>`
     : '';
+  /* The window after a restart, before the replayed log has rebuilt
+     anything. The render never stopped -- only this app's view of it did
+     -- and a card that simply sat blank there was read as a stuck render
+     and is the whole reason this text exists. It says what is happening,
+     why there is nothing to show yet, and that there is nothing to do. */
   const phase = live && live.phase
     ? `<div class="inst-foot"><b>${esc(live.phase)}</b>${elapsed}</div>`
+    : inst.reconnecting
+      ? `<div class="inst-foot"><b>reconnecting — replaying this session's`
+        + ` log from Kaggle to catch up</b>${elapsed}<span class="sub">The`
+        + ` render never stopped; nothing to restart.</span></div>`
     : (worker && worker.state === 'queued'
        ? '<div class="inst-foot">queued — waiting for Kaggle to allocate a machine</div>'
        : (elapsed ? `<div class="inst-foot">${elapsed}</div>` : ''));
@@ -541,7 +564,7 @@ function instanceCard(inst) {
       <div class="assign">
         <div class="wrapc">
           <div class="l1"><span class="flab">Frames</span>
-            <span class="frange">${done} / ${total}</span></div>
+            <span class="frange">${done} / ${total}</span>${savedFrames}</div>
           <div class="assign-progress"><i style="width:${progress}%"></i></div>
         </div>
       </div>` : ''}
@@ -1559,4 +1582,14 @@ new QWebChannel(qt.webChannelTransport, channel => {
 
   backend.refreshQuota();
   backend.poll();
+
+  /* LAST, and it has to stay last. This is how the page says "every
+     handler above is wired up now", and it is what makes the backend
+     re-attach its log streams to renders that were still running on
+     Kaggle when the app was last closed. Those streams announce
+     themselves through notification/stateChanged -- both connected
+     above -- so calling this any earlier (the `backend.state(...)` call
+     on the line above the stateChanged connect, say) would emit into
+     handlers that do not exist yet and the user would be told nothing. */
+  backend.ready();
 });

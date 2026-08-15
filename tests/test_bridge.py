@@ -2416,14 +2416,43 @@ def test_an_unavailable_quota_says_why_in_the_log(qapp, tmp_path,
 
 
 # ---------------------------------------------------------------------------
-# Progress that survives closing the app.
+# Surviving a restart.
 #
 # Reported from the field: "once it closes and when I try to open it again
-# the render progress disappears". Kaggle's kernel-status API reports no
-# frame count, so poll can never learn one -- the live log stream is the
-# only source, and until now it held that number in memory and nothing
-# else, so closing the window threw away every frame it had counted.
+# the render progress disappears, all we see is loading". The renders were
+# running on Kaggle the whole time -- the app had simply stopped looking at
+# them. Two independent gaps: nothing re-attached the log streams when the
+# app started (they were only ever started by a launch's success callback),
+# and the one progress number that IS written to disk, frames_done, was
+# only ever set by the live stream, so it never moved either.
 # ---------------------------------------------------------------------------
+
+class _StubStream:
+    """A stand-in for log_stream.stream_progress that never touches the
+    network and never returns until the test lets it.
+
+    Blocking is the point: a resumed stream is only "reconnecting" while
+    its thread is alive, and a stub that returned immediately would race
+    the assertion. release() is called by every test that uses it, so no
+    thread outlives its test (see conftest.no_leaked_threads).
+    """
+
+    def __init__(self):
+        self.calls = []
+        self.started = threading.Event()
+        self.finish = threading.Event()
+
+    def __call__(self, token, user_name, kernel_slug, on_progress,
+                 stop_event=None, **kwargs):
+        self.calls.append((token, user_name, kernel_slug))
+        self.started.set()
+        self.finish.wait(10)
+
+    def release(self, backend):
+        self.finish.set()
+        for thread in backend._stream_threads:
+            thread.join(timeout=5)
+
 
 def _running_job_backend(tmp_path, state="running", frames_done=0,
                          frames_done_at=0.0, n=2):
@@ -2440,9 +2469,132 @@ def _running_job_backend(tmp_path, state="running", frames_done=0,
     return backend
 
 
+def test_a_render_still_running_gets_its_stream_back_when_the_app_reopens(
+        qapp, tmp_path, monkeypatch):
+    """The gap the user actually hit. Nothing called _start_streams at
+    startup, so a job still rendering on Kaggle got no SSE stream at all
+    after a restart: no phase, no frame counter, no telemetry."""
+    stub = _StubStream()
+    monkeypatch.setattr(bridge_mod, "stream_progress", stub)
+    backend = _running_job_backend(tmp_path)
+
+    backend.ready()
+    assert stub.started.wait(5), "no stream was started for a running render"
+    stub.release(backend)
+
+    assert stub.calls == [("KGAT_" + "0" * 32, "user_0", "scene-render-1")]
+
+
+def test_a_worker_kaggle_has_not_started_yet_is_still_resumed(
+        qapp, tmp_path, monkeypatch):
+    """PENDING_STATES, not ACTIVE_STATES. A kernel pushed moments before
+    the app closed reports "not_started" -- it is about to render, and it
+    is exactly the case where the user has seen no progress at all."""
+    stub = _StubStream()
+    monkeypatch.setattr(bridge_mod, "stream_progress", stub)
+    backend = _running_job_backend(tmp_path, state="not_started")
+
+    backend.ready()
+    assert stub.started.wait(5)
+    stub.release(backend)
+
+
+@pytest.mark.parametrize("state", ["complete", "error", "cancel_acknowledged"])
+def test_a_finished_render_is_never_re_streamed(qapp, tmp_path, monkeypatch,
+                                                state):
+    """Replaying a finished kernel's log would rebuild a "rendering 6/6"
+    phase for a job that ended hours ago, and costs a Kaggle connection
+    per account to learn nothing."""
+    stub = _StubStream()
+    monkeypatch.setattr(bridge_mod, "stream_progress", stub)
+    backend = _running_job_backend(tmp_path, state=state)
+
+    backend.ready()
+
+    assert not stub.started.is_set()
+    assert backend._stream_threads == []
+    assert json.loads(backend.state())["instances"][0]["reconnecting"] is False
+
+
+def test_a_worker_already_being_streamed_does_not_get_a_second_stream(
+        qapp, tmp_path, monkeypatch):
+    """Two streams on one kernel double every PROGRESS line it reports and
+    open a second Kaggle connection for no gain."""
+    stub = _StubStream()
+    monkeypatch.setattr(bridge_mod, "stream_progress", stub)
+    backend = _running_job_backend(tmp_path)
+
+    backend.ready()
+    assert stub.started.wait(5)
+    backend.ready()                     # a second connect, or a page reload
+    backend._resume_streams()           # and the resume itself, again
+    stub.release(backend)
+
+    assert len(stub.calls) == 1
+    assert len(backend._stream_threads) == 1
+
+
+def test_a_reconnecting_card_says_so_and_does_not_claim_a_live_reading(
+        qapp, tmp_path, monkeypatch):
+    """The window between resuming a stream and it replaying anything. The
+    saved frame count is shown -- it is the best thing known -- but it is
+    flagged as saved, with its age, and `live` stays null."""
+    stub = _StubStream()
+    monkeypatch.setattr(bridge_mod, "stream_progress", stub)
+    backend = _running_job_backend(tmp_path, frames_done=4,
+                                   frames_done_at=time.time() - 600)
+
+    backend.ready()
+    assert stub.started.wait(5)
+    instance = json.loads(backend.state())["instances"][0]
+    stub.release(backend)
+
+    assert instance["reconnecting"] is True
+    assert instance["live"] is None, "a persisted count is not a live reading"
+    assert instance["worker"]["framesDone"] == 4
+    assert 500 < instance["worker"]["framesDoneAge"] < 700
+
+
+def test_reconnecting_stops_the_moment_the_stream_reports(
+        qapp, tmp_path, monkeypatch):
+    """"Catching up" is only true while it is catching up. Once anything
+    live arrives the card shows the live reading instead."""
+    stub = _StubStream()
+    monkeypatch.setattr(bridge_mod, "stream_progress", stub)
+    backend = _running_job_backend(tmp_path, frames_done=4)
+
+    backend.ready()
+    assert stub.started.wait(5)
+    backend._progress_q.put(("acct0", 5, 6))
+    backend._live_tick()
+    instance = json.loads(backend.state())["instances"][0]
+    stub.release(backend)
+
+    assert instance["reconnecting"] is False
+    assert instance["live"]["framesDone"] == 5
+
+
+def test_a_frame_count_that_was_never_saved_has_no_age(qapp, tmp_path):
+    """Absent is not zero. A worker whose count predates this field (or
+    that has not finished a frame yet) must not claim it was measured now."""
+    backend = _running_job_backend(tmp_path)
+    worker = json.loads(backend.state())["instances"][0]["worker"]
+    assert worker["framesDone"] == 0
+    assert worker["framesDoneAge"] is None
+
+
+def test_an_account_with_no_stream_is_not_reported_as_reconnecting(
+        qapp, tmp_path):
+    backend = _running_job_backend(tmp_path)
+    by_label = {i["label"]: i
+                for i in json.loads(backend.state())["instances"]}
+    assert by_label["acct1"]["reconnecting"] is False
+
+
 def test_the_live_tick_writes_the_frame_count_through_to_disk(qapp, tmp_path):
-    """If the live stream does not persist it, nothing does, and a restart
-    is back to showing no progress at all."""
+    """Kaggle's status API reports no frame count, so poll can never learn
+    one. If the live stream does not persist it, nothing does, and a
+    restart is back to showing nothing."""
     backend = _running_job_backend(tmp_path)
 
     backend._progress_q.put(("acct0", 3, 6))
@@ -2472,7 +2624,7 @@ def test_a_frame_count_that_has_not_moved_is_not_written_again(
     backend._live_tick()
     for _ in range(5):                  # idle ticks: nothing on any queue
         backend._live_tick()
-    backend._progress_q.put(("acct0", 3, 6))    # a re-delivered line
+    backend._progress_q.put(("acct0", 3, 6))    # a replayed line, same count
     backend._live_tick()
 
     assert len(writes) == 1, f"{len(writes)} writes for one finished frame"
@@ -2480,8 +2632,8 @@ def test_a_frame_count_that_has_not_moved_is_not_written_again(
 
 def test_one_write_covers_every_account_that_moved_in_the_same_tick(
         qapp, tmp_path, monkeypatch):
-    """Several accounts each finishing a frame in the same 2-second window
-    is one file write, not one per account."""
+    """Four accounts each finishing a frame in the same 2-second window is
+    one file write, not four."""
     backend = make_backend(tmp_path, n=3)
     fleet = backend.fleet_factory(backend.store.list())
     fleet.save_jobs([FleetState(
@@ -2511,8 +2663,8 @@ def test_one_write_covers_every_account_that_moved_in_the_same_tick(
 def test_telemetry_alone_never_touches_the_jobs_file(qapp, tmp_path,
                                                      monkeypatch):
     """GPU load, system RAM and the phase string are live-only readings
-    that a reconnecting stream rebuilds by replaying the log. Persisting
-    them would turn a 2-second tick into a 2-second disk write."""
+    that a resumed stream rebuilds by replaying the log. Persisting them
+    would turn a 2-second tick into a 2-second disk write."""
     backend = _running_job_backend(tmp_path)
     writes = []
     monkeypatch.setattr(Fleet, "save_jobs",
