@@ -120,7 +120,15 @@
             <div class="sum-mid"><div class="val" id="s-gpus">—</div><canvas class="sum-spark" id="ss-gpus" width="110" height="30"></canvas></div>
           </div>
           <div class="sum">
-            <div class="sum-top"><span class="lab">Frames done</span><span class="trend" id="tr-frames">—</span></div>
+            <!-- "now", not a fleet-wide running total: this tile counts
+                 only the renders that are actually going, exactly like
+                 "Rendering now" and "GPUs active" beside it, so it reads 0
+                 when nothing is rendering. Summing every tracked worker
+                 instead is what made a fleet whose renders had all
+                 finished show "FRAMES DONE 4" -- a leftover from the last
+                 live connection, true of nothing. A finished scene's own
+                 total is on its frame grid below. -->
+            <div class="sum-top"><span class="lab" title="Frames finished by the renders running right now — 0 when nothing is rendering. A finished scene's total stays on its own frame grid below, and “Collect frames…” is the authoritative list of what exists on Kaggle.">Frames done now</span><span class="trend" id="tr-frames">—</span></div>
             <div class="sum-mid"><div class="val" id="s-frames">—</div><canvas class="sum-spark" id="ss-frames" width="110" height="30"></canvas></div>
           </div>
         </div>

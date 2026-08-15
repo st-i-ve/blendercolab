@@ -735,6 +735,93 @@ def _two_scene_state(extra_job_fields=""):
     }})"""
 
 
+def _finished_fleet_state():
+    """Every tracked render has FINISHED: two scenes, one account each,
+    both complete, no live stream anywhere. Exactly the dashboard from the
+    field report, which still read "6 scenes rendering / FRAMES DONE 4"."""
+    return """({
+      job: null,
+      jobs: [
+        {jobId:'j-alpha', scene:'alpha', blend:'alpha.blend',
+         startFrame:1, endFrame:2, labels:['acct0'], elapsed:320,
+         finished:true},
+        {jobId:'j-beta', scene:'beta', blend:'beta.blend',
+         startFrame:1, endFrame:2, labels:['acct1'], elapsed:280,
+         finished:true}
+      ],
+      instances: [
+        {label:'acct0', username:'acct0', verified:true, revoked:false,
+         owner:false, jobId:'j-alpha', quota:'', hardware:null,
+         worker:{state:'complete', frames:[1,2], framesDone:2, message:'',
+                 elapsed:320, finished:true, framesDoneAge:3600,
+                 framesDoneSource:'final'}, live:null},
+        {label:'acct1', username:'acct1', verified:true, revoked:false,
+         owner:false, jobId:'j-beta', quota:'', hardware:null,
+         worker:{state:'complete', frames:[1,2], framesDone:2, message:'',
+                 elapsed:280, finished:true, framesDoneAge:3600,
+                 framesDoneSource:'final'}, live:null}
+      ],
+      dataset: null, unshared: null, unreadableJobs: [], blend: null,
+      approximate: true
+    })"""
+
+
+def _state_text(page, payload_js, element_id):
+    """renderState(json), then one element's textContent -- for the summary
+    tiles and headings, which are written into elements that already exist
+    rather than rebuilt."""
+    out = {}
+    loop = QEventLoop()
+    page.runJavaScript(
+        "(() => { try {"
+        f" renderState(JSON.stringify({payload_js}));"
+        f" return document.getElementById({element_id!r}).textContent;"
+        " } catch (e) { return 'THREW ' + e; } })()",
+        lambda r: (out.__setitem__("v", r or ""), loop.quit()))
+    QTimer.singleShot(5000, loop.quit)
+    loop.exec()
+    assert "v" in out and not out["v"].startswith("THREW"), out.get("v")
+    return out["v"]
+
+
+def test_the_heading_does_not_call_a_finished_job_a_rendering_one(loaded_page):
+    """"6 scenes rendering" with nothing rendering is the same untruth the
+    startup check exists to prevent -- and a job stays tracked until the
+    user forgets it, so that count only ever grew."""
+    page, _ = loaded_page
+    text = _state_text(page, _finished_fleet_state(), "job-meta")
+    assert "rendering" not in text.replace("none rendering", "")
+    assert "2 scenes tracked" in text
+    assert "Collect frames" in text
+
+
+def test_the_heading_counts_only_the_scenes_actually_rendering(loaded_page):
+    page, _ = loaded_page
+    text = _state_text(page, _two_scene_state(), "job-meta")
+    assert text.startswith("2 scenes rendering")
+
+
+def test_the_frames_done_tile_reads_zero_when_nothing_is_rendering(
+        loaded_page):
+    """It summed every TRACKED worker, so a fleet whose renders had all
+    finished showed a leftover count as though it were live activity."""
+    page, _ = loaded_page
+    assert _state_text(page, _finished_fleet_state(), "s-frames") == "0"
+
+
+def test_the_rendering_now_tile_reads_zero_when_nothing_is_rendering(
+        loaded_page):
+    page, _ = loaded_page
+    assert _state_text(page, _finished_fleet_state(), "s-run") == "0"
+
+
+def test_the_frames_done_tile_still_counts_a_live_render(loaded_page):
+    """Zero is only ever the answer when nothing is going: two running
+    accounts at 2 and 1 frames still read 3."""
+    page, _ = loaded_page
+    assert _state_text(page, _two_scene_state(), "s-frames") == "3"
+
+
 def test_instances_are_grouped_by_the_scene_they_are_rendering(loaded_page):
     """Two scenes at once, and no way to tell which card belongs to which,
     would be worse than not having the feature."""

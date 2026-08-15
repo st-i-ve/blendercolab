@@ -26,6 +26,31 @@ let prefs = { theme: 'light', accent: 'orange', translucent: false,
               sound: true };
 const history = { inst: [], run: [], gpus: [], frames: [] };
 
+/* kaggle_client.TERMINAL_STATES, mirrored here because the page has to
+   answer the same question the backend does: is this worker's kernel done
+   with, or could it still be doing something? "complete"/"error"/
+   "cancel_acknowledged" are the states after which nothing further happens
+   without a brand new push -- see the constant's own comment in
+   kaggle_client.py for why "not in ACTIVE_STATES" is NOT the same test (a
+   kernel Kaggle has accepted but not started yet answers "not_started",
+   and one whose session has not run its first cell answers "new_script";
+   neither is active and neither is finished).
+
+   Everything on the dashboard that claims something is HAPPENING is
+   computed through this: a tile, a heading or a Cancel button that counts
+   a finished job is the same untruth as a card that says a completed
+   render is still waiting. */
+const TERMINAL_STATES = ['complete', 'error', 'cancel_acknowledged'];
+function isTerminal(worker) {
+  return !!worker && TERMINAL_STATES.includes(worker.state);
+}
+/* An account whose kernel could still be doing something on Kaggle: it has
+   a worker and that worker has not reached a terminal state. Idle accounts
+   (worker: null) are not "live" -- there is no session at all. */
+function isLive(inst) {
+  return !!(inst && inst.worker && !isTerminal(inst.worker));
+}
+
 /* ---------------- sounds -------------------------------------------------
    Synthesised, exactly as the reference does it -- no audio files to ship,
    and the tones stay identical across themes and platforms. Audio cannot
@@ -228,10 +253,20 @@ function renderState(json) {
      hardware would give and would read as activity that is not happening. */
   const gpus = state.instances.reduce(
     (n, i) => n + (i.live ? i.live.gpus.length : 0), 0);
+  /* Scoped to workers that have NOT reached a terminal state, exactly like
+     "Rendering now" and "GPUs active" beside it. It used to sum every
+     tracked worker's framesDone, so a fleet whose renders had all finished
+     hours ago showed "FRAMES DONE 4" -- part live figure, part leftover
+     from whatever the log stream last saved before the window closed, and
+     true of nothing at all. This tile answers "what is happening right
+     now", so with nothing rendering the honest answer is 0; the finished
+     scenes' own totals live on their frame grids, where they carry the
+     scene they belong to. */
   const frames = state.instances.reduce(
-    (n, i) => n + (i.live && i.live.framesTotal
-                   ? i.live.framesDone
-                   : (i.worker ? i.worker.framesDone : 0)), 0);
+    (n, i) => n + (!isLive(i) ? 0
+                   : (i.live && i.live.framesTotal
+                      ? i.live.framesDone
+                      : (i.worker.framesDone || 0))), 0);
 
   setStat('inst', online);
   setStat('run', running);
@@ -239,10 +274,23 @@ function renderState(json) {
   setStat('frames', frames);
 
   const jobs = state.jobs || [];
+  /* Jobs with at least one worker still capable of doing something. The
+     heading counted TRACKED jobs, which is why a dashboard on which every
+     render had finished still read "6 scenes rendering" -- and a job stays
+     tracked until the user forgets it, so that number only ever grew.
+     Counted from the instances rather than from job.finished because a job
+     whose account was removed has no worker left to finish it, and the
+     cards are what the heading sits above. */
+  const liveJobIds = new Set(state.instances.filter(isLive)
+                             .map(i => i.jobId).filter(Boolean));
   const jobMeta = document.getElementById('job-meta');
   if (jobMeta) {
-    jobMeta.textContent = jobs.length
-      ? `${jobs.length} scene${jobs.length === 1 ? '' : 's'} rendering`
+    jobMeta.textContent = liveJobIds.size
+      ? `${liveJobIds.size} scene${liveJobIds.size === 1 ? '' : 's'} rendering`
+      : jobs.length
+      ? `${jobs.length} scene${jobs.length === 1 ? '' : 's'} tracked · none`
+        + ` rendering — use “Collect frames…” on a scene to download what`
+        + ` it made`
       : (state.blend ? `${state.blend.name} · not started` : 'no scene chosen');
   }
   document.getElementById('nav-running').textContent = running;
