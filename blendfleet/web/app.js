@@ -193,15 +193,32 @@ const downloads = {};
    without waiting for the next 30-second poll. */
 let lastStateJson = null;
 
+/* The payload the cards ON SCREEN were built from -- which is not the same
+   question as `lastStateJson`, the newest payload received whether or not
+   it changed anything. The live tick fires every 2 seconds and re-emits a
+   byte-identical payload whenever nothing moved; rebuilding every card for
+   one of those replaced a whole grid of composited layers to arrive back
+   at the same pixels. */
+let lastRenderedJson = null;
+
 function renderState(json) {
   lastStateJson = json;
   const state = JSON.parse(json);
   const wrap = document.getElementById('instances');
 
-  if (!state.instances.length) {
-    wrap.innerHTML = '<div class="empty">No accounts yet — add one under Instances to start rendering.</div>';
-  } else {
-    wrap.innerHTML = renderJobSections(state);
+  /* Only the card grid is guarded, and only against a payload that has
+     not changed by a single byte -- so anything that genuinely moved
+     (GPU load, frame counts, which is most ticks) still repaints. The
+     rest of this function writes numbers and text into elements that
+     already exist, which is cheap; THIS discards and rebuilds every
+     .inst in the fleet, which is not. */
+  if (json !== lastRenderedJson) {
+    if (!state.instances.length) {
+      wrap.innerHTML = '<div class="empty">No accounts yet — add one under Instances to start rendering.</div>';
+    } else {
+      wrap.innerHTML = renderJobSections(state);
+    }
+    lastRenderedJson = json;
   }
 
   const online = state.instances.length;
@@ -241,6 +258,18 @@ function renderState(json) {
   renderUnshared(state);
   renderFailures(state);
   renderDataset(state);
+}
+
+/* Rebuild the cards from the payload already on screen.
+   A card also reads `downloads`, which is NOT part of the payload, so a
+   download tick changes what the card should say without changing a byte
+   of state -- exactly the case renderState's guard above is built to
+   ignore. Callers that changed `downloads` say so by coming through
+   here rather than by calling renderState directly. */
+function repaintCards() {
+  if (!lastStateJson) return;
+  lastRenderedJson = null;
+  renderState(lastStateJson);
 }
 
 /* Groups state.instances by the job they belong to -- one section per
@@ -1462,8 +1491,8 @@ new QWebChannel(qt.webChannelTransport, channel => {
           ? Math.min(100, Math.round(100 * p.downloaded / p.total)) : 0) + '%';
       }
       if (text) text.textContent = fmtDownload(p);
-    } else if (lastStateJson) {
-      renderState(lastStateJson);   // first tick: the row does not exist yet
+    } else {
+      repaintCards();               // first tick: the row does not exist yet
     }
   });
 
@@ -1478,7 +1507,7 @@ new QWebChannel(qt.webChannelTransport, channel => {
        for ever, looking like it was still going. */
     if (key.indexOf('collect:') === 0 && !busy) {
       Object.keys(downloads).forEach(k => delete downloads[k]);
-      if (lastStateJson) renderState(lastStateJson);
+      repaintCards();
     }
     /* The dataset step has stopped. Anything still waiting was never
        confirmed -- prepare_dataset raises rather than continuing past an

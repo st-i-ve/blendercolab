@@ -1424,3 +1424,180 @@ def test_a_long_notification_wraps_to_several_lines(loaded_page):
     assert int(_overflow_of(page, js)) >= 5, (
         "a 250-character message that fits in fewer than five lines of a "
         "330px panel is being truncated, not wrapped")
+
+
+# ---------------------------------------------------------------------------
+# The frame preview flickering while a render runs (2026-08-15).
+#
+# Three separate faults sat behind the report, and each is pinned here on
+# its own terms. NONE of these tests can see a flicker -- that needs a
+# human, a running render and an open preview. What they assert is that
+# the three conditions that made the compositor redo work it did not need
+# to do are gone, and stay gone.
+# ---------------------------------------------------------------------------
+
+
+def _flicker_state(frames_done):
+    """One running account, carrying a number that can be varied so two
+    payloads can be made to differ in exactly one place."""
+    return f"""({{
+      job: null,
+      jobs: [{{jobId:'j-flick', scene:'flick', blend:'flick.blend',
+               startFrame:1, endFrame:4, labels:['acct0'],
+               elapsed:5, finished:false}}],
+      instances: [
+        {{label:'acct0', username:'acct0', verified:true, revoked:false,
+          owner:false, jobId:'j-flick', quota:'', hardware:null,
+          worker:{{state:'running', frames:[1,2,3,4],
+                  framesDone:{frames_done}, message:'', elapsed:5,
+                  finished:false}}, live:null}}
+      ],
+      dataset: null, unshared: null, unreadableJobs: [], blend: null,
+      approximate: true
+    }})"""
+
+
+def test_the_preview_sits_on_its_own_layer_above_the_modal(loaded_page):
+    """.lightbox and .modal were both z-index 120, which left "which of
+    the two covers the other" to DOM order rather than to a decision.
+
+    Read back through the real CSS engine rather than by grepping the
+    stylesheet: a later rule can always override an earlier one, so the
+    text of the file is not the answer -- the computed value is."""
+    page, _ = loaded_page
+    result = _preview_state(page,
+        "const modal = document.createElement('div');"
+        " modal.className = 'modal';"
+        " const tipped = document.createElement('div');"
+        " tipped.setAttribute('data-tip', 'x');"
+        " document.body.appendChild(modal);"
+        " document.body.appendChild(tipped);"
+        " const lb = document.getElementById('lightbox');"
+        " const was = lb.hidden; lb.hidden = false;"
+        " const out = {"
+        "   modal: getComputedStyle(modal).zIndex,"
+        "   lightbox: getComputedStyle(lb).zIndex,"
+        "   toasts: getComputedStyle("
+        "     document.getElementById('toast-stack')).zIndex,"
+        "   tooltip: getComputedStyle(tipped, '::after').zIndex};"
+        " lb.hidden = was; modal.remove(); tipped.remove();"
+        " return JSON.stringify(out);")
+    import json as _json
+    got = _json.loads(result)
+    assert "auto" not in got.values(), got
+    layers = {k: int(v) for k, v in got.items()}
+    assert layers["lightbox"] > layers["modal"], (
+        "the preview must cover a modal, not tie with it: " + str(layers))
+    assert layers["modal"] > layers["toasts"], layers
+    assert layers["tooltip"] > layers["lightbox"], (
+        "a tooltip belongs to controls at every level, including the "
+        "preview's own Close button: " + str(layers))
+
+
+def _alpha_of(css_colour):
+    """Alpha out of a computed colour, in EITHER syntax Chromium hands
+    back: legacy `rgba(r, g, b, a)`, or CSS Color 4's
+    `color(srgb r g b / a)` -- which is what a color-mix() resolves to,
+    and is exactly the translucent value this must not miss."""
+    if "/" in css_colour:
+        return float(css_colour.rsplit("/", 1)[1].strip(" )"))
+    if css_colour.startswith("rgba("):
+        return float(css_colour[css_colour.index("(") + 1:-1].split(",")[3])
+    return 1.0
+
+
+def test_the_open_preview_has_nothing_left_to_re_blur(loaded_page):
+    """A backdrop-filter must be re-sampled by the compositor whenever
+    anything BEHIND it repaints -- and behind this sits the whole
+    dashboard, every card of it rebuilt on each 2-second live tick of a
+    running render. An opaque background has nothing behind it to sample.
+
+    Swept over every mode the app actually ships -- light, dark, and each
+    of those with the `glass` translucency preference on -- because --bg
+    is a per-theme token and `body.glass` re-blurs surfaces in bulk. A
+    background that is only opaque in the theme that happened to be
+    loaded would be no fix at all for the user running the other one."""
+    page, _ = loaded_page
+    result = _preview_state(page,
+        "const root = document.documentElement;"
+        " const lb = document.getElementById('lightbox');"
+        " const wasHidden = lb.hidden, wasTheme = root.dataset.theme;"
+        " const wasGlass = document.body.classList.contains('glass');"
+        " lb.hidden = false;"
+        " const out = {};"
+        " ['light', 'dark'].forEach(theme => {"
+        "   [false, true].forEach(glass => {"
+        "     root.dataset.theme = theme;"
+        "     document.body.classList.toggle('glass', glass);"
+        "     const cs = getComputedStyle(lb);"
+        "     out[theme + (glass ? '+glass' : '')] = {"
+        "       bg: cs.backgroundColor,"
+        "       filter: cs.backdropFilter || cs.webkitBackdropFilter"
+        "               || 'none'};"
+        "   });"
+        " });"
+        " root.dataset.theme = wasTheme;"
+        " document.body.classList.toggle('glass', wasGlass);"
+        " lb.hidden = wasHidden;"
+        " return JSON.stringify(out);")
+    import json as _json
+    got = _json.loads(result)
+    assert set(got) == {"light", "light+glass", "dark", "dark+glass"}, got
+    for mode, seen in got.items():
+        assert seen["filter"] == "none", \
+            f"the preview still carries a backdrop-filter in {mode}: {seen}"
+        assert _alpha_of(seen["bg"]) == 1.0, \
+            f"the preview backdrop is still translucent in {mode} "\
+            f"({seen['bg']}), so the dashboard behind it still forces a "\
+            "re-composite"
+
+
+def test_an_unchanged_payload_does_not_rebuild_every_card(loaded_page):
+    """renderState replaced the entire card grid on EVERY state emit, and
+    the live tick emits every 2 seconds throughout a render whether or
+    not anything moved. Node identity is the assertion: identical HTML
+    would look the same either way, but only a skipped rebuild leaves the
+    same element in place."""
+    page, _ = loaded_page
+    result = _preview_state(page,
+        f"renderState(JSON.stringify({_flicker_state(1)}));"
+        " const first = document.querySelector('#instances .inst');"
+        f" renderState(JSON.stringify({_flicker_state(1)}));"
+        " const afterSame = document.querySelector('#instances .inst');"
+        f" renderState(JSON.stringify({_flicker_state(3)}));"
+        " const afterChange = document.querySelector('#instances .inst');"
+        " return JSON.stringify({"
+        "   present: first !== null,"
+        "   kept: first === afterSame,"
+        "   replaced: afterChange !== null && afterChange !== first});")
+    import json as _json
+    got = _json.loads(result)
+    assert got["present"], "the first render produced no card at all"
+    assert got["kept"], \
+        "a byte-identical payload still replaced the card grid"
+    assert got["replaced"], \
+        "a payload that DID change left the stale card on screen -- the "\
+        "skip is now swallowing real updates, which is far worse than "\
+        "the flicker it was added to fix"
+
+
+def test_a_download_tick_still_repaints_the_cards(loaded_page):
+    """The other side of the skip. A card also reads `downloads`, which
+    is not part of the state payload, so a collect starting or finishing
+    changes what the card should say without changing a byte of state --
+    precisely the case the skip above is built to ignore. That path goes
+    through repaintCards(), which must force the rebuild anyway."""
+    page, _ = loaded_page
+    result = _preview_state(page,
+        f"renderState(JSON.stringify({_flicker_state(2)}));"
+        " const first = document.querySelector('#instances .inst');"
+        " repaintCards();"
+        " const after = document.querySelector('#instances .inst');"
+        " return JSON.stringify({"
+        "   present: after !== null, rebuilt: first !== after});")
+    import json as _json
+    got = _json.loads(result)
+    assert got["present"], "repaintCards() left the grid empty"
+    assert got["rebuilt"], (
+        "repaintCards() was skipped as an unchanged payload -- a download "
+        "bar would then never appear until the state happened to change")

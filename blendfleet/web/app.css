@@ -86,6 +86,33 @@ body.glass .side,body.glass .offline-banner{
   -webkit-backdrop-filter:blur(16px) saturate(1.25);
 }
 
+/* ============================================================
+   STACKING ORDER
+   ============================================================
+   Every z-index in this file is listed here, because the only way to get
+   this wrong is to pick a number without knowing what else is using it --
+   which is how .lightbox and .modal both ended up on 120, leaving "which
+   one covers the other" to DOM order rather than to a decision.
+
+     -1   body::before   the ambient accent wash, behind the whole app
+      2   .fthumb .fnum/.fown, and
+      3   .lb-nav/.lb-count -- all four stack only inside their own
+                         positioned parent, so they never reach this scale
+     40   .side          the sidebar, over page content it scrolls past
+     90   .notif-panel   notification drawer
+     92   .health-panel  the wifi popup, which opens FROM the same corner
+                         and must land on top of the drawer, not under it
+    100   .toast-stack   transient messages, above both panels
+    120   .modal         takes the whole window; nothing routine is above it
+    130   .lightbox      a frame preview covers the dashboard AND any modal:
+                         it is opened deliberately, to look at one picture,
+                         and half a modal bleeding through it is noise
+    200   [data-tip]     tooltips belong to controls at EVERY level above,
+                         including the lightbox's own Close button, so they
+                         sit above all of them
+
+   Gaps are deliberate: room to slot a layer in without renumbering. */
+
 *{box-sizing:border-box;margin:0;padding:0}
 body{
   background:var(--bg);color:var(--ink);
@@ -825,6 +852,7 @@ h2.sec .meta{font-family:var(--mono);font-size:11px;font-weight:400;color:var(--
 /* ============================================================
    MODAL
    ============================================================ */
+/* 120: see STACKING ORDER at the top of this file. */
 .modal{position:fixed;inset:0;background:rgba(0,0,0,.35);z-index:120;display:none;align-items:center;justify-content:center;padding:20px}
 .modal.show{display:flex}
 .modal-box{background:var(--card);border:1px solid var(--border);border-radius:20px;box-shadow:var(--shadow-lg);width:100%;max-width:420px;overflow:hidden}
@@ -957,9 +985,18 @@ button:focus:not(:focus-visible){outline:none}
    rather than the whole job's output. Fills the window because the point
    is to look at the picture, not at chrome around it. */
 .lightbox{
-  position:fixed;inset:0;z-index:120;
-  background:color-mix(in srgb,var(--bg) 82%,transparent);
-  backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);
+  position:fixed;inset:0;z-index:130;   /* see STACKING ORDER, top of file */
+  /* Opaque, where this used to be 82% --bg over blur(10px). A
+     backdrop-filter has to be re-sampled by the compositor every time
+     ANYTHING behind it repaints, and what is behind this is the whole
+     dashboard -- every .inst card rebuilt on each 2-second live tick of a
+     running render, each of those a blurred layer of its own in glass
+     mode. Solid ground costs nothing to hold on screen, and it is also
+     the honest background for the job: judging a render against a
+     moving, tinted backdrop is judging it against the wrong thing.
+     --bg follows the theme, so this stays right in light, dark and
+     glass alike. */
+  background:var(--bg);
   display:flex;flex-direction:column;
   animation:toastIn .16s ease;
 }
