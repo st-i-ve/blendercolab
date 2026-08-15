@@ -389,6 +389,15 @@ function jobSectionHtml(job, instances) {
         ${cancelBtn}
       </div>
     </div>
+    <!-- The whole scene's download, alongside the per-account bytes each
+         card already shows. Collect now writes ONE zip per render, so
+         "how far along is my zip" is a question the per-card figures
+         cannot answer between them -- see rollupDownload for why it is
+         bytes, and why it declines to show a percentage until every
+         account has reported a real size. Empty when nothing is
+         downloading, so an idle section is unchanged. -->
+    <div class="job-dl" data-jdl="${esc(job.jobId)}">${
+      jobDownloadInnerHtml(job.jobId)}</div>
     <div class="instances">${instances.map(instanceCard).join('')}</div>
     ${renderFrameGrid(job, instances)}
   </section>`;
@@ -1310,6 +1319,89 @@ document.getElementById('scene-list').addEventListener('click', e => {
    a slower question answered afterwards by checkOutputs(), which is why
    `availability` has four values and why "unchecked" is one of them. */
 
+/* Held between renders so a row that is mid-download, or that has just
+   finished one, does not lose that the moment an availability check
+   re-emits the whole list. Keyed by jobId. */
+const collectResults = {};
+
+/* The last outputs payload, so a download tick or a finished collect can
+   redraw the rows without waiting for another bridge call -- the same
+   reason `lastStateJson` exists for the dashboard. */
+let lastOutputsJson = null;
+
+/* Every download tick seen for one render. `downloads` is keyed by
+   ACCOUNT because that is what the instance cards show; a job-level
+   figure is those same entries added up. */
+function jobDownloadEntries(jobId) {
+  return Object.keys(downloads).map(k => downloads[k])
+    .filter(d => d && d.jobId === jobId);
+}
+
+/* Per-account bytes rolled up into ONE figure for the whole render.
+ *
+ * Bytes, not "3 of 5 accounts done": the accounts are wildly unequal --
+ * one may hold 200 frames and another 2 -- so counting finished accounts
+ * would jump from 20% to 80% while most of the data was still arriving.
+ * Bytes are the thing actually being waited for, and summing them is
+ * exactly what the eventual zip is made of.
+ *
+ * The total is the honesty problem, and it is why `totalKnown` exists.
+ * Kaggle does not always send a Content-Length, so a worker's `total` can
+ * be 0 meaning NOT KNOWN (never "zero bytes"); and collect() fetches the
+ * accounts one after another, so an account that has not started yet has
+ * reported no size at all. In either case the sum of the totals is a
+ * FLOOR, not a total -- and dividing by a floor gives a percentage that
+ * climbs to 100% while bytes are still coming in, which is the one
+ * reading this app must never show. So a percentage is offered only when
+ * every account in the render has reported and every one of those
+ * reports carried a real size; otherwise `percent` is null and the caller
+ * shows the bytes so far and says the total is not yet known.
+ */
+function rollupDownload(entries, workerCount) {
+  const downloaded = entries.reduce((n, e) => n + (e.downloaded || 0), 0);
+  const rate = entries.reduce((n, e) => n + (e.rate || 0), 0);
+  const everyoneReported = workerCount > 0 && entries.length >= workerCount;
+  const everySizeKnown = entries.length > 0 && entries.every(e => e.total > 0);
+  const totalKnown = everyoneReported && everySizeKnown;
+  const total = totalKnown ? entries.reduce((n, e) => n + e.total, 0) : 0;
+  return {
+    downloaded, rate, total, totalKnown,
+    reported: entries.length,
+    workerCount,
+    /* null, never 0 and never 100: "no percentage can honestly be given
+       yet" is a different statement from "0% done". */
+    percent: totalKnown && total
+      ? Math.min(100, Math.round(100 * downloaded / total)) : null,
+  };
+}
+
+/* The inside of a job-level download indicator, shared by the Files row
+   and the dashboard's per-scene section so the two can never disagree.
+   Returns '' when this render has no download in flight. */
+function jobDownloadInnerHtml(jobId) {
+  const entries = jobDownloadEntries(jobId);
+  if (!entries.length) return '';
+  const roll = rollupDownload(entries, entries[0].jobWorkers || 0);
+  if (roll.percent === null) {
+    /* No bar at all. A bar drawn at 0% -- which is what an unknown total
+       forces -- reads as "not started" on a download that is plainly
+       moving, and a bar drawn against the sum-so-far reads as nearly
+       finished throughout. The byte counter is the honest instrument
+       here, and it is visibly ticking. */
+    return `<span class="tag on">downloading</span>
+      <span class="pct" data-jdl-text>${fmtDownload(
+        { downloaded: roll.downloaded, total: 0, rate: roll.rate })}</span>
+      <div class="out-note">Total size not known yet — ${roll.reported} of ${
+        roll.workerCount || '?'} account(s) have reported one, so there is no
+        honest percentage to show. The figure above is what has actually
+        arrived.</div>`;
+  }
+  return `<span class="tag on">downloading</span>
+    <div class="track rendering"><i data-jdl-bar style="width:${roll.percent}%"></i></div>
+    <span class="pct" data-jdl-text>${fmtDownload(
+      { downloaded: roll.downloaded, total: roll.total, rate: roll.rate })}</span>`;
+}
+
 /* Availability, in the row's own words. Four states, and the difference
    between them is the whole point of this section:
 
@@ -1371,6 +1463,25 @@ function outputRowHtml(o) {
   const accounts = o.accounts.length
     ? o.accounts.map(esc).join(', ')
     : 'no accounts recorded';
+  const dl = jobDownloadInnerHtml(o.jobId);
+  const result = collectResults[o.jobId];
+  /* Where the zip went, kept on the row rather than only in a toast that
+     fades. `archivePath` is empty when collect() wrote no zip at all --
+     which is a real outcome (nothing had rendered) and must not be
+     dressed up as a saved file. */
+  const resultHtml = !result ? ''
+    : result.archivePath
+      ? `<div class="out-note ok">Saved to ${esc(result.archivePath)} — ${
+          result.copied} frame(s). Unzip it to get the frames.${
+          result.wantedName
+            ? ` A ${esc(result.wantedName)} was already in that folder, so this
+               download was saved beside it rather than replacing it.` : ''}${
+          result.missing
+            ? ` ${result.missing} frame(s) are still missing — not rendered,
+               or that account failed.` : ''}</div>`
+      : `<div class="out-note bad">No zip was written to ${
+          esc(result.destination)} — nothing came back to put in one. ${
+          esc(result.message)}</div>`;
   return `<div class="fs-row out-row" data-out="${esc(o.jobId)}">
     <div class="fi frames">ZIP</div>
     <div class="grow">
@@ -1379,6 +1490,8 @@ function outputRowHtml(o) {
         (${o.frameCount})${esc(done)} · ${esc(when)} · ${esc(state)}
         · ${accounts}</div>
       <div class="out-state">${outputAvailabilityHtml(o)}</div>
+      <div class="out-prog" data-jdl="${esc(o.jobId)}">${dl}</div>
+      ${resultHtml}
     </div>
     <button class="btn sm" data-out-download="${esc(o.jobId)}"
       title="Downloads every frame this render produced into one zip in a
@@ -1389,12 +1502,17 @@ function outputRowHtml(o) {
 function renderOutputs(json) {
   const payload = JSON.parse(json);
   const outputs = payload.outputs || [];
+  lastOutputsJson = json;
   const list = document.getElementById('output-list');
   list.innerHTML = outputs.length
     ? outputs.map(outputRowHtml).join('')
     : '<div class="empty">No renders yet — BlendFleet lists the renders it '
       + 'has run itself, so this fills up once you render a scene. Renders '
       + 'started outside BlendFleet are not tracked here.</div>';
+}
+
+function repaintOutputs() {
+  if (lastOutputsJson) renderOutputs(lastOutputsJson);
 }
 
 document.getElementById('output-list').addEventListener('click', e => {
@@ -1867,6 +1985,27 @@ new QWebChannel(qt.webChannelTransport, channel => {
     } else {
       repaintCards();               // first tick: the row does not exist yet
     }
+    /* The JOB-level figure, on the dashboard section and on the Files
+       row alike. Rebuilt rather than patched field by field because the
+       indicator legitimately CHANGES SHAPE mid-download: it carries no
+       bar until every account has reported a real size, and grows one
+       the moment they have (see jobDownloadInnerHtml). */
+    const jobRows = Array.from(document.querySelectorAll('[data-jdl]'))
+      .filter(el => el.dataset.jdl === p.jobId);
+    jobRows.forEach(el => { el.innerHTML = jobDownloadInnerHtml(p.jobId); });
+    /* A Files row that has never been drawn for this render (the section
+       was rendered before the download began) has no [data-jdl] to patch,
+       so the whole list is redrawn once to grow one. */
+    if (!jobRows.length) repaintOutputs();
+  });
+
+  /* A collect has finished. The row that started it says where the zip
+     went -- the message already names the path -- instead of leaving a
+     bar behind or sending the user to hunt for the file. */
+  backend.collectFinished.connect(json => {
+    const result = JSON.parse(json);
+    if (result.jobId) collectResults[result.jobId] = result;
+    repaintOutputs();
   });
 
   backend.busyChanged.connect((key, busy) => {
@@ -1879,8 +2018,15 @@ new QWebChannel(qt.webChannelTransport, channel => {
        reached -- including a failed one, which would otherwise sit at 68%
        for ever, looking like it was still going. */
     if (key.indexOf('collect:') === 0 && !busy) {
-      Object.keys(downloads).forEach(k => delete downloads[k]);
+      const label = key.slice('collect:'.length);
+      /* Scoped to the account that finished, so a second collect running
+         alongside does not lose its bars. The fleet-wide button sends an
+         empty label and does mean "all of them". */
+      Object.keys(downloads).forEach(k => {
+        if (!label || k === label) delete downloads[k];
+      });
       repaintCards();
+      repaintOutputs();
     }
     /* The Files page's per-render Download button, keyed by jobId (see
        bridge.collect). Its own key, not a third segment of "collect:", so
@@ -1893,6 +2039,13 @@ new QWebChannel(qt.webChannelTransport, channel => {
       const jobBtn = Array.from(document.querySelectorAll('[data-job-collect]'))
         .find(el => el.dataset.jobCollect === jobId);
       if (jobBtn) jobBtn.disabled = busy;
+      if (!busy) {
+        Object.keys(downloads).forEach(k => {
+          if (downloads[k] && downloads[k].jobId === jobId) delete downloads[k];
+        });
+        repaintCards();
+        repaintOutputs();
+      }
     }
     /* The dataset step has stopped. Anything still waiting was never
        confirmed -- prepare_dataset raises rather than continuing past an

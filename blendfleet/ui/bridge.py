@@ -186,6 +186,10 @@ class Backend(QObject):
     # then again once the background availability pass has answered. See
     # outputs() / checkOutputs().
     outputsChanged = Signal(str)
+    # One finished collect, so the row that started it can say where the
+    # zip landed. Separate from downloadProgress because it is a RESULT,
+    # not a reading -- progress keeps flowing on the existing channel.
+    collectFinished = Signal(str)
 
     def __init__(self, store: AccountStore, fleet_factory, verifier,
                  settings: Settings, parent: QObject | None = None) -> None:
@@ -2121,6 +2125,12 @@ class Backend(QObject):
             return
         accounts = self.store.list()
         who = label or "the fleet"
+        # Which job this collect actually ran against, filled in by work()
+        # once it has resolved `label`/`job_id`/"the newest". The result
+        # handler needs it to tell the ONE row that started this download
+        # where its zip went, and it cannot re-derive it: "the newest job"
+        # could have changed by the time the download finishes.
+        resolved: dict[str, object] = {}
 
         def work():
             fleet = self.fleet_factory(accounts)
@@ -2140,6 +2150,18 @@ class Backend(QObject):
                 job = jobs[-1] if jobs else None
             if job is None:
                 return None
+            resolved["jobId"] = job.job_id
+            resolved["scene"] = job.scene_key
+            # How many accounts THIS collect will fetch from -- one for a
+            # per-instance download, the whole fleet otherwise, mirroring
+            # collector.collect's own filter exactly. The page rolls the
+            # per-account byte counts up into a single job figure and has
+            # no other way to know when it has heard from everyone; a count
+            # guessed from whoever has reported so far would read as
+            # complete the moment the first account finished.
+            resolved["workers"] = (
+                sum(1 for w in job.workers if w.label == label) if label
+                else len(job.workers))
             return collect_frames(
                 job, accounts, fleet.client_factory, Path(destination),
                 worker_label=label or None,
@@ -2156,6 +2178,13 @@ class Backend(QObject):
                         # above: a getattr default would turn a rename
                         # into a permanent, plausible-looking 0 B/s.
                         "rate": p.rate_bps,
+                        # Which render these bytes belong to, and how many
+                        # accounts are in it. Carried on the EXISTING
+                        # progress signal rather than a second channel:
+                        # the dashboard card still reads `label`, and the
+                        # job-level bar is the same ticks added up.
+                        "jobId": resolved["jobId"],
+                        "jobWorkers": resolved["workers"],
                     })))
 
         def ok(report) -> None:
@@ -2193,6 +2222,22 @@ class Backend(QObject):
                                    for k, v in report.worker_errors.items())
                 message += f". Could not reach: {detail}"
             self.notification.emit(message, tone)
+            # The same sentence, addressed to the ONE row that started
+            # this download, so it can stop showing a bar and say where
+            # the zip went instead of leaving the user to find it in a
+            # toast that has already faded.
+            self.collectFinished.emit(json.dumps({
+                "jobId": resolved.get("jobId", ""),
+                "label": label,
+                "archivePath": (str(report.archive_path)
+                                if report.archive_path else ""),
+                "wantedName": report.wanted_name,
+                "copied": report.copied,
+                "missing": len(report.missing_frames),
+                "destination": destination,
+                "message": message,
+                "tone": tone,
+            }))
 
         # Fix round 2: the busy key is BUTTON identity, not call identity.
         # `job_id` was folded into this key alongside `label`, but app.js

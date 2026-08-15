@@ -3455,3 +3455,97 @@ def test_the_fleet_wide_button_keeps_its_exact_key(qapp, tmp_path,
     _settle(backend)
 
     assert ("collect:", True) in keys and ("collect:", False) in keys
+
+
+def _progress_collect(monkeypatch, tmp_path, ticks, report=None):
+    """Stub collector.collect so it emits the given progress ticks."""
+    import blendfleet.collector as collector_mod
+    from blendfleet.collector import CollectReport
+
+    def fake_collect(state, accounts, client_factory, dest, *,
+                     worker_label=None, on_progress=None):
+        for label, downloaded, total in ticks:
+            on_progress(label, type("P", (), {
+                "downloaded": downloaded, "total": total,
+                "rate_bps": 1024})())
+        return report if report is not None else CollectReport(copied=3)
+
+    monkeypatch.setattr(collector_mod, "collect", fake_collect)
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory",
+                        lambda *a, **kw: str(tmp_path / "out"))
+
+
+def test_download_progress_says_which_render_and_how_many_accounts(
+        qapp, tmp_path, monkeypatch):
+    """Carried on the EXISTING downloadProgress signal -- the instance
+    cards still read `label` -- with just enough added for the page to add
+    the per-account ticks up into one figure for the render. The account
+    COUNT has to come from here: a page counting whoever has reported so
+    far would read as complete the moment the first account finished."""
+    backend = _two_job_collect_backend(tmp_path)
+    _progress_collect(monkeypatch, tmp_path, [("acct0", 500, 1000)])
+    ticks = []
+    backend.downloadProgress.connect(lambda j: ticks.append(json.loads(j)))
+
+    backend.collect("", "job-a")
+    _settle(backend)
+
+    assert ticks and ticks[0]["jobId"] == "job-a"
+    assert ticks[0]["label"] == "acct0"
+    assert ticks[0]["jobWorkers"] == 1
+    assert ticks[0]["downloaded"] == 500 and ticks[0]["total"] == 1000
+
+
+def test_a_per_instance_download_reports_one_account_not_the_whole_job(
+        qapp, tmp_path, monkeypatch):
+    """collector.collect filters to that one worker, so the roll-up must
+    be told to expect one -- otherwise the job bar waits for accounts this
+    download was never going to fetch from."""
+    backend = _two_job_collect_backend(tmp_path)
+    _progress_collect(monkeypatch, tmp_path, [("acct0", 10, 20)])
+    ticks = []
+    backend.downloadProgress.connect(lambda j: ticks.append(json.loads(j)))
+
+    backend.collect("acct0")
+    _settle(backend)
+
+    assert ticks[0]["jobWorkers"] == 1
+
+
+def test_a_finished_download_tells_the_row_where_the_zip_went(
+        qapp, tmp_path, monkeypatch):
+    """The row that started it says where the file is, rather than the
+    path living only in a toast that fades."""
+    from blendfleet.collector import CollectReport
+    backend = _two_job_collect_backend(tmp_path)
+    archive = tmp_path / "out" / "alpha.zip"
+    _progress_collect(monkeypatch, tmp_path, [("acct0", 10, 10)],
+                      report=CollectReport(copied=3, archive_path=archive))
+    done = []
+    backend.collectFinished.connect(lambda j: done.append(json.loads(j)))
+
+    backend.collect("", "job-a")
+    _settle(backend)
+
+    assert done and done[0]["jobId"] == "job-a"
+    assert done[0]["archivePath"] == str(archive)
+    assert done[0]["copied"] == 3
+    assert "alpha.zip" in done[0]["message"]
+
+
+def test_a_download_that_wrote_no_zip_does_not_name_one(qapp, tmp_path,
+                                                        monkeypatch):
+    """collect() writes no zip when nothing came back. Absent, not zero --
+    naming a file that is not there sends the user hunting for it."""
+    from blendfleet.collector import CollectReport
+    backend = _two_job_collect_backend(tmp_path)
+    _progress_collect(monkeypatch, tmp_path, [],
+                      report=CollectReport(copied=0))
+    done = []
+    backend.collectFinished.connect(lambda j: done.append(json.loads(j)))
+
+    backend.collect("", "job-a")
+    _settle(backend)
+
+    assert done and done[0]["archivePath"] == ""
+    assert done[0]["destination"] == str(tmp_path / "out")

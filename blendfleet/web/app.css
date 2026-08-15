@@ -946,6 +946,25 @@ h2.sec .meta{font-family:var(--mono);font-size:11px;font-weight:400;color:var(--
 .out-row .fi{margin-top:2px}
 .out-row .out-state{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin-top:6px}
 .out-row .out-state .lock{flex:1;min-width:140px;line-height:1.5}
+/* Empty until a download for THIS render starts, so an idle row shows
+   nothing at all rather than a bar at zero. */
+.out-row .out-prog:empty,.job-dl:empty{display:none}
+.out-row .out-prog,.job-dl{
+  display:grid;grid-template-columns:auto 1fr auto;
+  align-items:center;gap:9px;margin-top:8px;
+}
+.out-row .out-prog .tag,.job-dl .tag{font-family:var(--mono);font-size:10.5px;color:var(--ink);font-weight:500}
+.out-row .out-prog .pct,.job-dl .pct{font-family:var(--mono);font-size:10.5px;color:var(--ink-2);text-align:right}
+/* The "no honest percentage yet" sentence takes the bar's place, so it
+   spans the row rather than being squeezed into one column. */
+.out-row .out-prog .out-note,.job-dl .out-note{grid-column:1/-1;margin-top:0}
+.job-dl{margin:0 2px 12px}
+.out-row .out-note{
+  font-family:var(--mono);font-size:10px;color:var(--ink-3);
+  margin-top:6px;line-height:1.55;word-break:break-word;
+}
+.out-row .out-note.ok{color:var(--active-ink)}
+.out-row .out-note.bad{color:var(--offline-ink)}
 .out-row > .btn{flex:none;margin-top:2px}
 
 @media (prefers-reduced-motion: reduce){*{animation:none!important;transition:none!important}}

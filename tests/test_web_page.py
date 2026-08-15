@@ -2156,3 +2156,145 @@ def test_an_empty_outputs_list_says_why_it_is_empty(loaded_page):
     html = _outputs_html(page, "({outputs:[]})")
     assert "No renders yet" in html
     assert "outside BlendFleet are not tracked" in html
+
+
+# ---- job-level download progress ------------------------------------------
+
+def _rollup(page, entries_js, worker_count):
+    out = {}
+    loop = QEventLoop()
+    page.runJavaScript(
+        "(() => { try { return JSON.stringify(rollupDownload("
+        + entries_js + ", " + str(worker_count) + ")); }"
+        " catch (e) { return 'THREW ' + e; } })()",
+        lambda r: (out.__setitem__("v", r or ""), loop.quit()))
+    QTimer.singleShot(5000, loop.quit)
+    loop.exec()
+    assert "v" in out and not out["v"].startswith("THREW"), out.get("v")
+    return json_loads(out["v"])
+
+
+def test_job_progress_adds_the_accounts_bytes_together(loaded_page):
+    """Bytes, not "2 of 3 accounts done": the accounts hold wildly unequal
+    shares of a render, so counting finished ones jumps in useless steps."""
+    page, _ = loaded_page
+    roll = _rollup(page, "[{downloaded:400,total:1000,rate:100},"
+                         " {downloaded:600,total:1000,rate:200}]", 2)
+    assert roll["downloaded"] == 1000
+    assert roll["total"] == 2000
+    assert roll["percent"] == 50
+    assert roll["rate"] == 300
+
+
+def test_job_progress_shows_no_percentage_when_a_total_is_unknown(loaded_page):
+    """Kaggle does not always send a Content-Length, so total 0 means NOT
+    KNOWN. Dividing by the sum of the known ones gives a bar that reaches
+    100% while bytes are still arriving."""
+    page, _ = loaded_page
+    roll = _rollup(page, "[{downloaded:900,total:1000,rate:0},"
+                         " {downloaded:100,total:0,rate:0}]", 2)
+    assert roll["percent"] is None, "an unknown total must not become a bar"
+    assert roll["totalKnown"] is False
+    assert roll["downloaded"] == 1000, "the bytes that arrived are still real"
+
+
+def test_job_progress_waits_for_every_account_to_report(loaded_page):
+    """collect() fetches the accounts one after another, so a job whose
+    second account has not started yet has reported only part of its size.
+    Reading 100% there is exactly the false complete this forbids."""
+    page, _ = loaded_page
+    roll = _rollup(page, "[{downloaded:1000,total:1000,rate:0}]", 3)
+    assert roll["percent"] is None
+    assert roll["reported"] == 1 and roll["workerCount"] == 3
+
+
+def test_job_progress_is_complete_only_when_everyone_has_reported(loaded_page):
+    page, _ = loaded_page
+    roll = _rollup(page, "[{downloaded:1000,total:1000,rate:0},"
+                         " {downloaded:500,total:500,rate:0}]", 2)
+    assert roll["percent"] == 100
+
+
+def _row_with_downloads(page, downloads_js, results_js="({})"):
+    """Render the outputs list with `downloads`/`collectResults` primed."""
+    payload = "({outputs:[" + _output() + "]})"
+    out = {}
+    loop = QEventLoop()
+    page.runJavaScript(
+        "(() => { try {"
+        f"  const d = {downloads_js};"
+        "   Object.keys(d).forEach(k => { downloads[k] = d[k]; });"
+        f"  const r = {results_js};"
+        "   Object.keys(r).forEach(k => { collectResults[k] = r[k]; });"
+        f"  renderOutputs(JSON.stringify({payload}));"
+        "   const html = document.getElementById('output-list').innerHTML;"
+        "   Object.keys(d).forEach(k => delete downloads[k]);"
+        "   Object.keys(r).forEach(k => delete collectResults[k]);"
+        "   return html;"
+        " } catch (e) { return 'THREW ' + e; } })()",
+        lambda r: (out.__setitem__("v", r or ""), loop.quit()))
+    QTimer.singleShot(5000, loop.quit)
+    loop.exec()
+    assert "v" in out and not out["v"].startswith("THREW"), out.get("v")
+    return out["v"]
+
+
+def test_a_downloading_files_row_shows_its_own_progress(loaded_page):
+    """The row that started the download must not look inert while it
+    runs -- that was the complaint this whole change is about."""
+    page, _ = loaded_page
+    html = _row_with_downloads(
+        page,
+        "({acct0:{downloaded:13002343,total:37855928,rate:1887436,"
+        "jobId:'job-1',jobWorkers:2},"
+        " acct1:{downloaded:1048576,total:2097152,rate:1048576,"
+        "jobId:'job-1',jobWorkers:2}})")
+    assert 'data-jdl="job-1"' in html
+    assert "downloading" in html
+    assert "13 MB" in html and "38 MB" in html
+    assert "data-jdl-bar" in html
+
+
+def test_a_files_row_bar_is_absent_while_a_total_is_unknown(loaded_page):
+    page, _ = loaded_page
+    html = _row_with_downloads(
+        page,
+        "({acct0:{downloaded:13002343,total:0,rate:0,"
+        "jobId:'job-1',jobWorkers:2}})")
+    assert "downloading" in html
+    assert "12 MB" in html
+    assert "data-jdl-bar" not in html, \
+        "a bar with no honest denominator must not be drawn at all"
+    assert "Total size not known yet" in html
+
+
+def test_a_download_for_another_render_does_not_touch_this_row(loaded_page):
+    page, _ = loaded_page
+    html = _row_with_downloads(
+        page,
+        "({acct0:{downloaded:999,total:999,rate:1,"
+        "jobId:'some-other-job',jobWorkers:1}})")
+    assert "downloading" not in html
+
+
+def test_a_finished_download_names_the_zip_on_the_row(loaded_page):
+    page, _ = loaded_page
+    html = _row_with_downloads(
+        page, "({})",
+        "({'job-1':{jobId:'job-1',archivePath:'C:\\\\out\\\\waydown.zip',"
+        "wantedName:'',copied:25,missing:0,destination:'C:\\\\out',"
+        "message:'ok'}})")
+    assert "waydown.zip" in html
+    assert "25 frame(s)" in html
+    assert "Unzip it" in html
+
+
+def test_a_download_that_produced_no_zip_does_not_name_a_file(loaded_page):
+    page, _ = loaded_page
+    html = _row_with_downloads(
+        page, "({})",
+        "({'job-1':{jobId:'job-1',archivePath:'',wantedName:'',copied:0,"
+        "missing:25,destination:'C:\\\\out',"
+        "message:'Nothing to collect yet'}})")
+    assert "No zip was written" in html
+    assert ".zip" not in html.replace("Nothing to collect yet", "")
