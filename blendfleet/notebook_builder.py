@@ -24,8 +24,56 @@ from blendfleet.blender_versions import (DEFAULT_VERSION, download_url,
 # of its stdout, and one bad frame would kill every frame after it.
 # Looping in Python keeps the exact PROGRESS format log_stream.py parses,
 # and keeps a failed frame to ONE failed frame.
+#
+# LIVE PREVIEWS RIDE THE LOG STREAM, BECAUSE NOTHING ELSE CAN CARRY THEM.
+#
+# Kaggle's kernel-output API returns NOTHING until a session ends -- see
+# blendfleet/log_stream.py's module docstring, and the real 2026-08-15
+# reading where fetch_one_output listed 0 files for a kernel that was
+# mid-render. So an image of a finished frame cannot be fetched while the
+# render runs; it has to be PUSHED, and stdout is the only channel out of
+# a running kernel this app can read.
+#
+# Sizes are set here rather than in the generated source so the parser
+# contract and the byte budget are stated in one place:
+#
+#   THUMB_WIDTH_PX  320  -> 320x180 for a 16:9 render. Measured on a
+#                           1920x1080 test image: 4.3 kB at quality 45,
+#                           4.7 kB at 60, 6.3 kB at 75. 60 is the middle
+#                           of that, ~5 kB of JPEG -> ~6.7 kB of base64,
+#                           so a 100-frame render adds well under a
+#                           megabyte of log text in total.
+#   THUMB_CHUNK_CHARS 3000 -> ~3 lines for a typical frame. A single log
+#                           line carrying the whole payload is the risk
+#                           this splits: Kaggle's log capture is not
+#                           documented to carry tens of kilobytes on one
+#                           line, and a silently truncated line would
+#                           decode to a corrupt image. Each line carries
+#                           part=i/n and the total decoded byte count, so
+#                           a missing or clipped part is DETECTED and the
+#                           whole set discarded (log_stream.
+#                           ThumbnailAssembler) rather than shown.
+#   THUMB_MAX_BYTES 32768 -> the ceiling one frame may spend. Past it the
+#                           preview is dropped and says so, so a
+#                           pathological frame cannot bury the PROGRESS
+#                           lines the progress bar depends on.
+#
+# These are DEFAULTS the running kernel can override through BR_THUMB_*,
+# and previews as a whole are switched by BR_THUMBS -- a user on a slow
+# link, watching over a phone tether, pays for every one of these bytes.
+THUMB_WIDTH_PX = 320
+THUMB_QUALITY = 60
+THUMB_CHUNK_CHARS = 3000
+THUMB_MAX_BYTES = 32768
+
+# The numbers above are what the notebook PUTS IN THE ENVIRONMENT (see
+# the BR_THUMB_* entries in the render and worker cells). SETUP_SCRIPT is
+# a plain string, not an f-string -- it is full of f-strings of its own --
+# so the same values appear once more as its env fallbacks, and
+# test_notebook_builder.py asserts the two agree rather than trusting
+# them to.
 SETUP_SCRIPT = '''
-import os, sys, time, traceback, bpy
+import base64, io, os, sys, time, traceback, bpy
 
 # Set by the notebook immediately before launching Blender, so the gap
 # between it and now is exactly what the old per-frame loop was paying
@@ -120,6 +168,121 @@ else:
     print("[setup] post-processing left on the CPU (BR_POST_GPU=0)",
           flush=True)
 
+# LIVE FRAME PREVIEWS.
+#
+# Guarded exactly as the telemetry cell guards psutil: Pillow is on every
+# Kaggle image today, but an import that can raise must cost the preview
+# and NEVER the render. A missing Pillow leaves THUMBS_ON False and the
+# render proceeds untouched.
+THUMBS_ON = os.environ.get("BR_THUMBS", "1") == "1"
+THUMB_W = int(os.environ.get("BR_THUMB_W") or 320)
+THUMB_Q = int(os.environ.get("BR_THUMB_Q") or 60)
+THUMB_CHUNK = int(os.environ.get("BR_THUMB_CHUNK") or 3000)
+THUMB_MAX = int(os.environ.get("BR_THUMB_MAX") or 32768)
+_thumb_timed = [False]
+try:
+    from PIL import Image as _Img
+except Exception as _thumb_err:
+    _Img = None
+    if THUMBS_ON:
+        print("[setup] live frame previews off: Pillow could not be "
+              f"imported here ({type(_thumb_err).__name__}: {_thumb_err}). "
+              "The render is unaffected -- frames are still written and "
+              "collected as normal, there is just nothing to look at until "
+              "the session ends.", flush=True)
+if THUMBS_ON and _Img is not None:
+    print(f"[setup] live frame previews on: one {THUMB_W}px JPEG per "
+          "finished frame, sent down this log. Set BR_THUMBS=0 to turn "
+          "them off if the extra log traffic is unwelcome.", flush=True)
+elif not THUMBS_ON:
+    print("[setup] live frame previews off (BR_THUMBS=0). Frames will only "
+          "be viewable once the session ends and its output is released.",
+          flush=True)
+
+
+def _rendered_path(prefix):
+    """Where write_still actually put the frame, or None.
+
+    write_still appends the format's own extension to render.filepath, and
+    that mapping (PNG -> .png, OPEN_EXR -> .exr, ...) lives in Blender, not
+    here -- so it is ASKED for, and only guessed at by matching the prefix
+    if this Blender has no file_extension property.
+    """
+    ext = getattr(s.render, "file_extension", "") or ""
+    if ext and os.path.exists(prefix + ext):
+        return prefix + ext
+    import glob
+    hits = sorted(glob.glob(prefix + ".*"))
+    return hits[0] if hits else None
+
+
+def _emit_thumb(frame, prefix):
+    """Print one finished frame as chunked base64 JPEG on stdout.
+
+    CHUNKED, with part=i/n and the total decoded byte count on every line,
+    because this payload has to survive Kaggle's log capture and nothing
+    documents how long a single captured line may be. A truncated or
+    dropped part is therefore detectable by the reader
+    (log_stream.ThumbnailAssembler), which discards the whole set -- half a
+    JPEG must never be shown as though it were the frame.
+
+    Every failure path here is swallowed and NARRATED, never raised: this
+    runs inside the render loop, and a preview is worth nothing next to
+    the frame it previews.
+    """
+    if not (THUMBS_ON and _Img is not None):
+        return
+    # _t0, not t0: the render loop below has its own t0 holding the frame's
+    # start time, and a name collision there would be measured and printed
+    # as the frame's own duration.
+    _t0 = time.time()
+    try:
+        path = _rendered_path(prefix)
+        if path is None:
+            print(f"[setup] frame {frame} preview skipped: the rendered "
+                  f"file was not found at {prefix}.* -- the frame itself "
+                  "may still have been written elsewhere.", flush=True)
+            return
+        im = _Img.open(path)
+        # A no-op for PNG; for a JPEG render it decodes straight to a
+        # reduced size, which is most of this function's cost.
+        try:
+            im.draft("RGB", (THUMB_W, THUMB_W))
+        except Exception:
+            pass
+        im = im.convert("RGB")      # JPEG cannot carry PNG's alpha channel
+        im.thumbnail((THUMB_W, THUMB_W), _Img.BILINEAR)
+        buf = io.BytesIO()
+        im.save(buf, "JPEG", quality=THUMB_Q, optimize=True)
+        raw = buf.getvalue()
+        if len(raw) > THUMB_MAX:
+            # One retry at a quality nobody would mistake for the render,
+            # rather than either dropping a busy frame or letting it
+            # flood the log the PROGRESS lines share.
+            buf = io.BytesIO()
+            im.save(buf, "JPEG", quality=30, optimize=True)
+            raw = buf.getvalue()
+        if len(raw) > THUMB_MAX:
+            print(f"[setup] frame {frame} preview skipped: {len(raw)} bytes "
+                  f"is over the {THUMB_MAX}-byte budget one preview may "
+                  "spend on this log. The frame rendered fine.", flush=True)
+            return
+        b64 = base64.b64encode(raw).decode("ascii")
+        parts = [b64[i:i + THUMB_CHUNK]
+                 for i in range(0, len(b64), THUMB_CHUNK)] or [""]
+        # EXACT format parsed by log_stream.THUMB_RE.
+        for i, part in enumerate(parts, 1):
+            print(f"THUMB frame={frame} part={i}/{len(parts)} "
+                  f"bytes={len(raw)} {part}", flush=True)
+        if not _thumb_timed[0]:
+            _thumb_timed[0] = True
+            print(f"[setup] first frame preview cost {time.time()-_t0:.2f}s "
+                  f"and {len(raw)} bytes in {len(parts)} log line(s); every "
+                  "later frame costs about the same.", flush=True)
+    except Exception as e:
+        print(f"[setup] frame {frame} preview failed, render unaffected: "
+              f"{type(e).__name__}: {e}", flush=True)
+
 FRAMES = [int(x) for x in os.environ["BR_FRAMES"].split(",") if x.strip()]
 OUT = os.environ["BR_OUTPUT"]
 done, failed = [], []
@@ -139,6 +302,11 @@ for frame in FRAMES:
         print(f"[frame {frame}] FAILED", flush=True)
         traceback.print_exc()
         sys.stdout.flush()
+    # Only for a frame that actually rendered, and BEFORE its PROGRESS
+    # line: a preview for a failed frame would be a picture of whatever
+    # the last run left on disk, presented as this frame.
+    if ok:
+        _emit_thumb(frame, s.render.filepath)
     (done if ok else failed).append(frame)
     # EXACT format parsed by log_stream.PROGRESS_RE -- frame=, ok=, secs=,
     # done=N/M. Echoed verbatim by the notebook, so the app sees the same
@@ -211,6 +379,20 @@ class RenderSettings:
     # scene used 2.7 GB of each card's 15 GB), and a far larger scene
     # could want it off.
     post_on_gpu: bool = True
+    # A small JPEG of every finished frame, pushed down the log stream so
+    # a render can be watched WHILE it runs. Kaggle releases a session's
+    # output only once that session ends, so without this there is nothing
+    # to look at until the whole render is over -- which is the entire
+    # reason it exists.
+    #
+    # On by default because "what is it doing right now" is the question
+    # this app is for, and the cost is small (about 5 kB per frame, under
+    # a megabyte across a 100-frame render). Off is a real choice, not a
+    # hedge: the bytes travel over the same connection everything else
+    # does, and someone watching a render over a phone tether pays for
+    # them. The generated notebook also honours BR_THUMBS at runtime, so
+    # this can be overridden without rebuilding.
+    live_previews: bool = True
 
 
 def _code(src: str) -> dict:
@@ -405,6 +587,7 @@ SAMPLES, FMT = {settings.samples}, {settings.file_format!r}
 BLENDER_VERSION = {settings.blender_version!r}
 MIN_GPUS = {settings.min_gpus!r}
 POST_GPU = {settings.post_on_gpu!r}
+LIVE_PREVIEWS = {settings.live_previews!r}
 
 {HARDWARE_REPORT}
 if len(gpu_names) < MIN_GPUS:
@@ -572,6 +755,15 @@ def _run_blender(frames, blend, env, on_frame):
             except ValueError:
                 secs = 0.0
             on_frame(frame, fields.get("ok") == "True", secs)
+        elif line.startswith("THUMB frame="):
+            # Forwarded VERBATIM, never re-formatted: these lines are a
+            # byte-for-byte contract with log_stream.THUMB_RE, and each
+            # one carries part=i/n plus the total byte count that lets the
+            # reader tell a complete preview from a clipped one. Unlike
+            # PROGRESS -- which is re-emitted here so a fallback child's
+            # "1/1" cannot reach the app -- a preview means the same thing
+            # whichever process produced it.
+            print(line, flush=True)
         elif line.startswith("[setup]") or line.startswith("[frame "):
             print(line, flush=True)     # backend, device count, load time
     p.wait()
@@ -720,6 +912,18 @@ env = os.environ.copy()
 env.update({{"BR_RES_X": str(RES_X), "BR_RES_Y": str(RES_Y),
             "BR_SAMPLES": str(SAMPLES), "BR_FORMAT": FMT,
             "BR_POST_GPU": "1" if POST_GPU else "0",
+            # Live previews, and the byte budget one may spend. Read back
+            # out of the kernel's OWN environment first, so a session can
+            # be told to stop sending them without rebuilding the
+            # notebook; LIVE_PREVIEWS is what the app asked for at build
+            # time and is the default when nothing overrides it.
+            "BR_THUMBS": os.environ.get(
+                "BR_THUMBS", "1" if LIVE_PREVIEWS else "0"),
+            "BR_THUMB_W": os.environ.get("BR_THUMB_W", "{THUMB_WIDTH_PX}"),
+            "BR_THUMB_Q": os.environ.get("BR_THUMB_Q", "{THUMB_QUALITY}"),
+            "BR_THUMB_CHUNK": os.environ.get(
+                "BR_THUMB_CHUNK", "{THUMB_CHUNK_CHARS}"),
+            "BR_THUMB_MAX": os.environ.get("BR_THUMB_MAX", "{THUMB_MAX_BYTES}"),
             "BR_OUTPUT": f"{{OUT}}/f_"}})
 
 # ONE Blender process for every frame -- see SETUP_SCRIPT's header for the
@@ -810,6 +1014,19 @@ while True:
                 "BR_SAMPLES": str(job.get("samples", SAMPLES)),
                 "BR_FORMAT": job.get("format", FMT),
                 "BR_POST_GPU": "1" if job.get("postGpu", POST_GPU) else "0",
+                # Same switches as a one-shot render, for the same reason
+                # the runner is shared: a warm worker that quietly stopped
+                # sending previews would look like a render that had
+                # stalled.
+                "BR_THUMBS": os.environ.get(
+                    "BR_THUMBS",
+                    "1" if job.get("livePreviews", LIVE_PREVIEWS) else "0"),
+                "BR_THUMB_W": os.environ.get("BR_THUMB_W", "{THUMB_WIDTH_PX}"),
+                "BR_THUMB_Q": os.environ.get("BR_THUMB_Q", "{THUMB_QUALITY}"),
+                "BR_THUMB_CHUNK": os.environ.get(
+                    "BR_THUMB_CHUNK", "{THUMB_CHUNK_CHARS}"),
+                "BR_THUMB_MAX": os.environ.get(
+                    "BR_THUMB_MAX", "{THUMB_MAX_BYTES}"),
                 "BR_OUTPUT": f"{{OUT}}/f_"}})
     # Same batched runner as a one-shot render -- and the same PROGRESS
     # format. The warm worker used to print "PROGRESS 3/9", which

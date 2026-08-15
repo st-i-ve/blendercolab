@@ -711,3 +711,101 @@ def test_setup_is_identical_between_render_and_worker_modes(tmp_path):
     assert [c["source"] for c in render_cells[1:4]] == \
         [c["source"] for c in worker_cells[1:4]]
     assert render_cells[-1]["source"] != worker_cells[-1]["source"]
+
+
+# --------------------------------------------------------------------------
+# Live frame previews: the generated source.
+#
+# test_notebook_runner.py RUNS the emitter. These assert the things
+# running it cannot reach: that the notebook puts the right environment in
+# front of it, that both the one-shot and the warm-worker cell do, and
+# that the constants documented in one place are the constants shipped.
+# --------------------------------------------------------------------------
+
+def test_the_render_script_emits_a_chunked_preview_per_frame(tmp_path, settings):
+    src = nb.SETUP_SCRIPT
+    assert 'print(f"THUMB frame={frame} part={i}/{len(parts)} "' in src
+    assert 'f"bytes={len(raw)} {part}"' in src
+
+
+def test_the_preview_marker_matches_the_regex_the_app_parses_with():
+    """The format is a contract between two files. Asserted against
+    log_stream's own regex rather than by eye."""
+    from blendfleet.log_stream import THUMB_RE
+
+    m = THUMB_RE.search("THUMB frame=12 part=2/4 bytes=5123 QUJDRA==")
+    assert m and m.groups() == ("12", "2", "4", "5123", "QUJDRA==")
+
+
+def test_pillow_is_imported_under_a_guard_like_psutil(tmp_path, settings):
+    """A telemetry dependency that can raise at import time would take the
+    render down for the sake of a picture. Same discipline as the psutil
+    import in the telemetry cell."""
+    src = nb.SETUP_SCRIPT
+    guard = src.split("try:\n    from PIL import Image as _Img\n", 1)
+    assert len(guard) == 2, "the Pillow import is not inside a try"
+    assert guard[1].lstrip().startswith("except Exception")
+    assert "_Img = None" in guard[1]
+
+
+def test_a_preview_is_only_sent_for_a_frame_that_rendered(tmp_path, settings):
+    """A preview of a failed frame would be a picture of whatever the last
+    run left on disk, presented as this frame."""
+    src = nb.SETUP_SCRIPT
+    assert "    if ok:\n        _emit_thumb(frame, s.render.filepath)" in src
+
+
+def test_previews_are_on_by_default_and_switchable(tmp_path, settings):
+    joined = "\n".join(cells_src(build([1], settings, "me/x", tmp_path, "me/r")))
+    assert "LIVE_PREVIEWS = True" in joined, "previews must default to on"
+    assert '"BR_THUMBS", "1" if LIVE_PREVIEWS else "0"' in joined, \
+        "a running session must be able to override the default"
+    assert 'os.environ.get("BR_THUMBS", "1") == "1"' in nb.SETUP_SCRIPT
+
+
+def test_previews_can_be_built_off(tmp_path):
+    off = RenderSettings(resolution_x=1920, resolution_y=1080, samples=128,
+                         live_previews=False)
+    joined = "\n".join(cells_src(build([1], off, "me/x", tmp_path, "me/r")))
+    assert "LIVE_PREVIEWS = False" in joined
+
+
+def test_the_env_carries_the_documented_sizes(tmp_path, settings):
+    """The module constants are what the design is costed on; the
+    generated environment is what the render actually uses. They are
+    asserted equal rather than assumed, because SETUP_SCRIPT is a plain
+    string and cannot interpolate them."""
+    joined = "\n".join(cells_src(build([1], settings, "me/x", tmp_path, "me/r")))
+    assert f'"BR_THUMB_W", "{nb.THUMB_WIDTH_PX}"' in joined
+    assert f'"BR_THUMB_Q", "{nb.THUMB_QUALITY}"' in joined
+    assert f'"BR_THUMB_CHUNK", "{nb.THUMB_CHUNK_CHARS}"' in joined
+    assert f'"BR_THUMB_MAX", "{nb.THUMB_MAX_BYTES}"' in joined
+    # And the render script's own fallbacks, used only if the environment
+    # somehow arrives without them, must not disagree.
+    assert f'os.environ.get("BR_THUMB_W") or {nb.THUMB_WIDTH_PX}' \
+        in nb.SETUP_SCRIPT
+    assert f'os.environ.get("BR_THUMB_Q") or {nb.THUMB_QUALITY}' \
+        in nb.SETUP_SCRIPT
+    assert f'os.environ.get("BR_THUMB_CHUNK") or {nb.THUMB_CHUNK_CHARS}' \
+        in nb.SETUP_SCRIPT
+    assert f'os.environ.get("BR_THUMB_MAX") or {nb.THUMB_MAX_BYTES}' \
+        in nb.SETUP_SCRIPT
+
+
+def test_a_warm_worker_previews_exactly_like_a_one_shot_render(tmp_path,
+                                                               settings):
+    """A warm worker that quietly stopped sending previews would look like
+    a render that had stalled."""
+    p = build([1], settings, "me/x", tmp_path, "me/r", mode="worker",
+              control_slug="me/ctl", token="KGAT_" + "a" * 32,
+              worker_label="acct0")
+    joined = "\n".join(cells_src(p))
+    assert '"BR_THUMBS"' in joined
+    assert f'"BR_THUMB_W", "{nb.THUMB_WIDTH_PX}"' in joined
+
+
+def test_the_runner_forwards_preview_lines(tmp_path, settings):
+    """_run_blender drops most of Blender's stdout on the floor. A preview
+    that never got past that filter would never leave the kernel."""
+    joined = "\n".join(cells_src(build([1], settings, "me/x", tmp_path, "me/r")))
+    assert 'elif line.startswith("THUMB frame="):' in joined
