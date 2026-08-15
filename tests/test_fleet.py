@@ -1985,3 +1985,145 @@ def test_a_poll_does_not_undo_a_frame_count_saved_while_it_was_in_flight(
 
     assert polled[0].workers[0].frames_done == 4
     assert f.load().workers[0].frames_done == 4
+
+
+# ---------------------------------------------------------------------------
+# The count a FINISHED render actually reached.
+#
+# frames_done is only ever advanced by the live SSE stream, so a render that
+# finished while the app was closed kept whatever the stream last managed to
+# save: a worker that had rendered both its frames read "1 / 2 saved 1h ago",
+# and the card said "1 of 2 frames are waiting on Kaggle" about a render that
+# was completely done. Kaggle's status API reports no frame count, but a
+# COMPLETED kernel's log is fetchable -- see Fleet._read_final_frame_count.
+# ---------------------------------------------------------------------------
+
+def _finished_job(label="a0", frames=(1, 2), frames_done=1):
+    """One tracked job whose single worker Kaggle will report as complete,
+    carrying the stale count a closed window left behind."""
+    return FleetState(
+        job_id="j1", blend_name="shot.blend", start_frame=frames[0],
+        end_frame=frames[-1],
+        workers=[WorkerState(label=label, username="u0",
+                             kernel_slug="u0/shot-render-1",
+                             frames=list(frames), state="running",
+                             frames_done=frames_done,
+                             frames_done_at=1.0)])
+
+
+class _LogClient(FakeClient):
+    """A client whose kernel is complete and whose log can be fetched.
+
+    Counts the fetches, because the whole point of final_count_checked is
+    that this network call happens exactly once per worker however many
+    times a finished job is polled.
+    """
+
+    fetches: list[str] = []
+
+    def __init__(self, token, log="PROGRESS frame=1 ok=1 secs=3 done=1/2\n"
+                                  "PROGRESS frame=2 ok=1 secs=3 done=2/2\n"):
+        super().__init__(token, state="complete")
+        self._log = log
+
+    def fetch_log_tail(self, slug, dest, max_lines=200):
+        _LogClient.fetches.append(slug)
+        return self._log
+
+
+def test_a_finished_workers_true_frame_count_is_read_from_its_log(tmp_path):
+    _LogClient.fetches = []
+    f = Fleet(accounts(1), _LogClient, tmp_path / "w")
+    f.save_jobs([_finished_job()])
+
+    jobs = f.poll_all()
+
+    w = jobs[0].workers[0]
+    assert w.frames_done == 2, (
+        "the stale 1 must be replaced by the render's own final count")
+    assert w.final_count_known is True
+    assert f.load().workers[0].frames_done == 2, "and it must be persisted"
+
+
+def test_the_final_count_is_read_once_and_never_re_fetched(tmp_path):
+    """It is a real network call, and a finished job keeps being polled
+    every 30 seconds for as long as it is tracked."""
+    _LogClient.fetches = []
+    f = Fleet(accounts(1), _LogClient, tmp_path / "w")
+    f.save_jobs([_finished_job()])
+
+    f.poll_all()
+    f.poll_all()
+    f.poll_all()
+
+    assert len(_LogClient.fetches) == 1, _LogClient.fetches
+
+
+def test_an_unfetchable_log_leaves_the_count_not_known_not_stale(tmp_path):
+    """Never invent a reading, and never keep showing the stale one as if
+    it were current: final_count_known stays False, which is what the
+    payload turns into "not known"."""
+    class Unfetchable(FakeClient):
+        def __init__(self, token):
+            super().__init__(token, state="complete")
+
+        def fetch_log_tail(self, slug, dest, max_lines=200):
+            raise RuntimeError("kaggle said no")
+
+    f = Fleet(accounts(1), Unfetchable, tmp_path / "w")
+    f.save_jobs([_finished_job()])
+
+    w = f.poll_all()[0].workers[0]
+
+    assert w.final_count_checked is True
+    assert w.final_count_known is False
+    assert w.state == "complete", (
+        "a log that could not be read must not affect the kernel's state")
+
+
+def test_a_log_with_no_progress_line_never_invents_a_count(tmp_path):
+    _LogClient.fetches = []
+    f = Fleet(accounts(1), lambda t: _LogClient(t, log="Blender quit\n"),
+              tmp_path / "w")
+    f.save_jobs([_finished_job()])
+
+    w = f.poll_all()[0].workers[0]
+
+    assert w.final_count_known is False
+    assert w.frames_done == 1, (
+        "the old value is left alone rather than zeroed -- but it is "
+        "reported as not known, never as a count")
+
+
+def test_reading_the_final_count_never_marks_the_worker_unreachable(tmp_path):
+    """The STATUS call succeeded, so the startup check must keep counting
+    this worker as answered -- otherwise a finished render is announced as
+    one Kaggle could not be asked about."""
+    class Unfetchable(FakeClient):
+        def __init__(self, token):
+            super().__init__(token, state="complete")
+
+        def fetch_log_tail(self, slug, dest, max_lines=200):
+            raise RuntimeError("kaggle said no")
+
+    f = Fleet(accounts(1), Unfetchable, tmp_path / "w")
+    f.save_jobs([_finished_job()])
+
+    f.poll_all()
+
+    assert f.unreachable_workers == {}
+
+
+def test_a_worker_seen_running_again_may_have_its_final_count_re_read(tmp_path):
+    """A "final" count read after a mistaken terminal poll describes a
+    render that is still going, so the one-shot guard is released when
+    Kaggle reports the kernel active again."""
+    f = Fleet(accounts(1), lambda t: FakeClient(t, "running"), tmp_path / "w")
+    job = _finished_job()
+    job.workers[0].final_count_checked = True
+    job.workers[0].final_count_known = True
+    f.save_jobs([job])
+
+    w = f.poll_all()[0].workers[0]
+
+    assert w.final_count_checked is False and w.final_count_known is False

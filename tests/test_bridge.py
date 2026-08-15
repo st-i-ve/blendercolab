@@ -2649,6 +2649,62 @@ def test_a_frame_count_that_was_never_saved_has_no_age(qapp, tmp_path):
     assert worker["framesDoneAge"] is None
 
 
+def _finished_worker_backend(tmp_path, **worker_kw):
+    """One tracked job whose worker has STOPPED, as the payload sees it."""
+    backend = make_backend(tmp_path, n=1)
+    fleet = backend.fleet_factory(backend.store.list())
+    fields = dict(label="acct0", username="user_0",
+                  kernel_slug="user_0/scene-render-1", frames=[1, 2],
+                  state="complete", frames_done=1,
+                  frames_done_at=time.time() - 3600,
+                  started_at=time.time() - 900,
+                  finished_at=time.time() - 600)
+    fields.update(worker_kw)
+    fleet.save_jobs([FleetState(
+        job_id="job-1", blend_name="scene.blend", start_frame=1, end_frame=2,
+        workers=[WorkerState(**fields)])])
+    return backend
+
+
+def test_a_finished_count_read_from_the_log_is_labelled_final(qapp, tmp_path):
+    """Not "saved 1h ago": it is the render's own last word, read from its
+    kernel log once it stopped, and the card must not present it as a
+    cached live reading."""
+    backend = _finished_worker_backend(tmp_path, frames_done=2,
+                                       final_count_checked=True,
+                                       final_count_known=True)
+    worker = json.loads(backend.state())["instances"][0]["worker"]
+    assert worker["framesDone"] == 2
+    assert worker["framesDoneSource"] == "final"
+
+
+def test_a_finished_worker_whose_log_could_not_be_read_reads_as_unknown(
+        qapp, tmp_path):
+    """The stale 1 is still in the file -- it is a floor from before the
+    render ended -- but the payload must NOT let the page show it as a
+    count, and must not replace it with a zero either."""
+    backend = _finished_worker_backend(tmp_path, frames_done=1,
+                                       final_count_checked=True,
+                                       final_count_known=False)
+    worker = json.loads(backend.state())["instances"][0]["worker"]
+    assert worker["framesDoneSource"] == "unknown"
+
+
+def test_a_running_workers_saved_count_is_still_labelled_saved(qapp, tmp_path):
+    """Unchanged for a render that has NOT stopped: the saved-with-its-age
+    treatment is right there, and this must not turn into "unknown"."""
+    backend = _running_job_backend(tmp_path, frames_done=3,
+                                   frames_done_at=time.time() - 600)
+    worker = json.loads(backend.state())["instances"][0]["worker"]
+    assert worker["framesDoneSource"] == "saved"
+
+
+def test_a_worker_nothing_has_ever_counted_says_so(qapp, tmp_path):
+    backend = _running_job_backend(tmp_path)
+    worker = json.loads(backend.state())["instances"][0]["worker"]
+    assert worker["framesDoneSource"] == "none"
+
+
 def test_an_account_with_no_stream_is_not_reported_as_reconnecting(
         qapp, tmp_path):
     backend = _running_job_backend(tmp_path)

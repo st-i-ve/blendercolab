@@ -469,6 +469,12 @@ class Backend(QObject):
                     "framesDoneAge": (
                         max(time.time() - worker.frames_done_at, 0.0)
                         if getattr(worker, "frames_done_at", 0.0) else None),
+                    # WHAT KIND of number framesDone is -- see
+                    # _frames_done_source. The page must never present a
+                    # stopped render's leftover live reading as a count,
+                    # and it cannot tell the difference from the number
+                    # alone.
+                    "framesDoneSource": _frames_done_source(worker),
                     "message": (worker.message
                                 or self._failures.get(worker.label) or ""),
                     # Seconds this worker has been going, or took. Frozen
@@ -2672,6 +2678,38 @@ def _elapsed(worker) -> float | None:
         return None
     finished = getattr(worker, "finished_at", 0.0) or 0.0
     return (finished or time.time()) - started
+
+
+def _frames_done_source(worker) -> str:
+    """Where `framesDone` came from, so the page can never present one kind
+    of number as another. One of:
+
+      "final"   -- read from this worker's OWN kernel log after it stopped
+                   (Fleet._read_final_frame_count). The render's last word,
+                   not a cached live reading, and the only count of a
+                   finished render this app is entitled to state.
+      "unknown" -- the worker has STOPPED and that log could not be read,
+                   or carried no PROGRESS line. framesDone is then whatever
+                   a live stream last saved, which is a floor from some
+                   moment before the render ended: the page must show the
+                   count as not known, NOT as this number and NOT as zero.
+      "saved"   -- a live stream wrote it while the render was still going.
+                   framesDoneAge says how old it is; the card already
+                   labels it as saved rather than measured.
+      "none"    -- nothing has ever reported a count for this worker.
+
+    The distinction only exists because Kaggle's kernel-status API reports
+    no frame count at all: for a running kernel the live SSE stream is the
+    only source, and it dies with the window. A render that finished
+    overnight therefore reopened showing "1 / 2" -- the last thing the
+    stream managed to save -- for a render that had done both frames.
+    """
+    if getattr(worker, "finished_at", 0.0):
+        return "final" if getattr(worker, "final_count_known", False) \
+            else "unknown"
+    if getattr(worker, "frames_done_at", 0.0):
+        return "saved"
+    return "none"
 
 
 def _job_payload(job) -> dict:

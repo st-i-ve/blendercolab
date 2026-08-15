@@ -397,11 +397,24 @@ function instanceCard(inst) {
      it has reported, its numbers are the ones shown. */
   const live = inst.live;
   const liveFrames = !!(live && live.framesTotal);
+  /* WHAT KIND of number framesDone is, straight from the payload
+     (bridge._frames_done_source). "final" was read from this worker's own
+     kernel log once it stopped and is the render's last word; "unknown" is
+     a stopped render whose log could NOT be read, where framesDone is only
+     a floor from some moment before the end. A live stream outranks all of
+     them while one is connected. */
+  const source = liveFrames ? 'live'
+               : (worker ? (worker.framesDoneSource || 'saved') : 'none');
+  const unknown = source === 'unknown';
   const done = liveFrames ? live.framesDone
              : (worker ? worker.framesDone : 0);
   const total = liveFrames ? live.framesTotal
               : (worker ? worker.frames.length : 0);
-  const progress = total ? Math.round(100 * done / total) : 0;
+  /* A bar drawn from a number the app does not know is an invented
+     reading, so an unknown count draws no bar at all rather than the
+     stale one's width. */
+  const progress = (total && !unknown) ? Math.round(100 * done / total) : 0;
+  const doneText = unknown ? '—' : done;
 
   /* Where that number came from, said out loud whenever it is NOT live.
      After a restart the count is whatever the last stream managed to save
@@ -409,7 +422,19 @@ function instanceCard(inst) {
      meantime, so it is a floor, not a reading. Presenting it bare, next
      to a bar, would claim a measurement nobody took. It carries its age,
      the same way the cached hardware line does. */
-  const savedFrames = (!liveFrames && worker && worker.framesDoneAge != null)
+  const savedFrames = unknown
+    ? `<span class="frange dim" title="This render has stopped, but its own${
+         ''} log on Kaggle could not be read, so how many frames it${
+         ''} finished is not known. The last number a live connection${
+         ''} saved is from before it ended and would be wrong to show as a${
+         ''} count. “Collect frames…” is the authoritative list of what${
+         ''} actually exists.">count not known</span>`
+    : source === 'final'
+    ? `<span class="frange dim" title="The render's own final count, read${
+         ''} from its kernel log on Kaggle after it stopped — not a saved${
+         ''} live reading. “Collect frames…” is still the authoritative${
+         ''} list of what exists.">final count</span>`
+    : (!liveFrames && worker && worker.framesDoneAge != null)
     ? `<span class="frange dim" title="Saved by the last live connection.${
          ''} Kaggle's status API reports no frame count, so this is the${
          ''} newest number this app could have; the render has carried on${
@@ -523,9 +548,18 @@ function instanceCard(inst) {
         worker.state === 'complete' ? 'render finished'
         : worker.state === 'error' ? 'stopped before finishing'
         : 'stopped'}</b>${elapsed}<span class="sub">${
-        worker.state === 'complete'
+        /* This sentence follows the CORRECTED count, never the stale one
+           it used to quote: with the log unreadable there is no honest
+           "N of M" to say at all, so it says that instead of guessing. */
+        worker.state === 'complete' && !unknown
           ? `${done} of ${total} frames are waiting on Kaggle — “Collect`
             + ` frames…” above downloads them.`
+          : worker.state === 'complete'
+          ? `How many of its ${total} frames finished is not known: this`
+            + ` render's log on Kaggle could not be read, and Kaggle's`
+            + ` status API reports no frame count. Whatever it made is`
+            + ` still waiting there — “Collect frames…” above is the`
+            + ` authoritative list of what exists.`
           : `Any frames it did finish are still on Kaggle — “Collect frames…”`
             + ` above will fetch them.`
       }</span></div>`
@@ -588,7 +622,7 @@ function instanceCard(inst) {
       <div class="assign">
         <div class="wrapc">
           <div class="l1"><span class="flab">Frames</span>
-            <span class="frange">${done} / ${total}</span>${savedFrames}</div>
+            <span class="frange">${doneText} / ${total}</span>${savedFrames}</div>
           <div class="assign-progress"><i style="width:${progress}%"></i></div>
         </div>
       </div>` : ''}
@@ -1244,10 +1278,21 @@ function renderFrameGrid(job, instances) {
      assumed to have finished the first N of its own stride. That holds
      until a frame fails, which is why the legend says approximate. */
   const done = new Set();
+  /* Accounts whose count this app does NOT know: a stopped render whose
+     own log could not be read (bridge._frames_done_source === 'unknown').
+     Their cells are left unshaded rather than shaded from the last number
+     a live stream happened to save, and the meta line below names them --
+     an unshaded cell that is merely unknown must not read as "not
+     rendered". */
+  const unknownLabels = [];
   instances.forEach(i => {
     if (!i.worker) return;
-    const n = i.live && i.live.framesTotal ? i.live.framesDone
-            : i.worker.framesDone;
+    const liveFrames = !!(i.live && i.live.framesTotal);
+    if (!liveFrames && i.worker.framesDoneSource === 'unknown') {
+      unknownLabels.push(i.label);
+      return;
+    }
+    const n = liveFrames ? i.live.framesDone : i.worker.framesDone;
     i.worker.frames.slice(0, n).forEach(f => done.add(f));
   });
   const cells = [];
@@ -1270,7 +1315,13 @@ function renderFrameGrid(job, instances) {
     </div>
     <div class="fg-meta">${done.size}/${total} frames · ${esc(job.blend)}
       — a failed frame shifts every later cell for that account; Collect
-      frames is the authoritative list of what exists.</div>
+      frames is the authoritative list of what exists.${unknownLabels.length
+        ? ` ${unknownLabels.length} account(s) are not counted here at all
+            (${unknownLabels.map(esc).join(', ')}): they have stopped, but
+            their logs on Kaggle could not be read, so how many frames they
+            finished is not known — their cells are left blank rather than
+            guessed, and Collect frames will show what they actually made.`
+        : ''}</div>
   </div>`;
 }
 

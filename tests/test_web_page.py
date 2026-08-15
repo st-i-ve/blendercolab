@@ -406,6 +406,74 @@ def test_a_running_card_shows_the_same_field_as_a_stopwatch(card):
 
 
 # ---------------------------------------------------------------------------
+# A finished render's frame count.
+#
+# frames_done is only ever advanced by the live SSE stream, so a render that
+# finished while the app was closed showed whatever the stream last saved --
+# "FRAMES 1 / 2 saved 1h ago" for a worker that had done both frames, and a
+# card that said "1 of 2 frames are waiting on Kaggle" about a render that
+# was completely done. The payload now says what KIND of number it is
+# (bridge._frames_done_source) and the card has to honour that.
+# ---------------------------------------------------------------------------
+
+# A stopped worker: no live block at all, which is what the payload carries
+# once finished_at is stamped.
+def _stopped_instance(source, frames_done=1):
+    return ("({label: 'acct0', username: 'acct0', verified: true, quota: '',"
+            " worker: {state: 'complete', frames: [1,2], framesDone: "
+            f"{frames_done}, message: '', elapsed: 320, finished: true,"
+            f" framesDoneAge: 3600, framesDoneSource: '{source}'}},"
+            " hardware: null, live: null})")
+
+
+def test_a_finished_card_shows_the_count_read_from_its_own_log(card):
+    html = card(_stopped_instance("final", frames_done=2))
+    assert "2 / 2" in html
+    assert "final count" in html
+    assert "saved 1h ago" not in html, (
+        "a count read from the finished kernel's log is not a cached "
+        "live reading and must not be labelled as one")
+
+
+def test_the_waiting_sentence_follows_the_corrected_count(card):
+    html = card(_stopped_instance("final", frames_done=2))
+    assert "2 of 2 frames are waiting on Kaggle" in html
+    assert "1 of 2 frames" not in html
+
+
+def test_an_unreadable_log_shows_the_count_as_not_known_not_stale(card):
+    """Never a stale number dressed up as current, and never a zero."""
+    html = card(_stopped_instance("unknown", frames_done=1))
+    assert "count not known" in html
+    assert "1 / 2" not in html and "0 / 2" not in html
+    assert "&mdash; / 2" in html or "— / 2" in html or "— / 2" in html
+
+
+def test_an_unknown_count_draws_no_progress_bar(card):
+    html = card(_stopped_instance("unknown", frames_done=1))
+    assert 'class="assign-progress"><i style="width:0%"' in html
+
+
+def test_an_unknown_count_points_at_collect_frames(card):
+    html = card(_stopped_instance("unknown", frames_done=1))
+    assert "is not known" in html
+    assert "authoritative list of what exists" in html
+
+
+def test_a_still_running_card_keeps_its_saved_with_age_wording(card):
+    """Only a STOPPED render can have an unknown final count. A live one's
+    saved reading is still the best thing known, and still labelled."""
+    running = ("({label: 'acct0', username: 'acct0', verified: true,"
+               " quota: '', worker: {state: 'running', frames: [1,2],"
+               " framesDone: 1, message: '', elapsed: 95, finished: false,"
+               " framesDoneAge: 3600, framesDoneSource: 'saved'},"
+               " hardware: null, live: null})")
+    html = card(running)
+    assert "saved 1h ago" in html
+    assert "count not known" not in html
+
+
+# ---------------------------------------------------------------------------
 # A download you can watch.
 #
 # Progress was emitted all along, but only as a log line that scrolled

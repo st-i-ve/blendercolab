@@ -30,6 +30,12 @@ from blendfleet.dataset_sync import sync_blend
 from blendfleet.kaggle_client import (
     ACTIVE_STATES, PENDING_STATES, TERMINAL_STATES, KaggleError,
     RevokedTokenError, _mask, revoked_token_message)
+# The SAME expression the live stream parses PROGRESS lines with, reused
+# rather than re-written: _read_final_frame_count below reads exactly the
+# lines log_stream reads, only out of a finished kernel's log instead of a
+# live one, and a second copy of the pattern is a second thing to get out
+# of step with what notebook_builder actually prints.
+from blendfleet.log_stream import PROGRESS_RE
 from blendfleet.notebook_builder import RenderSettings, build, build_probe
 from blendfleet.platform_paths import state_dir
 
@@ -468,6 +474,20 @@ class WorkerState:
     # (the same rule the hardware snapshot already follows), and it cannot
     # do that unless the number carries its timestamp.
     frames_done_at: float = 0.0
+    # Has this worker's OWN kernel log already been read for its final
+    # frame count (Fleet._read_final_frame_count)? Set the first time the
+    # worker is seen in a terminal state, whether or not the read produced
+    # anything, so the fetch happens exactly ONCE per worker: it is a real
+    # network call, and a finished job stays tracked -- and polled every 30
+    # seconds -- until the user forgets it.
+    final_count_checked: bool = False
+    # True only when that read actually produced a count. frames_done is
+    # then the render's own last word, not the last thing a live stream
+    # happened to save before the window closed. False after a checked read
+    # means the count is NOT KNOWN -- the UI must say so rather than show
+    # the stale number as if it were current (see
+    # bridge._frames_done_source).
+    final_count_known: bool = False
     message: str = ""
     # Epoch seconds. Both default to 0.0, meaning "not recorded" -- which
     # is also what a state file written before these existed will load as,
@@ -2274,8 +2294,17 @@ class Fleet:
                 # actually starting.
                 if w.state in ACTIVE_STATES:
                     w.finished_at = 0.0
+                    # Back from the dead (a stamp left by an earlier,
+                    # mistaken poll): whatever was read out of a "final"
+                    # log then describes a render that is still going, so
+                    # the read is allowed to happen again when it really
+                    # does stop.
+                    w.final_count_checked = False
+                    w.final_count_known = False
                 elif w.state in TERMINAL_STATES and not w.finished_at:
                     w.finished_at = time.time()
+                if w.state in TERMINAL_STATES and not w.final_count_checked:
+                    self._read_final_frame_count(acct, w)
         current = self.load_jobs()
         updated_by_id = {st.job_id: st for st in jobs}
         merged = []
@@ -2284,24 +2313,97 @@ class Fleet:
             if updated is None:
                 merged.append(j)
                 continue
-            # frames_done is the one field on a worker that this method
-            # never learns and never sets -- Kaggle's status API does not
-            # report a frame count, only the live log stream does (see
-            # record_progress). `updated` was built from a snapshot read
-            # BEFORE the network round trips above, so a frame the stream
-            # persisted while this poll was in flight is in `j` and not in
-            # `updated`; writing `updated` out verbatim would silently roll
-            # the user's progress bar backwards every 30 seconds. Carried
-            # across per worker, and only ever forwards.
+            # frames_done is the one field on a worker this method learns
+            # only for a STOPPED kernel (_read_final_frame_count) -- while a
+            # render is going, Kaggle's status API reports no frame count at
+            # all and only the live log stream does (see record_progress).
+            # `updated` was built from a snapshot read BEFORE the network
+            # round trips above, so a frame the stream persisted while this
+            # poll was in flight is in `j` and not in `updated`; writing
+            # `updated` out verbatim would silently roll the user's progress
+            # bar backwards every 30 seconds. Carried across per worker, and
+            # only ever forwards -- EXCEPT past a count read from the
+            # worker's own finished log, which is the render's final word
+            # and outranks anything a mid-render stream managed to save.
             by_label = {w.label: w for w in j.workers}
             for w in updated.workers:
                 was = by_label.get(w.label)
-                if was is not None and was.frames_done > w.frames_done:
+                if (was is not None and was.frames_done > w.frames_done
+                        and not w.final_count_known):
                     w.frames_done = was.frames_done
                     w.frames_done_at = was.frames_done_at
             merged.append(updated)
         self.save_jobs(merged)
         return merged
+
+    def _read_final_frame_count(self, account, worker) -> None:
+        """Read a STOPPED worker's true frame count out of its own log.
+
+        frames_done is only ever advanced by the live SSE stream
+        (record_progress), and Kaggle's kernel-status API reports no frame
+        count at all -- so a render that finished while the app was closed
+        kept for ever whatever the stream last managed to persist. A worker
+        that had in fact rendered both its frames read "FRAMES 1 / 2 saved
+        1h ago", and the card went on to say "1 of 2 frames are waiting on
+        Kaggle" about a render that was completely done.
+
+        A COMPLETED kernel's log, unlike a running one's, IS fetchable:
+        `kernels logs`/`kernels output` return nothing only while a session
+        is still live (see log_stream's module docstring and
+        KaggleClient.fetch_log_tail, which exists for exactly this reason).
+        The notebook's last `PROGRESS frame=... done=N/M` line is the
+        render's own final word on how many frames it wrote, and it is
+        parsed here with log_stream.PROGRESS_RE -- the same expression the
+        live stream uses, not a second copy of it.
+
+        Fired ONCE per worker, guarded by final_count_checked, which is set
+        before anything is fetched and stays set whether or not the read
+        produced a number. This is a real network call and a finished job
+        keeps being polled every 30 seconds for as long as it is tracked;
+        retrying would turn one honest "not known" into a permanent
+        background download nobody asked for.
+
+        Never invents a number. A log that cannot be fetched, or that
+        carries no PROGRESS line, leaves final_count_known False and
+        frames_done exactly as it was -- and the payload then reports the
+        count as NOT KNOWN rather than dressing the stale figure up as
+        current (bridge._frames_done_source). "Collect frames…" stays the
+        authoritative list of what actually exists on Kaggle.
+        """
+        worker.final_count_checked = True
+        try:
+            client = self.client_factory(account.token)
+            text = client.fetch_log_tail(
+                worker.kernel_slug,
+                self.work_dir / f"finallog_{worker.label}")
+        except Exception as e:      # noqa: BLE001
+            # Deliberately NOT recorded on self.unreachable_workers: the
+            # STATUS call for this worker succeeded, so Kaggle WAS reached
+            # and the startup check must keep counting it as answered
+            # (see _finish_startup_check's UNCHECKED bucket -- putting it
+            # there would announce a finished render as one nobody could
+            # ask about). The only thing missing is the frame count, and
+            # that is reported as not known, in its own right.
+            crash_log.record(
+                f"could not read the final frame count for {worker.label} "
+                f"({worker.kernel_slug}) out of its kernel log, so that "
+                "card shows the count as not known rather than as a stale "
+                f"number. {type(e).__name__}: {e}")
+            return
+        matches = PROGRESS_RE.findall(text or "")
+        if not matches:
+            # A real possibility, not a bug: the tail may be all Blender
+            # output, the render may have died before its first frame, or
+            # BR_PROGRESS output may have been trimmed away. Saying "0"
+            # here would be an invented reading.
+            return
+        # The LAST match, never the first: the tail holds every PROGRESS
+        # line the render emitted and only the final one carries the
+        # final count. Group 2 is `done` (group 1 is the frame number,
+        # group 3 the total) -- see log_stream.PROGRESS_RE.
+        worker.frames_done = int(matches[-1][1])
+        worker.frames_done_at = time.time()
+        worker.final_count_known = True
 
     def poll(self) -> FleetState | None:
         """Kept for every existing caller (bridge.py's timer, the Qt
