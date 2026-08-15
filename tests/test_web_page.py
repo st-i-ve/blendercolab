@@ -822,6 +822,38 @@ def test_the_frames_done_tile_still_counts_a_live_render(loaded_page):
     assert _state_text(page, _two_scene_state(), "s-frames") == "3"
 
 
+def test_a_finished_job_is_not_offered_a_cancel_button(loaded_page):
+    """Cancel is meaningless on a render that has already stopped, and
+    offering it invites the user to try to stop work that is done."""
+    page, _ = loaded_page
+    html = _state_html(page, _finished_fleet_state())
+    assert "data-job-cancel" not in html
+    assert html.count("disabled") >= 2, html
+
+
+def test_a_disabled_cancel_says_why_and_what_to_do_instead(loaded_page):
+    page, _ = loaded_page
+    html = _state_html(page, _finished_fleet_state())
+    assert "Nothing left to cancel" in html
+    assert "Collect" in html
+
+
+def test_a_running_job_still_offers_cancel(loaded_page):
+    page, _ = loaded_page
+    html = _state_html(page, _two_scene_state())
+    assert html.count("data-job-cancel") == 2
+
+
+def test_a_job_kaggle_has_not_started_yet_can_still_be_cancelled(loaded_page):
+    """not_started/new_script are not ACTIVE_STATES but they are not
+    terminal either: the kernel is about to start spending quota, which is
+    exactly when cancelling matters most."""
+    page, _ = loaded_page
+    payload = _two_scene_state().replace("state:'running'", "state:'not_started'")
+    html = _state_html(page, payload)
+    assert html.count("data-job-cancel") == 2
+
+
 def test_instances_are_grouped_by_the_scene_they_are_rendering(loaded_page):
     """Two scenes at once, and no way to tell which card belongs to which,
     would be worse than not having the feature."""

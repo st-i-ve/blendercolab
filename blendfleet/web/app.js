@@ -353,6 +353,31 @@ function jobSectionHtml(job, instances) {
     ? `<span class="job-sub">${job.finished ? 'finished in ' : ''}${
         fmtDuration(job.elapsed)}</span>`
     : '';
+  /* Cancel is offered while ANY of this scene's workers is short of a
+     terminal state, not merely while one is ACTIVE. Those are different
+     tests and the difference is the whole point: a kernel Kaggle has
+     accepted but not started yet answers "not_started", and one whose
+     session has not run its first cell answers "new_script" -- neither is
+     active, both are about to start spending somebody's quota, and that is
+     exactly when cancelling matters most (see kaggle_client's
+     ACTIVE_STATES / PENDING_STATES / TERMINAL_STATES comments).
+
+     Once every worker IS terminal there is no session left to stop, and
+     offering to "cancel" invites the user to try to stop work that is
+     already done -- so the button is disabled and loses its
+     data-job-cancel, which is what routes the click, so a stray click can
+     never reach Fleet.cancel_job() for this scene at all. Disabled rather
+     than removed: a control that vanishes reads as a bug, and the title is
+     where the reason lives. */
+  const cancellable = instances.some(isLive);
+  const cancelBtn = cancellable
+    ? `<button class="btn sm danger" data-job-cancel="${esc(job.jobId)}"
+         title="Cancel every account rendering this scene">Cancel</button>`
+    : `<button class="btn sm danger" disabled
+         title="Nothing left to cancel: every account on this scene has
+                already stopped on Kaggle, so no session is still spending
+                quota. Their frames are waiting there — use “Collect
+                frames…” to download them.">Cancel</button>`;
   return `<section class="job-group">
     <div class="job-head">
       <h3 class="job-title">${esc(job.scene)}</h3>
@@ -361,8 +386,7 @@ function jobSectionHtml(job, instances) {
       <div class="job-actions">
         <button class="btn sm" data-job-collect="${esc(job.jobId)}"
           title="Download this scene's rendered frames">Collect frames…</button>
-        <button class="btn sm danger" data-job-cancel="${esc(job.jobId)}"
-          title="Cancel every account rendering this scene">Cancel</button>
+        ${cancelBtn}
       </div>
     </div>
     <div class="instances">${instances.map(instanceCard).join('')}</div>
