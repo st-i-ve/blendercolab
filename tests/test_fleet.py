@@ -1506,3 +1506,194 @@ def test_a_revoked_token_is_never_reported_as_a_propagation_delay(blend,
     assert "revoked" in reason
     assert "has not made" not in reason, (
         "a revoked token was described as a propagation delay")
+
+
+# ---------------------------------------------------------------------------
+# what the diagnostic log says about sharing
+#
+# A user reported "the upload worked but the other accounts never got the
+# file", and %APPDATA%\BlendFleet\logs had NOTHING about it -- the four
+# steps prepare_dataset performs (name, bulk grant, reachable, file at the
+# right size) produced one indistinguishable outcome and reached no file at
+# all. These tests are about that evidence existing, per account.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def diagnostic_log(tmp_path):
+    """A real crash_log for one test, then process-global state back.
+
+    install() rebinds sys.excepthook, threading.excepthook, Qt's message
+    handler and faulthandler's target fd -- left in place, a later test
+    would be reporting into a tmp file this one already deleted (the same
+    reasoning as tests/test_crash_log.py's own fixture).
+    """
+    import faulthandler
+    import sys as _sys
+    import threading as _threading
+
+    from blendfleet import crash_log
+
+    saved_excepthook = _sys.excepthook
+    saved_thread_hook = _threading.excepthook
+    saved_faulthandler = faulthandler.is_enabled()
+    path = crash_log.install(tmp_path / "logs")
+    yield path
+    crash_log.shutdown()
+    _sys.excepthook = saved_excepthook
+    _threading.excepthook = saved_thread_hook
+    try:
+        from PySide6.QtCore import qInstallMessageHandler
+        qInstallMessageHandler(None)
+    except ImportError:
+        pass
+    if saved_faulthandler:
+        faulthandler.enable()
+    else:
+        faulthandler.disable()
+
+
+def _log_text(path):
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def test_every_sharing_step_is_recorded_for_every_account(blend, tmp_path,
+                                                          diagnostic_log):
+    """Which step an account reached, named, with its Kaggle username."""
+    accts = accounts(3)
+    f = Fleet(accts, lambda t: FakeClient(t), tmp_path / "w")
+
+    slug = f.prepare_dataset(blend)
+    body = _log_text(diagnostic_log)
+
+    assert slug in body, "a sharing line that does not name the dataset is unusable"
+    for label, username in (("a1", "user_1"), ("a2", "user_2")):
+        assert f"{label} ({username})" in body
+    assert "step 1/4" in body
+    assert "step 2/4 grant -- bulk grant_readers accepted" in body
+    for label in ("a1", "a2"):
+        assert re.search(rf"{label} \(user_\d\): step 3/4 reachable -- yes", body)
+        assert re.search(rf"{label} \(user_\d\): step 4/4 file -- can see", body)
+
+
+def test_the_log_times_every_sharing_step(blend, tmp_path, diagnostic_log):
+    """A propagation delay and a permission error are the same sentence to
+    the user; only the elapsed time tells them apart afterwards."""
+    f = Fleet(accounts(2), lambda t: FakeClient(t), tmp_path / "w")
+    f.prepare_dataset(blend)
+
+    body = _log_text(diagnostic_log)
+    assert re.search(r"step 3/4 reachable -- yes, in \d+ ms", body)
+    assert re.search(r"step 4/4 file -- can see .* in \d+ ms", body)
+
+
+def test_the_log_proves_sharing_happened_after_the_upload(blend, tmp_path,
+                                                          diagnostic_log):
+    """The user asked whether sharing could wait until the upload is fully
+    complete. It already does -- and now the file says so in order."""
+    f = Fleet(accounts(2), lambda t: FakeClient(t), tmp_path / "w")
+    f.prepare_dataset(blend)
+
+    body = _log_text(diagnostic_log)
+    assert (body.index("upload finished")
+            < body.index("owner user_0: verified")
+            < body.index("step 1/4")
+            < body.index("step 2/4"))
+
+
+class BulkGrantRejectingSdk(FakeSdk):
+    def __init__(self):
+        super().__init__()
+
+        def update(request):
+            class Resp:
+                errors = ["Kaggle said no"]
+            return Resp()
+        self.datasets.dataset_api_client.update_dataset_metadata = update
+
+
+def test_a_failed_bulk_grant_is_never_pinned_on_one_account(blend, tmp_path,
+                                                            diagnostic_log):
+    """grant_readers is ONE write for every friend at once, so its failure
+    is not attributable to any single account -- the log has to say that
+    rather than let the next reader hunt the wrong one."""
+    accts = accounts(3)
+
+    def factory(tok):
+        client = FakeClient(tok)
+        if tok == accts[0].token:
+            client.sdk = BulkGrantRejectingSdk()
+            client._sdk_factory = lambda _t: client.sdk
+        return client
+
+    f = Fleet(accts, factory, tmp_path / "w")
+    with pytest.raises(Exception):
+        f.prepare_dataset(blend)
+
+    body = _log_text(diagnostic_log)
+    assert "step 2/4 grant -- FAILED" in body
+    assert "NOT attributable to any one account" in body
+    assert "a1 (user_1)" in body and "a2 (user_2)" in body
+
+
+def test_an_account_the_grant_never_reached_is_named_at_its_step(
+        blend, tmp_path, diagnostic_log):
+    """The reported failure: granted, but the friend still cannot see it."""
+    accts = accounts(3)
+
+    def factory(tok):
+        return FakeClient(tok, dataset_reachable=(tok != accts[1].token))
+
+    f = Fleet(accts, factory, tmp_path / "w")
+    f.prepare_dataset(blend, required=[accts[0]])
+
+    body = _log_text(diagnostic_log)
+    assert re.search(r"a1 \(user_1\): step 3/4 reachable -- NO", body)
+    assert "optional" in body
+    assert "a2 (user_2): step 3/4 reachable -- yes" in body, (
+        "one account failing must not stop the others being recorded")
+
+
+class TokenLeakingClient(FakeClient):
+    """A Kaggle failure that echoes back the credential it was sent.
+
+    Not hypothetical: errors from the SDK quote URLs and request context,
+    and this log is a file the user is asked to send on.
+    """
+    def dataset_file_size(self, slug, filename):
+        raise KaggleError(f"403 Forbidden for token={self.token}")
+
+
+def test_no_account_token_ever_reaches_the_diagnostic_log(blend, tmp_path,
+                                                          diagnostic_log):
+    accts = accounts(3)
+
+    def factory(tok):
+        if tok == accts[1].token:
+            return TokenLeakingClient(tok)
+        return FakeClient(tok)
+
+    f = Fleet(accts, factory, tmp_path / "w")
+    f.prepare_dataset(blend, required=[accts[0]])
+
+    body = _log_text(diagnostic_log)
+    assert "step 4/4 file" in body, "the failure itself must still be recorded"
+    for account in accts:
+        assert account.token not in body, (
+            "a diagnostic log carrying a live token turns a support request "
+            "into a credential rotation")
+    assert accts[1].token[:9] + "…" in body
+
+
+def test_the_closing_line_says_who_ended_up_with_the_scene(blend, tmp_path,
+                                                           diagnostic_log):
+    accts = accounts(3)
+
+    def factory(tok):
+        return FakeClient(tok, dataset_reachable=(tok != accts[2].token))
+
+    f = Fleet(accts, factory, tmp_path / "w")
+    f.prepare_dataset(blend, required=[accts[0]])
+
+    body = _log_text(diagnostic_log)
+    assert "sharing finished: 1 of 2 other account(s) can see" in body
+    assert "NOT shared with a2" in body

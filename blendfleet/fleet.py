@@ -23,13 +23,13 @@ from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Callable
 
-from blendfleet import sharing
+from blendfleet import crash_log, sharing
 from blendfleet.accounts import Account
 from blendfleet.assignment import assign_frames
 from blendfleet.dataset_sync import sync_blend
 from blendfleet.kaggle_client import (
     ACTIVE_STATES, PENDING_STATES, TERMINAL_STATES, KaggleError,
-    RevokedTokenError, revoked_token_message)
+    RevokedTokenError, _mask, revoked_token_message)
 from blendfleet.notebook_builder import RenderSettings, build, build_probe
 from blendfleet.platform_paths import state_dir
 
@@ -255,6 +255,26 @@ def _atomic_write(path: Path, text: str) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, path)
+
+
+def _tokenless(text: str, accounts: list) -> str:
+    """`text` with every configured account's API token reduced to the same
+    unusable fragment `_mask` puts in error messages.
+
+    Everything the sharing path writes to the diagnostic log goes through
+    here. That log quotes Kaggle's own failures verbatim -- which is the
+    point of it -- and a Kaggle error is free to echo back whatever it was
+    sent, including a token in a URL or a header dump. A diagnostic file
+    the user is asked to send on is the last place a live credential may
+    end up: the cost of this whole change must never be "now rotate every
+    account's token".
+    """
+    for account in accounts:
+        token = getattr(account, "token", "") or ""
+        # Short values are not credentials and could match half the log.
+        if len(token) > 12 and token in text:
+            text = text.replace(token, _mask(token))
+    return text
 
 
 _BAD_COLLABORATOR_RE = re.compile(
@@ -1035,6 +1055,23 @@ class Fleet:
         owner_username = usernames[owner.label]
         dataset_slug = f"{owner_username}/{dataset_name}"
 
+        # A sharing failure was reported from the field -- "the upload
+        # worked but the other accounts never got the file" -- and left NO
+        # trace anywhere: the four steps below (grant, then reachable, then
+        # the file at the right size, per account) all collapse into one
+        # toast that disappears, and nothing about them reached the
+        # diagnostic log. So this narrates itself from here on, per
+        # account, with elapsed times: a Kaggle propagation delay and a
+        # permission error are the same sentence to the user, and only the
+        # timing and the step number tell them apart afterwards.
+        def note(message: str, *, critical: bool = False) -> None:
+            crash_log.record(
+                _tokenless(f"share {dataset_slug}: {message}", self.accounts),
+                critical=critical)
+
+        def since(started: float) -> str:
+            return f"{(time.monotonic() - started) * 1000:.0f} ms"
+
         # Is it already up there? Asked of KAGGLE, not of memory. "We
         # uploaded this" used to be a fact the app only knew for the
         # lifetime of one session, so restarting it -- or pressing Render
@@ -1054,12 +1091,22 @@ class Fleet:
 
         if already_there:
             stage("already-uploaded", dataset_slug)
+            note(f"owner {owner_username}: {blend.name} is already on Kaggle "
+                 f"at {expected_size} bytes -- no upload needed")
         else:
             # One upload, shared by every account -- dataset sharing is
             # automatable, so N accounts does not mean N uploads.
             stage("uploading", dataset_slug)
+            upload_started = time.monotonic()
+            note(f"owner {owner_username}: uploading {blend.name} "
+                 f"({expected_size} bytes)")
             sync_blend(owner_client, blend, dataset_slug,
                        self.work_dir / "ds_owner", on_progress=on_progress)
+            # Timestamped on its own line so the log proves the ordering:
+            # nothing below this point can have started before the upload
+            # returned.
+            note(f"owner {owner_username}: upload finished in "
+                 f"{since(upload_started)}")
 
         # Confirm the upload that just happened actually landed as the
         # right content -- the remote-side counterpart of dataset_sync.py's
@@ -1068,8 +1115,17 @@ class Fleet:
         # it's the file just uploaded versus a stale one from an earlier
         # job with the same slug.
         stage("verifying", owner_username)
-        _require_matching_dataset(owner_client, owner_username, dataset_slug,
-                                  blend.name, expected_size)
+        owner_check = time.monotonic()
+        try:
+            _require_matching_dataset(owner_client, owner_username,
+                                      dataset_slug, blend.name, expected_size)
+        except Exception as e:      # noqa: BLE001 -- logged, then re-raised
+            note(f"owner {owner_username}: the uploaded copy did NOT verify "
+                 f"after {since(owner_check)} -- nothing was shared with "
+                 f"anyone. {type(e).__name__}: {e}", critical=True)
+            raise
+        note(f"owner {owner_username}: verified {blend.name} at "
+             f"{expected_size} bytes in {since(owner_check)}")
 
         # "Sharing" is attempted for every configured account -- see the
         # docstring above for why that stays fleet-wide regardless of
@@ -1089,10 +1145,18 @@ class Fleet:
                         "`required`.")
                 self.unshared_accounts[account.label] = (
                     "could not be reached to share the scene with")
+                note(f"{account.label}: step 1/4 name -- has no resolved "
+                     "Kaggle client, so it is not in this grant at all "
+                     "(optional for this call; recorded as unshared)",
+                     critical=True)
         resolvable = [a for a in friends if a.label in usernames]
 
         if resolvable:
             stage("sharing", ", ".join(usernames[a.label] for a in resolvable))
+            who = ", ".join(f"{a.label} ({usernames[a.label]})"
+                            for a in resolvable)
+            note(f"step 1/4 name -- upload verified, now granting READER to "
+                 f"{len(resolvable)} account(s): {who}")
             sdk = owner_client._sdk_factory(owner_client.token)
             # Wrong-username and bulk-grant-rejection failures are NOT
             # split by required/optional below -- both remain fully strict
@@ -1101,13 +1165,31 @@ class Fleet:
             # not what launch()'s coupling bug needed: this only has to
             # stop a REVOKED/UNREACHABLE account outside the subset from
             # failing a launch that never asked to render on it.
-            self._require_real_usernames(resolvable, usernames, clients)
-            current = sharing.get_settings(sdk, owner_username, dataset_name)
+            grant_started = time.monotonic()
+            try:
+                self._require_real_usernames(resolvable, usernames, clients)
+                current = sharing.get_settings(sdk, owner_username,
+                                               dataset_name)
+            except Exception as e:      # noqa: BLE001 -- logged, re-raised
+                note(f"step 2/4 grant -- never attempted: the checks before "
+                     f"it failed after {since(grant_started)}, so NO account "
+                     f"was granted anything. {type(e).__name__}: {e}",
+                     critical=True)
+                raise
             try:
                 sharing.grant_readers(
                     sdk, owner_username, dataset_name,
                     [usernames[a.label] for a in resolvable], current)
             except Exception as e:
+                # ONE write covers every friend, so this failure genuinely
+                # cannot be pinned on any one of them -- saying otherwise
+                # in the log would send the next reader hunting the wrong
+                # account.
+                note(f"step 2/4 grant -- FAILED after {since(grant_started)} "
+                     f"for all {len(resolvable)} account(s) at once ({who}). "
+                     "grant_readers is a single bulk write, so this is NOT "
+                     "attributable to any one account. "
+                     f"{type(e).__name__}: {e}", critical=True)
                 # The pre-check above cannot catch every bad name: an
                 # account that owns nothing has no handle for Kaggle to
                 # report, so it is allowed through deliberately and Kaggle
@@ -1117,6 +1199,12 @@ class Fleet:
                 # yours carries it, and arrives wrapped as an unexplained
                 # failure. Translate it here, where both are known.
                 raise _explain_bad_collaborators(e, resolvable, usernames) from e
+            # "Accepted", not "granted and visible": Kaggle takes the write
+            # and propagates it afterwards, which is precisely why steps
+            # 3 and 4 exist and why this line carries its own duration.
+            note(f"step 2/4 grant -- bulk grant_readers accepted in "
+                 f"{since(grant_started)} for all {len(resolvable)} "
+                 f"account(s): {who}")
 
             # Verify access actually landed, not just that the write
             # returned cleanly -- see UnreachableAccountsError. Deliberately
@@ -1133,14 +1221,38 @@ class Fleet:
             unreachable_required = []
             still_checkable = []
             for account in resolvable:
-                if clients[account.label].dataset_reachable(dataset_slug):
+                username = usernames[account.label]
+                need = ("required" if account.label in required_labels
+                        else "optional")
+                reach_started = time.monotonic()
+                try:
+                    reachable = clients[account.label].dataset_reachable(
+                        dataset_slug)
+                except Exception as e:  # noqa: BLE001 -- logged, re-raised
+                    note(f"{account.label} ({username}): step 3/4 reachable "
+                         f"-- the check itself failed after "
+                         f"{since(reach_started)} ({need}). "
+                         f"{type(e).__name__}: {e}", critical=True)
+                    raise
+                if reachable:
                     still_checkable.append(account)
+                    note(f"{account.label} ({username}): step 3/4 reachable "
+                         f"-- yes, in {since(reach_started)} ({need})")
                 elif account.label in required_labels:
-                    unreachable_required.append(usernames[account.label])
+                    unreachable_required.append(username)
+                    note(f"{account.label} ({username}): step 3/4 reachable "
+                         f"-- NO, after {since(reach_started)}. The grant was "
+                         "accepted but Kaggle does not show this dataset to "
+                         "this account. Required for this call, so the whole "
+                         "upload fails here.", critical=True)
                 else:
                     self.unshared_accounts[account.label] = (
                         "granted READER access, but Kaggle has not made "
                         "the dataset reachable for this account yet")
+                    note(f"{account.label} ({username}): step 3/4 reachable "
+                         f"-- NO, after {since(reach_started)}. Optional for "
+                         "this call, so it is recorded as unshared and the "
+                         "upload continues.", critical=True)
             if unreachable_required:
                 raise UnreachableAccountsError(
                     "granted READER access but the dataset is still not "
@@ -1155,12 +1267,20 @@ class Fleet:
             # required/optional split as above: a STALE or missing copy on
             # an optional friend is recorded, not raised.
             for account in still_checkable:
-                stage("verifying-access", usernames[account.label])
+                username = usernames[account.label]
+                need = ("required" if account.label in required_labels
+                        else "optional")
+                file_started = time.monotonic()
+                stage("verifying-access", username)
                 try:
                     _require_matching_dataset(
-                        clients[account.label], usernames[account.label],
+                        clients[account.label], username,
                         dataset_slug, blend.name, expected_size)
                 except StaleDatasetError as e:
+                    note(f"{account.label} ({username}): step 4/4 file -- "
+                         f"can see the dataset but NOT {blend.name} at "
+                         f"{expected_size} bytes, after {since(file_started)} "
+                         f"({need}). StaleDatasetError: {e}", critical=True)
                     if account.label in required_labels:
                         raise
                     self.unshared_accounts[account.label] = str(e)
@@ -1171,6 +1291,10 @@ class Fleet:
                     # wording would tell the user to wait for something
                     # that will never happen. Its own message already says
                     # what to do.
+                    note(f"{account.label} ({username}): step 4/4 file -- "
+                         f"this account's token is REVOKED (after "
+                         f"{since(file_started)}, {need}). Not a propagation "
+                         f"delay: waiting will not fix it. {e}", critical=True)
                     if account.label in required_labels:
                         raise
                     self.unshared_accounts[account.label] = str(e)
@@ -1185,11 +1309,31 @@ class Fleet:
                     # exactly why pressing Upload a second time "worked",
                     # the grant having propagated in between. Same
                     # required/optional split as every other check here.
+                    note(f"{account.label} ({username}): step 4/4 file -- "
+                         f"Kaggle refused this account's file listing after "
+                         f"{since(file_started)} ({need}), which is the same "
+                         "grant propagation delay one call later. "
+                         f"{type(e).__name__}: {e}", critical=True)
                     if account.label in required_labels:
                         raise
                     self.unshared_accounts[account.label] = (
                         "granted READER access, but Kaggle has not made the "
                         f"dataset's file listing visible yet ({e})")
+                else:
+                    note(f"{account.label} ({username}): step 4/4 file -- "
+                         f"can see {blend.name} at {expected_size} bytes, "
+                         f"confirmed in {since(file_started)} ({need}). "
+                         "Sharing complete for this account.")
+            # One closing line, so "who ended up with the scene" is a single
+            # lookup rather than a reconstruction from the lines above.
+            shared = [a.label for a in resolvable
+                      if a.label not in self.unshared_accounts]
+            missed = sorted(self.unshared_accounts)
+            note(f"sharing finished: {len(shared)} of {len(friends)} other "
+                 f"account(s) can see {blend.name}"
+                 + (f"; NOT shared with {', '.join(missed)}" if missed
+                    else " -- everyone"),
+                 critical=bool(missed))
         stage("ready", dataset_slug)
         return dataset_slug
 

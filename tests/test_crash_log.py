@@ -185,6 +185,28 @@ def test_errors_still_reach_a_capped_log(tmp_path, monkeypatch):
     assert "Must construct a QApplication first" in _text(path)
 
 
+def test_sharing_narration_cannot_evict_the_crash_report(tmp_path, monkeypatch):
+    """The sharing path (fleet.prepare_dataset) now narrates every step for
+    every account. That is a lot more routine volume than this file used to
+    carry, and the one thing it must never do is push the line explaining a
+    crash off the end -- so the routine cap absorbs it and the hard ceiling
+    still bounds the file."""
+    monkeypatch.setattr(crash_log, "MAX_RUN_BYTES", 2000)
+    path = crash_log.install(tmp_path)
+
+    for i in range(4000):
+        crash_log.record(
+            f"share user_0/scene-blend: a{i} (user_{i}): step 3/4 reachable "
+            "-- yes, in 41 ms")
+    crash_log.record("UNHANDLED EXCEPTION on the main thread", critical=True)
+
+    body = _text(path)
+    assert "UNHANDLED EXCEPTION on the main thread" in body
+    assert "log capped" in body
+    assert path.stat().st_size < crash_log.MAX_RUN_BYTES * 2 + 500
+    assert sum(p.stat().st_size for p in tmp_path.glob("blendfleet-*.log"))         <= crash_log.MAX_TOTAL_BYTES
+
+
 def test_writing_before_install_is_a_no_op(tmp_path):
     crash_log.shutdown()
     crash_log.record("nobody is listening yet")     # must not raise
