@@ -897,6 +897,12 @@ const UPLOAD_STAGES = {
   'already-uploaded':  d => ['already on Kaggle', 'skipping the upload'],
   uploading:           d => [`uploading to ${d}`, 'this is the slow one'],
   verifying:           d => [`checking Kaggle stored it`, `as ${d}`],
+  /* The upload is done and the byte counter is frozen at 100% while
+     Kaggle finishes indexing a dataset it has only just received -- 1s
+     was far too soon for a 499 MB scene (2026-08-15). Named so the wait
+     reads as progress rather than a hang. */
+  'waiting-for-kaggle': d => ['waiting for Kaggle to index the upload',
+                              `${d} — the file is already there`],
   sharing:             d => ['granting access', `to ${d}`],
   'verifying-access':  d => ['confirming access', `for ${d}`],
   ready:               d => ['ready', d],

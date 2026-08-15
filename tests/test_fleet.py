@@ -1509,6 +1509,182 @@ def test_a_revoked_token_is_never_reported_as_a_propagation_delay(blend,
 
 
 # ---------------------------------------------------------------------------
+# The OWNER's own post-upload verification is a RACE, not a failure.
+#
+# From %APPDATA%\BlendFleet\logs\blendfleet-20260815-142829.log:
+#
+#   14:30:37 uploading waydown.blend (498927212 bytes)
+#   14:33:38 upload finished in 181045 ms
+#   14:33:40 the uploaded copy did NOT verify after 1059 ms -- nothing was
+#            shared with anyone. KaggleError: could not list the files in
+#            dataset 'sudaouserwithani/waydown-blend': 403
+#
+# That 403 is the OWNER failing to list its OWN dataset one second after a
+# 499 MB upload: Kaggle had not finished ingesting it. Three minutes and
+# half a gigabyte of successful upload were discarded at the last check,
+# and pressing Upload again later "just worked".
+# ---------------------------------------------------------------------------
+
+class FakeClock:
+    """A clock that moves only when something sleeps on it.
+
+    The retry window is 20-300 real seconds; nothing in a test suite may
+    wait that out, and nothing may busy-loop either, so the fake sleep is
+    what advances the fake clock.
+    """
+
+    def __init__(self):
+        self.now = 0.0
+        self.slept: list[float] = []
+
+    def __call__(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.slept.append(seconds)
+        self.now += seconds
+
+
+class IngestingOwnerClient(FakeClient):
+    """The owner's own file listing 403s for its first `forbidden` calls.
+
+    Call 1 is the pre-upload "is it already there?" check, which on a
+    first upload legitimately 403s because the dataset does not exist yet
+    (Kaggle answers 403, not 404 -- see kaggle_client). Every call after
+    that is the post-upload verification.
+    """
+
+    def __init__(self, token, forbidden=2, **kw):
+        super().__init__(token, **kw)
+        self.forbidden = forbidden
+        self.listing_calls = 0
+
+    def dataset_file_size(self, slug, filename):
+        self.listing_calls += 1
+        if self.listing_calls <= self.forbidden:
+            raise KaggleError(
+                f"could not list the files in dataset {slug!r}: 403 Client "
+                "Error: Forbidden for url: https://api.kaggle.com/v1/"
+                "datasets.DatasetApiService/ListDatasetFiles.")
+        return super().dataset_file_size(slug, filename)
+
+
+def _uploads(clients):
+    return sum(c.dataset_creates + c.dataset_versions for c in clients.values())
+
+
+def test_a_403_that_clears_on_the_second_attempt_does_not_re_upload(blend,
+                                                                    tmp_path):
+    """The reported bug. One 403 immediately after the upload is Kaggle
+    still ingesting; waiting a second is the whole fix, and the file must
+    not be sent again to get it."""
+    clock = FakeClock()
+    clients = {}
+
+    def factory(tok):
+        clients[tok] = IngestingOwnerClient(tok, forbidden=2)
+        return clients[tok]
+
+    f = Fleet(accounts(1), factory, tmp_path / "w")
+    slug = f.prepare_dataset(blend, sleep=clock.sleep, clock=clock)
+
+    assert slug.endswith("-blend")
+    assert _uploads(clients) == 1, "the scene was re-sent to survive a 403"
+    assert clock.slept, "the owner's verification never waited at all"
+
+
+def test_a_403_that_never_clears_fails_with_upload_succeeded_wording(blend,
+                                                                     tmp_path):
+    """When the window really does expire, the message must not blame a
+    deleted dataset or a lapsed grant: the owner uploaded this file itself,
+    seconds ago."""
+    clock = FakeClock()
+    clients = {}
+
+    def factory(tok):
+        clients[tok] = IngestingOwnerClient(tok, forbidden=10_000)
+        return clients[tok]
+
+    f = Fleet(accounts(1), factory, tmp_path / "w")
+    with pytest.raises(fleet_mod.UploadNotVisibleError) as exc_info:
+        f.prepare_dataset(blend, sleep=clock.sleep, clock=clock)
+
+    message = str(exc_info.value)
+    assert "uploading to Kaggle successfully" in message
+    assert "not re-send" in message.lower() or "will not" in message.lower()
+    assert "already on Kaggle" in message, (
+        "the user must be told the retry skips the upload")
+    assert "deleted or renamed" not in message and "lapsed" not in message, (
+        "the owner's own fresh upload is not a deleted dataset or a lapsed "
+        "grant")
+    assert _uploads(clients) == 1, "gave up but still re-sent the scene"
+    assert clock.now >= fleet_mod.verify_window_s(BLEND_SIZE), (
+        "gave up before the window it promised to wait")
+
+
+def test_a_size_mismatch_fails_immediately_and_is_never_retried(blend,
+                                                                tmp_path):
+    """A stale copy is not a timing problem. Kaggle's listing is complete
+    and disagrees -- waiting cannot turn 999 bytes into the right file, so
+    this must not spend the window discovering that."""
+    clock = FakeClock()
+
+    def factory(tok):
+        return FakeClient(tok, remote_file_sizes={blend.name: 999})
+
+    f = Fleet(accounts(1), factory, tmp_path / "w")
+    with pytest.raises(StaleDatasetError):
+        f.prepare_dataset(blend, sleep=clock.sleep, clock=clock)
+
+    assert clock.slept == [], "a size mismatch was retried as if it were a race"
+
+
+def test_the_wait_for_kaggle_is_reported_through_the_stage_callback(blend,
+                                                                    tmp_path):
+    """A frozen 100% progress bar for a minute is indistinguishable from a
+    hang. The wait names itself, like every other stage does."""
+    clock = FakeClock()
+    seen = []
+
+    def factory(tok):
+        return IngestingOwnerClient(tok, forbidden=3)
+
+    f = Fleet(accounts(1), factory, tmp_path / "w")
+    f.prepare_dataset(blend, sleep=clock.sleep, clock=clock,
+                      on_stage=lambda k, d: seen.append((k, d)))
+
+    waits = [d for k, d in seen if k == "waiting-for-kaggle"]
+    assert waits, "the app went silent while waiting for Kaggle"
+    assert "s of up to" in waits[0], (
+        "the wait must say how long it has waited and how long it will")
+    assert [k for k, _ in seen][-1] == "ready"
+
+
+def test_the_wait_window_scales_with_the_size_actually_uploaded(blend):
+    """A 5 MB scene and a 500 MB scene do not need the same patience, and
+    neither may wait forever."""
+    small = fleet_mod.verify_window_s(5 << 20)
+    big = fleet_mod.verify_window_s(499 * (1 << 20))     # the reported scene
+
+    assert small >= 20, "less patience than the 1.06 s that already failed"
+    assert big > small, "half a gigabyte got no more time than 5 MB"
+    assert fleet_mod.verify_window_s(50 << 30) == fleet_mod._VERIFY_WINDOW_MAX_S
+
+
+def test_a_revoked_owner_token_is_never_waited_out(blend, tmp_path):
+    """Waiting five minutes for credentials that are dead is the cruellest
+    possible spinner -- and it is a KaggleError subclass, so the tolerant
+    branch has to exclude it deliberately."""
+    clock = FakeClock()
+
+    f = Fleet(accounts(1), lambda t: RevokedListingClient(t), tmp_path / "w")
+    with pytest.raises(RevokedTokenError):
+        f.prepare_dataset(blend, sleep=clock.sleep, clock=clock)
+
+    assert clock.slept == []
+
+
+# ---------------------------------------------------------------------------
 # what the diagnostic log says about sharing
 #
 # A user reported "the upload worked but the other accounts never got the

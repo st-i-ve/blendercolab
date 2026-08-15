@@ -190,7 +190,11 @@ def _require_matching_dataset(client, username: str, slug: str,
     """
     remote_size = client.dataset_file_size(slug, filename)
     if remote_size is None:
-        raise StaleDatasetError(
+        # DatasetFileNotListedError, a StaleDatasetError subclass: every
+        # existing catch still catches it, and the owner's post-upload
+        # retry (which must wait this one out but must NOT wait out a
+        # size mismatch) can tell the two apart.
+        raise DatasetFileNotListedError(
             f"{username} can reach dataset {slug!r}, but Kaggle's file "
             f"listing for it has no file named {filename!r} at all. "
             "Nothing has been started. This is not a stale copy -- the "
@@ -204,6 +208,146 @@ def _require_matching_dataset(client, username: str, slug: str,
         raise StaleDatasetError(
             _default_stale_message(username, filename, remote_size,
                                    expected_size))
+
+
+# ---------------------------------------------------------------------------
+# How long the OWNER waits for Kaggle to make its own fresh upload
+# queryable. Measured, not guessed -- from
+# %APPDATA%\BlendFleet\logs\blendfleet-20260815-142829.log:
+#
+#   14:30:37 uploading waydown.blend (498927212 bytes)   <- 499 MB
+#   14:33:38 upload finished in 181045 ms                <- 3 minutes
+#   14:33:40 the uploaded copy did NOT verify after 1059 ms
+#            KaggleError: could not list the files in dataset ...: 403
+#
+# The upload itself was fine. ListDatasetFiles was asked 1.06 SECONDS
+# after a half-gigabyte upload returned, Kaggle had not finished ingesting
+# it, and three minutes of upload were thrown away at the final check with
+# nothing shared. Pressing Upload again later "just worked" -- the only
+# thing that had changed was elapsed time.
+#
+# So: wait, and scale the patience with the bytes, because ingest work
+# does. A 5 MB scene and a 500 MB scene do not need the same window.
+#   - floor 20 s: even the smallest scene gets ~20x the 1.06 s that failed
+#     here, which costs nothing when the check normally passes first try.
+#   - +120 s per GB: the 499 MB above gets ~80 s total, ~75x that measured
+#     interval.
+#   - cap 300 s: five minutes is already longer than the 181 s the upload
+#     took. Past that, "Kaggle is still indexing" stops being the credible
+#     explanation and the user deserves an answer instead of a spinner.
+# The alternative to waiting is re-sending the file, which for this user
+# cost 3 minutes and 499 MB -- every one of these numbers is cheap by
+# comparison.
+_VERIFY_WINDOW_MIN_S = 20.0
+_VERIFY_WINDOW_PER_GB_S = 120.0
+_VERIFY_WINDOW_MAX_S = 300.0
+# Backoff is capped so the user gets a fresh "still waiting, Ns of Ms"
+# line at least this often: a 60 s silence is indistinguishable from a
+# hang, which is the complaint the stage vocabulary exists to answer.
+_VERIFY_POLL_MAX_S = 15.0
+_BYTES_PER_GB = 1 << 30
+
+
+def verify_window_s(size_bytes: int) -> float:
+    """Seconds to let Kaggle catch up after uploading `size_bytes`.
+
+    See the constants above for where the numbers come from.
+    """
+    scaled = (_VERIFY_WINDOW_MIN_S
+              + _VERIFY_WINDOW_PER_GB_S * (max(size_bytes, 0) / _BYTES_PER_GB))
+    return min(scaled, _VERIFY_WINDOW_MAX_S)
+
+
+def _verify_owner_upload(client, username: str, slug: str, filename: str,
+                         expected_size: int, *,
+                         note: Callable[..., None],
+                         stage: Callable[[str, str], None],
+                         sleep: Callable[[float], None] = time.sleep,
+                         clock: Callable[[], float] = time.monotonic) -> None:
+    """_require_matching_dataset for the owner's OWN just-finished upload,
+    retried with backoff until Kaggle admits the file exists.
+
+    Same verification, only patient: nothing here accepts an unverified
+    upload. A launch must never start on a scene the accounts cannot
+    actually see, so this still returns only when Kaggle itself confirms
+    `filename` at `expected_size` -- it just stops treating "asked too
+    soon" as "the upload failed".
+
+    Two failures count as "not ready yet", because right after an upload
+    they are the same state seen through two different calls:
+      * KaggleError carrying a 403 from dataset_files -- Kaggle refusing
+        to list a dataset it has not finished ingesting (this codebase
+        already documents that a missing or invisible dataset answers 403,
+        not 404 -- see dataset_reachable and _AMBIGUOUS_STATUSES).
+      * DatasetFileNotListedError -- the listing exists but the file is
+        not in it yet.
+
+    Everything else fails immediately, and deliberately:
+      * a SIZE MISMATCH (plain StaleDatasetError) means Kaggle's listing
+        is complete and disagrees with the local file. That is a real
+        stale copy; waiting cannot turn it into the right one.
+      * RevokedTokenError means the credentials are dead. Waiting for a
+        token that will never come back is the cruellest possible spinner.
+    """
+    started = clock()
+    deadline = started + verify_window_s(expected_size)
+    attempt = 0
+    delay = 1.0
+    while True:
+        attempt += 1
+        try:
+            _require_matching_dataset(client, username, slug, filename,
+                                      expected_size)
+        except RevokedTokenError:
+            raise                       # dead token: never a timing problem
+        except (KaggleError, DatasetFileNotListedError) as e:
+            waited = clock() - started
+            # Logged per attempt, with elapsed time, because the ONLY
+            # reason this bug was findable was that the log carried the
+            # 1059 ms. The next occurrence should say how long Kaggle
+            # actually took, so these numbers can be re-tuned from
+            # evidence rather than argued about.
+            note(f"owner {username}: Kaggle has not made the upload "
+                 f"queryable yet -- attempt {attempt} failed "
+                 f"{waited * 1000:.0f} ms after the upload finished. "
+                 f"{type(e).__name__}: {e}")
+            remaining = deadline - clock()
+            if remaining <= 0:
+                note(f"owner {username}: gave up waiting for Kaggle after "
+                     f"{waited * 1000:.0f} ms and {attempt} attempt(s). The "
+                     f"upload itself succeeded; Kaggle never made "
+                     f"{filename} queryable inside the window.",
+                     critical=True)
+                raise UploadNotVisibleError(
+                    f"{filename} finished uploading to Kaggle successfully, "
+                    f"but Kaggle has not yet made the dataset {slug!r} "
+                    f"queryable for {username}, its own owner -- so the "
+                    f"upload could not be confirmed and nothing was shared "
+                    f"or started. Kaggle indexes a new dataset some time "
+                    f"after the bytes land, and the bigger the scene the "
+                    f"longer that takes; this waited "
+                    f"{(clock() - started):.0f}s ({attempt} attempts) and "
+                    f"it still was not ready. Nothing is lost and nothing "
+                    f"is wrong with the file: wait a minute and press "
+                    f"Upload again. That retry will NOT re-send the scene "
+                    f"-- the 'already on Kaggle' check at the start finds "
+                    f"the copy that just landed and skips straight to "
+                    f"verifying it.") from e
+            nap = min(delay, remaining)
+            # An honest new stage, not silence: the byte counter is
+            # finished and frozen at 100% by now, so without this the UI
+            # looks hung for the whole window.
+            stage("waiting-for-kaggle",
+                  f"{username}: {waited:.0f}s of up to "
+                  f"{verify_window_s(expected_size):.0f}s")
+            sleep(nap)
+            delay = min(delay * 2, _VERIFY_POLL_MAX_S)
+        else:
+            if attempt > 1:
+                note(f"owner {username}: Kaggle made the upload queryable "
+                     f"after {(clock() - started) * 1000:.0f} ms and "
+                     f"{attempt} attempt(s)")
+            return
 
 
 def _find_blend_file(client, slug: str) -> tuple[str, int]:
@@ -450,6 +594,35 @@ class StaleDatasetError(RuntimeError):
     own just-uploaded copy (checked right after sync_blend, before a single
     friend is even granted access) and every friend's shared view of it
     (checked right after dataset_reachable, before push_kernel).
+    """
+
+
+class DatasetFileNotListedError(StaleDatasetError):
+    """The account can reach the dataset, but its file listing has no file
+    by that name at all -- the MISSING half of StaleDatasetError.
+
+    A subclass, not a separate error, so that every existing caller
+    catching StaleDatasetError keeps catching this unchanged; the only
+    reason it exists is that the owner's post-upload verification has to
+    tell the two halves apart. "The listing has no file called
+    scene.blend yet", seconds after that exact file finished uploading,
+    is Kaggle still ingesting -- worth waiting out. A SIZE MISMATCH is
+    the opposite: the listing is complete and disagrees, which no amount
+    of waiting repairs (see _verify_owner_upload).
+    """
+
+
+class UploadNotVisibleError(RuntimeError):
+    """The .blend uploaded fine, but Kaggle never made the dataset
+    queryable within the wait window (see _verify_owner_upload).
+
+    Deliberately NOT a KaggleError or a StaleDatasetError: both of those
+    carry advice ("the dataset was deleted or renamed", "this account's
+    grant has lapsed", "re-upload the current .blend") that is actively
+    wrong here. The owner has just uploaded the file itself, seconds
+    ago, with its own token; nothing is deleted, nothing has lapsed and
+    nothing is stale. The only true statement is that Kaggle's own index
+    has not caught up yet, so this type carries its own wording.
     """
 
 
@@ -1049,7 +1222,9 @@ class Fleet:
                         *, clients: dict | None = None,
                         usernames: dict | None = None,
                         on_stage: Callable[[str, str], None] | None = None,
-                        required: list[Account] | None = None) -> str:
+                        required: list[Account] | None = None,
+                        sleep: Callable[[float], None] = time.sleep,
+                        clock: Callable[[], float] = time.monotonic) -> str:
         """Upload the .blend as a Kaggle dataset, share it, and verify it.
 
         Split out of launch() so the upload can be driven on its own: it is
@@ -1076,6 +1251,11 @@ class Fleet:
         would burn its quota failing to find the .blend. Everything this
         call could not share with an optional account is recorded on
         self.unshared_accounts (label -> why) rather than raised.
+
+        `sleep`/`clock` exist only so the owner's post-upload wait (see
+        _verify_owner_upload) can be driven by a fake clock in tests --
+        a real 20-300 second window has no business inside a test suite.
+        Production callers never pass them.
 
         Returns the dataset slug every worker's notebook will reference.
         """
@@ -1150,11 +1330,33 @@ class Fleet:
             # mean re-sending a whole .blend the user may already have on
             # Kaggle, though, so the reason is worth a line -- "why did it
             # upload 60 MB again?" is otherwise unanswerable.
+            #
+            # But say WHICH of the two it is. Kaggle answers a dataset that
+            # does not exist (or is invisible to this account) with 403,
+            # not 404 -- see dataset_reachable's docstring and
+            # _AMBIGUOUS_STATUSES in kaggle_client.py -- so on a FIRST
+            # upload this branch is the normal, expected path, and the old
+            # single wording ("could not check ... so it will be uploaded
+            # again") read like a fault every single time. The 2026-08-15
+            # log shows exactly that at 14:30:37, three minutes before the
+            # real failure, sending the reader hunting the wrong line.
             already_there = False
+            not_there_yet = (isinstance(e, KaggleError)
+                             and not isinstance(e, RevokedTokenError)
+                             and "403" in str(e))
+            if not_there_yet:
+                reason = (f"{blend.name} is not on Kaggle under this slug "
+                          f"yet (Kaggle answers 403, not 404, for a dataset "
+                          f"that does not exist for this account), so it is "
+                          f"being uploaded now. Normal for a first upload; "
+                          f"nothing is wrong. {type(e).__name__}: {e}")
+            else:
+                reason = (f"could not check whether {blend.name} is already "
+                          f"on Kaggle, so it will be uploaded again -- this "
+                          f"is NOT the ordinary first-upload answer and is "
+                          f"worth reading. {type(e).__name__}: {e}")
             crash_log.record(_tokenless(
-                f"share {dataset_slug}: could not check whether "
-                f"{blend.name} is already on Kaggle, so it will be uploaded "
-                f"again. {type(e).__name__}: {e}", self.accounts))
+                f"share {dataset_slug}: {reason}", self.accounts))
 
         if already_there:
             stage("already-uploaded", dataset_slug)
@@ -1181,11 +1383,20 @@ class Fleet:
         # only prove the dataset is THERE; they say nothing about whether
         # it's the file just uploaded versus a stale one from an earlier
         # job with the same slug.
+        #
+        # Retried, not asked once: the 2026-08-15 log has this check
+        # failing 1059 ms after a 498,927,212-byte upload returned, with
+        # Kaggle 403ing ListDatasetFiles because it was still ingesting.
+        # That discarded three minutes and 499 MB of successful upload at
+        # the very last step. See _verify_owner_upload for the window and
+        # for which failures are "not ready yet" versus genuinely wrong.
         stage("verifying", owner_username)
         owner_check = time.monotonic()
         try:
-            _require_matching_dataset(owner_client, owner_username,
-                                      dataset_slug, blend.name, expected_size)
+            _verify_owner_upload(owner_client, owner_username, dataset_slug,
+                                 blend.name, expected_size,
+                                 note=note, stage=stage,
+                                 sleep=sleep, clock=clock)
         except Exception as e:      # noqa: BLE001 -- logged, then re-raised
             note(f"owner {owner_username}: the uploaded copy did NOT verify "
                  f"after {since(owner_check)} -- nothing was shared with "

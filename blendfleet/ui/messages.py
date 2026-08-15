@@ -20,7 +20,8 @@ from blendfleet.accounts import TokenFormatError
 from blendfleet.dataset_sync import SyncError
 from blendfleet.fleet import (FleetBusyError, NoBlendInDatasetError,
                               StaleDatasetError, UnreachableAccountsError,
-                              UnreadableJobChanged, WrongUsernameError)
+                              UnreadableJobChanged, UploadNotVisibleError,
+                              WrongUsernameError)
 from blendfleet.kaggle_client import KaggleError
 from blendfleet.uploader import UploadError
 
@@ -34,10 +35,15 @@ from blendfleet.uploader import UploadError
 # "BlendFleet does not recognise this failure pattern" appended on top,
 # which contradicts a message that already explains itself in full (Fix
 # round 1, Minor).
+#
+# UploadNotVisibleError says, in full, that the upload SUCCEEDED, that
+# Kaggle has not indexed it yet, how long was waited, and that retrying
+# will not re-send the file -- appending "BlendFleet does not recognise
+# this failure" to that would contradict every word of it.
 _SELF_EXPLANATORY = (
     FleetBusyError, UnreachableAccountsError, UnreadableJobChanged,
     WrongUsernameError, KaggleError, NoBlendInDatasetError,
-    StaleDatasetError,
+    StaleDatasetError, UploadNotVisibleError,
     SyncError, UploadError, TokenFormatError, ValueError,
 )
 
