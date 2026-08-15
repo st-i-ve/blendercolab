@@ -565,6 +565,31 @@ def test_progress_requested_but_client_lacks_progress_support_still_collects(tmp
     assert r.copied == 2
 
 
+def test_progress_transport_is_used_even_when_no_callback_was_given(tmp_path):
+    """Task D: which transport downloads is no longer decided by whether
+    the caller wanted a progress bar. fetch_output() is kaggle's own
+    kernels_output(), the one call with no bounded timeout -- a collect
+    with no on_progress must not silently be routed onto it."""
+    used: list[str] = []
+
+    class BothWaysClient(FakeClient):
+        def fetch_output(self, slug, dest):
+            used.append("fetch_output")
+            return super().fetch_output(slug, dest)
+
+        def fetch_output_with_progress(self, slug, dest, on_progress=None):
+            used.append("fetch_output_with_progress")
+            return super().fetch_output(slug, dest)
+
+    def factory(tok):
+        return BothWaysClient(tok, ["f_0001.png"] if tok.endswith("0"*32)
+                              else ["f_0002.png"])
+
+    r = collect(state(), accts(), factory, tmp_path / "out")   # no on_progress
+    assert r.copied == 2
+    assert used == ["fetch_output_with_progress"] * 2, used
+
+
 # --------------------------------------------------------------------------
 # One <scene>.zip per collect: naming, and never overwriting one that is
 # already there.

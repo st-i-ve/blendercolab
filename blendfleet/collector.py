@@ -154,15 +154,31 @@ def _fetch_with_retry(client, w, staging: Path, on_progress, sleep,
     Every attempt starts from an empty staging folder: a truncated file
     left behind by a failed attempt would otherwise be indistinguishable
     from a complete one, and could be copied out as a "collected" frame.
+
+    Task D: `fetch_output_with_progress` is used whenever the client has
+    it, even when this caller asked for no progress at all -- a no-op
+    callback is substituted rather than falling through to
+    `fetch_output`. The two are not interchangeable transports.
+    `fetch_output` is the kaggle package's own `kernels_output()`, which
+    reads each response body in one `.content` shot: no progress AND, more
+    importantly, no seam where a timeout can be bounded (commit beb0f0d
+    bounded every other Kaggle call; this was the one hole left), so a
+    stalled socket there hangs the download thread with nothing on screen
+    moving. Choosing the transport on whether a caller happened to want a
+    progress bar meant the download the user could not see was also the
+    only one that could hang forever. `fetch_output` survives purely as
+    the fallback for a client that genuinely lacks the newer method --
+    which is every test double in tests/test_collector.py and
+    tests/test_transient_failures.py.
     """
     last: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
-            if on_progress is not None and hasattr(
-                    client, "fetch_output_with_progress"):
+            if hasattr(client, "fetch_output_with_progress"):
+                report_progress = on_progress or (lambda label, p: None)
                 return client.fetch_output_with_progress(
                     w.kernel_slug, staging,
-                    on_progress=lambda p, label=w.label: on_progress(label, p))
+                    on_progress=lambda p, label=w.label: report_progress(label, p))
             return client.fetch_output(w.kernel_slug, staging)
         except Exception as e:
             last = e
@@ -273,9 +289,9 @@ def collect(fleet_state, accounts, client_factory: Callable,
     `on_progress`, if given, is called as `on_progress(label, progress)`
     for every DownloadProgress tick reported by whichever worker is
     currently downloading (see kaggle_client.KaggleClient.
-    fetch_output_with_progress) -- used only when the client exposes that
-    method; a client/test-double without it is still collected from, just
-    without live progress for that worker.
+    fetch_output_with_progress). Task D: passing nothing no longer
+    switches transports, it only silences the ticks -- see
+    _fetch_with_retry for why that distinction mattered.
 
     A worker's fetch failing (network, revoked token, ...) is recorded in
     `report.worker_errors` rather than raised, so it can never abort
