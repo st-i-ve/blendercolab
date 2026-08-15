@@ -3183,3 +3183,275 @@ def test_a_preview_never_touches_the_payload_from_the_stream_thread(qapp,
     backend._live_tick()
     assert json.loads(backend.state())["instances"][0]["live"]["thumb"][
         "frame"] == 2
+
+
+# ---------------------------------------------------------------------------
+# The renders / packed outputs list on the Files page.
+#
+# "i believe files should have a view that displays the packed outputs --
+# ie we have the render for waydown existing in the instances, press
+# download to download all of them -- and we can have other pre-existing
+# outputs too for previous projects." (2026-08-15.)
+#
+# The list is the jobs THIS app rendered (Fleet.load_jobs(), append-only),
+# so a render the user remembers doing cannot silently vanish from it --
+# not even once Kaggle has deleted the frames behind it. That case is
+# LISTED AND LABELLED, which is the whole reason `availability` has four
+# values rather than being a boolean.
+# ---------------------------------------------------------------------------
+
+def _outputs_backend(tmp_path, jobs, n=2):
+    backend = make_backend(tmp_path, n=n)
+    backend.fleet_factory(backend.store.list()).save_jobs(jobs)
+    return backend
+
+
+def _output_job(job_id, blend, *, labels=("acct0",), state="complete",
+                finished_at=1.0, started_at=1000.0, end_frame=4,
+                final_count_known=False, frames_done=0):
+    return FleetState(
+        job_id=job_id, blend_name=blend, start_frame=1, end_frame=end_frame,
+        started_at=started_at,
+        workers=[WorkerState(label=label,
+                             username=f"user_{label[-1]}",
+                             kernel_slug=f"user_{label[-1]}/{job_id}-render",
+                             frames=[1, 2], state=state,
+                             frames_done=frames_done,
+                             final_count_known=final_count_known,
+                             final_count_checked=True,
+                             finished_at=finished_at)
+                 for label in labels])
+
+
+class _OutputListingClient(FakeClient):
+    """A Kaggle whose per-kernel output listing is scripted by slug.
+
+    A value that is an Exception is RAISED, so "Kaggle says there is
+    nothing" and "this app could not ask" stay distinguishable -- which is
+    the difference between a render being gone and being unknown.
+    """
+
+    by_slug: dict = {}
+
+    def list_output_files(self, slug):
+        answer = self.by_slug.get(slug, [])
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+
+def _listing_factory(tmp_path, by_slug):
+    client = type("_Scripted", (_OutputListingClient,), {"by_slug": by_slug})
+    return lambda accounts: Fleet(accounts, lambda t: client(t), tmp_path / "w")
+
+
+def _outputs(backend):
+    """Drive outputs() and return the emitted list."""
+    seen = []
+    backend.outputsChanged.connect(lambda j: seen.append(json.loads(j)))
+    backend.outputs()
+    assert seen, "outputs() emitted nothing"
+    return seen[-1]["outputs"]
+
+
+def test_the_outputs_list_is_every_tracked_job_newest_first(qapp, tmp_path):
+    """load_jobs() is append-only and oldest-first. The render somebody
+    wants to download is overwhelmingly the one that just finished, so the
+    list is reversed -- and EVERY tracked job is in it, not just the
+    newest, because "previous projects" is exactly what was asked for."""
+    backend = _outputs_backend(tmp_path, [
+        _output_job("job-old", "old-project.blend"),
+        _output_job("job-mid", "another.blend", labels=("acct1",)),
+        _output_job("job-new", "waydown.blend"),
+    ])
+    rows = _outputs(backend)
+    assert [r["jobId"] for r in rows] == ["job-new", "job-mid", "job-old"]
+    assert [r["scene"] for r in rows] == ["waydown", "another", "old-project"]
+
+
+def test_the_outputs_list_answers_without_touching_the_network(qapp, tmp_path):
+    """It is what the Files page draws with the moment it opens. FakeClient
+    has no list_output_files at all, so an implementation that reached for
+    Kaggle here would blow up rather than quietly get slower."""
+    backend = _outputs_backend(tmp_path, [_output_job("job-1", "waydown.blend")])
+    assert len(_outputs(backend)) == 1
+
+
+def test_an_unchecked_render_claims_neither_available_nor_gone(qapp, tmp_path):
+    backend = _outputs_backend(tmp_path, [_output_job("job-1", "waydown.blend")])
+    row = _outputs(backend)[0]
+    assert row["availability"] == "unchecked"
+    assert row["checkedAgeSeconds"] is None
+    assert row["availableAccounts"] == 0
+
+
+def test_a_render_kaggle_has_deleted_is_still_listed_and_marked_gone(
+        qapp, tmp_path):
+    """Kaggle expires kernel output. The render DID happen, so the row
+    stays -- what changes is that it says there is nothing left."""
+    backend = _outputs_backend(
+        tmp_path, [_output_job("job-1", "waydown.blend", labels=("acct0",))])
+    backend.fleet_factory = _listing_factory(
+        tmp_path, {"user_0/job-1-render": []})
+
+    backend.checkOutputs()
+    _settle(backend)
+
+    row = _outputs(backend)[0]
+    assert row["scene"] == "waydown", "a deleted render must stay listed"
+    assert row["availability"] == "gone"
+    assert row["checkedAccounts"] == 1 and row["availableAccounts"] == 0
+
+
+def test_a_render_kaggle_still_has_is_marked_available(qapp, tmp_path):
+    backend = _outputs_backend(
+        tmp_path, [_output_job("job-1", "waydown.blend", labels=("acct0",))])
+    backend.fleet_factory = _listing_factory(
+        tmp_path, {"user_0/job-1-render": ["waydown.zip", "waydown_0001.png"]})
+
+    backend.checkOutputs()
+    _settle(backend)
+
+    row = _outputs(backend)[0]
+    assert row["availability"] == "available"
+    assert row["availableAccounts"] == 1
+    assert row["checkedAgeSeconds"] is not None
+
+
+def test_an_account_that_could_not_be_asked_is_unknown_never_gone(
+        qapp, tmp_path):
+    """Kaggle no longer having it, and this app being unable to ask, are
+    different sentences. Only the first may ever be shown as deleted."""
+    backend = _outputs_backend(
+        tmp_path, [_output_job("job-1", "waydown.blend", labels=("acct0",))])
+    backend.fleet_factory = _listing_factory(
+        tmp_path,
+        {"user_0/job-1-render": KaggleError("could not reach Kaggle")})
+
+    backend.checkOutputs()
+    _settle(backend)
+
+    row = _outputs(backend)[0]
+    assert row["availability"] == "unknown"
+    assert "acct0" in row["availabilityErrors"]
+    assert "Kaggle" in row["availabilityErrors"]["acct0"]
+
+
+def test_one_account_still_holding_frames_makes_the_render_available(
+        qapp, tmp_path):
+    """A partly-expired render is still worth downloading, and the row
+    says how much of it answered."""
+    backend = _outputs_backend(
+        tmp_path,
+        [_output_job("job-1", "waydown.blend", labels=("acct0", "acct1"))])
+    backend.fleet_factory = _listing_factory(tmp_path, {
+        "user_0/job-1-render": ["waydown.zip"],
+        "user_1/job-1-render": [],
+    })
+
+    backend.checkOutputs()
+    _settle(backend)
+
+    row = _outputs(backend)[0]
+    assert row["availability"] == "available"
+    assert row["availableAccounts"] == 1 and row["workerCount"] == 2
+
+
+def test_a_half_answered_check_is_unknown_not_gone(qapp, tmp_path):
+    """One account said nothing was there and the other could not be asked
+    at all. That is not proof Kaggle deleted the render."""
+    backend = _outputs_backend(
+        tmp_path,
+        [_output_job("job-1", "waydown.blend", labels=("acct0", "acct1"))])
+    backend.fleet_factory = _listing_factory(tmp_path, {
+        "user_0/job-1-render": [],
+        "user_1/job-1-render": KaggleError("rate limited"),
+    })
+
+    backend.checkOutputs()
+    _settle(backend)
+
+    assert _outputs(backend)[0]["availability"] == "unknown"
+
+
+def test_an_availability_answer_survives_a_later_plain_refresh(qapp, tmp_path):
+    """outputs() must not flick a checked row back to unchecked -- it is
+    called again whenever the list is redrawn."""
+    backend = _outputs_backend(
+        tmp_path, [_output_job("job-1", "waydown.blend", labels=("acct0",))])
+    backend.fleet_factory = _listing_factory(
+        tmp_path, {"user_0/job-1-render": ["waydown.zip"]})
+    backend.checkOutputs()
+    _settle(backend)
+
+    assert _outputs(backend)[0]["availability"] == "available"
+
+
+def test_a_render_never_claims_a_frame_count_it_cannot_confirm(qapp, tmp_path):
+    """frames_done off a live stream is a floor from some moment before
+    the render ended, not a total (see _frames_done_source). The row shows
+    the frame RANGE, which is a fact, and refuses the done count until
+    every account own kernel log has been read back for it."""
+    backend = _outputs_backend(tmp_path, [
+        _output_job("job-guess", "guess.blend", frames_done=3),
+        _output_job("job-final", "final.blend", frames_done=4,
+                    final_count_known=True),
+    ])
+    rows = {r["jobId"]: r for r in _outputs(backend)}
+    assert rows["job-guess"]["framesDoneKnown"] is False
+    assert rows["job-final"]["framesDoneKnown"] is True
+    assert rows["job-final"]["framesDone"] == 4
+    # The range is stated either way.
+    assert rows["job-guess"]["frameCount"] == 4
+
+
+def test_a_render_with_no_recorded_start_says_so_rather_than_1970(
+        qapp, tmp_path):
+    backend = _outputs_backend(
+        tmp_path, [_output_job("job-1", "waydown.blend", started_at=0.0)])
+    assert _outputs(backend)[0]["ageSeconds"] is None
+
+
+def test_an_unfinished_render_is_listed_and_not_called_finished(
+        qapp, tmp_path):
+    backend = _outputs_backend(tmp_path, [
+        _output_job("job-1", "waydown.blend", state="running", finished_at=0.0),
+    ])
+    row = _outputs(backend)[0]
+    assert row["finished"] is False
+    assert row["accounts"] == ["acct0"]
+
+
+# ---- downloading one render from the Files page ---------------------------
+
+def test_a_files_download_gets_its_own_busy_key(qapp, tmp_path, monkeypatch):
+    """Keyed per RENDER, because that is what the button is one of. The
+    fleet-wide button exact-match "collect:" and the per-instance
+    "collect:<label>" keys must keep matching exactly as before, which is
+    why this is its own prefix and not a third segment of that key."""
+    backend = _two_job_collect_backend(tmp_path)
+    seen_job_ids = []
+    _stub_collect_frames(monkeypatch, tmp_path, seen_job_ids)
+    keys = []
+    backend.busyChanged.connect(lambda k, b: keys.append((k, b)))
+
+    backend.collect("", "job-a")
+    _settle(backend)
+
+    assert seen_job_ids == ["job-a"]
+    assert ("collect-job:job-a", True) in keys
+    assert ("collect-job:job-a", False) in keys
+    assert not any(k.startswith("collect:") for k, _ in keys)
+
+
+def test_the_fleet_wide_button_keeps_its_exact_key(qapp, tmp_path,
+                                                   monkeypatch):
+    backend = _two_job_collect_backend(tmp_path)
+    _stub_collect_frames(monkeypatch, tmp_path, [])
+    keys = []
+    backend.busyChanged.connect(lambda k, b: keys.append((k, b)))
+
+    backend.collect("")
+    _settle(backend)
+
+    assert ("collect:", True) in keys and ("collect:", False) in keys

@@ -1158,6 +1158,55 @@ class KaggleClient:
         return sorted(p for p in dest.rglob("*")
                       if p.is_file() and p.suffix.lower() in _OUTPUT_SUFFIXES)
 
+    def list_output_files(self, slug: str) -> list[str]:
+        """The names of the render files Kaggle STILL has for this kernel.
+
+        Answers one question and downloads nothing: is there anything left
+        to collect? Kaggle deletes a kernel session's output after a while,
+        and a render this app tracked months ago is very likely gone --
+        which the outputs list on the Files page has to be able to say
+        without pulling 40 MB per row to find out.
+
+        Filtered to _OUTPUT_SUFFIXES, exactly like
+        fetch_output_with_progress' own `wanted`, so the two can never
+        disagree: a listing that held only, say, a stray .txt would let
+        this claim output exists while a collect from the same kernel
+        would come back with nothing.
+
+        An empty list means Kaggle listed no render files -- NOT that the
+        call failed. A failure raises, and every caller must keep those two
+        apart: "Kaggle no longer has it" and "this app could not ask" are
+        different sentences to show a user.
+
+        Pages through next_page_token for the same reason
+        fetch_output_with_progress does -- a no-archive render is hundreds
+        of loose frames and can exceed one page -- although a caller that
+        only wants to know whether ANYTHING is there stops mattering after
+        the first hit.
+        """
+        from kagglesdk.kernels.types.kernels_api_service import (
+            ApiListKernelSessionOutputRequest)
+
+        owner, name = slug.split("/", 1)
+        sdk = self._sdk_factory(self.token)
+        names: list[str] = []
+        page_token = ""
+        while True:
+            request = ApiListKernelSessionOutputRequest()
+            request.user_name = owner
+            request.kernel_slug = name
+            if page_token:
+                request.page_token = page_token
+            response = sdk.kernels.kernels_api_client.list_kernel_session_output(
+                request)
+            for f in (response.files or []):
+                if Path(f.file_name).suffix.lower() in _OUTPUT_SUFFIXES:
+                    names.append(f.file_name)
+            page_token = getattr(response, "next_page_token", "") or ""
+            if not page_token:
+                break
+        return names
+
     def fetch_output_with_progress(
             self, slug: str, dest: Path,
             on_progress: Callable | None = None,

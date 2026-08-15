@@ -2016,3 +2016,143 @@ def test_the_enlarged_live_preview_is_labelled_as_a_preview(loaded_page):
     assert "still rendering" in got["sub"]
     assert got["live"] is True, "the lightbox did not mark this as a preview"
     assert "preview" in got["alt"].lower()
+
+
+# ---------------------------------------------------------------------------
+# The renders / packed outputs section on the Files page.
+#
+# "i believe files should have a view that displays the packed outputs"
+# (2026-08-15). Sourced from the jobs this app rendered, newest first, and
+# a render whose frames Kaggle has since deleted stays LISTED and is
+# labelled rather than disappearing.
+# ---------------------------------------------------------------------------
+
+def _outputs_html(page, payload_js, element_id="output-list"):
+    """Drive the page's own renderOutputs(json) and return an innerHTML."""
+    out = {}
+    loop = QEventLoop()
+    page.runJavaScript(
+        "(() => { try {"
+        f" renderOutputs(JSON.stringify({payload_js}));"
+        f" return document.getElementById({element_id!r}).innerHTML;"
+        " } catch (e) { return 'THREW ' + e; } })()",
+        lambda r: (out.__setitem__("v", r or ""), loop.quit()))
+    QTimer.singleShot(5000, loop.quit)
+    loop.exec()
+    assert "v" in out and not out["v"].startswith("THREW"), out.get("v")
+    return out["v"]
+
+
+def _output(job_id="job-1", scene="waydown", availability="unchecked",
+            extra=""):
+    return ("{jobId:'" + job_id + "', scene:'" + scene + "', "
+            "blend:'" + scene + ".blend', startFrame:1, endFrame:25, "
+            "frameCount:25, ageSeconds:7200, accounts:['acct0','acct1'], "
+            "usernames:['user_0','user_1'], workerCount:2, framesDone:25, "
+            "framesDoneKnown:true, finished:true, "
+            "availability:'" + availability + "', availableAccounts:2, "
+            "checkedAccounts:2, availabilityErrors:{}, "
+            "checkedAgeSeconds:5" + extra + "}")
+
+
+TWO_OUTPUTS = ("({outputs:[" + _output("job-new", "waydown", "available")
+               + "," + _output("job-old", "kitchen", "gone") + "]})")
+
+
+def test_the_outputs_list_shows_the_tracked_renders_newest_first(loaded_page):
+    page, _ = loaded_page
+    html = _outputs_html(page, TWO_OUTPUTS)
+    assert html.index("waydown") < html.index("kitchen"), \
+        "the payload is already newest-first; the list must not re-sort it"
+    assert 'data-out-download="job-new"' in html
+    assert 'data-out-download="job-old"' in html
+
+
+def test_an_output_row_says_what_ran_when_and_on_what(loaded_page):
+    page, _ = loaded_page
+    html = _outputs_html(page, "({outputs:[" + _output() + "]})")
+    assert "frames 1-25" in html
+    assert "acct0, acct1" in html
+    assert "2h ago" in html
+    assert "every account finished" in html
+    assert "25 frame(s) reported rendered" in html
+
+
+def test_a_render_kaggle_deleted_is_listed_and_says_so(loaded_page):
+    """It must not vanish: the render happened. And the sentence must not
+    imply BlendFleet lost anything."""
+    page, _ = loaded_page
+    html = _outputs_html(
+        page, "({outputs:[" + _output(availability="gone") + "]})")
+    assert "waydown" in html, "an expired render must stay listed"
+    assert "output deleted by Kaggle" in html
+    assert "This render did happen" in html
+    assert "Nothing is left to download" in html
+    assert "re-render" in html.lower(), "must say what to do next"
+
+
+def test_an_unchecked_render_claims_neither_way(loaded_page):
+    page, _ = loaded_page
+    html = _outputs_html(page, "({outputs:[" + _output() + "]})")
+    assert "not checked yet" in html
+    assert "deleted by Kaggle" not in html
+    assert "on Kaggle<" not in html and ">on Kaggle" not in html
+
+
+def test_a_render_that_could_not_be_checked_is_not_called_deleted(loaded_page):
+    page, _ = loaded_page
+    # Built explicitly rather than through the helper so the error map is
+    # populated -- that map is the whole content of this row's sentence.
+    payload = ("({outputs:[{jobId:'job-1', scene:'waydown', "
+               "blend:'waydown.blend', startFrame:1, endFrame:25, "
+               "frameCount:25, ageSeconds:60, accounts:['acct0'], "
+               "usernames:['user_0'], workerCount:1, framesDone:0, "
+               "framesDoneKnown:false, finished:true, "
+               "availability:'unknown', availableAccounts:0, "
+               "checkedAccounts:0, "
+               "availabilityErrors:{acct0:'rate limited'}, "
+               "checkedAgeSeconds:2}]})")
+    html = _outputs_html(page, payload)
+    assert "could not check" in html
+    assert "deleted" not in html
+    assert "rate limited" in html
+    assert "Re-check" in html
+
+
+def test_a_row_never_quotes_a_frame_count_it_cannot_confirm(loaded_page):
+    page, _ = loaded_page
+    payload = ("({outputs:[{jobId:'job-1', scene:'waydown', "
+               "blend:'waydown.blend', startFrame:1, endFrame:25, "
+               "frameCount:25, ageSeconds:60, accounts:['acct0'], "
+               "usernames:['user_0'], workerCount:1, framesDone:9, "
+               "framesDoneKnown:false, finished:false, "
+               "availability:'unchecked', availableAccounts:0, "
+               "checkedAccounts:0, availabilityErrors:{}, "
+               "checkedAgeSeconds:null}]})")
+    html = _outputs_html(page, payload)
+    assert "frames rendered not confirmed for every account" in html
+    assert "9 frame(s) reported rendered" not in html
+    # The RANGE is a fact and is shown either way.
+    assert "frames 1-25" in html
+
+
+def test_a_render_with_no_recorded_start_does_not_invent_one(loaded_page):
+    page, _ = loaded_page
+    payload = ("({outputs:[{jobId:'job-1', scene:'waydown', "
+               "blend:'waydown.blend', startFrame:1, endFrame:2, "
+               "frameCount:2, ageSeconds:null, accounts:['acct0'], "
+               "usernames:['user_0'], workerCount:1, framesDone:0, "
+               "framesDoneKnown:false, finished:true, "
+               "availability:'unchecked', availableAccounts:0, "
+               "checkedAccounts:0, availabilityErrors:{}, "
+               "checkedAgeSeconds:null}]})")
+    html = _outputs_html(page, payload)
+    assert "when it ran is not recorded" in html
+    assert "1970" not in html and "just now" not in html
+
+
+def test_an_empty_outputs_list_says_why_it_is_empty(loaded_page):
+    page, _ = loaded_page
+    html = _outputs_html(page, "({outputs:[]})")
+    assert "No renders yet" in html
+    assert "outside BlendFleet are not tracked" in html

@@ -1298,6 +1298,117 @@ document.getElementById('scene-list').addEventListener('click', e => {
   }
 });
 
+/* ---------------- renders / packed outputs (Files page) -----------------
+   Every render THIS app has run, newest first, each with a Download that
+   packs its frames into one zip. Distinct from the scene library above:
+   a scene is a .blend waiting to be rendered, an output is what came back
+   from rendering one, and folding them into one list would make "delete"
+   and "download" sit on rows that mean opposite things.
+
+   The list itself is instant -- bridge.outputs() reads the tracked-job
+   file and nothing else. Whether Kaggle STILL has each render's frames is
+   a slower question answered afterwards by checkOutputs(), which is why
+   `availability` has four values and why "unchecked" is one of them. */
+
+/* Availability, in the row's own words. Four states, and the difference
+   between them is the whole point of this section:
+
+   available -- Kaggle still lists render files for at least one of this
+                render's accounts, so Download has something to fetch.
+   gone      -- every account was reached and none of them still has any.
+                The render DID happen; Kaggle expires kernel output after
+                a while and has deleted it. Nothing was lost by this app
+                and there is nothing left for it to download.
+   unknown   -- this app could not ask (no token, offline, rate limited).
+                Not the same as gone, and never shown as it.
+   unchecked -- nothing has asked yet. Claims neither way. */
+function outputAvailabilityHtml(o) {
+  if (o.availability === 'available') {
+    const partial = o.availableAccounts < o.workerCount
+      ? ` — ${o.availableAccounts} of ${o.workerCount} account(s)`
+      : '';
+    return `<span class="badge active"><i></i>on Kaggle${esc(partial)}</span>
+      <span class="lock">Download packs what is there into one zip.</span>`;
+  }
+  if (o.availability === 'gone') {
+    return `<span class="badge warn"><i></i>output deleted by Kaggle</span>
+      <span class="lock">This render did happen — Kaggle removes a kernel's
+      output after a while, and all ${o.workerCount} account(s) now list
+      none. Nothing is left to download; re-render the scene if you need
+      the frames again.</span>`;
+  }
+  if (o.availability === 'unknown') {
+    const why = Object.keys(o.availabilityErrors || {})
+      .map(k => `${k}: ${o.availabilityErrors[k]}`).join(' · ');
+    return `<span class="badge idle"><i></i>could not check</span>
+      <span class="lock">BlendFleet could not ask Kaggle whether these
+      frames are still there${why ? ' — ' + esc(why) : ''}. They may well
+      be. Press Re-check above once that is fixed.</span>`;
+  }
+  return `<span class="badge idle"><i></i>not checked yet</span>
+    <span class="lock">Whether Kaggle still has these frames has not been
+    asked yet — checking runs in the background. Download works if they
+    are there.</span>`;
+}
+
+/* Pure, like sceneRowHtml/instanceCard: reads only the one output handed
+   to it (plus the shared download/result maps), so it can be driven
+   directly from a test with a hand-built payload. */
+function outputRowHtml(o) {
+  const when = o.ageSeconds == null
+    ? 'when it ran is not recorded'
+    : `ran ${fmtAge(o.ageSeconds)}`;
+  /* The frame RANGE is a fact about the job. How many frames actually
+     came out is only known once every account's own kernel log has been
+     read back for its final count -- short of that, framesDone is
+     whatever a live stream last saved, which is a floor. */
+  const done = o.framesDoneKnown
+    ? ` · ${o.framesDone} frame(s) reported rendered`
+    : ' · frames rendered not confirmed for every account';
+  const state = o.finished
+    ? 'every account finished'
+    : 'not every account has finished';
+  const accounts = o.accounts.length
+    ? o.accounts.map(esc).join(', ')
+    : 'no accounts recorded';
+  return `<div class="fs-row out-row" data-out="${esc(o.jobId)}">
+    <div class="fi frames">ZIP</div>
+    <div class="grow">
+      <div class="fn2">${esc(o.scene)}</div>
+      <div class="fs2">${esc(o.blend)} · frames ${o.startFrame}-${o.endFrame}
+        (${o.frameCount})${esc(done)} · ${esc(when)} · ${esc(state)}
+        · ${accounts}</div>
+      <div class="out-state">${outputAvailabilityHtml(o)}</div>
+    </div>
+    <button class="btn sm" data-out-download="${esc(o.jobId)}"
+      title="Downloads every frame this render produced into one zip in a
+             folder you choose.">Download</button>
+  </div>`;
+}
+
+function renderOutputs(json) {
+  const payload = JSON.parse(json);
+  const outputs = payload.outputs || [];
+  const list = document.getElementById('output-list');
+  list.innerHTML = outputs.length
+    ? outputs.map(outputRowHtml).join('')
+    : '<div class="empty">No renders yet — BlendFleet lists the renders it '
+      + 'has run itself, so this fills up once you render a scene. Renders '
+      + 'started outside BlendFleet are not tracked here.</div>';
+}
+
+document.getElementById('output-list').addEventListener('click', e => {
+  const btn = e.target.closest('[data-out-download]');
+  /* Routed by the jobId carried on the button itself, never by row
+     position: the list is re-rendered whenever an availability check
+     lands, and a click resolved against "the nth row" would collect a
+     different render than the one pressed. */
+  if (btn && backend) backend.collect('', btn.dataset.outDownload);
+});
+
+document.getElementById('btn-recheck-outputs').onclick = () =>
+  backend && backend.checkOutputs();
+
 /* LIVE PREVIEWS: what each machine is producing RIGHT NOW.
  *
  * Kaggle releases a session's output only once that session ends, so
@@ -1771,6 +1882,18 @@ new QWebChannel(qt.webChannelTransport, channel => {
       Object.keys(downloads).forEach(k => delete downloads[k]);
       repaintCards();
     }
+    /* The Files page's per-render Download button, keyed by jobId (see
+       bridge.collect). Its own key, not a third segment of "collect:", so
+       the exact-match entries above keep matching. */
+    if (key.indexOf('collect-job:') === 0) {
+      const jobId = key.slice('collect-job:'.length);
+      const btn = Array.from(document.querySelectorAll('[data-out-download]'))
+        .find(el => el.dataset.outDownload === jobId);
+      if (btn) btn.disabled = busy;
+      const jobBtn = Array.from(document.querySelectorAll('[data-job-collect]'))
+        .find(el => el.dataset.jobCollect === jobId);
+      if (jobBtn) jobBtn.disabled = busy;
+    }
     /* The dataset step has stopped. Anything still waiting was never
        confirmed -- prepare_dataset raises rather than continuing past an
        account that cannot see the file -- so it is not still pending, it
@@ -1818,6 +1941,16 @@ new QWebChannel(qt.webChannelTransport, channel => {
 
   backend.scenesChanged.connect(renderScenes);
   backend.scenes();
+
+  /* Two calls, in this order, and the order is the point. outputs() is
+     pure disk and answers immediately, so the renders list is on screen
+     before anything touches the network. checkOutputs() then asks Kaggle
+     which of them it still has and re-emits; until it answers, every row
+     honestly says it has not been checked. Nothing here blocks the page
+     -- the startup poll already taught us what that feels like. */
+  backend.outputsChanged.connect(renderOutputs);
+  backend.outputs();
+  backend.checkOutputs();
 
   backend.refreshQuota();
   backend.poll();

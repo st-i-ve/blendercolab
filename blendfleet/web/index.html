@@ -243,6 +243,21 @@
              severity" shape. -->
         <div class="unshared-banner" id="scene-errors"></div>
         <div class="panel" id="scene-list"></div>
+
+        <!-- Outputs are NOT scenes, which is why this is its own section
+             rather than more rows in the library above: a scene is a
+             .blend waiting to be rendered, an output is the frames that
+             came back from one. Sourced from the jobs this app itself
+             launched (bridge.outputs() -> Fleet.load_jobs()), so it is a
+             record of what BlendFleet rendered, never a browse of Kaggle.
+             -->
+        <h2 class="sec" style="margin-top:26px">Renders <span class="meta">packed outputs · every render BlendFleet has run · newest first</span></h2>
+        <div class="out-head">
+          <span class="dz-sub">Download packs a render's frames into one zip. Kaggle deletes a kernel's output after a while — a render whose frames are gone stays listed here and says so.</span>
+          <button class="btn sm" id="btn-recheck-outputs"
+            title="Ask Kaggle again which of these renders it still has frames for.">Re-check</button>
+        </div>
+        <div class="panel" id="output-list"></div>
       </div>
 
       <!-- ============ INSTANCES ============ -->

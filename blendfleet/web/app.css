@@ -933,6 +933,21 @@ h2.sec .meta{font-family:var(--mono);font-size:11px;font-weight:400;color:var(--
 .fs-row .grow{flex:1;min-width:0}
 .fs-row .lock{font-family:var(--mono);font-size:10px;color:var(--ink-4)}
 
+/* ---- renders / packed outputs (Files page) ----
+   Deliberately built from the .fs-row vocabulary the scene library
+   already uses, so the two sections read as the same kind of list, and
+   from .badge/.track/.tag for state and progress, so a downloading render
+   looks like a rendering instance rather than like a new thing. Nothing
+   here introduces a colour or a z-index. */
+.out-head{display:flex;align-items:flex-start;gap:12px;margin:-4px 2px 12px}
+.out-head .dz-sub{flex:1;min-width:0}
+.out-head .btn{flex:none}
+.out-row{align-items:flex-start}
+.out-row .fi{margin-top:2px}
+.out-row .out-state{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin-top:6px}
+.out-row .out-state .lock{flex:1;min-width:140px;line-height:1.5}
+.out-row > .btn{flex:none;margin-top:2px}
+
 @media (prefers-reduced-motion: reduce){*{animation:none!important;transition:none!important}}
 @media(max-width:760px){.side{position:fixed;left:0}.main{padding-left:96px}}
 

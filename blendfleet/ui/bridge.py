@@ -180,6 +180,12 @@ class Backend(QObject):
     healthChanged = Signal(str)
     busyChanged = Signal(str, bool)  # (action key, in flight)
     scenesChanged = Signal(str)     # {"scenes": [...], "errors": {label: why}}
+    # Every render THIS app has tracked, newest first, each carrying what
+    # is known about whether Kaggle still has its output. Emitted twice per
+    # refresh on purpose: once instantly from disk (every row "unchecked"),
+    # then again once the background availability pass has answered. See
+    # outputs() / checkOutputs().
+    outputsChanged = Signal(str)
 
     def __init__(self, store: AccountStore, fleet_factory, verifier,
                  settings: Settings, parent: QObject | None = None) -> None:
@@ -225,6 +231,12 @@ class Backend(QObject):
         self._last_poll_ms: int | None = None
         self._last_poll_at: str | None = None
         self._online = True
+        # job_id -> what checkOutputs() last learned about that render's
+        # output on Kaggle. A job absent from here has NOT been checked,
+        # which is a third state the outputs list has to show as itself:
+        # neither "still there" nor "gone". Never pre-filled with a
+        # default, because a default here would be a fabricated reading.
+        self._output_availability: dict[str, dict] = {}
 
         # Everything the user is told, kept where it can be read back.
         #
@@ -1049,6 +1061,150 @@ class Backend(QObject):
             }))
 
         self._start("scenes", work, "Loading the scene library", ok)
+
+    def _outputs_payload(self) -> dict:
+        """Every render this app has tracked, newest first.
+
+        Sourced from `Fleet.load_jobs()` and NOTHING else. That list is
+        append-only -- it is only ever shortened one entry at a time by an
+        explicit forgetJob() -- so it already holds every render this app
+        has started, today's and last month's alike. A render started
+        outside this app was never tracked and cannot appear here; there is
+        no other record to read.
+
+        Pure disk, no network, deliberately: this is what the Files page
+        draws with the moment it opens, and the startup Kaggle poll already
+        taught us what happens when a page waits on the network to show
+        something it already knows. Whether Kaggle STILL has each render's
+        output is a separate, slower question, answered by checkOutputs()
+        afterwards and merged in here from `_output_availability`.
+        """
+        fleet = self.fleet_factory(self.store.list())
+        jobs = fleet.load_jobs()
+        # Newest first: the render someone wants to download is
+        # overwhelmingly the one that just finished. load_jobs() is
+        # oldest-first (append order), so this is a reverse, not a sort on
+        # started_at -- a job recorded before started_at existed reads 0.0
+        # and would sort to the bottom as if it were the oldest thing here,
+        # when all that is actually known is when it was appended.
+        return {
+            "outputs": [_output_payload(job, self._output_availability.get(
+                job.job_id)) for job in reversed(jobs)],
+        }
+
+    @Slot()
+    def outputs(self) -> None:
+        """Emit the tracked-render list straight off disk.
+
+        Synchronous on purpose -- see _outputs_payload. Availability is not
+        touched here, so a row this session has already checked keeps its
+        answer across a refresh instead of flickering back to unchecked.
+        """
+        self.outputsChanged.emit(json.dumps(self._outputs_payload()))
+
+    @Slot()
+    def checkOutputs(self) -> None:
+        """Ask Kaggle which tracked renders it still has output for.
+
+        Kaggle deletes a kernel session's output after a while. The render
+        still happened, and the row stays listed for exactly that reason --
+        a render someone remembers doing must not vanish from the app that
+        ran it just because the files behind it expired. What changes is
+        that the row can say there is nothing left to download.
+
+        Off-thread and after the fact: the list is already on screen by the
+        time this starts, and if it never answers the rows simply stay
+        unchecked, which is what they honestly are.
+
+        Per JOB, a render is only "gone" when EVERY one of its accounts was
+        actually reached and none of them still had a render file. One
+        account answering, with files, is enough to make the render
+        downloadable -- partly, and the row says how many. An account this
+        app could not ask (revoked token, rate limit, no configured account
+        for it any more) is neither: with no account answering "yes", the
+        whole row falls back to unknown rather than claiming Kaggle has
+        deleted something this app never managed to ask about.
+        """
+        accounts = self.store.list()
+
+        def work():
+            fleet = self.fleet_factory(accounts)
+            jobs = fleet.load_jobs()
+            by_label = {a.label: a for a in accounts}
+            # The same label-then-username fallback collector.collect uses,
+            # for the same reason: a label is a nickname the user can edit
+            # at any time, the username is the account's real identity, and
+            # a renamed account must not turn a perfectly collectable
+            # render into an unreachable one.
+            by_username = {getattr(a, "username", None): a for a in accounts
+                           if getattr(a, "username", None)}
+            found: dict[str, dict] = {}
+            for job in jobs:
+                with_output = 0
+                checked = 0
+                files = 0
+                errors: dict[str, str] = {}
+                for worker in job.workers:
+                    account = (by_label.get(worker.label)
+                               or by_username.get(worker.username))
+                    if account is None:
+                        errors[worker.label] = (
+                            f"no configured account matches "
+                            f"{worker.username or worker.label} any more, so "
+                            f"BlendFleet has no token to ask Kaggle with. "
+                            f"Re-add that account under Manage accounts… to "
+                            f"find out whether its frames are still there.")
+                        continue
+                    try:
+                        names = fleet.client_factory(
+                            account.token).list_output_files(worker.kernel_slug)
+                    except Exception as e:      # noqa: BLE001 -- becomes text
+                        errors[worker.label] = explain(
+                            f"Asking Kaggle whether {worker.label} still has "
+                            f"this render's frames", e)
+                        continue
+                    checked += 1
+                    if names:
+                        with_output += 1
+                        files += len(names)
+                if with_output:
+                    state = "available"
+                elif checked and checked == len(job.workers):
+                    state = "gone"
+                else:
+                    # Either nobody could be asked, or only some accounts
+                    # answered and every one of those had nothing. Both are
+                    # "not established", never "deleted".
+                    state = "unknown"
+                found[job.job_id] = {
+                    "state": state,
+                    "withOutput": with_output,
+                    "checked": checked,
+                    "workers": len(job.workers),
+                    "files": files,
+                    "errors": errors,
+                    "at": time.time(),
+                }
+            return found
+
+        def ok(found: dict) -> None:
+            # update(), not replace: a job forgotten between the two reads
+            # simply stops being emitted, and a job checked earlier this
+            # session keeps its answer if this pass somehow skipped it.
+            self._output_availability.update(found)
+            self.outputsChanged.emit(json.dumps(self._outputs_payload()))
+
+        def failed(message: str) -> None:
+            # Nothing is marked. Every row stays unchecked, which is true,
+            # and the user is told why rather than being left with a list
+            # that never resolves.
+            self.notification.emit(
+                f"Could not check which renders Kaggle still has: {message} "
+                f"The renders below are still listed — use Re-check once the "
+                f"connection is back.", "offline")
+
+        self._start("outputs-availability", work,
+                    "Checking which renders Kaggle still has", ok, failed)
 
     # ---- JS -> Python: writes -----------------------------------------
     @Slot(str, str)
@@ -2044,14 +2200,17 @@ class Backend(QObject):
         # "collect:") only ever sends "" for both on the fleet-wide button
         # -- so the key it now saw was "collect::", which nothing in that
         # map matches, and the button never disabled while a collect ran.
-        # A second click then re-opened the folder picker with the first
-        # collect still in flight. `job_id` never needs to be part of this
-        # key: collect() is scoped to one job either way, and the UI has
-        # exactly one button per label (never per job), so `label` alone
-        # is the right granularity -- exactly as it was before job_id
-        # existed.
-        self._start(f"collect:{label}", work,
-                    f"Collecting frames from {who}", ok)
+        #
+        # Round 3 restores a per-job key, but as its own PREFIX rather
+        # than as a third segment of this one -- "collect-job:<id>", never
+        # "collect::<id>". That is what keeps the exact-match "collect:"
+        # entry (the fleet-wide button) and the "collect:<label>" per
+        # instance buttons matching exactly as they did, while the Files
+        # page's per-render Download button, which is genuinely one button
+        # PER JOB and not per account, gets a key that identifies it. Same
+        # idiom as launch-scene:/delete-scene:.
+        key = f"collect-job:{job_id}" if job_id else f"collect:{label}"
+        self._start(key, work, f"Collecting frames from {who}", ok)
 
     @Slot(str, str)
     def addAccount(self, label: str, token: str) -> None:
@@ -2744,6 +2903,59 @@ def _job_payload(job) -> dict:
         "labels": [w.label for w in job.workers],
         "elapsed": elapsed,
         "finished": finished,
+    }
+
+
+def _output_payload(job, availability: dict | None) -> dict:
+    """One tracked render, as the Files page's outputs list needs it.
+
+    Everything here is read off the job record this app already keeps --
+    no network, no guessing. The two judgement calls:
+
+    `framesDoneKnown` is False unless EVERY worker's own kernel log has
+    been read back for its final count (WorkerState.final_count_known).
+    Short of that, `framesDone` is whatever a live log stream last managed
+    to save before the window closed: a floor from some moment before the
+    render ended, not a total. The row shows the frame RANGE either way --
+    that is a fact about the job -- and only quotes a done count when it
+    is the render's own last word.
+
+    `finished` means every worker reached a terminal state, matching
+    _job_payload's identical test. It says nothing about whether the
+    frames still exist; that is `availability`, which comes from Kaggle.
+
+    `availability` is "unchecked" when nothing has asked yet -- a real
+    state, and the one every row starts in. Merging a default of
+    "available" or "gone" here would be inventing a reading.
+    """
+    started = getattr(job, "started_at", 0.0) or 0.0
+    avail = availability or {}
+    return {
+        "jobId": job.job_id,
+        "scene": job.scene_key,
+        "blend": job.blend_name,
+        "startFrame": job.start_frame,
+        "endFrame": job.end_frame,
+        "frameCount": max(job.end_frame - job.start_frame + 1, 0),
+        # Age in seconds rather than a date, matching framesDoneAge's own
+        # contract: None means never recorded, which is what a job saved
+        # before started_at existed loads as -- and an absent timestamp
+        # must read as unknown, never as 1970.
+        "ageSeconds": max(time.time() - started, 0.0) if started else None,
+        "accounts": [w.label for w in job.workers],
+        "usernames": [w.username for w in job.workers],
+        "workerCount": len(job.workers),
+        "framesDone": sum(w.frames_done for w in job.workers),
+        "framesDoneKnown": bool(job.workers) and all(
+            getattr(w, "final_count_known", False) for w in job.workers),
+        "finished": bool(job.workers) and all(w.finished_at
+                                              for w in job.workers),
+        "availability": avail.get("state", "unchecked"),
+        "availableAccounts": avail.get("withOutput", 0),
+        "checkedAccounts": avail.get("checked", 0),
+        "availabilityErrors": avail.get("errors", {}),
+        "checkedAgeSeconds": (max(time.time() - avail["at"], 0.0)
+                              if avail.get("at") else None),
     }
 
 

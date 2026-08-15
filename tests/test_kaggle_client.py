@@ -1466,3 +1466,82 @@ def test_a_missing_frame_records_what_kaggle_actually_listed(tmp_path,
         "the log must name what Kaggle DID list, or it cannot distinguish "
         "'not rendered yet' from 'loose frames are not listed'")
     assert "f_0001.png" in written[0]
+
+
+# ---------------------------------------------------------------------------
+# list_output_files -- "is there anything left to collect?", answered
+# without downloading anything. The Files page's renders list needs this
+# per tracked job, and pulling 40 MB per row to find out is not an option.
+# ---------------------------------------------------------------------------
+
+def test_list_output_files_names_what_kaggle_still_has():
+    class FakeSdk:
+        class kernels:
+            class kernels_api_client:
+                @staticmethod
+                def list_kernel_session_output(request):
+                    assert request.user_name == "x"
+                    assert request.kernel_slug == "y"
+                    return FakeListOutputResponse([
+                        FakeOutputFile("https://x/f.zip", "f.zip"),
+                        FakeOutputFile("https://x/a.png", "frames/a.png"),
+                    ])
+
+    c = KaggleClient(TOKEN, api_factory=lambda t: FakeApi(),
+                     sdk_factory=lambda t: FakeSdk())
+    assert c.list_output_files("x/y") == ["f.zip", "frames/a.png"]
+
+
+def test_list_output_files_ignores_files_a_collect_would_not_take():
+    """Filtered to the same suffixes fetch_output_with_progress downloads,
+    so the two can never disagree: a listing holding only a stray log
+    would otherwise let a row claim output exists while collecting from
+    the same kernel came back with nothing."""
+    class FakeSdk:
+        class kernels:
+            class kernels_api_client:
+                @staticmethod
+                def list_kernel_session_output(request):
+                    return FakeListOutputResponse([
+                        FakeOutputFile("https://x/log.txt", "log.txt"),
+                    ])
+
+    c = KaggleClient(TOKEN, api_factory=lambda t: FakeApi(),
+                     sdk_factory=lambda t: FakeSdk())
+    assert c.list_output_files("x/y") == []
+
+
+def test_list_output_files_follows_pagination():
+    pages = [
+        FakeListOutputResponse([FakeOutputFile("https://x/f1.png", "f1.png")]),
+        FakeListOutputResponse([FakeOutputFile("https://x/f2.png", "f2.png")]),
+    ]
+    pages[0].next_page_token = "page2"
+
+    class FakeSdk:
+        class kernels:
+            class kernels_api_client:
+                @staticmethod
+                def list_kernel_session_output(request):
+                    return pages[0] if not request.page_token else pages[1]
+
+    c = KaggleClient(TOKEN, api_factory=lambda t: FakeApi(),
+                     sdk_factory=lambda t: FakeSdk())
+    assert c.list_output_files("x/y") == ["f1.png", "f2.png"]
+
+
+def test_list_output_files_raises_rather_than_reporting_nothing():
+    """An empty list means Kaggle has deleted the output. A failure must
+    NOT look like that -- the caller shows two different sentences, and
+    only one of them says the frames are gone."""
+    class FakeSdk:
+        class kernels:
+            class kernels_api_client:
+                @staticmethod
+                def list_kernel_session_output(request):
+                    raise RuntimeError("connection reset")
+
+    c = KaggleClient(TOKEN, api_factory=lambda t: FakeApi(),
+                     sdk_factory=lambda t: FakeSdk())
+    with pytest.raises(RuntimeError):
+        c.list_output_files("x/y")
