@@ -1631,13 +1631,13 @@ def test_collect_fleet_wide_with_a_worker_error_warns_not_informs(
     dash.close()
 
 
-def test_collect_fleet_wide_message_names_the_actual_scene_subfolder(
+def test_collect_fleet_wide_message_names_the_actual_zip(
         qapp, tmp_path, monkeypatch, stub_message_boxes):
-    """Minor (Task 5 fix round 1): collect() writes under
-    Path(d)/<scene_key>, not straight into the folder `d` the user picked
-    -- this dialog is the ONLY place the app says where a render's frames
-    went, and it kept saying "to {d}" regardless, which is now wrong for
-    every caller."""
+    """This dialog is the ONLY place the app says where a render's output
+    went. collect() now leaves exactly one file -- <scene>.zip -- in the
+    folder the user picked, and picks the final name itself (it will not
+    overwrite one already there), so the dialog must quote the path off
+    the report rather than reconstruct it."""
     def make_client(tok, acct):
         if acct.label == "acct0":
             return BoomFetchClient(tok)
@@ -1662,9 +1662,12 @@ def test_collect_fleet_wide_message_names_the_actual_scene_subfolder(
     assert stub_message_boxes["warning"], "expected a worker_errors warning"
     _, message = stub_message_boxes["warning"][-1]
     # _seed_job launches "remember.blend" -- collect()'s own scene_key.
-    expected = str(dest / "remember")
+    expected = str(dest / "remember.zip")
     assert expected in message, (
-        f"the dialog must name where frames actually landed: {message!r}")
+        f"the dialog must name the zip that was actually written: {message!r}")
+    assert (dest / "remember.zip").is_file()
+    assert [p.name for p in dest.iterdir()] == ["remember.zip"], (
+        "the destination must be left holding the zip and nothing else")
     dash.close()
 
 
@@ -1673,14 +1676,16 @@ def test_collect_fleet_wide_message_names_the_actual_scene_subfolder(
 # ---------------------------------------------------------------------------
 
 class _CollectReportStub:
-    """The three fields _describe_collect_result reads."""
+    """The fields _describe_collect_result reads."""
 
     def __init__(self, copied=0, missing_frames=(), archive_errors=(),
-                 worker_errors=None):
+                 worker_errors=None, archive_path=None, wanted_name=""):
         self.copied = copied
         self.missing_frames = list(missing_frames)
         self.archive_errors = list(archive_errors)
         self.worker_errors = worker_errors or {}
+        self.archive_path = archive_path
+        self.wanted_name = wanted_name
 
 
 def test_collect_result_message_never_doubles_the_word_to(
@@ -1706,13 +1711,23 @@ def test_collect_result_message_never_doubles_the_word_to(
     # A successful collect reports through a toast and the fleet log now,
     # not a modal -- so the wording is asserted on the builder both paths
     # share, which is where the doubled "to to" actually came from.
-    report = _CollectReportStub(copied=2)
+    report = _CollectReportStub(copied=2, archive_path=tmp_path / "remember.zip")
     fleet_message = dash._describe_collect_result(
-        report, destination_phrase=f"to {tmp_path}")
+        report, source_phrase="", folder=str(tmp_path))
     assert "to to" not in fleet_message, fleet_message
+    assert str(tmp_path / "remember.zip") in fleet_message, fleet_message
     instance_message = dash._describe_collect_result(
-        report, destination_phrase=f"from acct0 to {tmp_path}")
+        report, source_phrase=" from acct0", folder=str(tmp_path))
     assert "to to" not in instance_message, instance_message
+    assert "from acct0" in instance_message, instance_message
+    assert "  " not in instance_message, instance_message
+
+    # Nothing collected: no zip was written, so the message must not name
+    # one -- it says so, and points at the folder it did not write to.
+    nothing = dash._describe_collect_result(
+        _CollectReportStub(copied=0), source_phrase="", folder=str(tmp_path))
+    assert "no zip was written" in nothing, nothing
+    assert ".zip\n" not in nothing, nothing
 
     dash._collect()
     pump(dash._collect_worker)

@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+from blendfleet.fleet import slugify_stem
 from blendfleet.notebook_builder import ARCHIVE_SUFFIX
 
 FRAME_RE = re.compile(r"_(\d+)\.(png|jpg|jpeg)$", re.I)
@@ -28,6 +29,21 @@ class CollectReport:
     # simply stay unaccounted for and fall out in missing_frames exactly
     # as if nothing had been rendered yet.
     worker_errors: dict[str, str] = field(default_factory=dict)
+    # The single zip this collect actually wrote, or None when it wrote
+    # nothing. Deliberately None -- not a path to an empty zip -- when no
+    # frame was collected at all: an empty <scene>.zip sitting in the
+    # user's folder looks exactly like a delivered render until they open
+    # it, and "absent" is the honest reading of "nothing came back", not
+    # "zero frames, here is your file". Every caller must say which of the
+    # two happened rather than claiming a destination it never wrote to.
+    archive_path: Path | None = None
+    # Non-empty ONLY when the name this collect wanted (`<scene>.zip`, or
+    # `<scene>-<account>.zip` for a single-instance download) was already
+    # taken, in which case it holds that wanted file name and
+    # `archive_path` points at the numbered sibling actually written. The
+    # UI needs both to explain the odd name; see _unique_archive_path for
+    # why the existing file is never overwritten.
+    wanted_name: str = ""
 
 
 def _wipe(staging: Path) -> None:
@@ -95,6 +111,14 @@ def _resolve_frame_sources(files: list[Path], staging: Path,
     letting any of them escape uncaught would mark this worker as failed
     (report.worker_errors) instead, discarding perfectly good loose files
     sitting right next to the archive.
+
+    Still goes through an EXTRACT (rather than copying entries straight
+    from the worker's zip into the merged one) because the loose-file
+    fallback above has to be able to win on a frame the archive is
+    missing, and comparing the two sources by frame number is only
+    possible once both are plain files on disk. Extraction is cheap here:
+    the worker's archive is ZIP_STORED, so this is a byte copy, not a
+    decompress.
     """
     frame_paths: dict[int, Path] = {}
     archive = next((f for f in files if f.suffix.lower() == ARCHIVE_SUFFIX), None)
@@ -150,26 +174,101 @@ def _fetch_with_retry(client, w, staging: Path, on_progress, sleep,
     raise last
 
 
+def _archive_base_name(fleet_state, worker_label: str | None) -> str:
+    """The zip's file name, minus ".zip" and minus any de-duplication.
+
+    Fleet-wide it is the scene, so the one file the user is handed says
+    which render it holds without being opened.
+
+    A PER-INSTANCE download ("can I just download fleet instance 2")
+    additionally carries that account's label, because such a zip holds
+    only that account's own stride of frames. Naming it `<scene>.zip`
+    like the merged one would leave a SLICE of a render indistinguishable
+    on disk from the whole of it -- and, under the never-overwrite rule
+    in _unique_archive_path, it would also shove the eventual real merged
+    archive out to `<scene>-2.zip` for no reason at all. The label is
+    slugified through the same function the scene key uses so a nickname
+    like "Stive's laptop / 2" cannot produce a path separator or an
+    illegal Windows character; a label that slugifies to nothing at all
+    (all emoji, say) falls back to a literal word rather than collapsing
+    into the fleet-wide name.
+    """
+    base = fleet_state.scene_key
+    if worker_label is not None:
+        base = f"{base}-{slugify_stem(worker_label) or 'instance'}"
+    return base
+
+
+def _unique_archive_path(dest: Path, base: str) -> Path:
+    """`dest/<base>.zip`, or `dest/<base>-2.zip`, `-3.zip`... if taken.
+
+    Re-collecting the same scene into the same folder must NEVER replace
+    the zip already sitting there. That file may be the only copy of an
+    earlier, LONGER render -- collecting a half-finished job, then
+    collecting again after two more accounts finish, is the flow this app
+    actively tells people to use ("Collect again once those accounts
+    finish"), and it is just as easy to do it the other way round after
+    re-launching a shorter frame range. Silently overwriting would
+    destroy already-rendered, already-paid-for output with no way back.
+    Merging into the existing zip was the alternative and is worse: it
+    would fold two different jobs' frames together behind one name with
+    nothing on disk recording that it happened.
+
+    The caller reports BOTH names to the user (CollectReport.wanted_name)
+    so a "-2" is explained rather than mysterious.
+
+    Compared case-INSENSITIVELY against what is really in the directory,
+    not with Path.exists(): two scenes whose stems differ only by case
+    ("Kitchen.blend" vs "kitchen.blend") slugify to the identical
+    scene_key, and on Windows/macOS "Kitchen.zip" and "kitchen.zip" are
+    the same file. Folding the case here makes every platform behave the
+    way the most restrictive one has to.
+    """
+    taken = {p.name.casefold() for p in dest.iterdir()} if dest.is_dir() else set()
+    name = f"{base}.zip"
+    n = 1
+    while name.casefold() in taken:
+        n += 1
+        name = f"{base}-{n}.zip"
+    return dest / name
+
+
 def collect(fleet_state, accounts, client_factory: Callable,
             dest: Path, *, worker_label: str | None = None,
             on_progress: Callable[[str, object], None] | None = None,
             sleep: Callable[[float], None] = time.sleep,
-            subfolder: bool = True
             ) -> CollectReport:
-    """Pull worker output into one folder, renamed by real frame number.
+    """Merge every worker's rendered frames into ONE zip in `dest`.
+
+    `dest` gets exactly one new file -- `<scene>.zip`, named from
+    `fleet_state.scene_key` -- and nothing else: no loose frames, no
+    per-scene subfolder. Inside it the frames keep the names that make
+    them useful when the zip is opened (`<stem>_0001.png`, numbered by
+    real frame number, in the format the render actually produced), so
+    unzipping gives the same folder of frames this used to write directly
+    and the user decides when and where to unpack it.
+
+    The scene subfolder this used to create is gone because the zip's own
+    NAME now does that job: two scenes rendering into the same chosen
+    folder can no longer collide, since a name already taken is never
+    overwritten (see _unique_archive_path).
 
     Missing frames are reported explicitly: a partial render must be
     visibly partial rather than quietly looking finished. Prefers each
     worker's single zip archive when Kaggle actually has one (Task 5: one
     download instead of hundreds), falling back to loose per-frame images
     when there is no archive, or when it will not open -- see
-    _resolve_frame_sources.
+    _resolve_frame_sources. Either way those frames end up in the merged
+    zip; the fallback is about where a frame is READ from, never about
+    whether it is delivered.
 
     `worker_label`, if given, collects ONLY that one worker (Task 6: "can
     I just download fleet instance 1") -- `missing_frames` is then scoped
     to that worker's own assigned frames, not the whole fleet's range,
-    since this worker was never responsible for anyone else's frames. An
-    unknown label collects nothing (empty report) rather than raising.
+    since this worker was never responsible for anyone else's frames, and
+    the zip is named for that account as well as the scene (see
+    _archive_base_name). An unknown label collects nothing (empty report,
+    no zip) rather than raising.
 
     `on_progress`, if given, is called as `on_progress(label, progress)`
     for every DownloadProgress tick reported by whichever worker is
@@ -182,20 +281,8 @@ def collect(fleet_state, accounts, client_factory: Callable,
     `report.worker_errors` rather than raised, so it can never abort
     collecting the rest of the fleet -- see the class docstring on
     `CollectReport.worker_errors`.
-
-    `subfolder`, on by default, is `fleet_state.scene_key` -- see its own
-    docstring for why frames landing straight in `dest` is exactly what
-    makes two concurrent scenes overwrite each other's output. Only ever
-    turned off by a caller that already owns a scene-specific destination
-    (none exist yet); every current caller passes a directory the user
-    picked once from a file dialog, which is exactly the case this exists
-    to protect.
     """
-    # One folder per scene. Two jobs rendering at once would otherwise
-    # write into the same directory, and two scenes whose .blend files
-    # share a stem would overwrite each other's frames outright.
-    if subfolder:
-        dest = dest / fleet_state.scene_key
+    dest = Path(dest)
     dest.mkdir(parents=True, exist_ok=True)
     by_label = {a.label: a for a in accounts}
     # A worker records BOTH its label (the user's own nickname for the
@@ -207,29 +294,13 @@ def collect(fleet_state, accounts, client_factory: Callable,
     # Username is the stable key, so it is the fallback.
     by_username = {getattr(a, "username", None): a for a in accounts
                    if getattr(a, "username", None)}
+    # The raw, case-preserved stem, which is what makes the entry names
+    # inside the zip recognisable as this scene. It no longer needs the
+    # job_id disambiguation the loose-frame layout required for stems
+    # differing only by case: those two jobs now land in two separate
+    # zip FILES (kitchen.zip and kitchen-2.zip), so their entries cannot
+    # be the same path as each other any more.
     stem = Path(fleet_state.blend_name).stem
-    # Task 5 fix round 1, IMPORTANT 4: two scenes whose stems differ ONLY
-    # by case ("Kitchen.blend" vs "kitchen.blend") slugify to the exact
-    # same scene_key -- see FleetState.scene_key's own docstring -- so
-    # they deliberately share this folder. But their FRAME filenames come
-    # from the raw, case-preserved stem, and on a case-insensitive
-    # filesystem (Windows, default macOS) "Kitchen_0001.png" and
-    # "kitchen_0001.png" are literally the same path: writing this job's
-    # frames under its own raw stem would silently replace the other
-    # scene's already-rendered, already-paid-for output. Detected by
-    # reading what is ALREADY on disk -- every completed frame's filename
-    # already records the exact stem that wrote it (undo-able with
-    # FRAME_RE) -- rather than a separate bookkeeping file, and fixed by
-    # making THIS job's stem unique with its own job_id, which is stable
-    # and already unique per launch. A stem that matches something
-    # already on disk EXACTLY (the normal re-collect-the-same-job case,
-    # covered by the tests above) is left alone -- only a same-but-
-    # differently-cased stem is disambiguated.
-    existing_stems = {FRAME_RE.sub("", p.name) for p in dest.iterdir()
-                      if p.is_file() and FRAME_RE.search(p.name)}
-    if any(s != stem and s.casefold() == stem.casefold()
-           for s in existing_stems):
-        stem = f"{stem}-{fleet_state.job_id}"
     report = CollectReport()
     found: set[int] = set()
 
@@ -237,79 +308,138 @@ def collect(fleet_state, accounts, client_factory: Callable,
     if worker_label is not None:
         workers = [w for w in workers if w.label == worker_label]
 
-    for w in workers:
-        acct = by_label.get(w.label) or by_username.get(w.username)
-        if acct is None:
-            # This used to `continue` in silence. The worker's frames then
-            # landed in missing_frames with nothing to explain them, which
-            # on screen is indistinguishable from an account that rendered
-            # nothing at all -- and that is exactly how a real 25-frame
-            # render (2026-08-12) was read as "two accounts did not
-            # render", when both had in fact finished every frame.
-            report.per_worker[w.label] = 0
-            report.worker_errors[w.label] = (
-                f"{w.username or w.label} rendered "
-                f"{len(w.frames)} frame(s), but no configured account "
-                f"matches it any more, so BlendFleet has no token to "
-                f"download them with. Nothing is lost -- the frames are "
-                f"still on Kaggle. Re-add that account under Manage "
-                f"accounts… (the Kaggle username is {w.username or 'unknown'}) "
-                f"and download again.")
-            continue
-        client = client_factory(acct.token)
-        staging = dest / f".raw_{w.label}"
-        # Staging must start empty. Left-over frames from an EARLIER job
-        # collected into this same folder would be re-globbed into `found`
-        # and silently subtracted from missing_frames -- exactly inverting
-        # the guarantee this function makes. This check runs BEFORE the
-        # per-worker try/except below (unlike a fetch failure) because it
-        # is a precondition, not a download outcome: proceeding past an
-        # unclearable staging dir risks corrupting every worker's report,
-        # not just this one's.
+    # Staging is named from the job id and the worker's POSITION, never
+    # from its label: a label is a nickname the user types, so it can
+    # hold a slash, a colon or a quote, none of which can appear in a
+    # Windows directory name -- and this folder is created inside the
+    # destination the user picked, so an unusable name here would fail
+    # the whole download of an account whose only sin is being called
+    # "Stive's laptop / 2". The position comes from the FULL worker list
+    # so it stays the same whether this call is collecting the fleet or
+    # just one instance, which is what keeps a fleet-wide collect and a
+    # per-instance download of the same job from sharing a folder. It
+    # used to live inside the per-scene subfolder, which is what kept two
+    # different scenes collected into one chosen folder apart; with that
+    # folder gone, the job id does that instead.
+    #
+    # Cleared for EVERY worker up front, before a single byte is
+    # downloaded: left-over frames from an earlier job would be
+    # re-globbed into `found` and silently subtracted from missing_frames
+    # -- exactly inverting the guarantee this function makes -- and
+    # failing on that after four of five workers had already downloaded
+    # would both waste the download and throw away the frames it
+    # produced, since a raise from here abandons the merged zip (see the
+    # `finally` below). A precondition belongs before the work, not in
+    # the middle of it.
+    positions = {w.label: i for i, w in enumerate(fleet_state.workers)}
+    stagings = {w.label: dest / f".raw_{fleet_state.job_id}_{positions[w.label]}"
+                for w in workers}
+    for label, staging in stagings.items():
         _wipe(staging)
         if staging.exists():
             raise RuntimeError(
                 f"could not clear stale staging folder {staging}. Delete it "
                 f"and collect again -- leaving it would make this report "
                 f"claim frames were rendered when they were not.")
-        try:
-            # Retried as a whole, on top of the per-file retry inside
-            # downloader.fetch_files: this also covers the no-progress
-            # path, which goes through kaggle's own kernels_output() and
-            # has no retry of its own. Measured 2026-08-11: a finished
-            # 15-minute render reported ZERO frames because one download
-            # was truncated, and simply calling collect again recovered
-            # all 15. The frames are already rendered and paid for by the
-            # time this runs -- a transient socket error must not be what
-            # loses them.
-            files = _fetch_with_retry(client, w, staging, on_progress, sleep)
 
-            frame_paths = _resolve_frame_sources(files, staging, w.label, report)
+    # Built under a hidden, job-scoped temporary name and only renamed
+    # into place once every worker has been through. A collect that dies
+    # half way (or is killed) must never leave a file called
+    # "<scene>.zip" holding half a render: on disk that is
+    # indistinguishable from the finished article, which is the same
+    # mistake as counting a truncated download as a collected frame.
+    part = dest / f".{fleet_state.job_id}-collecting.zip.part"
+    part.unlink(missing_ok=True)   # a previous interrupted collect's leftovers
+    try:
+        # ZIP_STORED for exactly the reason notebook_builder.py uses it on
+        # the worker side: PNG and JPEG are already compressed, so
+        # deflating them burns CPU over the whole render for a percent or
+        # two. This is a container, not a compressor.
+        with zipfile.ZipFile(part, "w", zipfile.ZIP_STORED) as merged:
+            for w in workers:
+                acct = by_label.get(w.label) or by_username.get(w.username)
+                if acct is None:
+                    # This used to `continue` in silence. The worker's
+                    # frames then landed in missing_frames with nothing to
+                    # explain them, which on screen is indistinguishable
+                    # from an account that rendered nothing at all -- and
+                    # that is exactly how a real 25-frame render
+                    # (2026-08-12) was read as "two accounts did not
+                    # render", when both had in fact finished every frame.
+                    report.per_worker[w.label] = 0
+                    report.worker_errors[w.label] = (
+                        f"{w.username or w.label} rendered "
+                        f"{len(w.frames)} frame(s), but no configured account "
+                        f"matches it any more, so BlendFleet has no token to "
+                        f"download them with. Nothing is lost -- the frames are "
+                        f"still on Kaggle. Re-add that account under Manage "
+                        f"accounts… (the Kaggle username is {w.username or 'unknown'}) "
+                        f"and download again.")
+                    continue
+                client = client_factory(acct.token)
+                staging = stagings[w.label]
+                try:
+                    # Retried as a whole, on top of the per-file retry
+                    # inside downloader.fetch_files. Measured 2026-08-11: a
+                    # finished 15-minute render reported ZERO frames
+                    # because one download was truncated, and simply
+                    # calling collect again recovered all 15. The frames
+                    # are already rendered and paid for by the time this
+                    # runs -- a transient socket error must not be what
+                    # loses them.
+                    files = _fetch_with_retry(client, w, staging, on_progress,
+                                              sleep)
 
-            n = 0
-            for frame in sorted(frame_paths):
-                src = frame_paths[frame]
-                is_new = frame not in found
-                # Keep the source extension: the render format is a user
-                # choice (PNG or JPEG) and a .jpg renamed to .png is a
-                # corrupt file, not a converted one.
-                suffix = src.suffix.lower()
-                shutil.copy(src, dest / f"{stem}_{frame:04d}{suffix}")
-                found.add(frame)
-                if is_new:
-                    n += 1
-                    report.copied += 1
-            report.per_worker[w.label] = n
-        except Exception as e:
-            # Task 6: one worker's fetch failing (dead kernel, revoked
-            # token, network blip) must not abort collecting everyone
-            # else -- reported here instead, and this worker's frames
-            # simply stay out of `found`, which is exactly correct: they
-            # were not actually collected.
-            report.worker_errors[w.label] = str(e)
-            report.per_worker[w.label] = 0
-        finally:
-            _wipe(staging)
+                    frame_paths = _resolve_frame_sources(files, staging,
+                                                         w.label, report)
+
+                    n = 0
+                    for frame in sorted(frame_paths):
+                        if frame in found:
+                            # An earlier worker already contributed this
+                            # frame. Writing it again would put two
+                            # entries under one name in the zip, and
+                            # extractors disagree about which of them wins
+                            # -- so the first writer keeps it, which also
+                            # keeps `copied` counting frames rather than
+                            # copies (two workers handed the same frame is
+                            # 1 frame collected, not 2).
+                            continue
+                        src = frame_paths[frame]
+                        # Keep the source extension: the render format is
+                        # a user choice (PNG or JPEG) and a .jpg renamed
+                        # to .png is a corrupt file, not a converted one.
+                        suffix = src.suffix.lower()
+                        merged.write(src, arcname=f"{stem}_{frame:04d}{suffix}")
+                        found.add(frame)
+                        n += 1
+                        report.copied += 1
+                    report.per_worker[w.label] = n
+                except Exception as e:
+                    # Task 6: one worker's fetch failing (dead kernel,
+                    # revoked token, network blip) must not abort
+                    # collecting everyone else -- reported here instead,
+                    # and this worker's frames simply stay out of `found`,
+                    # which is exactly correct: they were not actually
+                    # collected.
+                    report.worker_errors[w.label] = str(e)
+                    report.per_worker[w.label] = 0
+                finally:
+                    _wipe(staging)
+
+        if report.copied:
+            base = _archive_base_name(fleet_state, worker_label)
+            final = _unique_archive_path(dest, base)
+            part.rename(final)
+            report.archive_path = final
+            if final.name != f"{base}.zip":
+                report.wanted_name = f"{base}.zip"
+    finally:
+        # Nothing was collected (or something escaped): no zip. An empty
+        # <scene>.zip would read as a delivered render right up until it
+        # is opened -- absent is the honest answer, and CollectReport
+        # already says how many frames are missing and why.
+        part.unlink(missing_ok=True)
 
     if worker_label is not None:
         expected = sorted({f for w in workers for f in w.frames})

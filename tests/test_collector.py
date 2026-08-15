@@ -59,18 +59,44 @@ def accts():
     return [Account("a0", "KGAT_" + "0"*32), Account("a1", "KGAT_" + "1"*32)]
 
 
+def entries(zip_path):
+    """The frame file names inside a collected archive."""
+    with zipfile.ZipFile(zip_path) as zf:
+        return sorted(zf.namelist())
+
+
+def entry_bytes(zip_path, name):
+    with zipfile.ZipFile(zip_path) as zf:
+        return zf.read(name)
+
+
 def test_collects_from_all_workers(tmp_path):
     def factory(tok):
         return FakeClient(tok, ["f_0001.png", "f_0003.png"] if tok.endswith("0"*32)
                           else ["f_0002.png", "f_0004.png"])
-    r = collect(state(), accts(), factory, tmp_path / "out")
+    out = tmp_path / "out"
+    r = collect(state(), accts(), factory, out)
     assert r.copied == 4
     assert r.missing_frames == []
-    # Task 5: every frame lands under a subfolder named for the scene
-    # ("r", from blend_name "r.blend" -- state()'s own scene_key) rather
-    # than straight in the chosen destination.
-    assert sorted(p.name for p in (tmp_path / "out" / "r").glob("*.png")) == [
+    # One zip named for the scene ("r", from blend_name "r.blend" --
+    # state()'s own scene_key), straight in the chosen destination, and
+    # NOTHING else beside it.
+    assert r.archive_path == out / "r.zip"
+    assert [p.name for p in out.iterdir()] == ["r.zip"]
+    # Frames keep the names that make the zip useful when it is opened.
+    assert entries(out / "r.zip") == [
         "r_0001.png", "r_0002.png", "r_0003.png", "r_0004.png"]
+
+
+def test_the_merged_zip_is_stored_not_deflated(tmp_path):
+    """Same reasoning as the notebook's own archive: PNG/JPEG are already
+    compressed, so deflating them costs CPU for almost nothing."""
+    def factory(tok):
+        return FakeClient(tok, ["f_0001.png"] if tok.endswith("0"*32)
+                          else ["f_0002.png"])
+    r = collect(state(), accts(), factory, tmp_path / "out")
+    with zipfile.ZipFile(r.archive_path) as zf:
+        assert {i.compress_type for i in zf.infolist()} == {zipfile.ZIP_STORED}
 
 
 def test_reports_missing_frames(tmp_path):
@@ -79,6 +105,9 @@ def test_reports_missing_frames(tmp_path):
     r = collect(state(), accts(), factory, tmp_path / "out")
     assert r.copied == 1
     assert r.missing_frames == [2, 3, 4]
+    # A partial render is still visibly partial: the zip holds only what
+    # was really there, and missing_frames names the rest.
+    assert entries(r.archive_path) == ["r_0001.png"]
 
 
 def test_per_worker_counts(tmp_path):
@@ -96,7 +125,9 @@ def test_duplicate_frame_counted_once(tmp_path):
     r = collect(state(), accts(), factory, tmp_path / "out")
     assert r.copied == 1
     assert sum(r.per_worker.values()) == 1
-    assert len(list((tmp_path / "out" / "r").glob("*.png"))) == 1
+    # One entry, not two under the same name -- a zip with duplicate
+    # names is read differently by different extractors.
+    assert entries(r.archive_path) == ["r_0002.png"]
 
 
 def test_account_removed_mid_job(tmp_path):
@@ -133,10 +164,10 @@ def test_second_job_into_the_same_folder_reports_its_own_missing_frames(tmp_path
 
     r1 = collect(job1, accts(), factory1, out)
     assert r1.copied == 4 and r1.missing_frames == []
-    # Task 5: staging lives inside the per-scene subfolder (both jobs here
-    # share blend_name "r.blend", hence scene_key "r"), not straight under
-    # `out`.
-    assert not list((out / "r").glob(".raw_*")), "staging left behind"
+    # Staging now lives directly under the chosen folder (the per-scene
+    # subfolder is gone -- the zip's own name separates scenes), scoped by
+    # job_id so two jobs collected into one folder cannot share it.
+    assert not list(out.glob(".raw_*")), "staging left behind"
 
     # Job 2 renders the SAME frame range but every worker comes back empty
     # (e.g. both kernels errored). Every frame must be reported missing.
@@ -151,7 +182,12 @@ def test_second_job_into_the_same_folder_reports_its_own_missing_frames(tmp_path
     r2 = collect(job2, accts(), factory2, out)
     assert r2.copied == 0
     assert r2.missing_frames == [1, 2, 3, 4]
-    assert not list((out / "r").glob(".raw_*"))
+    assert not list(out.glob(".raw_*"))
+    # Nothing came back, so no zip is written at all -- an empty "r.zip"
+    # would read as a delivered render until it was opened -- and job 1's
+    # archive is untouched.
+    assert r2.archive_path is None
+    assert [p.name for p in out.iterdir()] == ["r.zip"]
 
 
 def test_second_job_into_the_same_folder_via_archives_reports_its_own_missing_frames(
@@ -170,7 +206,7 @@ def test_second_job_into_the_same_folder_via_archives_reports_its_own_missing_fr
                                WorkerState("a1", "u1", "u1/k1", [2])])
     r1 = collect(job1, accts(), factory1, out)
     assert r1.copied == 2 and r1.missing_frames == []
-    assert not list((out / "r").glob(".raw_*"))
+    assert not list(out.glob(".raw_*"))
 
     job2 = FleetState(job_id="j2", blend_name="r.blend", start_frame=1, end_frame=2,
                       workers=[WorkerState("a0", "u0", "u0/k2", [1]),
@@ -182,7 +218,8 @@ def test_second_job_into_the_same_folder_via_archives_reports_its_own_missing_fr
     r2 = collect(job2, accts(), factory2, out)
     assert r2.copied == 0
     assert r2.missing_frames == [1, 2]
-    assert not list((out / "r").glob(".raw_*"))
+    assert not list(out.glob(".raw_*"))
+    assert r2.archive_path is None
 
 
 def test_staging_is_cleaned_up_after_a_successful_collect(tmp_path):
@@ -191,8 +228,9 @@ def test_staging_is_cleaned_up_after_a_successful_collect(tmp_path):
                           else ["f_0002.png"])
     out = tmp_path / "out"
     collect(state(), accts(), factory, out)
-    assert sorted(p.name for p in (out / "r").iterdir()) == [
-        "r_0001.png", "r_0002.png"]
+    # The destination is left holding the zip and nothing else: no
+    # staging, no in-progress .part file, no loose frames.
+    assert sorted(p.name for p in out.iterdir()) == ["r.zip"]
 
 
 def test_staging_is_cleaned_up_even_when_a_fetch_raises(tmp_path):
@@ -207,10 +245,12 @@ def test_staging_is_cleaned_up_even_when_a_fetch_raises(tmp_path):
 
     out = tmp_path / "out"
     r = collect(state(), accts(), factory, out)
-    assert not list((out / "r").glob(".raw_*"))
+    assert not list(out.glob(".raw_*"))
+    assert not list(out.glob("*.part")), "a half-built zip was left behind"
     # Task 6: a fetch failure is REPORTED, not raised -- see the
     # one-worker's-failure-must-not-abort-the-others tests below.
     assert r.copied == 0
+    assert r.archive_path is None
     assert r.worker_errors["a0"]
     assert r.worker_errors["a1"]
 
@@ -222,10 +262,10 @@ def test_unclearable_staging_fails_loudly_rather_than_under_reporting(tmp_path,
     import blendfleet.collector as collector_mod
 
     out = tmp_path / "out"
-    # Staging lives under the per-scene subfolder ("r", from state()'s
-    # blend_name "r.blend") that collect() itself creates -- so the stale
-    # folder blocking the real collect must be planted there too.
-    stale = out / "r" / ".raw_a0"
+    # Staging now lives straight under the chosen folder, named
+    # ".raw_<job_id>_<label>" -- so the stale folder blocking the real
+    # collect must be planted there.
+    stale = out / ".raw_j1_0"
     stale.mkdir(parents=True)
     (stale / "f_0001.png").write_bytes(b"PNG")
     monkeypatch.setattr(collector_mod.shutil, "rmtree",
@@ -247,7 +287,7 @@ def test_collects_jpeg_frames_keeping_the_extension(tmp_path):
     r = collect(state(), accts(), factory, tmp_path / "out")
     assert r.copied == 4
     assert r.missing_frames == []
-    assert sorted(p.name for p in (tmp_path / "out" / "r").glob("*.jpg")) == [
+    assert entries(r.archive_path) == [
         "r_0001.jpg", "r_0002.jpg", "r_0003.jpg", "r_0004.jpg"]
 
 
@@ -274,9 +314,8 @@ def test_collects_from_archive_when_present_no_loose_files(tmp_path):
     r = collect(state(), accts(), factory, tmp_path / "out")
     assert r.copied == 4
     assert r.missing_frames == []
-    out = tmp_path / "out" / "r"
-    assert (out / "r_0001.png").read_bytes() == b"AAA"
-    assert (out / "r_0003.png").read_bytes() == b"BBB"
+    assert entry_bytes(r.archive_path, "r_0001.png") == b"AAA"
+    assert entry_bytes(r.archive_path, "r_0003.png") == b"BBB"
     assert not r.archive_errors
 
 
@@ -322,9 +361,9 @@ def test_archive_lagging_one_frame_behind_loose_files_still_finds_it(tmp_path):
     r = collect(state(), accts(), factory, tmp_path / "out")
     assert r.copied == 4
     assert r.missing_frames == []
-    out = tmp_path / "out" / "r"
-    assert (out / "r_0001.png").read_bytes() == b"AAA"
-    assert (out / "r_0003.png").exists()   # recovered from the loose file
+    assert entry_bytes(r.archive_path, "r_0001.png") == b"AAA"
+    # recovered from the loose file, and still delivered inside the zip
+    assert "r_0003.png" in entries(r.archive_path)
 
 
 def test_archive_corruption_that_raises_something_other_than_badzipfile_still_falls_back(
@@ -376,9 +415,11 @@ def test_archive_zip_slip_entries_are_rejected_not_extracted_outside_staging(tmp
     r = collect(st, [Account("a0", "KGAT_" + "0"*32)], factory, out)
 
     assert r.copied == 1
-    assert (out / "r" / "r_0001.png").read_bytes() == b"AAA"
+    assert entry_bytes(r.archive_path, "r_0001.png") == b"AAA"
     assert list(tmp_path.rglob("evil_0002.png")) == [], (
         "the escaping entry must never be extracted anywhere on disk")
+    assert entries(r.archive_path) == ["r_0001.png"], (
+        "the escaping entry must not be carried into the merged zip either")
 
 
 def test_archive_and_matching_loose_files_do_not_double_count(tmp_path):
@@ -401,12 +442,51 @@ def test_worker_label_targets_only_that_one_worker(tmp_path):
     def factory(tok):
         return FakeClient(tok, ["f_0001.png", "f_0003.png"] if tok.endswith("0"*32)
                           else ["f_0002.png", "f_0004.png"])
-    r = collect(state(), accts(), factory, tmp_path / "out", worker_label="a0")
+    out = tmp_path / "out"
+    r = collect(state(), accts(), factory, out, worker_label="a0")
     assert r.copied == 2
     assert r.per_worker == {"a0": 2}
     assert "a1" not in r.per_worker
-    out = tmp_path / "out" / "r"
-    assert sorted(p.name for p in out.glob("*.png")) == ["r_0001.png", "r_0003.png"]
+    # A one-account download is a SLICE of the render, so its zip says so
+    # in its own name rather than pretending to be the whole scene (and
+    # so it does not push the eventual merged "r.zip" out to "r-2.zip").
+    assert r.archive_path == out / "r-a0.zip"
+    assert entries(r.archive_path) == ["r_0001.png", "r_0003.png"]
+
+
+def test_per_instance_zip_does_not_take_the_fleet_wide_name(tmp_path):
+    """Downloading one instance, then the whole fleet, must leave the
+    merged archive under the plain scene name -- the per-account slice
+    must not have claimed it."""
+    def factory(tok):
+        return FakeClient(tok, ["f_0001.png", "f_0003.png"] if tok.endswith("0"*32)
+                          else ["f_0002.png", "f_0004.png"])
+    out = tmp_path / "out"
+    one = collect(state(), accts(), factory, out, worker_label="a1")
+    whole = collect(state(), accts(), factory, out)
+    assert one.archive_path == out / "r-a1.zip"
+    assert whole.archive_path == out / "r.zip"
+    assert whole.wanted_name == ""      # nothing was in its way
+    assert entries(whole.archive_path) == [
+        "r_0001.png", "r_0002.png", "r_0003.png", "r_0004.png"]
+
+
+def test_per_instance_zip_name_survives_a_label_with_path_characters(tmp_path):
+    """An account label is a nickname the user types, so it can contain
+    slashes, colons and anything else -- none of which may reach the file
+    name unescaped."""
+    st = FleetState(job_id="j1", blend_name="r.blend", start_frame=1, end_frame=1,
+                    workers=[WorkerState("Stive's laptop / 2", "u0", "u0/k0", [1])])
+
+    def factory(tok):
+        return FakeClient(tok, ["f_0001.png"])
+
+    out = tmp_path / "out"
+    r = collect(st, [Account("Stive's laptop / 2", "KGAT_" + "0"*32)],
+                factory, out, worker_label="Stive's laptop / 2")
+    assert r.copied == 1
+    assert r.archive_path == out / "r-stive-s-laptop-2.zip"
+    assert r.archive_path.is_file()
 
 
 def test_worker_label_missing_frames_is_scoped_to_that_workers_own_frames(tmp_path):
@@ -436,14 +516,15 @@ def test_one_workers_failure_does_not_abort_collecting_the_others(tmp_path):
         return Boom(tok) if tok.endswith("0"*32) else \
             FakeClient(tok, ["f_0002.png", "f_0004.png"])
 
-    r = collect(state(), accts(), factory, tmp_path / "out")
+    out = tmp_path / "out"
+    r = collect(state(), accts(), factory, out)
     assert r.per_worker["a1"] == 2
     assert r.per_worker["a0"] == 0
     assert "network died mid-download" in r.worker_errors["a0"]
     assert "a1" not in r.worker_errors
     assert r.missing_frames == [1, 3]   # a0's frames never came in
-    out = tmp_path / "out" / "r"
-    assert sorted(p.name for p in out.glob("*.png")) == ["r_0002.png", "r_0004.png"]
+    # The surviving worker's frames are still delivered, in the zip.
+    assert entries(r.archive_path) == ["r_0002.png", "r_0004.png"]
     assert not list(out.glob(".raw_*"))
 
 
@@ -485,13 +566,14 @@ def test_progress_requested_but_client_lacks_progress_support_still_collects(tmp
 
 
 # --------------------------------------------------------------------------
-# Task 5: one output folder per scene.
+# One <scene>.zip per collect: naming, and never overwriting one that is
+# already there.
 # --------------------------------------------------------------------------
 
-def test_frames_land_in_a_folder_named_for_their_scene(tmp_path):
-    """Two scenes rendering at once would otherwise write into one folder,
-    and two scenes whose .blend files share a stem would overwrite each
-    other outright."""
+def test_the_zip_is_named_for_its_scene(tmp_path):
+    """Two scenes collected into one folder would otherwise write over
+    each other. The zip's own name is what keeps them apart now that
+    there is no per-scene subfolder."""
     st = FleetState(job_id="j1", blend_name="alpha.blend", start_frame=1,
                     end_frame=1,
                     workers=[WorkerState("a0", "u0", "u0/k0", [1])])
@@ -499,33 +581,41 @@ def test_frames_land_in_a_folder_named_for_their_scene(tmp_path):
     def factory(tok):
         return FakeClient(tok, ["f_0001.png"])
 
-    collect(st, [Account("a0", "KGAT_" + "0"*32)], factory, tmp_path / "frames")
-    assert (tmp_path / "frames" / "alpha" / "alpha_0001.png").exists()
+    r = collect(st, [Account("a0", "KGAT_" + "0"*32)], factory,
+                tmp_path / "frames")
+    assert r.archive_path == tmp_path / "frames" / "alpha.zip"
+    assert [p.name for p in (tmp_path / "frames").iterdir()] == ["alpha.zip"]
+    assert entries(r.archive_path) == ["alpha_0001.png"]
 
 
-def test_subfolder_false_writes_straight_into_dest(tmp_path):
-    """The opt-out for a caller that already owns a scene-specific
-    destination and does not want a second layer of nesting under it."""
-    st = FleetState(job_id="j1", blend_name="alpha.blend", start_frame=1,
-                    end_frame=1,
-                    workers=[WorkerState("a0", "u0", "u0/k0", [1])])
-
+def test_collecting_the_same_scene_twice_never_overwrites_the_first_zip(tmp_path):
+    """The first zip may be the only copy of a longer render. Re-collecting
+    writes a numbered sibling and SAYS so (wanted_name), rather than
+    replacing already-rendered, already-paid-for output."""
     def factory(tok):
-        return FakeClient(tok, ["f_0001.png"])
+        return FakeClient(tok, ["f_0001.png", "f_0003.png"] if tok.endswith("0"*32)
+                          else ["f_0002.png", "f_0004.png"])
+    out = tmp_path / "out"
+    first = collect(state(), accts(), factory, out)
+    second = collect(state(), accts(), factory, out)
+    third = collect(state(), accts(), factory, out)
 
-    collect(st, [Account("a0", "KGAT_" + "0"*32)], factory, tmp_path / "frames",
-           subfolder=False)
-    assert (tmp_path / "frames" / "alpha_0001.png").exists()
-    assert not (tmp_path / "frames" / "alpha").exists()
+    assert first.archive_path == out / "r.zip"
+    assert first.wanted_name == ""
+    assert second.archive_path == out / "r-2.zip"
+    assert second.wanted_name == "r.zip"
+    assert third.archive_path == out / "r-3.zip"
+    assert sorted(p.name for p in out.iterdir()) == ["r-2.zip", "r-3.zip", "r.zip"]
+    # The original is byte-for-byte still the original's content.
+    assert entries(out / "r.zip") == [
+        "r_0001.png", "r_0002.png", "r_0003.png", "r_0004.png"]
 
 
-def test_colliding_scene_names_share_a_folder_but_not_a_filename(tmp_path):
-    """The residual collision FleetState.scene_key's docstring accepts as
-    harmless: "shot 1.blend" and "shot-1.blend" slugify to the identical
-    scene_key ("shot-1"), so both collects land in the SAME folder -- but
-    each worker's copied filename comes from its own raw, un-slugified
-    stem (collector.collect's own `stem`, not scene_key), so the second
-    collect must never overwrite the first's frame."""
+def test_colliding_scene_names_get_separate_zips(tmp_path):
+    """The residual collision FleetState.scene_key's docstring accepts:
+    "shot 1.blend" and "shot-1.blend" slugify to the identical scene_key
+    ("shot-1"), so both collects want the same file name -- the second
+    must never overwrite the first."""
     acct = [Account("a0", "KGAT_" + "0"*32)]
 
     def factory(tok):
@@ -538,23 +628,25 @@ def test_colliding_scene_names_share_a_folder_but_not_a_filename(tmp_path):
                       end_frame=1,
                       workers=[WorkerState("a0", "u0", "u0/k1", [1])])
 
-    collect(st_a, acct, factory, tmp_path / "frames")
-    collect(st_b, acct, factory, tmp_path / "frames")
+    a = collect(st_a, acct, factory, tmp_path / "frames")
+    b = collect(st_b, acct, factory, tmp_path / "frames")
 
-    shared = tmp_path / "frames" / "shot-1"
-    assert (shared / "shot 1_0001.png").exists()
-    assert (shared / "shot-1_0001.png").exists()
+    assert a.archive_path == tmp_path / "frames" / "shot-1.zip"
+    assert b.archive_path == tmp_path / "frames" / "shot-1-2.zip"
+    # Each zip still names its frames from its own raw, un-slugified stem.
+    assert entries(a.archive_path) == ["shot 1_0001.png"]
+    assert entries(b.archive_path) == ["shot-1_0001.png"]
 
 
-def test_case_only_collision_disambiguates_instead_of_overwriting(tmp_path):
-    """Task 5 fix round 1, IMPORTANT 4: "Kitchen.blend" and "kitchen.blend"
-    share a scene_key ("kitchen" -- slugify_stem already lowercases)
-    exactly like the differently-spelled collision above -- but here the
-    raw stems differ ONLY by case, so on a case-insensitive filesystem
-    (Windows, default macOS) "Kitchen_0001.png" and "kitchen_0001.png" are
-    literally the SAME path. Without disambiguation the second collect's
-    shutil.copy would silently replace the first scene's already-rendered,
-    already-paid-for frame."""
+def test_case_only_collision_does_not_overwrite_on_a_case_insensitive_disk(tmp_path):
+    """Task 5 fix round 1, IMPORTANT 4, restated for the zip:
+    "Kitchen.blend" and "kitchen.blend" share a scene_key ("kitchen" --
+    slugify_stem already lowercases), and on a case-insensitive filesystem
+    (Windows, default macOS) "Kitchen.zip" and "kitchen.zip" are literally
+    the SAME path. Without disambiguation the second collect would
+    silently replace the first scene's already-rendered, already-paid-for
+    output. The name check is case-folded on every platform so this
+    behaves identically everywhere."""
     acct = [Account("a0", "KGAT_" + "0"*32)]
 
     def factory(tok):
@@ -567,15 +659,13 @@ def test_case_only_collision_disambiguates_instead_of_overwriting(tmp_path):
                       end_frame=1,
                       workers=[WorkerState("a0", "u0", "u0/k1", [1])])
 
-    collect(st_a, acct, factory, tmp_path / "frames")
-    collect(st_b, acct, factory, tmp_path / "frames")
+    a = collect(st_a, acct, factory, tmp_path / "frames")
+    b = collect(st_b, acct, factory, tmp_path / "frames")
 
-    shared = tmp_path / "frames" / "kitchen"
-    names = sorted(p.name for p in shared.glob("*.png"))
-    assert len(names) == 2, (
-        "both scenes' frames must survive -- neither may silently "
-        f"replace the other on a case-insensitive filesystem: {names}")
-    assert "Kitchen_0001.png" in names, names
-    assert "kitchen-j2_0001.png" in names, (
-        "the SECOND, colliding job's frame must be disambiguated with "
-        f"its own job_id rather than overwrite the first: {names}")
+    names = sorted(p.name for p in (tmp_path / "frames").iterdir())
+    assert names == ["kitchen-2.zip", "kitchen.zip"], (
+        "both scenes' output must survive -- neither may silently replace "
+        f"the other on a case-insensitive filesystem: {names}")
+    assert entries(a.archive_path) == ["Kitchen_0001.png"]
+    assert entries(b.archive_path) == ["kitchen_0001.png"]
+    assert b.wanted_name == "kitchen.zip"

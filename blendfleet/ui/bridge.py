@@ -1692,7 +1692,26 @@ class Backend(QObject):
                 self.notification.emit(
                     "No render job found — start a render first.", "idle")
                 return
-            message = f"Collected {report.copied} frame(s) from {who}"
+            if report.archive_path is None:
+                # Nothing came back, so collect() wrote no zip at all --
+                # saying "collected 0 frames to <folder>" would send the
+                # user looking for a file that is not there. Absent, not
+                # zero.
+                message = (f"Nothing to collect from {who} yet — no frames "
+                           f"have finished rendering, so no zip was written "
+                           f"to {destination}. Collect again once an "
+                           f"account reports frames done")
+            else:
+                message = (f"Collected {report.copied} frame(s) from {who} "
+                           f"into {report.archive_path} — unzip it to get "
+                           f"the frames")
+                if report.wanted_name:
+                    # Re-collecting never replaces the zip already there:
+                    # it may be the only copy of a longer render. The odd
+                    # name has to be explained or it just looks like a bug.
+                    message += (f" (a {report.wanted_name} was already in "
+                                f"that folder, so this download was saved "
+                                f"beside it instead of replacing it)")
             if report.missing_frames:
                 # Never presented as a complete set when it is not one.
                 message += (f" — {len(report.missing_frames)} still missing "

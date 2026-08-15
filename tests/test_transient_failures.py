@@ -138,6 +138,9 @@ class State:
         self.start_frame = 1
         self.end_frame = len(workers[0].frames)
         self.blend_name = "remember.blend"   # collect names frames from it
+        # collect() scopes its staging folders by job id so two jobs
+        # collected into one chosen folder cannot share one.
+        self.job_id = "j-transient"
 
     @property
     def scene_key(self):
@@ -198,11 +201,14 @@ def test_a_failed_attempts_leftovers_are_never_collected(tmp_path):
     worker = Worker("stive", [1, 2, 3])
     client = FlakyClient(failures=1, frames=[1, 2, 3])
     state = State([worker])
-    collect(state, [Account("stive")], lambda tok: client, dest,
-            sleep=lambda s: None)
-    # Task 5: collect() writes under dest/scene_key, not straight into dest.
-    for f in (dest / state.scene_key).iterdir():
-        assert f.read_bytes() == b"PNG-real", f"{f.name} is a partial file"
+    report = collect(state, [Account("stive")], lambda tok: client, dest,
+                     sleep=lambda s: None)
+    # collect() now leaves one zip in `dest` -- the truncated 5-byte
+    # leftover must not be inside it either.
+    assert report.archive_path == dest / f"{state.scene_key}.zip"
+    with zipfile.ZipFile(report.archive_path) as zf:
+        for name in zf.namelist():
+            assert zf.read(name) == b"PNG-real", f"{name} is a partial file"
 
 
 def test_collect_still_reports_a_worker_that_never_recovers(tmp_path):

@@ -1533,18 +1533,41 @@ class Dashboard(FramelessMixin, QMainWindow):
         if card is not None:
             card.set_download_progress(progress)
 
-    def _describe_collect_result(self, r, *, destination_phrase: str) -> str:
+    def _describe_collect_result(self, r, *, source_phrase: str,
+                                 folder: str) -> str:
         """One friendly message for a CollectReport, shared by the
         fleet-wide and per-instance download paths so the two do not grow
         two different tellings of the same report.
 
-        `destination_phrase` is the WHOLE "to <where>" clause, fully
-        formed by the caller (review finding: this used to take `who` +
-        `dest` separately and glue them together with its own literal
-        " to " -- but both call sites' `who` already ended in "to",
-        producing a doubled "... to to <path>." in the actual dialog).
+        `source_phrase` is the WHOLE " from <who>" clause including its
+        leading space, or "" for the fleet-wide path -- fully formed by
+        the caller (review finding: this used to take `who` + `dest`
+        separately and glue them together with its own literal " to ", and
+        both call sites' `who` already ended in "to", producing a doubled
+        "... to to <path>." in the actual dialog). `folder` is the
+        directory the user picked, used ONLY to say where a zip was not
+        written; where one WAS written comes from the report itself, since
+        that is the only thing that knows the file's final name.
         """
-        msg = f"Copied {r.copied} frame(s) {destination_phrase}."
+        if r.archive_path is None:
+            # No zip is written when nothing was collected -- an empty
+            # <scene>.zip reads as a delivered render until it is opened.
+            # Saying "copied 0 frames to <folder>" would send the user
+            # hunting for a file that is not there.
+            msg = (f"No frames were collected{source_phrase}, so no zip was "
+                   f"written to {folder}.")
+        else:
+            msg = (f"Collected {r.copied} frame(s){source_phrase} into one "
+                   f"zip:\n\n{r.archive_path}\n\nUnzip it to get the frames "
+                   f"-- they are inside under their own frame numbers.")
+            if r.wanted_name:
+                # Re-collecting never replaces the zip already sitting
+                # there: it may be the only copy of an earlier, longer
+                # render. An unexplained "-2" just looks like a bug.
+                msg += (f"\n\n{r.wanted_name} was already in that folder, so "
+                        f"this download was saved beside it rather than "
+                        f"replacing it. Delete whichever one you do not "
+                        f"want.")
         if r.missing_frames:
             msg += (f"\n\n{len(r.missing_frames)} frame(s) are still "
                     f"missing (not rendered yet, or the render failed for "
@@ -1575,23 +1598,12 @@ class Dashboard(FramelessMixin, QMainWindow):
             return   # a collect is already in flight -- the button is disabled too
         from blendfleet.collector import collect
         accounts = self.store.list()
-        # Set inside work() (background thread), read from done_ok() only
-        # after that thread has finished -- _DownloadWorker's succeeded
-        # signal fires strictly after work() returns, so this is never
-        # read concurrently with the write. Needed because collect() now
-        # writes under Path(d)/<scene_key> (Task 5), not straight into
-        # Path(d) -- see the fix to `msg` below (Task 5 fix round 1,
-        # Minor: this dialog was the app's only place saying where a
-        # render's frames actually went, and it kept saying "to {d}" even
-        # though that stopped being true the moment the subfolder shipped).
-        landed_in = {"path": d}
 
         def work(on_progress):
             fleet = self.fleet_factory(accounts)
             st = fleet.load()
             if st is None:
                 return None
-            landed_in["path"] = str(Path(d) / st.scene_key)
             return collect(st, accounts, fleet.client_factory, Path(d),
                            on_progress=on_progress)
 
@@ -1612,8 +1624,12 @@ class Dashboard(FramelessMixin, QMainWindow):
                     self, "Nothing to collect",
                     "No render job was found -- start a render first.")
                 return
-            msg = self._describe_collect_result(
-                r, destination_phrase=f"to {landed_in['path']}")
+            # Where the frames went is read off the report, not guessed
+            # from `d`: collect() picks the zip's final name itself (it
+            # will not overwrite one already there), so this dialog -- the
+            # app's only place that says where a render actually landed --
+            # can only be truthful by quoting what was really written.
+            msg = self._describe_collect_result(r, source_phrase="", folder=d)
             if r.worker_errors:
                 # Consistent with _show_download_instance_result's own
                 # per-instance path below: at least one account's fetch
@@ -1664,18 +1680,12 @@ class Dashboard(FramelessMixin, QMainWindow):
         who = (account.username or label) if account else label
         accounts = self.store.list()
         card = self._instance_cards.get(label)
-        # Same reasoning as _collect()'s own `landed_in` above: collect()
-        # writes under Path(d)/<scene_key>, not straight into Path(d), and
-        # this dict is only ever read from done_ok() after work() (the
-        # background thread that fills it in) has already finished.
-        landed_in = {"path": d}
 
         def work(on_progress):
             fleet = self.fleet_factory(accounts)
             st = fleet.load()
             if st is None:
                 return None
-            landed_in["path"] = str(Path(d) / st.scene_key)
             return collect(st, accounts, fleet.client_factory, Path(d),
                            worker_label=label, on_progress=on_progress)
 
@@ -1690,7 +1700,7 @@ class Dashboard(FramelessMixin, QMainWindow):
             if card is not None:
                 card.set_download_busy(False)
                 card.set_download_progress(None)
-            self._show_download_instance_result(who, landed_in["path"], r)
+            self._show_download_instance_result(who, d, r)
 
         def done_fail(message: str) -> None:
             self._instance_download_workers.pop(label, None)
@@ -1705,8 +1715,15 @@ class Dashboard(FramelessMixin, QMainWindow):
         worker.finished.connect(worker.deleteLater)
         worker.start()
 
-    def _show_download_instance_result(self, who: str, dest: str, r) -> None:
+    def _show_download_instance_result(self, who: str, folder: str, r) -> None:
         """Report one account's collect() outcome.
+
+        `folder` is the directory the user picked, and is only used to say
+        where nothing was written -- when a zip WAS written its name comes
+        from the report, because collect() chooses that name itself (a
+        single account's download is saved as `<scene>-<account>.zip`, so
+        a slice of a render is never mistaken on disk for the whole of
+        it).
 
         Routes through _describe_collect_result for the message body in
         every case -- including worker_errors -- rather than formatting
@@ -1725,7 +1742,7 @@ class Dashboard(FramelessMixin, QMainWindow):
                 "No render job was found -- start a render first.")
             return
         msg = self._describe_collect_result(
-            r, destination_phrase=f"from {who} to {dest}")
+            r, source_phrase=f" from {who}", folder=folder)
         if r.worker_errors:
             QMessageBox.warning(self, "Could not download frames", msg)
             return
