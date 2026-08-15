@@ -18,12 +18,14 @@ socket, and a dropped stream is not a failed render.
 """
 from __future__ import annotations
 
+import warnings
 import zipfile
 from pathlib import Path
 
 import pytest
 
-from blendfleet import log_stream
+from blendfleet import kaggle_client, log_stream
+from blendfleet.kaggle_http import install_request_timeout
 from blendfleet.collector import collect
 from blendfleet.downloader import IncompleteDownload, fetch_files
 from blendfleet.fleet import FleetState
@@ -412,3 +414,168 @@ def test_one_unmatched_worker_does_not_stop_the_others(tmp_path):
     assert report.copied == 2, "the matched worker's frames still arrive"
     assert "gone" in report.worker_errors
     assert report.missing_frames == [3]
+
+
+# --------------------------------------------------------------------------
+# kaggle_client: a call that can block forever is a thread that cannot stop
+# --------------------------------------------------------------------------
+#
+# Backend.stop() gives an in-flight worker 5 seconds and then cuts it
+# loose, which is what stopped the packaged app aborting with "QThread:
+# Destroyed while thread is still running". But a worker could not be
+# stopped in the first place because kagglesdk sets no timeout anywhere, so
+# a poll parked in connect/TLS/read waited forever. These tests pin the
+# backstop that makes cutting a thread loose the rare case again.
+
+class FakeSession:
+    """Enough of requests.Session for the helper: a .send to wrap."""
+
+    def __init__(self):
+        self.sent = []
+
+    def send(self, request, **kwargs):
+        self.sent.append(kwargs)
+        return "response"
+
+
+class FakeHttpClient:
+    def __init__(self):
+        self._session = None
+
+    def _init_session(self):
+        if self._session is None:
+            self._session = FakeSession()
+
+
+class FakeSdkClient:
+    """Shaped like kagglesdk.KaggleClient as far as the helper reaches."""
+
+    def __init__(self):
+        self._http = FakeHttpClient()
+
+    def http_client(self):
+        return self._http
+
+
+def sent_timeout(client) -> object:
+    """The timeout the wrapped session would actually put on the wire."""
+    session = client.http_client()._session
+    session.send(object())
+    return session.sent[-1].get("timeout")
+
+
+def test_the_sdk_client_type_gets_a_timeout(monkeypatch):
+    """_default_sdk_factory's kagglesdk.KaggleClient is used by quota(),
+    cancel(), the blob-upload session and dataset listing."""
+    built = FakeSdkClient()
+    import kagglesdk
+    monkeypatch.setattr(kagglesdk, "KaggleClient", lambda api_token: built)
+    client = kaggle_client._default_sdk_factory("KGAT_" + "a" * 32)
+    assert sent_timeout(client) == kaggle_client.REQUEST_TIMEOUT
+
+
+def test_the_kaggle_api_type_gets_a_timeout_on_every_call_it_builds():
+    """KaggleApi holds no session of its own -- it builds a FRESH kagglesdk
+    client per network call via build_kaggle_client(). Patching the object
+    once would cover nothing, so the factory itself is the seam, and every
+    client it hands back afterwards must arrive already bounded."""
+    class FakeApi:
+        def __init__(self):
+            self.built = []
+
+        def build_kaggle_client(self):
+            c = FakeSdkClient()
+            self.built.append(c)
+            return c
+
+    api = FakeApi()
+    assert kaggle_client._install_api_timeout(
+        api, kaggle_client.REQUEST_TIMEOUT) is True
+
+    first, second = api.build_kaggle_client(), api.build_kaggle_client()
+    assert sent_timeout(first) == kaggle_client.REQUEST_TIMEOUT
+    assert sent_timeout(second) == kaggle_client.REQUEST_TIMEOUT, \
+        "a per-call factory must bound EVERY client, not just the first"
+
+
+def test_a_client_that_already_has_a_timeout_keeps_it():
+    """setdefault, not overwrite: a caller passing its own timeout for one
+    specific call must win over the blanket default."""
+    client = FakeSdkClient()
+    install_request_timeout(client, kaggle_client.REQUEST_TIMEOUT)
+    session = client.http_client()._session
+    session.send(object(), timeout=(1.0, 2.0))
+    assert session.sent[-1]["timeout"] == (1.0, 2.0)
+
+
+@pytest.mark.parametrize("fake", [
+    object(),                                   # nothing at all
+    type("NoHttp", (), {})(),                   # no http_client
+    type("BadHttp", (), {"http_client": lambda self: None})(),
+])
+def test_a_client_without_the_internals_degrades_instead_of_raising(fake):
+    """Best-effort by design. Tests inject fake factories everywhere, and a
+    future kagglesdk that reshuffles its privates must cost the backstop,
+    never the whole app."""
+    assert install_request_timeout(fake, (5.0, 30.0)) is False
+
+
+@pytest.mark.parametrize("fake", [
+    object(),
+    type("NotCallable", (), {"build_kaggle_client": None})(),
+])
+def test_an_api_without_the_factory_degrades_instead_of_raising(fake):
+    assert kaggle_client._install_api_timeout(fake, (5.0, 30.0)) is False
+
+
+def test_a_fake_api_survives_the_timeout_install_unchanged():
+    """The whole existing suite injects api_factory doubles. Installing the
+    timeout must be invisible to them -- no raise, no warning, no
+    attribute appearing that a strict double would reject."""
+    class StrictDouble:
+        __slots__ = ()
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert kaggle_client._install_api_timeout(
+            StrictDouble(), kaggle_client.REQUEST_TIMEOUT) is False
+        assert install_request_timeout(
+            StrictDouble(), kaggle_client.REQUEST_TIMEOUT) is False
+
+
+def test_bulk_transfers_get_a_longer_read_timeout_than_control_calls():
+    """A read timeout is a gap BETWEEN bytes, so it does not cap a long
+    transfer -- but it does bound the request-SEND phase, and it must also
+    cover the far end's think time after the last byte of a 400 MB upload.
+    Using the control-plane value there would abort uploads that work."""
+    assert (kaggle_client.TRANSFER_READ_TIMEOUT_SECONDS
+            > kaggle_client.READ_TIMEOUT_SECONDS)
+    assert kaggle_client.CONNECT_TIMEOUT_SECONDS > 0
+    # Comfortably above Kaggle's slowest control-plane RPC, and above the
+    # 30s poll interval so a slow-but-alive poll is not called a failure.
+    assert kaggle_client.READ_TIMEOUT_SECONDS > 30
+
+
+def test_both_real_transports_pass_a_timeout(monkeypatch):
+    """uploader.py/downloader.py take an injected Transport and do no HTTP
+    of their own -- the only real `requests` calls are these two, so an
+    unbounded PUT/GET here would leave a stuck transfer just as
+    unstoppable as an unbounded poll."""
+    calls = {}
+    monkeypatch.setattr(kaggle_client.requests, "put",
+                        lambda url, **kw: calls.setdefault("put", kw))
+    monkeypatch.setattr(kaggle_client.requests, "get",
+                        lambda url, **kw: calls.setdefault("get", kw))
+
+    kaggle_client._RequestsPutTransport(token="t").put("u", b"", {})
+    kaggle_client._RequestsGetTransport().get("u")
+
+    assert calls["put"]["timeout"] == kaggle_client.TRANSFER_TIMEOUT
+    assert calls["get"]["timeout"] == kaggle_client.TRANSFER_TIMEOUT
+    assert calls["get"]["stream"] is True, "streaming must survive the change"
+
+
+def test_there_is_exactly_one_implementation_of_the_helper():
+    """log_stream and kaggle_client both need it. Two copies would be two
+    things to fix the day kagglesdk renames an internal."""
+    assert log_stream._install_request_timeout is install_request_timeout

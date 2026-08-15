@@ -20,8 +20,56 @@ from requests.exceptions import HTTPError
 
 from blendfleet import crash_log
 from blendfleet.downloader import Transport, fetch_files
+from blendfleet.kaggle_http import install_request_timeout
 from blendfleet.notebook_builder import ARCHIVE_SUFFIX
 from blendfleet.uploader import UploadError, upload_file
+
+# Why any of this exists: every call in this module runs on a background
+# thread, and Backend.stop() gives an in-flight worker 5 seconds to finish
+# before cutting it loose so Qt can tear the window down. kagglesdk passes
+# no timeout to requests at all, so before these constants a thread parked
+# in connect/TLS-handshake/read waited FOREVER -- which is why "cut the
+# worker loose" was the routine path rather than the rare exception, and
+# why the packaged app aborted with "QThread: Destroyed while thread is
+# still running". A bound does not make stop() instant; it makes a wedged
+# thread mortal, so the 5-second wait normally just succeeds.
+#
+# The load-bearing fact behind both read timeouts: a requests read timeout
+# is the maximum gap BETWEEN bytes, NOT a cap on total duration. Verified
+# rather than assumed -- a 6-second body arriving in 1-second chunks
+# survives a 2-second read timeout. So neither the 400 MB dataset upload
+# nor an output download trips these while data keeps moving.
+
+# TCP connect plus TLS handshake to kaggle.com. Under a second when the
+# network is healthy, a few seconds on a bad mobile link; 20s is generous
+# headroom, and a handshake still unfinished after it is not slow, it is
+# dead. Same value and same reasoning as log_stream's.
+CONNECT_TIMEOUT_SECONDS = 20.0
+
+# Control-plane RPCs: status, quota, list, cancel, push, dataset create.
+# Kaggle answers these in seconds, so 60s is an order of magnitude of
+# headroom while still bounding a dead socket at one minute. Deliberately
+# NOT log_stream's 120s -- that value is justified by the SSE stream
+# holding the connection open for up to 30s before its first byte, which
+# no unary RPC here does. Set it too low and a slow-but-alive
+# kernels_push/dataset_create_version gets called a failure and retried,
+# duplicating work Kaggle already accepted; too high and a wedged poll
+# outlives several more 30s poll ticks.
+READ_TIMEOUT_SECONDS = 60.0
+
+# Bulk body transfer only: the blob PUT and the output GET. Longer because
+# the read timeout also governs the request-SEND phase -- urllib3 2.x sets
+# the socket timeout to the read timeout before writing the body, verified
+# against the installed urllib3 2.7.0 -- so this has to cover both the
+# longest stall while the far end absorbs bytes AND the far end's think
+# time between our last byte and its response. For a 400 MB object that
+# trailing pause is GCS finalising an upload, not a round trip. Setting
+# this too low would not merely slow a transfer down: it would abort one
+# that was working perfectly.
+TRANSFER_READ_TIMEOUT_SECONDS = 300.0
+
+REQUEST_TIMEOUT = (CONNECT_TIMEOUT_SECONDS, READ_TIMEOUT_SECONDS)
+TRANSFER_TIMEOUT = (CONNECT_TIMEOUT_SECONDS, TRANSFER_READ_TIMEOUT_SECONDS)
 
 # Status strings returned by ApiGetKernelSessionStatusResponse.status
 ACTIVE_STATES = {"queued", "running"}
@@ -100,6 +148,68 @@ class RevokedTokenError(KaggleError):
 
     See _is_revoked_token for what does and does not count.
     """
+
+
+class KaggleTimeoutError(KaggleError):
+    """A Kaggle call was abandoned because it stopped making progress.
+
+    A KaggleError subclass for the same reason RevokedTokenError is: every
+    existing `except KaggleError` site keeps working, while the poll loop
+    can tell "the network went quiet" apart from "Kaggle said no".
+
+    The one thing this must never be confused with is RevokedTokenError --
+    they call for opposite actions. A timeout means retry; a revoked token
+    means retrying is pointless and only a new key at kaggle.com helps.
+    Telling a user their key is dead because their wifi dropped is a
+    mistake this app has already made once.
+    """
+
+
+def _is_timeout(exc: BaseException) -> bool:
+    """True when one of this module's own timeouts fired.
+
+    Walks the cause/context chain rather than testing only the outermost
+    type. The timeout is installed on the requests.Session UNDERNEATH
+    kagglesdk, so what actually reaches this module is usually some
+    kagglesdk or kaggle-package exception raised *from* a ReadTimeout --
+    checking `isinstance(exc, Timeout)` alone would miss precisely the
+    case these timeouts exist to produce.
+    """
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        # requests.exceptions.Timeout covers ConnectTimeout and ReadTimeout;
+        # builtin TimeoutError covers socket.timeout, which is an alias for
+        # it on every Python this app supports.
+        if isinstance(cur, (requests.exceptions.Timeout, TimeoutError)):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    # Last resort, for a library that stringifies the cause instead of
+    # chaining it. Matched on requests' own exact wording, not a bare
+    # "timeout", so a server message merely discussing timeouts cannot
+    # masquerade as one.
+    text = f"{exc}".lower()
+    return "read timed out" in text or "connect timeout" in text
+
+
+def _timeout_message(what: str) -> str:
+    """One actionable sentence for a timeout, never a bare ReadTimeout.
+
+    Says what happened, why BlendFleet gave up rather than hanging, that
+    nothing was changed -- only ever used on read-only calls, so that
+    claim stays true -- and explicitly rules out the account, because a
+    user who reads "failed" next to a Kaggle account reaches for the token
+    first.
+    """
+    return (
+        f"{what} timed out: the connection to Kaggle went quiet for "
+        f"{READ_TIMEOUT_SECONDS:.0f} seconds, so BlendFleet stopped waiting "
+        "instead of hanging (a call with no time limit is one the app cannot "
+        "close out of). Nothing was changed on Kaggle and no work was lost. "
+        "This is a slow or interrupted connection, NOT a problem with this "
+        "account or its token -- check the network and retry. If it keeps "
+        "happening, check whether kaggle.com itself is degraded.")
 
 
 # Kaggle uses 403 for TWO unrelated things: a bad token, and a dataset
@@ -255,7 +365,12 @@ class _RequestsPutTransport:
         self.token = token
 
     def put(self, url: str, data, headers: dict):
-        return requests.put(url, data=data, headers=headers)
+        # TRANSFER_TIMEOUT, not REQUEST_TIMEOUT: this is the 400 MB body,
+        # and the read half of the pair bounds the send phase too. Safe to
+        # bound at all because uploader.py retries with resume on top of
+        # this, so a timeout here costs a resumed transfer, not the upload.
+        return requests.put(url, data=data, headers=headers,
+                            timeout=TRANSFER_TIMEOUT)
 
 
 def _safe_dest(dest: Path, file_name: str) -> Path | None:
@@ -290,7 +405,11 @@ class _RequestsGetTransport:
     """
 
     def get(self, url: str):
-        return requests.get(url, stream=True)
+        # The timeout is per-read, not per-download, so a large output file
+        # is unaffected while bytes keep arriving -- it only fires on a
+        # connection that has gone silent, which is the case downloader.py's
+        # IncompleteDownload retry exists to recover from.
+        return requests.get(url, stream=True, timeout=TRANSFER_TIMEOUT)
 
 
 def _start_blob_upload(sdk, path: Path, blob_type) -> tuple[str, str]:
@@ -443,6 +562,10 @@ def _default_api_factory(token: str, account: str | None = None):
 
     def construct():
         api = KaggleApi()
+        # Before authenticate(), not after: authenticate() itself talks to
+        # Kaggle, and an unbounded handshake there hangs account
+        # verification exactly as badly as an unbounded poll hangs a render.
+        _install_api_timeout(api, REQUEST_TIMEOUT)
         try:
             api.authenticate()
         except Exception as e:
@@ -462,11 +585,48 @@ def _default_api_factory(token: str, account: str | None = None):
     return api
 
 
+def _install_api_timeout(api, timeout) -> bool:
+    """Bound every HTTP call a `kaggle` package KaggleApi makes.
+
+    KaggleApi is NOT a kagglesdk client and holds no session of its own,
+    so there is nothing to patch once at authenticate() time. What it does
+    instead (checked against the installed kaggle 2.2.4) is
+    `with self.build_kaggle_client() as kaggle:` in all ~30 of its network
+    methods, building a FRESH kagglesdk client per call. That factory is
+    therefore the real seam: wrapping it covers every call site at once,
+    including ones added by a later kaggle release, and each client it
+    hands back is the exact type install_request_timeout already handles.
+
+    Best-effort for the same reason install_request_timeout is -- tests
+    inject fake apis with no build_kaggle_client at all, and a kaggle
+    release that renames it must degrade to "no backstop" rather than
+    breaking every account on startup.
+    """
+    try:
+        build = api.build_kaggle_client
+        if not callable(build):
+            return False
+
+        def build_with_timeout():
+            client = build()
+            install_request_timeout(client, timeout)
+            # Returned unwrapped: callers use it as a context manager, so
+            # anything but the client itself would break `with`.
+            return client
+
+        api.build_kaggle_client = build_with_timeout
+        return True
+    except Exception:      # noqa: BLE001 -- a missing internal is not fatal
+        return False
+
+
 def _default_sdk_factory(token: str):
     """Env-free: kagglesdk.KaggleClient accepts api_token= and only falls
     back to os.environ when it is None (kaggle_http_client.py:268)."""
     from kagglesdk import KaggleClient as SdkClient
-    return SdkClient(api_token=token)
+    client = SdkClient(api_token=token)
+    install_request_timeout(client, REQUEST_TIMEOUT)
+    return client
 
 
 class KaggleClient:
@@ -598,6 +758,14 @@ class KaggleClient:
         try:
             listing = self.api.kernels_list(mine=True, page_size=1) or []
         except Exception as e:
+            # Before the revoked check, for the same reason status() does
+            # it: this runs during "verify account", where reporting a
+            # timeout as a dead token sends the user to regenerate a key
+            # that was never the problem.
+            if _is_timeout(e):
+                raise KaggleTimeoutError(
+                    _timeout_message("reading this account's Kaggle username")
+                ) from e
             if _is_revoked_token(e):
                 raise RevokedTokenError(
                     revoked_token_message(self.label, self.token)) from e
@@ -916,6 +1084,16 @@ class KaggleClient:
         except ValueError:
             return KernelStatus(state="not_started")
         except Exception as e:
+            # Checked BEFORE the revoked-token test, not after. A timeout
+            # already fails _is_revoked_token (no HTTP status, none of the
+            # auth phrases), so this is belt and braces -- but "your key is
+            # dead" is the one verdict that must never come out of a dropped
+            # connection, and ordering it first means no future widening of
+            # _is_revoked_token can quietly reintroduce that.
+            if _is_timeout(e):
+                raise KaggleTimeoutError(
+                    _timeout_message(f"the render status check for {slug}")
+                ) from e
             # A token revoked mid-render surfaces HERE, because poll() is
             # what runs every 30 seconds for the life of a job. Without
             # this it would be reported as "usually a transient network

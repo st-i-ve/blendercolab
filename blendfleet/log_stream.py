@@ -12,6 +12,8 @@ import threading
 import time
 from typing import Callable
 
+from blendfleet.kaggle_http import install_request_timeout
+
 # blendfleet/notebook_builder.py prints exactly:
 #   f"PROGRESS frame={frame} ok={ok} secs={time.time()-t0:.1f} "
 #   f"done={len(done)}/{len(FRAMES)}"
@@ -87,31 +89,10 @@ READ_TIMEOUT_SECONDS = 120.0
 STOP_POLL_SECONDS = 0.25
 
 
-def _install_request_timeout(client, timeout) -> bool:
-    """Give `client`'s requests.Session a default timeout.
-
-    kagglesdk exposes no timeout parameter anywhere, so the only injection
-    point is the Session it builds internally. Best-effort by design: if a
-    future kagglesdk reshuffles its internals this returns False and the
-    stream still runs (just without the backstop) rather than taking the
-    dashboard down over a private attribute.
-    """
-    try:
-        http = client.http_client()
-        http._init_session()
-        session = http._session
-        if session is None:
-            return False
-        original_send = session.send
-
-        def send(request, **kwargs):
-            kwargs.setdefault("timeout", timeout)
-            return original_send(request, **kwargs)
-
-        session.send = send
-        return True
-    except Exception:      # noqa: BLE001 -- a missing internal is not fatal
-        return False
+# Re-exported under its original private name so the call site below, and
+# the tests that monkeypatch it there, keep working. kaggle_client.py needs
+# the identical helper, and one shared implementation is the point.
+_install_request_timeout = install_request_timeout
 
 
 def _close_when_stopped(resp, stop_event: threading.Event,

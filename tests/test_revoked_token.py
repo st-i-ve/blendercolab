@@ -23,7 +23,8 @@ import pytest
 import requests
 
 from blendfleet.kaggle_client import (KaggleClient, KaggleError,
-                                      RevokedTokenError, _is_revoked_token)
+                                      KaggleTimeoutError, RevokedTokenError,
+                                      _is_revoked_token)
 
 
 def http_error(status: int, message: str = "") -> requests.HTTPError:
@@ -171,3 +172,78 @@ def test_the_token_itself_is_never_put_in_the_message():
     full = "KGAT_" + "a" * 32
     assert full not in str(info.value), "a token must never reach a message"
     assert "KGAT_aaaa" in str(info.value), "a masked prefix identifies it"
+
+
+# --------------------------------------------------------------------------
+# A network timeout is the newest way to be mistaken for a dead token
+# --------------------------------------------------------------------------
+#
+# kaggle_client now installs a real read timeout, so "the connection went
+# quiet" has become a routine, EXPECTED outcome of poll() rather than a
+# thread that hangs forever. That makes the false-positive risk this whole
+# module is about strictly worse: there is now a new exception type
+# arriving on the same code path that reports revoked tokens.
+
+TIMEOUT_ERRORS = [
+    requests.exceptions.ReadTimeout(
+        "HTTPSConnectionPool(host='www.kaggle.com', port=443): Read timed "
+        "out. (read timeout=60.0)"),
+    requests.exceptions.ConnectTimeout(
+        "HTTPSConnectionPool(host='www.kaggle.com', port=443): Max retries "
+        "exceeded (Caused by ConnectTimeoutError)"),
+]
+
+
+@pytest.mark.parametrize("exc", TIMEOUT_ERRORS)
+def test_a_timeout_is_never_a_revoked_token(exc):
+    assert not _is_revoked_token(exc)
+
+
+@pytest.mark.parametrize("exc", TIMEOUT_ERRORS)
+def test_status_reports_a_timeout_as_transient_not_revoked(exc):
+    with pytest.raises(KaggleError) as info:
+        client_raising(exc).status("me/render-1")
+    assert isinstance(info.value, KaggleTimeoutError)
+    assert not isinstance(info.value, RevokedTokenError), \
+        "a quiet socket must never be reported as a dead key"
+
+
+@pytest.mark.parametrize("exc", TIMEOUT_ERRORS)
+def test_whoami_reports_a_timeout_as_transient_not_revoked(exc):
+    with pytest.raises(KaggleError) as info:
+        client_raising(exc).whoami()
+    assert isinstance(info.value, KaggleTimeoutError)
+    assert not isinstance(info.value, RevokedTokenError)
+
+
+def test_a_timeout_wrapped_in_another_exception_is_still_a_timeout():
+    """The timeout is installed on the session UNDERNEATH kagglesdk, so
+    what reaches kaggle_client is usually a library exception raised FROM
+    a ReadTimeout -- never the ReadTimeout itself. Matching only the
+    outermost type would miss every real occurrence."""
+    inner = requests.exceptions.ReadTimeout("Read timed out.")
+    outer = RuntimeError("kernels_status failed")
+    outer.__cause__ = inner
+    with pytest.raises(KaggleTimeoutError):
+        client_raising(outer).status("me/render-1")
+
+
+def test_a_timeout_message_tells_the_user_what_to_do():
+    """A bare "ReadTimeout" tells a user nothing. The message has to say
+    what happened, that the account is fine, and what to do next."""
+    with pytest.raises(KaggleTimeoutError) as info:
+        client_raising(TIMEOUT_ERRORS[0]).status("me/render-1")
+    text = str(info.value)
+    assert "timed out" in text, "what happened"
+    assert "retry" in text.lower(), "what to do next"
+    assert "NOT a problem with this account or its token" in text, \
+        "must actively rule out the token, not merely omit it"
+    assert "nothing was lost" in text.lower() or "no work was lost" in text
+    assert "ReadTimeout" not in text, "no raw exception type in a user string"
+
+
+def test_a_timeout_is_still_a_kaggle_error():
+    """Same contract RevokedTokenError has: every existing
+    `except KaggleError` site keeps working unchanged."""
+    assert issubclass(KaggleTimeoutError, KaggleError)
+    assert not issubclass(KaggleTimeoutError, RevokedTokenError)
