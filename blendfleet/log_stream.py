@@ -12,6 +12,7 @@ import threading
 import time
 from typing import Callable
 
+from blendfleet import crash_log
 from blendfleet.kaggle_http import install_request_timeout
 
 # blendfleet/notebook_builder.py prints exactly:
@@ -19,6 +20,20 @@ from blendfleet.kaggle_http import install_request_timeout
 #   f"done={len(done)}/{len(FRAMES)}"
 # The `.*?` bridges the ok=/secs= fields between frame= and done=.
 PROGRESS_RE = re.compile(r"PROGRESS frame=(\d+) .*?done=(\d+)/(\d+)")
+
+
+def _tokenless(text: str, token: str) -> str:
+    """`text` with this stream's own API token reduced to a fragment.
+
+    Every line this module writes to the diagnostic log quotes an
+    exception from the Kaggle SDK, which is free to echo back the request
+    it was given -- and that log is a file the user is asked to send on
+    when something goes wrong. Mirrors kaggle_client._mask's fragment so a
+    masked token reads the same wherever it appears.
+    """
+    if token and len(token) > 12 and token in text:
+        return text.replace(token, f"{token[:9]}…")
+    return text
 
 # blendfleet/notebook_builder.py's background telemetry thread prints exactly:
 #   f"TELEMETRY gpu={idx} util={util} mem_used={mem_used} "
@@ -337,12 +352,20 @@ def stream_progress(token: str, user_name: str, kernel_slug: str,
                 client, (CONNECT_TIMEOUT_SECONDS, READ_TIMEOUT_SECONDS))
             resp = client.kernels.kernels_api_client \
                 .get_kernel_session_logs_stream(req)
-        except Exception:       # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
             if stop_event is not None and stop_event.is_set():
                 return
             attempt += 1
             if attempt > max_reconnects:
                 raise
+            # Retried, not swallowed -- but every retry until the last one
+            # used to be invisible, so "it took four minutes to show any
+            # progress" and "Kaggle was refusing the stream outright" read
+            # identically. Bounded by max_reconnects, so this cannot flood.
+            crash_log.record(_tokenless(
+                f"log stream for {user_name}/{kernel_slug}: could not open "
+                f"it (attempt {attempt} of {max_reconnects}), retrying. "
+                f"{type(e).__name__}: {e}", token))
             sleep(min(2 ** (attempt - 1), 8))
             continue
 
@@ -394,13 +417,22 @@ def stream_progress(token: str, user_name: str, kernel_slug: str,
                     hw_record = parse_hardware_banner(raw)
                     if hw_record:
                         on_hardware(hw_record)
-        except Exception:       # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
             # A dropped stream is not a failed render. Measured on a real
             # 15-frame run (2026-08-11): ChunkedEncodingError at frame 3,
             # after which the app showed 3/15 for seven minutes while the
             # kernel quietly finished all fifteen. Reconnect instead.
             if stop_event is not None and stop_event.is_set():
                 return
+            # Recorded on the way past. When the reconnect works nobody is
+            # told anything at all -- correctly, since the render is fine --
+            # so a stream dropping repeatedly looks exactly like a slow
+            # render from the outside, and this line is the only thing that
+            # can separate them afterwards.
+            crash_log.record(_tokenless(
+                f"log stream for {user_name}/{kernel_slug}: dropped mid-"
+                f"stream after {seen_lines} line(s) (attempt {attempt} of "
+                f"{max_reconnects}). {type(e).__name__}: {e}", token))
             if attempt >= max_reconnects and not progressed:
                 raise
         finally:

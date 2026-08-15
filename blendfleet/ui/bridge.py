@@ -33,6 +33,7 @@ import json
 import queue
 import threading
 import time
+import traceback
 import uuid
 from pathlib import Path
 from typing import Callable
@@ -43,7 +44,8 @@ from blendfleet import crash_log
 from blendfleet.accounts import AccountStore
 from blendfleet.assignment import estimate
 from blendfleet.blender_versions import KNOWN_VERSIONS, validate_version
-from blendfleet.fleet import _capped_stem, fingerprint_unreadable_entry
+from blendfleet.fleet import (_capped_stem, _tokenless,
+                              fingerprint_unreadable_entry)
 from blendfleet.instance_state import (GpuSnapshot, InstanceSnapshot,
                                        InstanceStore)
 from blendfleet.kaggle_client import PENDING_STATES
@@ -76,15 +78,32 @@ class _Worker(QThread):
     succeeded = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, fn: Callable[[], object], action: str, parent=None) -> None:
+    def __init__(self, fn: Callable[[], object], action: str, parent=None,
+                 scrub: Callable[[str], str] | None = None) -> None:
         super().__init__(parent)
         self._fn = fn
         self._action = action
+        # How to strip credentials out of anything about to be written to
+        # the diagnostic log. See Backend._scrub.
+        self._scrub = scrub or (lambda text: text)
 
     def run(self) -> None:
         try:
             result = self._fn()
         except Exception as e:      # noqa: BLE001 -- turned into a message
+            # explain() produces a friendly sentence and DISCARDS the
+            # exception, which is the right trade for the page and the
+            # wrong one for a support request: "Kaggle could not be
+            # reached" covers a DNS failure, a 403 and a bug in this app
+            # equally well. The traceback is kept here, next to the
+            # sentence the user will actually quote back.
+            crash_log.record(
+                self._scrub(
+                    f"a background call failed -- {self._action}: "
+                    f"{type(e).__name__}: {e}\n"
+                    + "".join(traceback.format_exception(
+                        type(e), e, e.__traceback__))),
+                critical=True)
             self.failed.emit(explain(self._action, e))
         else:
             self.succeeded.emit(result)
@@ -207,6 +226,27 @@ class Backend(QObject):
         self._last_poll_at: str | None = None
         self._online = True
 
+        # Everything the user is told, kept where it can be read back.
+        #
+        # A sharing failure was reported from the field and there was
+        # nothing about it anywhere in %APPDATA%\BlendFleet\logs -- the log
+        # only ever carried Qt messages and crashes, while the app's own
+        # errors lived in a toast that fades after a few seconds. Connected
+        # to the signals rather than added at each emit site so a message
+        # added later cannot forget to do this.
+        #
+        # Bound methods, NOT lambdas: a lambda closing over `self` is
+        # stored by the connection and makes the Backend reference itself,
+        # so it can only ever be freed by a garbage collection pass rather
+        # than at once when the last reference goes. A Backend that outlives
+        # its owner keeps its 30-second poll timer -- and therefore keeps
+        # making Kaggle calls and rewriting fleet.json -- long after the
+        # window it belonged to is gone. PySide holds a QObject receiver's
+        # bound method weakly, so these connections add no such cycle.
+        self._last_user_message: tuple[str, str] | None = None
+        self.notification.connect(self._note_notification)
+        self.logLine.connect(self._note_log_line)
+
         # ---- live telemetry --------------------------------------------
         # `kernels logs`/`kernels output` return NOTHING until a kernel is
         # COMPLETE, so a 30-second status poll can only ever say "queued"
@@ -243,6 +283,43 @@ class Backend(QObject):
         self._live_timer.start(LIVE_INTERVAL_MS)
 
     # ---- helpers ------------------------------------------------------
+    def _scrub(self, text: str) -> str:
+        """`text` with any configured account's token masked.
+
+        Applied to everything this class writes to the diagnostic log.
+        Messages here quote Kaggle's own errors and, now, whole tracebacks
+        -- and this is a file the user is asked to send on when something
+        goes wrong, so it must never be the thing that costs them a
+        credential.
+        """
+        return _tokenless(text, self.store.list())
+
+    def _note_notification(self, message: str, tone: str) -> None:
+        self._note_user_message("notification", message, tone)
+
+    def _note_log_line(self, message: str, tone: str) -> None:
+        self._note_user_message("log", message, tone)
+
+    def _note_user_message(self, kind: str, message: str, tone: str) -> None:
+        """Record what the user was just told.
+
+        An "offline" tone is this app's error tone -- the message names
+        something that FAILED -- so it is written as critical, i.e. it
+        survives the log's routine-message cap alongside crashes and fatal
+        Qt lines. Every other tone is ordinary narration and is written at
+        normal level.
+
+        Consecutive duplicates are dropped: the 30-second poll failing
+        while the network is down emits the identical sentence every 30
+        seconds, and a log filled with one repeated line is how the fault
+        that matters gets buried.
+        """
+        if (message, tone) == self._last_user_message:
+            return
+        self._last_user_message = (message, tone)
+        crash_log.record(f"{kind} [{tone}] {self._scrub(message)}",
+                         critical=(tone == "offline"))
+
     def _start(self, key: str, fn, action: str, on_ok, on_fail=None) -> bool:
         """Run `fn` off-thread under `key`, skipping if one is in flight.
 
@@ -252,7 +329,7 @@ class Backend(QObject):
         """
         if key in self._workers:
             return False
-        worker = _Worker(fn, action, self)
+        worker = _Worker(fn, action, self, scrub=self._scrub)
         self._workers[key] = worker
         self._running_workers.add(worker)
         self.busyChanged.emit(key, True)
@@ -642,6 +719,15 @@ class Backend(QObject):
 
         def ok(result) -> None:
             found, errors = result
+            # These never pass through notification/logLine -- they reach
+            # the page as a per-account map beside the library -- so this
+            # is the only place they can be kept. An empty-looking scene
+            # library is a failure the user WILL report, and every account
+            # having failed for its own reason is the answer.
+            for label, message in errors.items():
+                crash_log.record(
+                    self._scrub(f"scene library: {label} listed nothing "
+                                f"because {message}"), critical=True)
             self.scenesChanged.emit(json.dumps({
                 "scenes": [_scene_payload(s) for s in found],
                 "errors": errors,
@@ -729,8 +815,17 @@ class Backend(QObject):
         def work() -> dict[str, str]:
             try:
                 client_factory = self.fleet_factory(accounts).client_factory
-            except Exception:
+            except Exception as e:      # noqa: BLE001 -- see below
+                # Swallowed on purpose: quota is decoration, and a fleet
+                # that cannot be built must not stop the page drawing. But
+                # "unavailable" on every card is also exactly what a
+                # REVOKED token looks like, so the reason has to survive
+                # somewhere -- it is the difference between "Kaggle is
+                # rate-limiting you" and "this account is dead".
                 client_factory = None
+                crash_log.record(self._scrub(
+                    "quota refresh: could not build a Fleet at all, so every "
+                    f"account reads 'unavailable'. {type(e).__name__}: {e}"))
             result: dict[str, str] = {}
             for acct in accounts:
                 if client_factory is None:
@@ -740,8 +835,11 @@ class Backend(QObject):
                     q = client_factory(acct.token).quota()
                     result[acct.label] = (f"{q.used_seconds / 3600.0:.1f} / "
                                           f"{q.total_seconds / 3600.0:.1f} h")
-                except Exception:
+                except Exception as e:      # noqa: BLE001 -- see above
                     result[acct.label] = "unavailable"
+                    crash_log.record(self._scrub(
+                        f"quota refresh: {acct.label} reads 'unavailable' "
+                        f"because {type(e).__name__}: {e}"))
             return result
 
         def ok(result: dict) -> None:
@@ -1822,6 +1920,16 @@ class Backend(QObject):
                 # account -- say what happened and leave it at that.
                 self._notify_q.put((
                     f"Could not read {label}'s hardware check: {e}", "warn"))
+                # The sentence above reaches the log too (see
+                # _note_user_message), but only as its friendly half; the
+                # traceback is what distinguishes a dropped connection from
+                # a bug in the parser.
+                crash_log.record(self._scrub(
+                    f"the hardware probe stream for {label} ({kernel_slug}) "
+                    f"failed. {type(e).__name__}: {e}\n"
+                    + "".join(traceback.format_exception(
+                        type(e), e, e.__traceback__))),
+                    critical=True)
 
         thread = threading.Thread(
             target=run, name=f"blendfleet-hwcheck-{label}", daemon=True)
@@ -1859,8 +1967,23 @@ class Backend(QObject):
                         on_system=lambda r: self._system_q.put((label, r)),
                         on_hardware=lambda r: self._hardware_q.put((label, r)),
                         on_preflight=lambda r: self._preflight_q.put((label, r)))
-                except Exception:
-                    pass        # a dead stream must never kill the render
+                except Exception as e:      # noqa: BLE001
+                    # Still swallowed -- a dead stream must never kill the
+                    # render, which keeps going on Kaggle regardless of
+                    # whether anyone is watching it. But this is the exact
+                    # shape of "the progress bar froze at 3/15 and nothing
+                    # said why": from here on that account simply reports
+                    # nothing, forever, and the traceback was the only
+                    # evidence of it. Recorded, not raised.
+                    crash_log.record(self._scrub(
+                        f"the live log stream for {label} "
+                        f"({worker.kernel_slug}) stopped and will not "
+                        "reconnect, so this account's progress and telemetry "
+                        "freeze at whatever they last showed. The render "
+                        f"itself is unaffected. {type(e).__name__}: {e}\n"
+                        + "".join(traceback.format_exception(
+                            type(e), e, e.__traceback__))),
+                        critical=True)
 
             thread = threading.Thread(target=run, daemon=True,
                                       name=f"blendfleet-stream-{worker.label}")

@@ -1084,10 +1084,17 @@ class Fleet:
             already_there = (
                 owner_client.dataset_file_size(dataset_slug, blend.name)
                 == expected_size)
-        except Exception:
+        except Exception as e:      # noqa: BLE001
             # Never a reason to fail: not being able to check just means
-            # uploading, which is what would have happened anyway.
+            # uploading, which is what would have happened anyway. It does
+            # mean re-sending a whole .blend the user may already have on
+            # Kaggle, though, so the reason is worth a line -- "why did it
+            # upload 60 MB again?" is otherwise unanswerable.
             already_there = False
+            crash_log.record(_tokenless(
+                f"share {dataset_slug}: could not check whether "
+                f"{blend.name} is already on Kaggle, so it will be uploaded "
+                f"again. {type(e).__name__}: {e}", self.accounts))
 
         if already_there:
             stage("already-uploaded", dataset_slug)

@@ -622,6 +622,14 @@ def test_a_frame_nobody_was_assigned_says_so(qapp, tmp_path, monkeypatch):
     notes = []
     backend.notification.connect(lambda m, t: notes.append(m))
     backend.previewFrame(99)
+    # Settled BEFORE being dropped from the list, exactly like the two
+    # tests below that do the same thing. Removing it without settling it
+    # leaves a Backend nobody ever calls stop() on, so its 30-second poll
+    # timer keeps firing for the rest of the session -- and a poll that
+    # lands in a LATER test builds a Fleet with redirect_app_dirs no longer
+    # in effect, i.e. writes to the user's REAL fleet.json (caught by
+    # conftest's guard_real_app_dir_untouched).
+    _settle(backend)
     _LIVE_BACKENDS.remove(backend)
     assert notes and "not assigned" in notes[0]
 
@@ -2241,3 +2249,167 @@ def test_a_fully_shared_upload_still_reports_plain_success(qapp, tmp_path):
     _settle(backend)
 
     assert notes[-1] == ("Uploaded scene.blend to me/scene-blend", "active")
+
+
+# ---------------------------------------------------------------------------
+# user-facing failures must reach the diagnostic log
+#
+# A sharing failure was reported from the field and %APPDATA%\BlendFleet\
+# logs had nothing about it at all: the log only ever carried Qt messages
+# and crashes, while this app's own errors lived in a toast that fades.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def diagnostic_log(tmp_path):
+    """A real crash_log for one test, then process-global state back.
+
+    install() rebinds sys.excepthook, threading.excepthook, Qt's message
+    handler and faulthandler's target fd -- the same reasoning (and the
+    same restore) as tests/test_crash_log.py's own fixture.
+    """
+    import faulthandler
+    import sys as _sys
+
+    from blendfleet import crash_log
+
+    saved_excepthook = _sys.excepthook
+    saved_thread_hook = threading.excepthook
+    saved_faulthandler = faulthandler.is_enabled()
+    path = crash_log.install(tmp_path / "logs")
+    yield path
+    crash_log.shutdown()
+    _sys.excepthook = saved_excepthook
+    threading.excepthook = saved_thread_hook
+    from PySide6.QtCore import qInstallMessageHandler
+    qInstallMessageHandler(None)
+    if saved_faulthandler:
+        faulthandler.enable()
+    else:
+        faulthandler.disable()
+
+
+def _log_text(path):
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def test_an_error_notification_is_recorded(qapp, tmp_path, diagnostic_log):
+    backend = make_backend(tmp_path, n=1)
+    backend.notification.emit("Choose a .blend file first.", "offline")
+
+    assert "Choose a .blend file first." in _log_text(diagnostic_log)
+
+
+def test_an_error_tone_is_recorded_prominently(qapp, tmp_path, monkeypatch,
+                                               diagnostic_log):
+    """"offline" is this app's error tone. Those lines have to survive the
+    log's routine-message cap, or the fault gets dropped and the chatter
+    around it kept."""
+    seen = []
+    monkeypatch.setattr(bridge_mod.crash_log, "record",
+                        lambda message, critical=False:
+                        seen.append((message, critical)))
+    backend = make_backend(tmp_path, n=1)
+
+    backend.notification.emit("Kaggle refused the upload.", "offline")
+    backend.logLine.emit("dataset ready: me/scene-blend", "active")
+
+    assert ("notification [offline] Kaggle refused the upload.", True) in seen
+    assert ("log [active] dataset ready: me/scene-blend", False) in seen
+
+
+def test_the_same_message_repeating_does_not_bury_the_log(
+        qapp, tmp_path, diagnostic_log):
+    """The 30-second poll failing while the network is down emits the
+    identical sentence every 30 seconds."""
+    backend = make_backend(tmp_path, n=1)
+    for _ in range(20):
+        backend.notification.emit("lost contact with Kaggle", "offline")
+
+    assert _log_text(diagnostic_log).count("lost contact with Kaggle") == 1
+
+
+def test_a_failed_call_records_the_exception_behind_the_friendly_sentence(
+        qapp, tmp_path, diagnostic_log):
+    """explain() is right for the page and useless for a support request:
+    "Kaggle could not be reached" covers a DNS failure, a 403 and a bug in
+    this app equally well."""
+    backend = make_backend(tmp_path, n=1)
+
+    def work():
+        raise KaggleError("403 Forbidden from ListDatasetFiles")
+
+    backend._start("probe", work, "Uploading the scene", lambda _r: None)
+    _settle(backend)
+
+    body = _log_text(diagnostic_log)
+    assert "KaggleError: 403 Forbidden from ListDatasetFiles" in body
+    assert "Traceback (most recent call last)" in body
+    assert "Uploading the scene" in body
+    assert "notification [offline]" in body, (
+        "the sentence the user actually saw must be in the log too -- it is "
+        "what they will quote back")
+
+
+def test_no_account_token_ever_reaches_the_diagnostic_log(qapp, tmp_path,
+                                                          diagnostic_log):
+    backend = make_backend(tmp_path, n=2)
+    token = backend.store.list()[0].token
+
+    def work():
+        raise KaggleError(f"401 Unauthorized (token={token})")
+
+    backend._start("probe", work, "Checking render status", lambda _r: None)
+    _settle(backend)
+
+    body = _log_text(diagnostic_log)
+    assert "401 Unauthorized" in body
+    assert token not in body, (
+        "a diagnostic log carrying a live token turns a support request "
+        "into a credential rotation")
+    assert token[:9] + "…" in body
+
+
+def test_a_dead_log_stream_leaves_a_trace(qapp, tmp_path, monkeypatch,
+                                          diagnostic_log):
+    """Swallowing this keeps the app alive, correctly -- but it is also
+    exactly what "the progress bar froze at 3/15 and nothing said why"
+    looks like from the outside."""
+    def explode(*a, **kw):
+        raise RuntimeError("ChunkedEncodingError: connection broken")
+
+    monkeypatch.setattr(bridge_mod, "stream_progress", explode)
+    backend = make_backend(tmp_path, n=1)
+    state = FleetState(job_id="j1", blend_name="scene.blend",
+                       start_frame=1, end_frame=4, workers=[
+                           WorkerState(label="acct0", username="user_0",
+                                       kernel_slug="user_0/scene-render-abc",
+                                       frames=[1, 2], state="running")])
+
+    backend._start_streams(state)
+    for thread in backend._stream_threads:
+        thread.join(timeout=5)
+
+    body = _log_text(diagnostic_log)
+    assert "the live log stream for acct0" in body
+    assert "ChunkedEncodingError: connection broken" in body
+    assert "Traceback (most recent call last)" in body
+
+
+def test_an_unavailable_quota_says_why_in_the_log(qapp, tmp_path,
+                                                  diagnostic_log):
+    """"unavailable" on a card is what a rate limit AND a revoked token
+    both look like."""
+    class DeadClient(FakeClient):
+        def quota(self):
+            raise KaggleError("429 Too Many Requests")
+
+    backend = make_backend(tmp_path, n=1)
+    backend.fleet_factory = lambda accounts: Fleet(
+        accounts, lambda t: DeadClient(t), tmp_path / "w")
+
+    backend.refreshQuota()
+    _settle(backend)
+
+    body = _log_text(diagnostic_log)
+    assert "acct0 reads 'unavailable'" in body
+    assert "429 Too Many Requests" in body
