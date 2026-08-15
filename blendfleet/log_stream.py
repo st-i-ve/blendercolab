@@ -6,6 +6,8 @@ kernel completes, so neither can drive a live progress bar.
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import re
 import threading
@@ -79,6 +81,27 @@ HARDWARE_GPU_RE = re.compile(r"^(.+?),\s*(\d+)\s*MiB$")
 # '|'-joined field ("Tesla T4|Tesla T4"), not separate lines to reassemble.
 PREFLIGHT_RE = re.compile(
     r"PREFLIGHT gpus=(\d+) gpu_names=(.*?) cpu=(\d+) ram=([\d.]+)"
+)
+
+# A SMALL JPEG OF A FINISHED FRAME, WHILE THE RENDER IS STILL RUNNING.
+#
+# This module's docstring is the reason this exists: `kernels output`
+# returns nothing until the session ends, so a rendered frame cannot be
+# FETCHED mid-render -- it has to be pushed, and stdout is the only
+# channel out of a live kernel. blendfleet/notebook_builder.py's
+# _emit_thumb prints exactly:
+#   f"THUMB frame={frame} part={i}/{len(parts)} bytes={len(raw)} {part}"
+#
+# CHUNKED, and that is the whole point of the format. Nothing documents
+# how long a single line Kaggle's log capture will carry intact, and a
+# quietly truncated line would base64-decode to a corrupt image that
+# looks like a rendering fault. So: `part=i/n` says how many lines the
+# set has, `bytes=` says how many bytes it must decode to, and
+# ThumbnailAssembler below refuses to emit a set that fails either check.
+# A distinct marker with its own regex, never a widened PROGRESS/
+# TELEMETRY one -- same rule as SYSTEM_RE.
+THUMB_RE = re.compile(
+    r"THUMB frame=(\d+) part=(\d+)/(\d+) bytes=(\d+) ([A-Za-z0-9+/=]*)"
 )
 
 
@@ -237,7 +260,8 @@ def parse_hardware_banner(line: str) -> dict | None:
     if m:
         return {"kind": "cpu_ram", "cpu_count": int(m.group(1)),
                 "ram_total": float(m.group(2))}
-    if PROGRESS_RE.search(data) or TELEMETRY_RE.search(data):
+    if (PROGRESS_RE.search(data) or TELEMETRY_RE.search(data)
+            or THUMB_RE.search(data)):
         return None
     m = HARDWARE_GPU_RE.match(data.strip())
     if not m:
@@ -282,6 +306,96 @@ def parse_preflight(line: str) -> dict | None:
     }
 
 
+def parse_thumbnail_part(line: str) -> dict | None:
+    """Return ONE chunk of a live frame preview from an SSE line, or None.
+
+    Same gate as every other parser here: only a `data:` line whose
+    payload is valid JSON with stream_name == "stdout" is considered.
+
+    A chunk on its own is not a picture -- this returns the piece, and
+    ThumbnailAssembler is what turns a complete set into an image. Keys:
+    frame, part, parts, bytes, data.
+    """
+    if not line.startswith("data:"):
+        return None
+    payload = line[len("data:"):].strip()
+    try:
+        obj = json.loads(payload)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if obj.get("stream_name") != "stdout":
+        return None
+    m = THUMB_RE.search(obj.get("data", ""))
+    if not m:
+        return None
+    part, parts = int(m.group(2)), int(m.group(3))
+    # A set of zero parts, or a part outside its own set, is a mangled
+    # line rather than a preview. Rejected here so the assembler only
+    # ever sees coherent pieces.
+    if parts < 1 or not 1 <= part <= parts:
+        return None
+    return {
+        "frame": int(m.group(1)),
+        "part": part,
+        "parts": parts,
+        "bytes": int(m.group(4)),
+        "data": m.group(5),
+    }
+
+
+class ThumbnailAssembler:
+    """Turns chunked THUMB lines back into one frame's JPEG, or nothing.
+
+    ONE frame is held at a time, deliberately. A render prints its
+    previews strictly in frame order down a single stdout, so the moment a
+    part of frame N+1 arrives, any part of frame N still sitting here is
+    proof that frame N's set will never complete -- it is dropped, not
+    carried forward in the hope the rest turns up. That is also what
+    bounds this: at most one frame's chunks are ever in memory, whether
+    the render is four frames or four hundred.
+
+    `add` returns {"frame", "jpeg_b64", "bytes"} only for a set that is
+    complete AND decodes to exactly the byte count every one of its lines
+    declared. Anything else returns None. HALF A JPEG MUST NEVER BE SHOWN
+    AS THOUGH IT WERE THE FRAME: a clipped preview would read as a
+    rendering fault in a render that is perfectly healthy.
+    """
+
+    def __init__(self) -> None:
+        self._key: tuple[int, int, int] | None = None
+        self._parts: dict[int, str] = {}
+
+    def add(self, part: dict) -> dict | None:
+        key = (part["frame"], part["parts"], part["bytes"])
+        if key != self._key:
+            # Includes the case of the SAME frame re-announced with a
+            # different length -- a retried frame in the fallback path
+            # renders again and its preview may legitimately differ, so
+            # the older, now-unfinishable set goes.
+            self._key = key
+            self._parts = {}
+        self._parts[part["part"]] = part["data"]
+        if len(self._parts) != part["parts"]:
+            return None
+        b64 = "".join(self._parts[i] for i in range(1, part["parts"] + 1))
+        try:
+            raw = base64.b64decode(b64, validate=True)
+        except (binascii.Error, ValueError):
+            # A part survived as text but not as base64: the set is
+            # unusable, and keeping it would only make the next part of
+            # the next frame look like a continuation of this one.
+            self._key = None
+            self._parts = {}
+            return None
+        self._key = None
+        self._parts = {}
+        if len(raw) != part["bytes"]:
+            # Every line agreed on the total, and the pieces do not add up
+            # to it -- so at least one arrived truncated.
+            return None
+        return {"frame": part["frame"], "jpeg_b64": b64, "bytes": len(raw)}
+
+
 def stream_progress(token: str, user_name: str, kernel_slug: str,
                     on_progress: Callable[[int, int], None],
                     stop_event: threading.Event | None = None,
@@ -289,6 +403,7 @@ def stream_progress(token: str, user_name: str, kernel_slug: str,
                     on_hardware: Callable[[dict], None] | None = None,
                     on_preflight: Callable[[dict], None] | None = None,
                     on_system: Callable[[dict], None] | None = None,
+                    on_thumbnail: Callable[[dict], None] | None = None,
                     max_reconnects: int = 5,
                     sleep: Callable[[float], None] = time.sleep) -> None:
     """Block, calling on_progress(done, total) as lines arrive.
@@ -311,6 +426,14 @@ def stream_progress(token: str, user_name: str, kernel_slug: str,
     the next cell even starts downloading Blender. This is how a caller
     finds out real hardware within seconds of the kernel starting, not
     only once telemetry/the hardware banner arrive later.
+
+    `on_thumbnail`, if given, is called with {"frame", "jpeg_b64",
+    "bytes"} once every chunk of one frame's live preview has arrived and
+    the pieces decode to the byte count they declared -- see
+    ThumbnailAssembler. It is NOT called for an incomplete or truncated
+    set: nothing at all is better than a corrupt image that reads as a
+    broken render. This is the only way to see a frame before a session
+    ends, because Kaggle releases a kernel's output only once it has.
 
     The token is passed to KaggleClient explicitly and NEVER through
     os.environ: the dashboard starts one of these threads per account
@@ -341,6 +464,13 @@ def stream_progress(token: str, user_name: str, kernel_slug: str,
     # TELEMETRY from briefly showing a GPU's state from five minutes ago.
     seen_lines = 0
     attempt = 0
+    # One per call, and deliberately OUTSIDE the reconnect loop: a stream
+    # that drops halfway through a frame's chunks reconnects and replays
+    # from the top, and seen_lines makes the replayed parts invisible --
+    # so the half-set left here would never complete. Holding it across
+    # reconnects lets the NEXT frame's first part discard it, which is
+    # exactly the behaviour the assembler is built around.
+    thumbnails = ThumbnailAssembler()
 
     while True:
         if stop_event is not None and stop_event.is_set():
@@ -407,6 +537,13 @@ def stream_progress(token: str, user_name: str, kernel_slug: str,
                     sys_record = parse_system(raw)
                     if sys_record:
                         on_system(sys_record)
+                        continue
+                if on_thumbnail is not None:
+                    chunk = parse_thumbnail_part(raw)
+                    if chunk:
+                        whole = thumbnails.add(chunk)
+                        if whole:
+                            on_thumbnail(whole)
                         continue
                 if on_preflight is not None:
                     pf_record = parse_preflight(raw)
