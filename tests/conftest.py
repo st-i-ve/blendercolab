@@ -38,12 +38,25 @@ billing someone's GPU quota, become uncancellable and uncollectable from
 the app the moment that file no longer names them). `redirect_app_dirs`
 fixes the cause; `guard_real_app_dir_untouched` fails the whole session,
 loudly, if any test -- this one or a future one -- ever does it again.
+
+That guard then produced its own real bug: it cannot distinguish "a test
+wrote here" from "the user's own BlendFleet app wrote here", and the app
+legitimately rewrites state/fleet.json and state/instance_state.json
+every 30s while it runs. Whenever the user had the app open while running
+this suite -- exactly when someone is testing a build -- the guard failed
+and blamed the tests: three false failures in one working session, each
+one investigated as if it were real, before this fixture learned to check
+for a live BlendFleet process first and only fail outright when none is
+running.
 """
 from __future__ import annotations
 
 import socket
+import subprocess
+import sys
 import threading
 import time
+import warnings
 
 import pytest
 from PySide6.QtWidgets import QMessageBox
@@ -301,11 +314,129 @@ def _snapshot_real_app_dir():
     return snapshot
 
 
+def _diff_snapshot(before: dict, after: dict) -> list[str]:
+    """Paths whose (size, mtime_ns) differ between two
+    _snapshot_real_app_dir() calls, or that only exist on one side --
+    sorted so the failure/warning message below is stable and readable
+    instead of dict-iteration-order soup.
+    """
+    return sorted(p for p in before.keys() | after.keys()
+                  if before.get(p) != after.get(p))
+
+
+# Process names the PACKAGED build runs under (see dist/blendfleetweb/).
+# Deliberately narrow: matching every python.exe on the box would turn a
+# guard meant to name a specific innocent writer into one that excuses
+# anything, which is just a slower way of deleting it. A dev-mode run via
+# `python -m blendfleet.web_main` will NOT be detected by this and will
+# still be (correctly) treated as "no app running" below -- documented
+# gap, not silently assumed away.
+_APP_PROCESS_NAMES = ("blendfleetweb.exe", "blendfleetweb")
+
+
+def _blendfleet_app_is_running() -> bool:
+    """Best-effort: is the packaged BlendFleet app alive right now?
+
+    Exists because this guard cannot otherwise tell "a test wrote to the
+    real app dir" from "the user's own running app did", and the second
+    one is not a bug -- BlendFleet polls Kaggle every 30s and rewrites
+    state/fleet.json, state/instance_state.json and cache/work/... as it
+    goes. Verified live on 2026-08-15: fleet.json's mtime advanced while
+    blendfleetweb.exe was the only relevant process running and no test
+    had touched it -- that is the false positive this function exists to
+    catch, not a hole to patch over the real one.
+
+    A missed detection (app running but not found here, e.g. dev-mode)
+    just makes the guard fail loudly instead of warn -- the safe
+    direction, since the caller can then check by hand. Any exception
+    finding processes (tasklist/ps missing, permissions, ...) is treated
+    the same way: assume no app, let the real check run.
+    """
+    try:
+        if sys.platform == "win32":
+            out = subprocess.run(
+                ["tasklist", "/fo", "csv", "/nh"],
+                capture_output=True, text=True, timeout=5, check=False,
+            ).stdout
+        else:
+            out = subprocess.run(
+                ["ps", "-eo", "comm"],
+                capture_output=True, text=True, timeout=5, check=False,
+            ).stdout
+    except Exception:
+        return False
+    out_lower = out.lower()
+    return any(name.lower() in out_lower for name in _APP_PROCESS_NAMES)
+
+
+def _evaluate_real_app_dir_snapshots(before: dict, after: dict, *,
+                                      app_running: bool, base) -> None:
+    """The guard's actual verdict, pulled out of the fixture so it can be
+    exercised directly with synthetic snapshots and a forced app_running
+    value -- proving both branches without ever touching, or needing to
+    kill, the real %APPDATA%\\BlendFleet directory or the user's live app.
+
+    Same assertion either way (`after == before`); the only question this
+    function answers is whether a mismatch is reported as a WARNING (a
+    live app is the plausible writer) or a hard failure (nothing is
+    running, so a test is the only remaining explanation).
+    """
+    if after == before:
+        return
+
+    changed = "\n  ".join(_diff_snapshot(before, after))
+
+    if app_running:
+        warnings.warn(
+            "guard_real_app_dir_untouched: the REAL BlendFleet config/state "
+            f"directory ({base}) changed during this test session, but a "
+            "live blendfleetweb process was found running. This is almost "
+            "certainly that app's own 30s Kaggle poll loop rewriting "
+            "fleet.json / instance_state.json / cache files under you, "
+            "NOT a test -- this exact situation produced 3 false failures "
+            "in one working session before this check existed. Changed "
+            f"path(s):\n  {changed}\n"
+            "How to tell this apart from a real test bug: close BlendFleet "
+            "completely and re-run `pytest tests/ -q`. If the real "
+            "directory is then untouched, the app was the writer and this "
+            "warning was correct. If changed paths are STILL reported with "
+            "no BlendFleet process running, that is a genuine regression "
+            "-- treat it exactly as the hard failure below would.",
+            stacklevel=2)
+        return
+
+    assert after == before, (
+        "a test just wrote to the REAL BlendFleet config/state directory "
+        f"({base}) instead of a redirected tmp path. No BlendFleet app "
+        "process was found running, which rules out the known false "
+        "positive (a live app's own 30s poll loop rewriting its own state "
+        "-- see this fixture's WARNING path for that case) and leaves a "
+        "test as the only explanation. Changed path(s):\n"
+        f"  {changed}\n"
+        "This is the exact defect that once overwrote the user's only "
+        "record of which Kaggle kernels were actually running with a "
+        "synthetic test job. Find whichever test constructed a "
+        "Fleet/Settings/AccountStore/InstanceStore/Backend without "
+        "redirect_app_dirs in effect for it (e.g. via a session- or "
+        "module-scoped fixture that runs before autouse function-scoped "
+        "fixtures do) and make it go through the normal per-test tmp_path "
+        "instead. Do NOT clear this failure by deleting or overwriting "
+        "the real files it points at -- back them up first, the same way "
+        "the previous occurrence was recovered (see "
+        ".superpowers/sdd/2026-08-12-scene-library-and-multi-scene/"
+        "state-isolation-report.md).")
+
+
 @pytest.fixture(scope="session", autouse=True)
 def guard_real_app_dir_untouched():
     """Fail the whole session, loudly, if any test -- this one or a future
     one that forgets redirect_app_dirs applies to it -- wrote to the real
-    BlendFleet config/state directory.
+    BlendFleet config/state directory. Downgrades to a named WARNING
+    instead of failing when a live BlendFleet process is found, since then
+    the app itself (polling Kaggle every 30s and rewriting its own state
+    files) is the far more likely writer than a test -- see
+    _evaluate_real_app_dir_snapshots and _blendfleet_app_is_running above
+    for the mechanics and their limits.
 
     Session-scoped so its setup runs before the first test's function-
     scoped fixtures (redirect_app_dirs included) and its teardown runs
@@ -315,18 +446,7 @@ def guard_real_app_dir_untouched():
     before = _snapshot_real_app_dir()
     yield
     after = _snapshot_real_app_dir()
-    assert after == before, (
-        "a test just wrote to the REAL BlendFleet config/state directory "
-        f"({platform_paths_mod.config_dir()}) instead of a redirected "
-        "tmp path -- this is the exact defect that once overwrote the "
-        "user's only record of which Kaggle kernels were actually "
-        "running with a synthetic test job. Find whichever test "
-        "constructed a Fleet/Settings/AccountStore/InstanceStore/Backend "
-        "without redirect_app_dirs in effect for it (e.g. via a session- "
-        "or module-scoped fixture that runs before autouse function-"
-        "scoped fixtures do) and make it go through the normal per-test "
-        "tmp_path instead. Do NOT clear this failure by deleting or "
-        "overwriting the real files it points at -- back them up first, "
-        "the same way the previous occurrence was recovered (see "
-        ".superpowers/sdd/2026-08-12-scene-library-and-multi-scene/"
-        "state-isolation-report.md).")
+    _evaluate_real_app_dir_snapshots(
+        before, after,
+        app_running=_blendfleet_app_is_running(),
+        base=platform_paths_mod.config_dir())
