@@ -1654,6 +1654,63 @@ def test_a_live_frame_count_is_never_labelled_saved(card):
 
 
 # ---------------------------------------------------------------------------
+# Reopening the app on a render that has ALREADY FINISHED.
+#
+# The follow-up report: "everything is stuck". A card whose session had
+# ended kept whatever the log stream last said -- and after a restart the
+# stream REPLAYS a finished kernel's whole log, so it rebuilt "rendering ·
+# 6/6 frames" and a set of GPU bars for a machine that no longer existed.
+# The backend now drops those readings once the worker has finished
+# (Backend._live_payload); the card has to say what did happen instead.
+# ---------------------------------------------------------------------------
+
+FINISHED_INSTANCE = """({
+  label:'acct0', username:'acct0', verified:true, quota:'2.0 / 30.0 h',
+  worker:{ state:'complete', frames:[1,2,3,4], framesDone:4,
+           framesDoneAge:60, message:'', elapsed:320, finished:true },
+  hardware:null, reconnecting:false,
+  live:{ phase:'', framesDone:4, framesTotal:4, gpus:[], cpuCount:4,
+         ramTotal:31.3, ramUsed:null, cpuPct:null, preflight:null,
+         thumb:null }
+})"""
+
+
+def test_a_finished_card_says_finished_rather_than_reconnecting(card):
+    html = card(FINISHED_INSTANCE)
+    assert "render finished" in html
+    assert "finished in 5:20" in html
+    assert "reconnecting" not in html
+    assert "rendering ·" not in html
+
+
+def test_a_finished_card_says_the_frames_are_collectable(card):
+    """The one thing left to do. The frames sit on Kaggle until they are
+    collected, and a card that only says "done" does not say that."""
+    html = card(FINISHED_INSTANCE)
+    assert "4 of 4 frames are waiting on Kaggle" in html
+    assert "Collect frames" in html
+
+
+def test_a_finished_card_shows_no_live_gpu_rows(card):
+    """A GPU load bar for a session that has ended is a reading nobody
+    took."""
+    html = card(FINISHED_INSTANCE)
+    assert "GPU 0" not in html
+    assert "System RAM" not in html
+
+
+def test_a_render_that_stopped_early_is_not_called_finished(card):
+    """"complete" and "error" are different outcomes and the card must not
+    round one into the other -- but the frames it did manage are still
+    collectable."""
+    stopped = FINISHED_INSTANCE.replace("state:'complete'", "state:'error'")
+    html = card(stopped)
+    assert "stopped before finishing" in html
+    assert "render finished" not in html
+    assert "Collect frames" in html
+
+
+# ---------------------------------------------------------------------------
 # Live frame previews, mid-render.
 #
 # "the preview works after all the renders are complete, can we make it

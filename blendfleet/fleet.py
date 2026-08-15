@@ -699,6 +699,17 @@ class Fleet:
         # this is a report for the caller to surface, not an error.
         # Overwritten (not accumulated) on every prepare_dataset() call.
         self.unshared_accounts: dict[str, str] = {}
+        # label -> why, for every worker the last poll_all() could not get
+        # a status for. poll_all() is deliberately tolerant per worker (see
+        # its own docstring): one blip must not abort the rest. But that
+        # tolerance leaves the worker's state exactly as it was, and a
+        # CALLER cannot otherwise tell "Kaggle says this is still running"
+        # apart from "Kaggle was never asked" -- which is the difference
+        # between a fact and a stale file. Reported here so a caller that
+        # cares (the startup check, which decides whether to reconnect a
+        # log stream) can say the view may be out of date instead of
+        # presenting it as current. Reset on every poll_all().
+        self.unreachable_workers: dict[str, str] = {}
 
     def _state_path(self) -> Path:
         return state_dir() / STATE_FILE
@@ -2155,6 +2166,10 @@ class Fleet:
         (an unreachable worker LOCKS its account) if a revoked token were
         left inside it.
         """
+        # Cleared before anything is asked, so this never carries an answer
+        # from a previous call into this one: a worker that failed last
+        # time and succeeded now must not still read as unreachable.
+        self.unreachable_workers = {}
         jobs = self.load_jobs()
         if not jobs:
             return jobs
@@ -2163,6 +2178,14 @@ class Fleet:
             for w in st.workers:
                 acct = by_label.get(w.label)
                 if acct is None:
+                    # No token, so this worker cannot be asked about at all
+                    # -- reported for the same reason as the tolerant
+                    # branch below: its state on disk is whatever it was
+                    # when the account still existed, and a caller must be
+                    # able to tell that apart from a fresh reading.
+                    self.unreachable_workers[w.label] = (
+                        "no account with this label is configured any more, "
+                        "so there is no token to ask Kaggle with")
                     continue
                 try:
                     s = self.client_factory(acct.token).status(w.kernel_slug)
@@ -2209,7 +2232,15 @@ class Fleet:
                     if not w.finished_at:
                         w.finished_at = time.time()
                     continue
-                except Exception:
+                except Exception as e:      # noqa: BLE001 -- see below
+                    # Recorded before being swallowed: leaving the state
+                    # untouched is right, but it makes a worker nobody
+                    # could ask about look exactly like one Kaggle
+                    # confirmed is still running, and the startup check
+                    # has to be able to tell those apart before it decides
+                    # whether to reconnect a log stream. See
+                    # self.unreachable_workers.
+                    self.unreachable_workers[w.label] = f"{type(e).__name__}: {e}"
                     # One worker's status check failing for any OTHER
                     # reason (network blip, rate limit) must not abort
                     # refreshing every OTHER worker in every OTHER job --

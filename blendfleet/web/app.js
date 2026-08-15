@@ -509,7 +509,31 @@ function instanceCard(inst) {
      -- and a card that simply sat blank there was read as a stuck render
      and is the whole reason this text exists. It says what is happening,
      why there is nothing to show yet, and that there is nothing to do. */
-  const phase = live && live.phase
+  /* A session that has ENDED, said as an ending. Checked BEFORE the live
+     phase and before `reconnecting`, both of which describe a session that
+     is still going: a finished worker whose replayed log left "rendering ·
+     15/15 frames" behind was the "everything is stuck" report -- a card
+     that had, in fact, finished hours ago and said so nowhere. The payload
+     no longer carries those readings once finished_at is stamped (see
+     Backend._live_payload), so this is what the card falls to, and it has
+     to name the state, the time it took, and the one thing left to do:
+     the frames are still on Kaggle until they are collected. */
+  const endedFoot = worker && worker.finished
+    ? `<div class="inst-foot"><b>${
+        worker.state === 'complete' ? 'render finished'
+        : worker.state === 'error' ? 'stopped before finishing'
+        : 'stopped'}</b>${elapsed}<span class="sub">${
+        worker.state === 'complete'
+          ? `${done} of ${total} frames are waiting on Kaggle — “Collect`
+            + ` frames…” above downloads them.`
+          : `Any frames it did finish are still on Kaggle — “Collect frames…”`
+            + ` above will fetch them.`
+      }</span></div>`
+    : '';
+
+  const phase = endedFoot
+    ? endedFoot
+    : live && live.phase
     ? `<div class="inst-foot"><b>${esc(live.phase)}</b>${elapsed}</div>`
     : inst.reconnecting
       ? `<div class="inst-foot"><b>reconnecting — replaying this session's`

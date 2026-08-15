@@ -447,6 +447,35 @@ def test_one_jobs_broken_status_check_does_not_abort_polling_the_others(fleet):
     # Persisted, not just returned in memory.
     reloaded = fleet.load_jobs()
     assert reloaded[1].workers[0].state == "complete"
+    # ...and the caller can tell WHICH of those two "queued" answers was
+    # Kaggle's and which was nobody's. Left alone is right; presenting it
+    # as a fresh reading is not.
+    assert "network blip" in fleet.unreachable_workers["a0"]
+    assert "a1" not in fleet.unreachable_workers
+
+
+def test_a_worker_kaggle_answered_for_is_not_reported_unreachable(fleet):
+    """unreachable_workers is per-CALL, never accumulated: a worker that
+    failed one poll and answered the next must not still read as
+    unreachable, or the startup check would keep saying the view may be
+    stale long after it stopped being true."""
+    failing = {"yes": True}
+
+    class Client:
+        def __init__(self, token): self.token = token
+        def status(self, slug):
+            if failing["yes"]:
+                raise RuntimeError("network blip")
+            from blendfleet.kaggle_client import KernelStatus
+            return KernelStatus(state="running")
+    fleet.client_factory = Client
+    fleet.save_jobs([job("alpha", ["a0"], "j1")])
+
+    fleet.poll_all()
+    assert "a0" in fleet.unreachable_workers
+    failing["yes"] = False
+    fleet.poll_all()
+    assert fleet.unreachable_workers == {}
 
 
 def test_an_unparseable_state_file_is_preserved_through_a_save_jobs_round_trip(

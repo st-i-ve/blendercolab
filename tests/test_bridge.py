@@ -18,7 +18,8 @@ from PySide6.QtWidgets import QApplication, QFileDialog
 from blendfleet.accounts import Account, AccountStore
 from blendfleet.fleet import Fleet, FleetState, WorkerState
 from blendfleet.instance_state import GpuSnapshot, InstanceSnapshot
-from blendfleet.kaggle_client import DatasetInfo, KaggleError, Quota
+from blendfleet.kaggle_client import (DatasetInfo, KaggleError, KernelStatus,
+                                      Quota)
 from blendfleet.settings import Settings
 from blendfleet.ui import bridge as bridge_mod
 from blendfleet.ui.bridge import Backend
@@ -2454,9 +2455,43 @@ class _StubStream:
             thread.join(timeout=5)
 
 
+class _KaggleSaysClient(FakeClient):
+    """A Kaggle that answers the startup status check with a fixed state.
+
+    FakeClient has no status() at all, which poll_all() treats as one more
+    unreachable worker -- correct, and exactly what the "Kaggle could not
+    be asked" tests want, but useless for the cases that need Kaggle to
+    actually answer.
+    """
+
+    def __init__(self, token, state="running", error=None):
+        super().__init__(token)
+        self._state = state
+        self._error = error
+
+    def status(self, slug):
+        if self._error is not None:
+            raise self._error
+        return KernelStatus(self._state, "")
+
+
+# "not given", distinct from kaggle_says=None ("Kaggle cannot be reached").
+_UNSET = object()
+
+
 def _running_job_backend(tmp_path, state="running", frames_done=0,
-                         frames_done_at=0.0, n=2):
-    """One tracked job already on disk, as a restarted app would find it."""
+                         frames_done_at=0.0, n=2, kaggle_says=_UNSET,
+                         status_error=None):
+    """One tracked job already on disk, as a restarted app would find it.
+
+    `kaggle_says` is what the startup check's poll gets back, which is a
+    DIFFERENT question from `state` (what the file on disk says) -- the
+    whole point of that check is that the two can disagree after the app
+    has been shut for a while. It defaults to agreeing with the file, so a
+    test that does not care reads as "nothing changed while it was closed".
+    Pass `kaggle_says=None` to leave the fleet using FakeClient, i.e. a
+    Kaggle that cannot be reached at all.
+    """
     backend = make_backend(tmp_path, n=n)
     fleet = backend.fleet_factory(backend.store.list())
     fleet.save_jobs([FleetState(
@@ -2465,8 +2500,39 @@ def _running_job_backend(tmp_path, state="running", frames_done=0,
                              kernel_slug="user_0/scene-render-1",
                              frames=[1, 2, 3, 4, 5, 6], state=state,
                              frames_done=frames_done,
-                             frames_done_at=frames_done_at)])])
+                             frames_done_at=frames_done_at,
+                             started_at=time.time() - 900)])])
+    if kaggle_says is _UNSET:
+        kaggle_says = state
+    if kaggle_says is not None or status_error is not None:
+        backend.fleet_factory = lambda accounts: Fleet(
+            accounts,
+            lambda t: _KaggleSaysClient(t, kaggle_says, status_error),
+            tmp_path / "w")
     return backend
+
+
+def _ready(backend):
+    """backend.ready(), including the Kaggle check it now runs off-thread.
+
+    ready() no longer resumes anything on the spot: it asks Kaggle what is
+    still running first, on a worker thread, and only then decides. Tests
+    have to let that round trip finish, which means pumping the loop --
+    the succeeded/failed connections are queued across threads.
+    """
+    backend.ready()
+    worker = backend._workers.get("startupCheck")
+    if worker is not None:
+        worker.wait(5000)
+    for _ in range(30):
+        QApplication.processEvents()
+
+
+def _collect_notifications(backend):
+    """Every (message, tone) the backend emits from here on."""
+    seen = []
+    backend.notification.connect(lambda m, t: seen.append((m, t)))
+    return seen
 
 
 def test_a_render_still_running_gets_its_stream_back_when_the_app_reopens(
@@ -2478,7 +2544,7 @@ def test_a_render_still_running_gets_its_stream_back_when_the_app_reopens(
     monkeypatch.setattr(bridge_mod, "stream_progress", stub)
     backend = _running_job_backend(tmp_path)
 
-    backend.ready()
+    _ready(backend)
     assert stub.started.wait(5), "no stream was started for a running render"
     stub.release(backend)
 
@@ -2494,7 +2560,7 @@ def test_a_worker_kaggle_has_not_started_yet_is_still_resumed(
     monkeypatch.setattr(bridge_mod, "stream_progress", stub)
     backend = _running_job_backend(tmp_path, state="not_started")
 
-    backend.ready()
+    _ready(backend)
     assert stub.started.wait(5)
     stub.release(backend)
 
@@ -2509,7 +2575,7 @@ def test_a_finished_render_is_never_re_streamed(qapp, tmp_path, monkeypatch,
     monkeypatch.setattr(bridge_mod, "stream_progress", stub)
     backend = _running_job_backend(tmp_path, state=state)
 
-    backend.ready()
+    _ready(backend)
 
     assert not stub.started.is_set()
     assert backend._stream_threads == []
@@ -2524,9 +2590,9 @@ def test_a_worker_already_being_streamed_does_not_get_a_second_stream(
     monkeypatch.setattr(bridge_mod, "stream_progress", stub)
     backend = _running_job_backend(tmp_path)
 
-    backend.ready()
+    _ready(backend)
     assert stub.started.wait(5)
-    backend.ready()                     # a second connect, or a page reload
+    _ready(backend)                     # a second connect, or a page reload
     backend._resume_streams()           # and the resume itself, again
     stub.release(backend)
 
@@ -2544,7 +2610,7 @@ def test_a_reconnecting_card_says_so_and_does_not_claim_a_live_reading(
     backend = _running_job_backend(tmp_path, frames_done=4,
                                    frames_done_at=time.time() - 600)
 
-    backend.ready()
+    _ready(backend)
     assert stub.started.wait(5)
     instance = json.loads(backend.state())["instances"][0]
     stub.release(backend)
@@ -2563,7 +2629,7 @@ def test_reconnecting_stops_the_moment_the_stream_reports(
     monkeypatch.setattr(bridge_mod, "stream_progress", stub)
     backend = _running_job_backend(tmp_path, frames_done=4)
 
-    backend.ready()
+    _ready(backend)
     assert stub.started.wait(5)
     backend._progress_q.put(("acct0", 5, 6))
     backend._live_tick()
@@ -2589,6 +2655,268 @@ def test_an_account_with_no_stream_is_not_reported_as_reconnecting(
     by_label = {i["label"]: i
                 for i in json.loads(backend.state())["instances"]}
     assert by_label["acct1"]["reconnecting"] is False
+
+
+# ---------------------------------------------------------------------------
+# Reopening the app AFTER the renders have already finished.
+#
+# Reported from the field: "Reconnecting to 5 render(s) still running on
+# Kaggle ... but still everything is stuck". They were not still running.
+# ready() resumed streams straight from the state FILE, which holds whatever
+# was true when the app last closed -- nothing had asked Kaggle since. So
+# five finished kernels each got an SSE stream that had no progress left to
+# send, the app announced five renders that did not exist, and the cards sat
+# there. The check below is the fix: ask first, then decide, then say what
+# was actually found.
+# ---------------------------------------------------------------------------
+
+def test_a_render_that_finished_while_the_app_was_closed_gets_no_stream(
+        qapp, tmp_path, monkeypatch):
+    """The file says running; Kaggle says complete. Kaggle wins -- opening a
+    stream on a finished kernel replays a log that can never advance."""
+    stub = _StubStream()
+    monkeypatch.setattr(bridge_mod, "stream_progress", stub)
+    backend = _running_job_backend(tmp_path, state="running",
+                                   kaggle_says="complete")
+
+    _ready(backend)
+
+    assert not stub.started.is_set(), "a finished kernel was streamed anyway"
+    assert backend._stream_threads == []
+
+
+def test_a_render_that_finished_while_closed_shows_as_finished_not_reconnecting(
+        qapp, tmp_path, monkeypatch):
+    """The card the user was actually looking at. Once the check has run,
+    it must carry the finished state, the time it took, and the frame
+    count -- not a reconnection that is never coming."""
+    stub = _StubStream()
+    monkeypatch.setattr(bridge_mod, "stream_progress", stub)
+    backend = _running_job_backend(tmp_path, state="running", frames_done=6,
+                                   kaggle_says="complete")
+
+    _ready(backend)
+    instance = json.loads(backend.state())["instances"][0]
+
+    assert instance["worker"]["state"] == "complete"
+    assert instance["worker"]["finished"] is True
+    assert instance["worker"]["elapsed"] > 0
+    assert instance["worker"]["framesDone"] == 6
+    assert instance["reconnecting"] is False
+
+
+def test_a_render_that_finished_while_closed_says_where_the_frames_are(
+        qapp, tmp_path, monkeypatch):
+    """Someone reopening the app needs the useful fact, not just "done":
+    the frames are still sitting on Kaggle until they are collected."""
+    stub = _StubStream()
+    monkeypatch.setattr(bridge_mod, "stream_progress", stub)
+    backend = _running_job_backend(tmp_path, state="running",
+                                   kaggle_says="complete")
+    seen = _collect_notifications(backend)
+
+    _ready(backend)
+
+    answers = [m for m, _t in seen if "have finished" in m]
+    assert answers, f"nothing said the renders had finished: {seen}"
+    assert "acct0" in answers[-1]
+    assert "Collect frames" in answers[-1]
+    assert "still running" not in answers[-1]
+
+
+def test_a_render_kaggle_confirms_is_running_is_streamed_and_announced(
+        qapp, tmp_path, monkeypatch):
+    stub = _StubStream()
+    monkeypatch.setattr(bridge_mod, "stream_progress", stub)
+    backend = _running_job_backend(tmp_path, state="running",
+                                   kaggle_says="running")
+    seen = _collect_notifications(backend)
+
+    _ready(backend)
+    assert stub.started.wait(5)
+    stub.release(backend)
+
+    answers = [m for m, _t in seen if "still running" in m]
+    assert answers, f"the resume was never announced: {seen}"
+    assert "Kaggle says 1 render(s) are still running (acct0)" in answers[-1]
+
+
+def test_a_mixed_fleet_is_reported_as_both(qapp, tmp_path, monkeypatch):
+    """Some finished overnight and some did not. One sentence has to be
+    true of both halves, and neither half may be rounded into the other."""
+    stub = _StubStream()
+    monkeypatch.setattr(bridge_mod, "stream_progress", stub)
+    backend = make_backend(tmp_path, n=2)
+    fleet = backend.fleet_factory(backend.store.list())
+    fleet.save_jobs([FleetState(
+        job_id="job-1", blend_name="scene.blend", start_frame=1, end_frame=6,
+        workers=[WorkerState(label="acct0", username="user_0",
+                             kernel_slug="user_0/k0", frames=[1, 2, 3],
+                             state="running", started_at=time.time() - 900),
+                 WorkerState(label="acct1", username="user_1",
+                             kernel_slug="user_1/k1", frames=[4, 5, 6],
+                             state="running",
+                             started_at=time.time() - 900)])])
+
+    # acct0 is done, acct1 is still going.
+    def client(token):
+        done = token.endswith("0" * 32)
+        return _KaggleSaysClient(token, "complete" if done else "running")
+    backend.fleet_factory = lambda accounts: Fleet(accounts, client,
+                                                   tmp_path / "w")
+    seen = _collect_notifications(backend)
+
+    _ready(backend)
+    assert stub.started.wait(5)
+    stub.release(backend)
+
+    answer = [m for m, _t in seen if "Checking with Kaggle" not in m][-1]
+    assert "still running (acct1)" in answer
+    assert "have finished (acct0)" in answer
+    assert "All 1 render(s)" not in answer, (
+        "'all' is only true when nothing is still going")
+    assert stub.calls == [("KGAT_" + "1".rjust(32, "0"), "user_1", "k1")]
+
+
+def test_the_startup_check_says_what_it_is_doing_before_it_answers(
+        qapp, tmp_path, monkeypatch):
+    """The check costs a network call per account. Saying nothing until it
+    returns is how a fleet of stale cards reads as a stuck app."""
+    stub = _StubStream()
+    monkeypatch.setattr(bridge_mod, "stream_progress", stub)
+    backend = _running_job_backend(tmp_path)
+    seen = _collect_notifications(backend)
+
+    backend.ready()
+    assert seen, "nothing was said while the check was in flight"
+    assert "Checking with Kaggle" in seen[0][0]
+    assert "may be out of date" in seen[0][0]
+
+    _ready(backend)
+    stub.release(backend)
+
+
+def test_an_unreachable_kaggle_says_the_view_may_be_stale(
+        qapp, tmp_path, monkeypatch):
+    """Never silently present the state file as current. If the check
+    failed, the app says so and says what that means."""
+    stub = _StubStream()
+    monkeypatch.setattr(bridge_mod, "stream_progress", stub)
+    backend = _running_job_backend(
+        tmp_path, state="running",
+        status_error=KaggleError("503 Service Unavailable"))
+    seen = _collect_notifications(backend)
+
+    _ready(backend)
+
+    answers = [(m, t) for m, t in seen if "could not be asked" in m]
+    assert answers, f"an unreachable Kaggle was never reported: {seen}"
+    message, tone = answers[-1]
+    assert "503 Service Unavailable" in message
+    assert "may be out of date" in message
+    assert tone == "offline"
+
+
+def test_an_unreachable_kaggle_opens_no_stream(qapp, tmp_path, monkeypatch):
+    """A worker nobody could ask about is not a worker known to be running.
+    Streaming it is how the app ends up claiming a live reading it does not
+    have."""
+    stub = _StubStream()
+    monkeypatch.setattr(bridge_mod, "stream_progress", stub)
+    backend = _running_job_backend(
+        tmp_path, state="running",
+        status_error=KaggleError("503 Service Unavailable"))
+
+    _ready(backend)
+
+    assert not stub.started.is_set()
+    assert json.loads(backend.state())["instances"][0]["reconnecting"] is False
+
+
+def test_nothing_pending_asks_kaggle_nothing_and_says_nothing(
+        qapp, tmp_path, monkeypatch):
+    """A fleet whose jobs were all finished before the app closed has
+    nothing to check -- and a startup toast about it would be noise."""
+    stub = _StubStream()
+    monkeypatch.setattr(bridge_mod, "stream_progress", stub)
+    backend = _running_job_backend(tmp_path, state="complete")
+    seen = _collect_notifications(backend)
+
+    _ready(backend)
+
+    assert seen == []
+    assert not stub.started.is_set()
+
+
+def test_the_reconnecting_flag_clears_when_the_stream_thread_ends(
+        qapp, tmp_path, monkeypatch):
+    """A stream that ended without ever reporting -- a replayed log that hit
+    END_OF_LOG, or a connection that gave up -- must not leave the card
+    promising a reconnection that is never coming."""
+    stub = _StubStream()
+    monkeypatch.setattr(bridge_mod, "stream_progress", stub)
+    backend = _running_job_backend(tmp_path)
+
+    _ready(backend)
+    assert stub.started.wait(5)
+    assert json.loads(backend.state())["instances"][0]["reconnecting"] is True
+
+    stub.release(backend)       # the stream thread returns
+
+    assert json.loads(backend.state())["instances"][0]["reconnecting"] is False
+
+
+def test_a_finished_workers_replayed_readings_are_not_shown_as_live(
+        qapp, tmp_path):
+    """The other half of "everything is stuck". `_live` is only ever cleared
+    by a new launch, so a session that ended left its last phase and GPU
+    bars on the card for ever -- and a resumed stream REPLAYS a finished
+    kernel's whole log, rebuilding them from scratch. They describe a
+    machine that no longer exists."""
+    backend = _running_job_backend(tmp_path, state="complete")
+    fleet = backend.fleet_factory(backend.store.list())
+    jobs = fleet.load_jobs()
+    jobs[0].workers[0].finished_at = time.time()
+    fleet.save_jobs(jobs)
+    slot = backend._slot("acct0")
+    slot["phase"] = "rendering · 6/6 frames"
+    slot["framesDone"], slot["framesTotal"] = 6, 6
+    slot["gpus"][0] = {"index": 0, "util": 91, "memUsed": 4096,
+                       "memTotal": 15360}
+    slot["ramUsed"] = 8 * 1024 ** 3
+    slot["cpuPct"] = 70
+
+    live = json.loads(backend.state())["instances"][0]["live"]
+
+    assert live["phase"] == ""
+    assert live["gpus"] == []
+    assert live["ramUsed"] is None
+    assert live["cpuPct"] is None
+    # What the session really did is still a fact about it, and is kept.
+    assert live["framesDone"] == 6
+
+
+def test_the_thirty_second_poll_turns_a_stale_running_card_into_a_finished_one(
+        qapp, tmp_path):
+    """The routine poll already corrected the state FILE. Nothing carried
+    that through to the card, because the replayed live phase outranked it
+    -- the same bug in a different hat."""
+    backend = _running_job_backend(tmp_path, state="running",
+                                   kaggle_says="complete")
+    slot = backend._slot("acct0")
+    slot["phase"] = "rendering · 6/6 frames"
+    slot["framesDone"], slot["framesTotal"] = 6, 6
+
+    backend.poll()
+    for worker in list(backend._workers.values()):
+        worker.wait(5000)
+    for _ in range(30):
+        QApplication.processEvents()
+
+    instance = json.loads(backend.state())["instances"][0]
+    assert instance["worker"]["state"] == "complete"
+    assert instance["worker"]["finished"] is True
+    assert instance["live"]["phase"] == ""
 
 
 def test_the_live_tick_writes_the_frame_count_through_to_disk(qapp, tmp_path):

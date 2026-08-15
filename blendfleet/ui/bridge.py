@@ -48,7 +48,7 @@ from blendfleet.fleet import (_capped_stem, _tokenless,
                               fingerprint_unreadable_entry)
 from blendfleet.instance_state import (GpuSnapshot, InstanceSnapshot,
                                        InstanceStore)
-from blendfleet.kaggle_client import PENDING_STATES
+from blendfleet.kaggle_client import PENDING_STATES, TERMINAL_STATES
 from blendfleet.log_stream import stream_progress
 from blendfleet.notebook_builder import RenderSettings
 from blendfleet.platform_paths import log_dir, state_dir
@@ -487,14 +487,14 @@ class Backend(QObject):
                 # per-GPU utilisation and memory, and the hardware the
                 # session actually got. None until a stream reports --
                 # never a cached value dressed up as live.
-                "live": self._live_payload(account.label),
+                "live": self._live_payload(account.label, worker),
                 # True only in the window between resuming this worker's
                 # stream at startup and that stream reporting anything.
                 # The card uses it to say "reconnecting, catching up"
                 # rather than showing the saved frame count as though it
                 # were current -- an empty card in that window reads as a
                 # render that has stalled.
-                "reconnecting": self._is_reconnecting(account.label),
+                "reconnecting": self._is_reconnecting(account.label, worker),
             })
         return {
             "job": {
@@ -525,42 +525,72 @@ class Backend(QObject):
             "approximate": True,
         }
 
-    def _is_reconnecting(self, label: str) -> bool:
+    def _is_reconnecting(self, label: str, worker=None) -> bool:
         """Is this label's resumed stream still catching up?
 
-        Three conditions, all required. It was resumed at startup rather
+        Four conditions, all required. It was resumed at startup rather
         than launched here; nothing live has arrived yet (_slot clears the
-        label the instant anything does); and the thread is genuinely still
-        trying. That last one matters: a resumed stream that died on its
-        first connection would otherwise leave the card promising a
-        reconnection that is never coming, which is a worse lie than the
-        blank it replaced. When it drops out, the card falls back to the
-        saved frame count carrying its age -- still honest, just older.
+        label the instant anything does); the thread is genuinely still
+        trying; and the worker is not already known to have ENDED.
+
+        The third matters because a resumed stream that died on its first
+        connection would otherwise leave the card promising a reconnection
+        that is never coming, which is a worse lie than the blank it
+        replaced. When it drops out, the card falls back to the saved frame
+        count carrying its age -- still honest, just older.
+
+        The fourth is the one the field report was actually about. A stream
+        attached to a kernel that has since finished can sit in
+        log_stream's reconnect budget for minutes without ever delivering a
+        line, so "reconnecting" outlived the render it referred to -- and
+        by then the 30-second poll had already learned the kernel was
+        complete. Once finished_at is stamped there is nothing left to
+        catch up WITH, and the card must say finished instead.
         """
         if label not in self._resumed_labels:
+            return False
+        if worker is not None and getattr(worker, "finished_at", 0.0):
             return False
         thread = self._stream_by_label.get(label)
         return thread is not None and thread.is_alive()
 
-    def _live_payload(self, label: str) -> dict | None:
+    def _live_payload(self, label: str, worker=None) -> dict | None:
         """What the SSE stream has reported for `label` this run.
 
         None when nothing has arrived. That is the honest answer between
         renders: there is no idle session to poll, so "no live data" is a
         state, not a gap to paper over with the last run's numbers.
+
+        ONCE THE SESSION HAS ENDED, the readings that only describe a
+        RUNNING session are dropped: the phase, per-GPU load and memory,
+        live system RAM and CPU. They were live once and they are facts
+        about nothing now -- the machine they were measured on no longer
+        exists. Leaving them in is the "everything is stuck" report: a card
+        whose foot read "rendering · 15/15 frames" with GPU bars still up,
+        for a job that ended hours ago, because `_live` is only ever
+        cleared by a new launch. Worse after a restart, where the stream
+        REPLAYS a finished kernel's whole log and rebuilds those readings
+        from scratch.
+
+        What survives is what stays true: how many frames the session
+        finished, the hardware it actually got (preflight/CPU/RAM totals),
+        and the last frame preview it sent. Those describe the render, not
+        the moment.
         """
         slot = self._live.get(label)
         if not slot:
             return None
+        ended = bool(worker is not None and getattr(worker, "finished_at", 0.0))
         return {
-            "phase": slot["phase"],
+            "phase": "" if ended else slot["phase"],
             "framesDone": slot["framesDone"],
             "framesTotal": slot["framesTotal"],
-            "gpus": [slot["gpus"][k] for k in sorted(slot["gpus"])],
+            "gpus": ([] if ended
+                     else [slot["gpus"][k] for k in sorted(slot["gpus"])]),
             "cpuCount": slot["cpuCount"],
             "ramTotal": slot["ramTotal"],
-            "ramUsed": slot["ramUsed"],
-            "cpuPct": slot["cpuPct"],
+            "ramUsed": None if ended else slot["ramUsed"],
+            "cpuPct": None if ended else slot["cpuPct"],
             "preflight": slot["preflight"],
             # A LOW-RESOLUTION preview of the newest frame this account
             # finished, or None -- never a placeholder. A frame with no
@@ -611,8 +641,185 @@ class Backend(QObject):
         if self._resumed:
             return
         self._resumed = True
-        if self._resume_streams():
-            self._emit_state()      # so the cards say "reconnecting" now
+        self._startup_check()
+
+    def _startup_check(self) -> None:
+        """Ask Kaggle what is still running BEFORE deciding anything.
+
+        This used to call _resume_streams() straight away, and that is the
+        bug the field report describes. _resume_streams reads each worker's
+        state from the file on disk, which holds whatever was true when the
+        app last CLOSED -- nothing had asked Kaggle since. So a fleet whose
+        renders all finished overnight reopened as "Reconnecting to 5
+        render(s) still running on Kaggle", opened an SSE stream per
+        finished kernel, and showed five cards that could never advance
+        because there was no progress left to send. The reasoning in
+        _resume_streams was right all along; it was being handed a stale
+        answer.
+
+        Off the UI thread through _start (the established pattern here):
+        this is one network round trip per tracked worker, and the window
+        must draw and stay responsive while it happens.
+
+        The Fleet is built HERE, on the UI thread, not inside work(): the
+        completion handler has to read fleet.unreachable_workers, which is
+        exactly how it tells "Kaggle says this is still running" apart from
+        "Kaggle could not be asked" -- and a Fleet built inside the worker's
+        closure goes out of scope with it. Same reason syncDataset() builds
+        its own.
+        """
+        accounts = self.store.list()
+        fleet = self.fleet_factory(accounts)
+        try:
+            jobs = fleet.load_jobs()
+        except Exception as e:      # noqa: BLE001
+            # A jobs file that cannot be read at all is already reported to
+            # the page through unreadableJobs; failing here must not stop
+            # the app starting.
+            crash_log.record(self._scrub(
+                "could not read the tracked jobs at startup, so no render "
+                "already running on Kaggle will show live progress until "
+                f"the next launch. {type(e).__name__}: {e}"), critical=True)
+            return
+        # What was pending when the app last closed -- the only workers
+        # this check is about. Everything else was already finished on
+        # disk, and the 30-second poll covers it from here.
+        before = {(job.job_id, w.label): w.state
+                  for job in jobs for w in job.workers}
+        pending = sorted({label for (_job, label), state in before.items()
+                          if state in PENDING_STATES})
+        if not pending:
+            # Nothing was mid-render, so there is nothing to reconnect to,
+            # nothing to announce, and no reason to spend a network call
+            # saying so. The routine poll takes over.
+            return
+
+        # Said BEFORE the call, not after: the check takes a moment per
+        # account, and a fleet of cards showing last week's state with no
+        # explanation is exactly how "everything is stuck" starts.
+        self.notification.emit(
+            f"Checking with Kaggle whether the {len(pending)} render(s) "
+            f"tracked here are still running ({', '.join(pending)}). Until "
+            "it answers, the cards below show what was true when BlendFleet "
+            "last closed, which may be out of date. This spends no GPU "
+            "quota and nothing needs restarting.", "idle")
+
+        def work():
+            return fleet.poll_all()
+
+        def ok(polled) -> None:
+            # dict(): unreachable_workers is rewritten in place by the next
+            # poll_all(), and the 30-second timer can fire while this
+            # handler is still running.
+            self._finish_startup_check(before, polled,
+                                       dict(fleet.unreachable_workers))
+
+        def fail(message: str) -> None:
+            # poll_all is tolerant per worker, so reaching here means the
+            # whole check fell over (an unreadable state file, a Fleet that
+            # could not be built) rather than one account failing.
+            self._startup_unreachable(
+                sorted(pending), {label: message for label in pending})
+
+        self._start("startupCheck", work,
+                    "Checking what is still running on Kaggle", ok, fail)
+
+    def _finish_startup_check(self, before: dict, jobs: list,
+                              unreachable: dict[str, str]) -> None:
+        """Resume, and announce, from what Kaggle just said.
+
+        Three disjoint buckets, in this priority order:
+
+          - UNCHECKED first. poll_all() leaves an unreachable worker's
+            state exactly as it was, so an unchecked worker still READS as
+            pending -- indistinguishable, on disk, from one Kaggle
+            confirmed. It must not be counted as running and must not get a
+            stream, or the app is back to presenting a stale file as a live
+            reading with a "reconnecting" card that never resolves.
+          - FINISHED next: pending when the app closed, terminal now. No
+            stream, deliberately (see _resume_streams) -- and this is the
+            case the user reopens into most often, so it gets said out
+            loud, along with where the frames are.
+          - Everything still pending is what actually gets watched.
+
+        A label pending in one job and finished in another is reported by
+        its most demanding state, which is why the buckets subtract in that
+        order rather than being built independently.
+        """
+        after = {(job.job_id, w.label): w.state
+                 for job in jobs for w in job.workers}
+        was_pending = [key for key, state in before.items()
+                       if state in PENDING_STATES]
+        unchecked = {label for _job, label in was_pending
+                     if label in unreachable}
+        finished = {label for job_id, label in was_pending
+                    if after.get((job_id, label)) in TERMINAL_STATES
+                    } - unchecked
+        still = {label for job_id, label in was_pending
+                 if after.get((job_id, label)) in PENDING_STATES
+                 } - unchecked - finished
+
+        watched = self._resume_streams(jobs, only=still)
+        # Still rendering on Kaggle, but with no token here to watch it
+        # with -- the account was removed while it ran. Named rather than
+        # quietly dropped: those kernels are still spending quota.
+        unwatched = sorted(still - set(watched))
+
+        parts: list[str] = []
+        if watched:
+            parts.append(
+                f"Kaggle says {len(watched)} render(s) are still running "
+                f"({', '.join(sorted(watched))}) — reconnecting to each "
+                "one's live log now. Kaggle replays a session's log from "
+                "the start, so the phase, frame count and GPU readings "
+                "rebuild themselves over the next few moments. Nothing "
+                "needs restarting, and no quota is spent on this.")
+        if finished:
+            everything = not watched and not unchecked and not unwatched
+            parts.append(
+                (f"All {len(finished)} render(s) that were running when "
+                 if everything else
+                 f"{len(finished)} of the render(s) that were running when ")
+                + "BlendFleet last closed have finished "
+                f"({', '.join(sorted(finished))}) — nothing was reconnected "
+                "for them, because a finished kernel has no progress left "
+                "to send. Their frames are waiting on Kaggle: use “Collect "
+                "frames…” on the scene to download them before you launch "
+                "anything else on those accounts.")
+        if unwatched:
+            parts.append(
+                f"{len(unwatched)} render(s) are still running on Kaggle "
+                f"({', '.join(unwatched)}) but no account with that label is "
+                "configured here any more, so BlendFleet cannot show their "
+                "progress, cancel them or collect their frames. Re-add the "
+                "account under Instances to get them back.")
+        if unchecked:
+            reasons = sorted({unreachable[label] for label in unchecked})
+            parts.append(
+                f"Kaggle could not be asked about {len(unchecked)} render(s) "
+                f"({', '.join(sorted(unchecked))}): {'; '.join(reasons[:2])}. "
+                "What their cards show is from when BlendFleet last closed "
+                "and may be out of date — no log stream was reopened for "
+                "them, because reconnecting to a render that has already "
+                "finished shows a bar that never moves. The check runs "
+                "again by itself every 30 seconds, or press Retry.")
+
+        if parts:
+            tone = "offline" if unchecked else "idle"
+            self.notification.emit(self._scrub(" ".join(parts)), tone)
+        # Unconditional: the poll rewrote the state file, and the cards are
+        # still drawn from what was true before it.
+        self._emit_state()
+
+    def _startup_unreachable(self, pending: list[str],
+                             reasons: dict[str, str]) -> None:
+        """The whole startup check failed, not one account's status call.
+
+        Nothing is resumed and nothing is claimed: the cards keep showing
+        the file's own state, and the message says that is what they are.
+        """
+        self._finish_startup_check(
+            {(None, label): "running" for label in pending}, [], reasons)
 
     @Slot(result=str)
     def preferences(self) -> str:
@@ -2120,8 +2327,23 @@ class Backend(QObject):
         self._stream_threads.append(thread)
         thread.start()
 
-    def _resume_streams(self) -> int:
+    def _resume_streams(self, jobs: list | None = None,
+                        only: set[str] | None = None) -> list[str]:
         """Re-attach a log stream to every worker still running on Kaggle.
+
+        Returns the labels now being watched, so the caller can say
+        precisely which renders it reconnected to rather than counting
+        workers it hoped it had.
+
+        `jobs` is what a poll JUST read from Kaggle, and `only` is the set
+        of labels that poll confirmed are still pending. Both come from
+        _startup_check, and they are the whole point: without them this
+        method falls back to the state file, which holds whatever was true
+        when the app last CLOSED -- so a render that finished overnight
+        read as running, got a stream it could never learn anything from,
+        and produced a card that said "reconnecting" for ever. The state
+        below is only ever a starting point for what to watch; it is never
+        evidence that anything IS running.
 
         The gap this closes: _start_streams is only ever called from the
         success callback of a launch. Nothing called it when the app
@@ -2151,31 +2373,48 @@ class Backend(QObject):
         account to learn nothing.
 
         Nothing is invented for the reconnecting window -- see
-        _resumed_labels and _state_payload's "reconnecting" flag.
+        _resumed_labels and _state_payload's "reconnecting" flag. What the
+        user is TOLD about all this is composed by _finish_startup_check,
+        not here: only that caller knows which renders finished while the
+        app was closed and which could not be checked at all, and one
+        sentence covering every case is the only way it can be true in
+        every case.
         """
         by_label = {a.label: a for a in self.store.list()}
         resumed: list[str] = []
-        try:
-            jobs = self.fleet_factory(self.store.list()).load_jobs()
-        except Exception as e:      # noqa: BLE001
-            # A jobs file that cannot even be read is already reported to
-            # the page through unreadableJobs; failing to resume on top of
-            # that must not stop the app starting.
-            crash_log.record(self._scrub(
-                "could not read the tracked jobs at startup, so no render "
-                "already running on Kaggle will show live progress until "
-                f"the next launch. {type(e).__name__}: {e}"), critical=True)
-            return 0
+        if jobs is None:
+            try:
+                jobs = self.fleet_factory(self.store.list()).load_jobs()
+            except Exception as e:      # noqa: BLE001
+                # A jobs file that cannot even be read is already reported
+                # to the page through unreadableJobs; failing to resume on
+                # top of that must not stop the app starting.
+                crash_log.record(self._scrub(
+                    "could not read the tracked jobs at startup, so no "
+                    "render already running on Kaggle will show live "
+                    f"progress until the next launch. {type(e).__name__}: "
+                    f"{e}"), critical=True)
+                return []
         for job in jobs:
             for worker in job.workers:
                 if worker.state not in PENDING_STATES:
+                    continue
+                if only is not None and worker.label not in only:
+                    # Pending in the file, but this run's poll did not
+                    # confirm it -- unreachable, or already reported
+                    # finished by another job. Not watched, and not counted
+                    # as running by the caller either.
                     continue
                 account = by_label.get(worker.label)
                 if account is None:
                     continue    # account removed since: no token, no stream
                 before = self._stream_by_label.get(worker.label)
                 if before is not None and before.is_alive():
-                    continue    # already watched; never open a second one
+                    # Already watched; never open a second one. Still
+                    # reported as watched, because it is.
+                    if worker.label not in resumed:
+                        resumed.append(worker.label)
+                    continue
                 self._stream_worker(account, worker)
                 # Seeded from what is on disk so the first replayed
                 # PROGRESS line, which re-reports numbers already saved,
@@ -2183,19 +2422,7 @@ class Backend(QObject):
                 self._persisted_done[worker.label] = worker.frames_done
                 self._resumed_labels.add(worker.label)
                 resumed.append(worker.label)
-        if resumed:
-            # Queued, not emitted: _notify_q is drained by _live_tick on
-            # the UI thread, and going through it means this sentence
-            # cannot be emitted into a page that has not finished
-            # connecting its signal handlers. See ready().
-            self._notify_q.put((
-                f"Reconnecting to {len(resumed)} render(s) still running on "
-                f"Kaggle ({', '.join(sorted(resumed))}). Kaggle replays each "
-                "session's log from the start, so the phase, frame count and "
-                "GPU readings rebuild themselves over the next few moments — "
-                "nothing needs restarting, and no quota is being spent on "
-                "this.", "idle"))
-        return len(resumed)
+        return resumed
 
     def _persist_progress(self, advanced: dict[str, int]) -> None:
         """Write the frame counts this tick learned through to the jobs file.
