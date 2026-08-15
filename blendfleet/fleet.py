@@ -19,6 +19,7 @@ import re
 import time
 import unicodedata
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Callable
@@ -31,7 +32,7 @@ from blendfleet.kaggle_client import (
     ACTIVE_STATES, PENDING_STATES, TERMINAL_STATES, KaggleError,
     RevokedTokenError, _mask, revoked_token_message)
 # The SAME expression the live stream parses PROGRESS lines with, reused
-# rather than re-written: _read_final_frame_count below reads exactly the
+# rather than re-written: _final_frame_count below reads exactly the
 # lines log_stream reads, only out of a finished kernel's log instead of a
 # live one, and a second copy of the pattern is a second thing to get out
 # of step with what notebook_builder actually prints.
@@ -56,6 +57,30 @@ _SLUG_STRIP_RE = re.compile(r"[^a-z0-9]+")
 # long filename fail at the same late, post-upload moment.
 MIN_STEM_LENGTH = 3
 MAX_STEM_LENGTH = 30
+
+# How many accounts poll_all() asks Kaggle about at once.
+#
+# It used to ask them one after another, and that is what a user saw as
+# "it takes a lot of time": the connection indicator read 115887 ms on a
+# reopened app, because five accounts' worth of tracked workers were each a
+# round trip taken in turn -- each now bounded by, but also potentially
+# waiting out, kaggle_client.READ_TIMEOUT_SECONDS (60s). Serial cost is the
+# SUM of every account; concurrent cost is the SLOWEST one.
+#
+# 8, not "one thread per account" and not 2:
+#   - it covers a typical fleet (the whole point is that five accounts
+#     finish in one wave, not five), with headroom;
+#   - a bigger number buys nothing per account. Kaggle rate-limits per
+#     account, so an account's own calls are serialised by _poll_account
+#     anyway, and every KaggleApi construction queues on
+#     kaggle_client._ENV_TOKEN_LOCK, which serialises the authenticate()
+#     handshake process-wide regardless of how many threads are waiting;
+#   - it is a CAP, and a fleet can be large. Fifty accounts must not mean
+#     fifty simultaneous TLS handshakes to kaggle.com -- that is a
+#     self-inflicted rate limit, and fifty threads each holding a
+#     connection and a KaggleApi is real memory on a machine that is also
+#     rendering.
+POLL_FANOUT = 8
 
 
 class InvalidBlendNameError(ValueError):
@@ -475,7 +500,7 @@ class WorkerState:
     # do that unless the number carries its timestamp.
     frames_done_at: float = 0.0
     # Has this worker's OWN kernel log already been read for its final
-    # frame count (Fleet._read_final_frame_count)? Set the first time the
+    # frame count (Fleet._final_frame_count)? Set the first time the
     # worker is seen in a terminal state, whether or not the read produced
     # anything, so the fetch happens exactly ONCE per worker: it is a real
     # network call, and a finished job stays tracked -- and polled every 30
@@ -550,6 +575,32 @@ class FleetState:
         collision would otherwise happen.
         """
         return _capped_stem(Path(self.blend_name).stem) or "scene"
+
+
+@dataclass
+class _WorkerRefresh:
+    """What one worker's network round trips found, on its way back from a
+    poll thread to poll_all()'s apply loop.
+
+    Data only, and deliberately so. The pool threads never touch a
+    WorkerState: a second writer racing the apply loop would leave what
+    lands in the state file at the mercy of thread interleaving. This is the
+    same discipline the UI side keeps -- work happens off-thread and results
+    come back through a queue that exactly one thread drains.
+    """
+    # KernelStatus, when the status call succeeded.
+    status: object | None = None
+    # The exception it raised instead, re-raised by the apply loop so a
+    # revoked token and a network blip keep being told apart there, in the
+    # one place that already knows the difference.
+    error: BaseException | None = None
+    # True when the finished-kernel log was actually asked for. Set whether
+    # or not it answered, because it is what makes that fetch one-shot per
+    # worker (WorkerState.final_count_checked).
+    log_checked: bool = False
+    # The frame count read out of it, or None for "not known" -- never a
+    # guess and never a zero. See _final_frame_count.
+    final_done: int | None = None
 
 
 @dataclass
@@ -2166,6 +2217,19 @@ class Fleet:
         job" answer must reflect what was actually just written, not a
         tick-stale view from before a concurrent launch was folded in.
 
+        The network round trips are FANNED OUT, one task per account, and
+        nothing else about this method changed with them. They used to run
+        one after another, which is what a user saw as a two-minute startup:
+        the connection indicator read 115887 ms on a reopened app, because
+        every tracked worker was a round trip taken in turn, each bounded by
+        (and able to wait out) kaggle_client.READ_TIMEOUT_SECONDS. Serial
+        cost is the sum of every account; concurrent cost is the slowest
+        one. See POLL_FANOUT for the bound and _poll_account for why the
+        grouping is by account and why a pool thread returns data rather
+        than writing to a WorkerState. Per-worker tolerance is unchanged:
+        an account that fails or hangs produces failures for its OWN workers
+        and holds up nobody else's.
+
         A REVOKED token is deliberately NOT swallowed by the tolerant
         `except Exception` below (Task 5 fix round 2, NEW IMPORTANT): a
         network blip clears itself on the next poll, but a dead token
@@ -2194,6 +2258,36 @@ class Fleet:
         if not jobs:
             return jobs
         by_label = {a.label: a for a in self.accounts}
+
+        # EVERY network round trip this method makes happens in this one
+        # block, off the calling thread and grouped by account (see
+        # _poll_account). Nothing below it touches the network, and nothing
+        # inside it touches a WorkerState -- the pool threads return data
+        # and the apply loop below is the only writer, which is the same
+        # discipline the UI side keeps with its queues.
+        #
+        # Keyed by id(worker) because a WorkerState has no identity of its
+        # own that is unique across jobs -- the same label can be a worker
+        # in two tracked jobs at once. Every one of these objects is held
+        # alive by `jobs` for the whole of this method, so the ids cannot
+        # be reused underneath it.
+        pending: dict[str, list[WorkerState]] = {}
+        for st in jobs:
+            for w in st.workers:
+                if w.label in by_label:
+                    pending.setdefault(w.label, []).append(w)
+        refreshed: dict[int, _WorkerRefresh] = {}
+        if pending:
+            with ThreadPoolExecutor(
+                    max_workers=min(POLL_FANOUT, len(pending)),
+                    thread_name_prefix="blendfleet-poll") as pool:
+                futures = {
+                    pool.submit(self._poll_account, by_label[label], ws): ws
+                    for label, ws in pending.items()}
+                for future, ws in futures.items():
+                    for w, r in zip(ws, future.result()):
+                        refreshed[id(w)] = r
+
         for st in jobs:
             for w in st.workers:
                 acct = by_label.get(w.label)
@@ -2207,8 +2301,11 @@ class Fleet:
                         "no account with this label is configured any more, "
                         "so there is no token to ask Kaggle with")
                     continue
+                result = refreshed[id(w)]
                 try:
-                    s = self.client_factory(acct.token).status(w.kernel_slug)
+                    if result.error is not None:
+                        raise result.error
+                    s = result.status
                 except RevokedTokenError:
                     # Never a transient failure and never something a
                     # retry fixes -- so, unlike the tolerant branch below,
@@ -2303,8 +2400,18 @@ class Fleet:
                     w.final_count_known = False
                 elif w.state in TERMINAL_STATES and not w.finished_at:
                     w.finished_at = time.time()
-                if w.state in TERMINAL_STATES and not w.final_count_checked:
-                    self._read_final_frame_count(acct, w)
+                # The log read itself already happened, on the pool thread
+                # alongside this worker's status call (see _poll_account);
+                # all that is left here is writing down what it found.
+                # log_checked is set whether or not a number came back, so
+                # this is one network call per worker for ever -- see
+                # _final_frame_count.
+                if result.log_checked:
+                    w.final_count_checked = True
+                    if result.final_done is not None:
+                        w.frames_done = result.final_done
+                        w.frames_done_at = time.time()
+                        w.final_count_known = True
         current = self.load_jobs()
         updated_by_id = {st.job_id: st for st in jobs}
         merged = []
@@ -2314,7 +2421,7 @@ class Fleet:
                 merged.append(j)
                 continue
             # frames_done is the one field on a worker this method learns
-            # only for a STOPPED kernel (_read_final_frame_count) -- while a
+            # only for a STOPPED kernel (_final_frame_count) -- while a
             # render is going, Kaggle's status API reports no frame count at
             # all and only the live log stream does (see record_progress).
             # `updated` was built from a snapshot read BEFORE the network
@@ -2336,7 +2443,64 @@ class Fleet:
         self.save_jobs(merged)
         return merged
 
-    def _read_final_frame_count(self, account, worker) -> None:
+    def _poll_account(self, account, workers) -> list["_WorkerRefresh"]:
+        """Every network round trip this poll makes for ONE account, on one
+        pool thread, in the order `workers` were given.
+
+        Grouped by ACCOUNT rather than by worker, and that grouping is
+        load-bearing twice over. Building a KaggleClient authenticates, and
+        authenticate() is itself a network round trip that
+        kaggle_client._ENV_TOKEN_LOCK serialises across the whole process
+        (KaggleApi has no api_token= parameter and reads the environment --
+        see that lock's own comment). A client per WORKER therefore paid
+        that handshake once per worker AND queued every one of them behind
+        the same lock; with six tracked jobs across five accounts that was
+        most of the poll. One client per account also means one thread owns
+        it, so the lazy `.api` on it can never be built twice at once.
+
+        Returns DATA, never a mutated WorkerState: a pool thread that wrote
+        to tracked state would be a second writer racing poll_all's own
+        apply loop, and would put the state file's contents at the mercy of
+        thread interleaving. The `workers` it reads are only ever read.
+
+        Never raises. One account that is unreachable, rate-limited or
+        revoked must not take the other four down with it -- that is
+        poll_all's own long-standing per-worker tolerance, and moving the
+        calls into a pool must not quietly lose it.
+        """
+        results: list[_WorkerRefresh] = []
+        try:
+            client = self.client_factory(account.token)
+        except Exception as e:      # noqa: BLE001
+            # The client could not even be built (a revoked token fails
+            # here, loudly, in _default_api_factory). Reported per worker
+            # so the apply loop handles it exactly as it handles a failed
+            # status call -- including the RevokedTokenError branch.
+            return [_WorkerRefresh(error=e) for _ in workers]
+        for worker in workers:
+            results.append(self._refresh_worker(client, worker))
+        return results
+
+    def _refresh_worker(self, client, worker) -> "_WorkerRefresh":
+        """One worker's status, plus -- once, and only once -- the final
+        frame count out of its own kernel log. Pure with respect to
+        `worker`: see _poll_account."""
+        result = _WorkerRefresh()
+        try:
+            result.status = client.status(worker.kernel_slug)
+        except Exception as e:      # noqa: BLE001 -- re-raised by the caller
+            result.error = e
+            return result
+        if (getattr(result.status, "state", "") in TERMINAL_STATES
+                and not worker.final_count_checked):
+            # Set BEFORE the fetch and regardless of its outcome: this is
+            # what makes the read one-shot per worker (see
+            # _final_frame_count).
+            result.log_checked = True
+            result.final_done = self._final_frame_count(client, worker)
+        return result
+
+    def _final_frame_count(self, client, worker) -> int | None:
         """Read a STOPPED worker's true frame count out of its own log.
 
         frames_done is only ever advanced by the live SSE stream
@@ -2356,23 +2520,20 @@ class Fleet:
         parsed here with log_stream.PROGRESS_RE -- the same expression the
         live stream uses, not a second copy of it.
 
-        Fired ONCE per worker, guarded by final_count_checked, which is set
-        before anything is fetched and stays set whether or not the read
-        produced a number. This is a real network call and a finished job
-        keeps being polled every 30 seconds for as long as it is tracked;
-        retrying would turn one honest "not known" into a permanent
-        background download nobody asked for.
+        Fired ONCE per worker: the caller sets final_count_checked whether
+        or not this produced a number. It is a real network call, and a
+        finished job keeps being polled every 30 seconds for as long as it
+        is tracked; retrying would turn one honest "not known" into a
+        permanent background download nobody asked for.
 
-        Never invents a number. A log that cannot be fetched, or that
-        carries no PROGRESS line, leaves final_count_known False and
-        frames_done exactly as it was -- and the payload then reports the
-        count as NOT KNOWN rather than dressing the stale figure up as
-        current (bridge._frames_done_source). "Collect frames…" stays the
+        Returns None rather than inventing a number when the log cannot be
+        fetched or carries no PROGRESS line. frames_done is then left
+        exactly as it was and the payload reports the count as NOT KNOWN,
+        instead of dressing the stale figure up as current (see
+        bridge._frames_done_source). "Collect frames…" stays the
         authoritative list of what actually exists on Kaggle.
         """
-        worker.final_count_checked = True
         try:
-            client = self.client_factory(account.token)
             text = client.fetch_log_tail(
                 worker.kernel_slug,
                 self.work_dir / f"finallog_{worker.label}")
@@ -2389,21 +2550,19 @@ class Fleet:
                 f"({worker.kernel_slug}) out of its kernel log, so that "
                 "card shows the count as not known rather than as a stale "
                 f"number. {type(e).__name__}: {e}")
-            return
+            return None
         matches = PROGRESS_RE.findall(text or "")
         if not matches:
             # A real possibility, not a bug: the tail may be all Blender
             # output, the render may have died before its first frame, or
-            # BR_PROGRESS output may have been trimmed away. Saying "0"
-            # here would be an invented reading.
-            return
+            # the PROGRESS lines may have scrolled past max_lines. Saying
+            # "0" here would be an invented reading.
+            return None
         # The LAST match, never the first: the tail holds every PROGRESS
-        # line the render emitted and only the final one carries the
-        # final count. Group 2 is `done` (group 1 is the frame number,
-        # group 3 the total) -- see log_stream.PROGRESS_RE.
-        worker.frames_done = int(matches[-1][1])
-        worker.frames_done_at = time.time()
-        worker.final_count_known = True
+        # line the render emitted and only the final one carries the final
+        # count. Group 2 is `done` (group 1 is the frame number, group 3
+        # the total) -- see log_stream.PROGRESS_RE.
+        return int(matches[-1][1])
 
     def poll(self) -> FleetState | None:
         """Kept for every existing caller (bridge.py's timer, the Qt

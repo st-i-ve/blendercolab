@@ -8,7 +8,7 @@ from blendfleet.accounts import Account
 from blendfleet.kaggle_client import (KaggleError, KernelStatus, Quota,
                                       RevokedTokenError)
 from blendfleet.notebook_builder import RenderSettings
-from blendfleet.fleet import (Fleet, FleetBusyError, FleetState,
+from blendfleet.fleet import (POLL_FANOUT, Fleet, FleetBusyError, FleetState,
                               StaleDatasetError, UnreachableAccountsError,
                               WorkerState, WrongUsernameError)
 
@@ -2127,3 +2127,148 @@ def test_a_worker_seen_running_again_may_have_its_final_count_re_read(tmp_path):
     w = f.poll_all()[0].workers[0]
 
     assert w.final_count_checked is False and w.final_count_known is False
+
+
+# ---------------------------------------------------------------------------
+# The startup poll's wall clock.
+#
+# It asked Kaggle about every tracked worker one after another, so a
+# reopened app spent about two minutes before it could say anything --
+# 115887 ms on the connection indicator. Serial cost is the SUM of every
+# account; the fan-out makes it the slowest one. See Fleet.POLL_FANOUT.
+# ---------------------------------------------------------------------------
+
+def test_the_poll_asks_the_accounts_concurrently(tmp_path):
+    """Five accounts, each holding for a moment. Serial would take five
+    times as long as one; concurrent takes about as long as one."""
+    import threading
+
+    barrier = threading.Barrier(5, timeout=10)
+
+    class SlowClient(FakeClient):
+        def __init__(self, token):
+            super().__init__(token, state="running")
+
+        def status(self, slug):
+            # Only passes if all five are inside status() AT ONCE. A serial
+            # poll deadlocks here and the timeout fails the test, which is
+            # exactly the assertion.
+            barrier.wait()
+            return super().status(slug)
+
+    f = Fleet(accounts(5), SlowClient, tmp_path / "w")
+    f.save_jobs([FleetState(
+        job_id="j1", blend_name="shot.blend", start_frame=1, end_frame=5,
+        workers=[WorkerState(label=f"a{i}", username=f"u{i}",
+                             kernel_slug=f"u{i}/shot-render-1",
+                             frames=[i + 1], state="running")
+                 for i in range(5)])])
+
+    jobs = f.poll_all()
+
+    assert [w.state for w in jobs[0].workers] == ["running"] * 5
+
+
+def test_one_failing_account_does_not_block_or_break_the_others(tmp_path):
+    """poll_all was already tolerant per worker; moving the calls into a
+    pool must not quietly lose that."""
+    class OneBadClient(FakeClient):
+        def __init__(self, token):
+            super().__init__(token, state="complete")
+
+        def status(self, slug):
+            if slug.startswith("u1/"):
+                raise RuntimeError("kaggle timed out")
+            return super().status(slug)
+
+    f = Fleet(accounts(3), OneBadClient, tmp_path / "w")
+    f.save_jobs([FleetState(
+        job_id="j1", blend_name="shot.blend", start_frame=1, end_frame=3,
+        workers=[WorkerState(label=f"a{i}", username=f"u{i}",
+                             kernel_slug=f"u{i}/shot-render-1",
+                             frames=[i + 1], state="running")
+                 for i in range(3)])])
+
+    jobs = f.poll_all()
+
+    by_label = {w.label: w for w in jobs[0].workers}
+    assert by_label["a0"].state == "complete"
+    assert by_label["a2"].state == "complete"
+    assert by_label["a1"].state == "running", (
+        "an unreachable worker is left exactly as it was, never guessed at")
+    assert "a1" in f.unreachable_workers
+    assert "a0" not in f.unreachable_workers
+
+
+def test_the_fan_out_is_bounded(tmp_path):
+    """A fleet can be large, and fifty simultaneous TLS handshakes to
+    kaggle.com is a self-inflicted rate limit."""
+    import threading
+
+    live = set()
+    peak = []
+    lock = threading.Lock()
+    gate = threading.Event()
+
+    class CountingClient(FakeClient):
+        def __init__(self, token):
+            super().__init__(token, state="running")
+
+        def status(self, slug):
+            with lock:
+                live.add(threading.current_thread().name)
+                peak.append(len(live))
+            # Held only until the pool is demonstrably full, so the test
+            # never depends on timing to observe the ceiling.
+            if len(peak) >= POLL_FANOUT:
+                gate.set()
+            gate.wait(5)
+            with lock:
+                live.discard(threading.current_thread().name)
+            return super().status(slug)
+
+    n = POLL_FANOUT + 6
+    f = Fleet(accounts(n), CountingClient, tmp_path / "w")
+    f.save_jobs([FleetState(
+        job_id="j1", blend_name="shot.blend", start_frame=1, end_frame=n,
+        workers=[WorkerState(label=f"a{i}", username=f"u{i}",
+                             kernel_slug=f"u{i}/shot-render-1",
+                             frames=[i + 1], state="running")
+                 for i in range(n)])])
+
+    f.poll_all()
+
+    assert max(peak) <= POLL_FANOUT, max(peak)
+
+
+def test_one_account_gets_one_client_however_many_workers_it_has(tmp_path):
+    """Building a client authenticates, and that handshake is serialised
+    process-wide by kaggle_client._ENV_TOKEN_LOCK -- so a client per WORKER
+    paid it once per worker and queued them all behind the same lock."""
+    built = []
+
+    def factory(token):
+        built.append(token)
+        return FakeClient(token, state="running")
+
+    f = Fleet(accounts(2), factory, tmp_path / "w")
+    f.save_jobs([
+        FleetState(job_id="j1", blend_name="a.blend", start_frame=1,
+                   end_frame=2,
+                   workers=[WorkerState(label="a0", username="u0",
+                                        kernel_slug="u0/a-render-1",
+                                        frames=[1], state="running"),
+                            WorkerState(label="a1", username="u1",
+                                        kernel_slug="u1/a-render-1",
+                                        frames=[2], state="running")]),
+        FleetState(job_id="j2", blend_name="b.blend", start_frame=1,
+                   end_frame=2,
+                   workers=[WorkerState(label="a0", username="u0",
+                                        kernel_slug="u0/b-render-1",
+                                        frames=[1], state="running")]),
+    ])
+
+    f.poll_all()
+
+    assert len(built) == 2, (
+        f"three workers across two accounts must build two clients: {built}")

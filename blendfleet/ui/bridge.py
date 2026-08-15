@@ -665,7 +665,14 @@ class Backend(QObject):
 
         Off the UI thread through _start (the established pattern here):
         this is one network round trip per tracked worker, and the window
-        must draw and stay responsive while it happens.
+        must draw and stay responsive while it happens. poll_all() then
+        fans those round trips out across accounts on its own pool (see
+        Fleet.POLL_FANOUT) -- taken one at a time they added up to the
+        two-minute startup a user reported as "it takes a lot of time".
+        Nothing about the threading contract here changes: this method
+        still runs on ONE worker thread, still touches no Qt object from
+        it, and still comes back through _start's succeeded/failed signals
+        for the UI thread to act on.
 
         The Fleet is built HERE, on the UI thread, not inside work(): the
         completion handler has to read fleet.unreachable_workers, which is

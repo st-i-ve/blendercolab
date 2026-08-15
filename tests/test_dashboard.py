@@ -1782,6 +1782,16 @@ def test_fleet_wide_collect_finishing_does_not_clobber_a_concurrent_instance_dow
 # log tail when it is empty, and ONLY for a failed worker.
 # ---------------------------------------------------------------------------
 
+# Both tests below count only the FAILURE-log fetch. poll_all() also reads a
+# terminal worker's log tail exactly once, for its final frame count
+# (Fleet._final_frame_count), and that call is told apart by its destination
+# -- "finallog_<label>" versus fetch_failure_log()'s "log_<label>". These
+# tests are about the dashboard never going to the network to explain a
+# failure Kaggle already explained, which is unchanged.
+def _is_failure_log(dest) -> bool:
+    return "finallog" not in str(dest)
+
+
 def test_poll_shows_failure_message_without_fetching_a_log_when_present(
         qapp, tmp_path):
     fetch_calls: list[str] = []
@@ -1789,7 +1799,8 @@ def test_poll_shows_failure_message_without_fetching_a_log_when_present(
     def make_client(tok, acct):
         class TrackedClient(FakeClient):
             def fetch_log_tail(self, slug, dest, max_lines=200):
-                fetch_calls.append(slug)
+                if _is_failure_log(dest):
+                    fetch_calls.append(slug)
                 return "should never be requested"
         return TrackedClient(
             tok, "error", message="CUDA out of memory: tried to allocate 2GB")
@@ -1821,7 +1832,8 @@ def test_poll_fetches_the_log_once_for_a_failure_with_no_message(qapp, tmp_path)
     def make_client(tok, acct):
         class TrackedClient(FakeClient):
             def fetch_log_tail(self, slug, dest, max_lines=200):
-                fetch_calls.append(slug)
+                if _is_failure_log(dest):
+                    fetch_calls.append(slug)
                 return "Fatal Python error: Segmentation fault"
         return TrackedClient(tok, "error")
 
