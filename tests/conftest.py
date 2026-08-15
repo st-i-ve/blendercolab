@@ -48,6 +48,24 @@ and blamed the tests: three false failures in one working session, each
 one investigated as if it were real, before this fixture learned to check
 for a live BlendFleet process first and only fail outright when none is
 running.
+
+That fix still had a race, and it produced a fourth false failure the
+same day: the app was running mid-session -- it rewrote fleet.json on its
+own 30s poll timer at 17:04:37 -- but had already exited by the time the
+guard sampled `tasklist` at teardown, so the process check found nothing
+and the guard took the hard-failure branch anyway, blaming the tests for
+the app's own write. It was only provably a false alarm because the
+file's contents were the user's real jobs (real .blend filenames, real
+Kaggle usernames -- nothing this suite generates) and a later, unrelated
+subset run left the file's mtime untouched. The fix: the verdict is now
+based on whether a live app was seen at ANY point during the session --
+sampled at session setup, at session teardown, and periodically while
+tests run (see `_AppSeenTracker` and `pytest_runtest_teardown` below) --
+instead of only "is it running right now, at the exact instant teardown
+happens to check". Four false failures in one working session, each
+chased down as if it were a real regression, is the bar this guard now
+has to clear: one more and nobody will trust it, which is worse than not
+having it at all.
 """
 from __future__ import annotations
 
@@ -369,49 +387,115 @@ def _blendfleet_app_is_running() -> bool:
     return any(name.lower() in out_lower for name in _APP_PROCESS_NAMES)
 
 
+# How often pytest_runtest_teardown below is allowed to actually shell out
+# to tasklist, in wall-clock seconds -- NOT once per test. A per-test check
+# would scale cost with suite size (1298 tests today, more tomorrow); a
+# wall-clock throttle instead bounds the added cost by session duration,
+# which is what makes "sample periodically" affordable without a dedicated
+# polling thread (and a thread is exactly the kind of thing no_leaked_threads
+# above exists to catch -- not a place to introduce one to fix a different
+# guard).
+_APP_SEEN_POLL_INTERVAL_SECONDS = 5.0
+
+
+class _AppSeenTracker:
+    """Session-wide memory of "was a live BlendFleet process seen at ANY
+    point during this session", not just "is one running right now".
+
+    That distinction is the whole fix: a live app that exits before
+    teardown checks used to be indistinguishable from no app ever having
+    run, which produced the fourth false failure described in this
+    module's docstring. `seen` only ever goes False -> True; nothing
+    resets it once a live process has been observed, because the write
+    that changed the real directory could have happened at any point
+    while that app was up, not only at the instant it was last checked.
+    """
+
+    def __init__(self, initial_seen: bool) -> None:
+        self.seen = initial_seen
+        self._last_poll = time.monotonic()
+
+    def sample(self, *, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and (now - self._last_poll) < _APP_SEEN_POLL_INTERVAL_SECONDS:
+            return
+        self._last_poll = now
+        if _blendfleet_app_is_running():
+            self.seen = True
+
+
+# Set by guard_real_app_dir_untouched's setup, read by pytest_runtest_teardown
+# below. A module global, not a fixture, on purpose: it needs to be poked
+# once per test regardless of that test's own fixtures, and adding a sixth
+# autouse fixture just to piggyback a periodic side-effect onto every test
+# would misrepresent this module's docstring count of five guards -- this
+# is bookkeeping in service of guard #5, not a new guard in its own right.
+_app_seen_tracker: "_AppSeenTracker | None" = None
+
+
+def pytest_runtest_teardown(item, nextitem):
+    """Between every test, not just at session start/end -- give the app
+    another chance to be caught running before it exits mid-session, same
+    as it did in the false failure this fixes. Throttled by
+    _AppSeenTracker.sample()'s wall-clock check, so this is a cheap
+    time.monotonic() comparison on ~1298 of 1298 calls and an actual
+    tasklist shell-out on only the handful where enough real time has
+    passed -- overhead bounded by wall-clock session length, not test count.
+    """
+    if _app_seen_tracker is not None:
+        _app_seen_tracker.sample()
+
+
 def _evaluate_real_app_dir_snapshots(before: dict, after: dict, *,
-                                      app_running: bool, base) -> None:
+                                      app_seen: bool, base) -> None:
     """The guard's actual verdict, pulled out of the fixture so it can be
-    exercised directly with synthetic snapshots and a forced app_running
+    exercised directly with synthetic snapshots and a forced app_seen
     value -- proving both branches without ever touching, or needing to
     kill, the real %APPDATA%\\BlendFleet directory or the user's live app.
 
     Same assertion either way (`after == before`); the only question this
     function answers is whether a mismatch is reported as a WARNING (a
-    live app is the plausible writer) or a hard failure (nothing is
-    running, so a test is the only remaining explanation).
+    live app was seen at some point this session and is the plausible
+    writer) or a hard failure (no app was ever seen, so a test is the only
+    remaining explanation). `app_seen` means "seen at any point during the
+    session", not "running right now" -- see _AppSeenTracker.
     """
     if after == before:
         return
 
     changed = "\n  ".join(_diff_snapshot(before, after))
 
-    if app_running:
+    if app_seen:
         warnings.warn(
             "guard_real_app_dir_untouched: the REAL BlendFleet config/state "
-            f"directory ({base}) changed during this test session, but a "
-            "live blendfleetweb process was found running. This is almost "
-            "certainly that app's own 30s Kaggle poll loop rewriting "
-            "fleet.json / instance_state.json / cache files under you, "
-            "NOT a test -- this exact situation produced 3 false failures "
-            "in one working session before this check existed. Changed "
-            f"path(s):\n  {changed}\n"
+            f"directory ({base}) changed during this test session, and a "
+            "live blendfleetweb process WAS OBSERVED running at some point "
+            "during this session (it may have exited before this check ran "
+            "-- that no longer matters, see this module's docstring for "
+            "why). This is almost certainly that app's own 30s Kaggle poll "
+            "loop rewriting fleet.json / instance_state.json / cache files "
+            "under you, NOT a test -- this exact situation produced 4 false "
+            "failures in one working session before this check existed. "
+            f"Changed path(s):\n  {changed}\n"
             "How to tell this apart from a real test bug: close BlendFleet "
             "completely and re-run `pytest tests/ -q`. If the real "
             "directory is then untouched, the app was the writer and this "
             "warning was correct. If changed paths are STILL reported with "
-            "no BlendFleet process running, that is a genuine regression "
-            "-- treat it exactly as the hard failure below would.",
+            "no BlendFleet process seen running at any point, that is a "
+            "genuine regression -- treat it exactly as the hard failure "
+            "below would.",
             stacklevel=2)
         return
 
     assert after == before, (
         "a test just wrote to the REAL BlendFleet config/state directory "
         f"({base}) instead of a redirected tmp path. No BlendFleet app "
-        "process was found running, which rules out the known false "
-        "positive (a live app's own 30s poll loop rewriting its own state "
-        "-- see this fixture's WARNING path for that case) and leaves a "
-        "test as the only explanation. Changed path(s):\n"
+        "process was observed running at ANY point during this session "
+        "(checked at session start, session end, and periodically between "
+        "tests), which rules out the known false positive (a live app's "
+        "own 30s poll loop rewriting its own state -- see this fixture's "
+        "WARNING path for that case) and leaves a test as the only "
+        "explanation. Changed path(s):\n"
         f"  {changed}\n"
         "This is the exact defect that once overwrote the user's only "
         "record of which Kaggle kernels were actually running with a "
@@ -432,21 +516,33 @@ def guard_real_app_dir_untouched():
     """Fail the whole session, loudly, if any test -- this one or a future
     one that forgets redirect_app_dirs applies to it -- wrote to the real
     BlendFleet config/state directory. Downgrades to a named WARNING
-    instead of failing when a live BlendFleet process is found, since then
-    the app itself (polling Kaggle every 30s and rewriting its own state
-    files) is the far more likely writer than a test -- see
-    _evaluate_real_app_dir_snapshots and _blendfleet_app_is_running above
-    for the mechanics and their limits.
+    instead of failing when a live BlendFleet process was seen at any
+    point during the session, since then the app itself (polling Kaggle
+    every 30s and rewriting its own state files) is the far more likely
+    writer than a test -- see _evaluate_real_app_dir_snapshots,
+    _AppSeenTracker and _blendfleet_app_is_running above for the
+    mechanics and their limits.
 
     Session-scoped so its setup runs before the first test's function-
     scoped fixtures (redirect_app_dirs included) and its teardown runs
     after the last test's have already been undone -- both snapshots see
     the real, unpatched directory, never a redirected tmp path.
+
+    The liveness check is NOT similarly a single point-in-time sample:
+    `global _app_seen_tracker` is set here at setup (first sample, before
+    any test runs) so pytest_runtest_teardown above can keep sampling
+    between tests, and a forced final sample is taken here again at
+    teardown -- "seen running at any point" is what decides warn-vs-fail
+    below, not "running right now", which is what let a live app that
+    exited mid-session get blamed on the tests instead.
     """
+    global _app_seen_tracker
     before = _snapshot_real_app_dir()
+    _app_seen_tracker = _AppSeenTracker(_blendfleet_app_is_running())
     yield
+    _app_seen_tracker.sample(force=True)
     after = _snapshot_real_app_dir()
     _evaluate_real_app_dir_snapshots(
         before, after,
-        app_running=_blendfleet_app_is_running(),
+        app_seen=_app_seen_tracker.seen,
         base=platform_paths_mod.config_dir())
