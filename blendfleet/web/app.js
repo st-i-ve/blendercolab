@@ -1162,6 +1162,48 @@ document.getElementById('scene-list').addEventListener('click', e => {
   }
 });
 
+/* LIVE PREVIEWS: what each machine is producing RIGHT NOW.
+ *
+ * Kaggle releases a session's output only once that session ends, so
+ * until then there is no rendered frame to fetch -- the notebook pushes a
+ * small JPEG of every finished frame down the same log stream that
+ * carries progress, and this draws the newest one per account.
+ *
+ * IT IS NOT THE RENDERED FRAME, and the markup says so three times over:
+ * in the heading tag, in the note under the tiles, and in the lightbox it
+ * opens. A 320-pixel JPEG next to a 1920-pixel render is a glance, not a
+ * judgement -- the full-resolution image is still what Collect brings
+ * back, and still what clicking a finished cell in the grid below
+ * fetches once the session has ended.
+ *
+ * An account with no preview yet contributes NOTHING here: no tile, no
+ * placeholder. An empty frame-shaped box would imply a frame had
+ * rendered, which is the one thing this must never say. */
+function livePreviewStrip(instances) {
+  const tiles = instances.filter(
+    i => i.live && i.live.thumb && i.live.thumb.dataUrl).map(i => {
+    const t = i.live.thumb;
+    return `<figure class="lp-tile" data-live-frame="${t.frame}"
+        data-live-label="${esc(i.label)}" role="button" tabindex="0"
+        title="Frame ${t.frame}, as ${esc(i.label)} finished it moments ago — a small preview sent over the log, not the full-resolution render. Click to see it larger.">
+      <img src="${esc(t.dataUrl)}" alt="Small live preview of frame ${t.frame}, rendered by ${esc(i.label)}">
+      <figcaption><b>${esc(i.label)}</b> · frame ${t.frame}</figcaption>
+    </figure>`;
+  });
+  if (!tiles.length) return '';
+  return `<div class="lp-strip">
+    <div class="lp-head">Live preview
+      <span class="lp-tag">small JPEG, not the render</span></div>
+    <div class="lp-tiles">${tiles.join('')}</div>
+    <p class="lp-note">Each machine sends a small picture of every frame
+      it finishes down the same log this page reads progress from, so a
+      render can be watched without stopping it. Kaggle only releases the
+      full-resolution frames once a session ends — until then, clicking a
+      finished cell below will tell you so. Set BR_THUMBS=0 on a render to
+      turn these off.</p>
+  </div>`;
+}
+
 /* One job's own frame grid, as an HTML fragment -- never the whole page's
    state. Pure, like instanceCard(): it reads only the ONE job and the
    instances already known to belong to it (the caller, renderJobSections,
@@ -1190,6 +1232,7 @@ function renderFrameGrid(job, instances) {
   }
   const total = job.endFrame - job.startFrame + 1;
   return `<div class="fgrid-wrap show">
+    ${livePreviewStrip(instances)}
     <div class="fgrid" data-job="${esc(job.jobId || '')}">${cells.join('')}</div>
     <div class="fgrid-legend">
       <span><i style="background:var(--accent)"></i>done <b>(approximate)</b></span>
@@ -1306,13 +1349,34 @@ document.getElementById('btn-add').onclick = () => {
 };
 
 /* ---------------- one rendered frame ------------------------------------ */
-function openPreview(frame, url, label) {
-  document.getElementById('lb-title').textContent = `frame ${frame}`;
-  document.getElementById('lb-sub').textContent = label ? `rendered by ${label}` : '';
+/* `live` marks the small JPEG the notebook pushed down the log stream
+   while the render was still going, as opposed to the full-resolution
+   file fetched from a finished session. The two are NEVER titled the
+   same: they are different pictures of different quality, and a viewer
+   who mistook one for the other would judge a render by a thumbnail.
+   The live one is also shown at its own size and never stretched up to
+   fill the stage -- see .lb-stage img in app.css for the same rule
+   applied to the real thing. */
+function openPreview(frame, url, label, live) {
+  document.getElementById('lb-title').textContent =
+    live ? `frame ${frame} · live preview` : `frame ${frame}`;
+  document.getElementById('lb-sub').textContent = live
+    ? `a small picture ${label || 'that machine'} sent while it was still `
+      + 'rendering — not the full-resolution frame, which Kaggle releases '
+      + 'only once that session ends'
+    : (label ? `rendered by ${label}` : '');
   const img = document.getElementById('lb-img');
   img.src = url;
-  img.alt = `Rendered frame ${frame}`;
-  document.getElementById('lightbox').hidden = false;
+  img.alt = live
+    ? `Small live preview of frame ${frame}`
+    : `Rendered frame ${frame}`;
+  img.classList.toggle('lb-live', !!live);
+  /* The dialog's own name, not just its contents: a screen reader
+     announcing "Rendered frame" over a thumbnail would make exactly the
+     mistake the visible labels are here to prevent. */
+  const box = document.getElementById('lightbox');
+  box.setAttribute('aria-label', live ? 'Live frame preview' : 'Rendered frame');
+  box.hidden = false;
   document.getElementById('lb-close').focus();
 }
 
@@ -1353,7 +1417,23 @@ function jobIdOfCell(cell) {
   return (grid && grid.dataset.job) || '';
 }
 
+/* A live tile opens the picture it is ALREADY showing, larger -- it never
+   asks the backend for anything. Mid-render there is nothing on Kaggle to
+   fetch (the session has not ended, so its output does not exist yet), so
+   routing this through previewFrame would only ever produce an apology. */
+function openLiveTile(tile) {
+  const img = tile.querySelector('img');
+  if (!img || !img.src) return;
+  openPreview(Number(tile.dataset.liveFrame), img.src,
+              tile.dataset.liveLabel, true);
+}
+
 document.getElementById('instances').addEventListener('click', e => {
+  const tile = e.target.closest('[data-live-frame]');
+  if (tile) {
+    openLiveTile(tile);
+    return;
+  }
   const cell = e.target.closest('[data-frame]');
   if (cell && backend) {
     backend.previewFrame(Number(cell.dataset.frame), jobIdOfCell(cell));
@@ -1395,6 +1475,12 @@ document.getElementById('instances').addEventListener('click', e => {
 });
 document.getElementById('instances').addEventListener('keydown', e => {
   if (e.key !== 'Enter' && e.key !== ' ') return;
+  const tile = e.target.closest('[data-live-frame]');
+  if (tile) {
+    e.preventDefault();
+    openLiveTile(tile);
+    return;
+  }
   const cell = e.target.closest('[data-frame]');
   if (cell && backend) {
     e.preventDefault();

@@ -1651,3 +1651,124 @@ def test_a_live_frame_count_is_never_labelled_saved(card):
     html = card()
     assert "saved" not in html
     assert "reconnecting" not in html
+
+
+# ---------------------------------------------------------------------------
+# Live frame previews, mid-render.
+#
+# "the preview works after all the renders are complete, can we make it
+# work when the frame is available? I might want to see what was happening
+# mid render without stopping the process." (2026-08-15)
+#
+# The picture is small and it is NOT the rendered frame -- Kaggle releases
+# the full-resolution files only once a session ends. These assert that
+# the page shows it, and that it never lets the two be confused.
+# ---------------------------------------------------------------------------
+
+# A one-pixel JPEG is enough: nothing here is about the image, only about
+# what the page says around it.
+TINY_JPEG_URL = ("data:image/jpeg;base64,/9j/4AAQSkZJRgABAQEAYABgAAD/"
+                 "2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4n"
+                 "ICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/wAALCAABAAEBAREA/8QA"
+                 "FAABAAAAAAAAAAAAAAAAAAAACf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/"
+                 "2gAIAQEAAD8AKp//2Q==")
+
+LIVE_GRID_INSTANCES = ("[{label:'acct0', worker:{state:'running',"
+                       " frames:[1,2,3,4], framesDone:2},"
+                       " live:{framesDone:2, framesTotal:4,"
+                       f" thumb:{{frame:2, dataUrl:'{TINY_JPEG_URL}',"
+                       " bytes:1973}}}]")
+
+
+def test_a_live_preview_is_drawn_in_the_grid(loaded_page):
+    """A preview nobody can find is a preview nobody has -- it sits in the
+    same panel as the frame grid, not behind a click."""
+    page, _ = loaded_page
+    html = _grid_html(page, FOUR_FRAME_JOB, LIVE_GRID_INSTANCES)
+    assert "lp-tile" in html, "no live preview tile was drawn"
+    assert TINY_JPEG_URL in html, "the picture itself is not in the markup"
+    assert "acct0" in html and "frame 2" in html
+
+
+def test_the_live_preview_never_claims_to_be_the_rendered_frame(loaded_page):
+    """A 320-pixel JPEG next to a 1920-pixel render is a glance, not a
+    judgement. The page has to say so where it is shown."""
+    page, _ = loaded_page
+    html = _grid_html(page, FOUR_FRAME_JOB, LIVE_GRID_INSTANCES)
+    assert "not the render" in html
+    assert "full-resolution" in html
+    assert "once a session ends" in html
+
+
+def test_a_grid_with_no_previews_shows_no_placeholder(loaded_page):
+    """Never invent a reading. A frame with no preview shows nothing at
+    all -- an empty frame-shaped box would imply it had rendered."""
+    page, _ = loaded_page
+    html = _grid_html(page, FOUR_FRAME_JOB, TWO_DONE)
+    assert "lp-tile" not in html
+    assert "lp-strip" not in html
+
+
+def test_the_live_preview_is_reachable_by_keyboard(loaded_page):
+    page, _ = loaded_page
+    html = _grid_html(page, FOUR_FRAME_JOB, LIVE_GRID_INSTANCES)
+    assert 'data-live-frame="2"' in html
+    assert 'role="button"' in html and 'tabindex="0"' in html
+
+
+def test_the_finished_cells_are_still_clickable_alongside_a_preview(
+        loaded_page):
+    """The live tile is an addition, not a replacement: the grid below it
+    still fetches the real frame once the session has ended."""
+    page, _ = loaded_page
+    html = _grid_html(page, FOUR_FRAME_JOB, LIVE_GRID_INSTANCES)
+    assert 'data-frame="1"' in html and 'data-frame="2"' in html
+    assert "click to preview" in html
+
+
+def _open_live_tile(page):
+    """Click a live tile for real, through the page's own delegated
+    handler, and read back what the lightbox ended up saying."""
+    out = {}
+    loop = QEventLoop()
+    page.runJavaScript(
+        "(() => { try {"
+        "  const host = document.getElementById('instances');"
+        f" host.innerHTML = renderFrameGrid({FOUR_FRAME_JOB},"
+        f"   {LIVE_GRID_INSTANCES});"
+        "  host.querySelector('[data-live-frame]').click();"
+        "  const img = document.getElementById('lb-img');"
+        "  return JSON.stringify({"
+        "    hidden: document.getElementById('lightbox').hidden,"
+        "    title: document.getElementById('lb-title').textContent,"
+        "    sub: document.getElementById('lb-sub').textContent,"
+        "    alt: img.alt, live: img.classList.contains('lb-live'),"
+        "    src: img.getAttribute('src') || ''});"
+        " } catch (e) { return 'THREW ' + e; } })()",
+        lambda r: (out.__setitem__("v", r or ""), loop.quit()))
+    QTimer.singleShot(5000, loop.quit)
+    loop.exec()
+    assert "v" in out and not out["v"].startswith("THREW"), out.get("v")
+    return json_loads(out["v"])
+
+
+def test_clicking_a_live_preview_enlarges_the_picture_it_already_has(
+        loaded_page):
+    """It must NOT ask the backend for the frame: mid-render there is
+    nothing on Kaggle to fetch, so that could only ever be an apology."""
+    page, _ = loaded_page
+    got = _open_live_tile(page)
+    assert got["hidden"] is False
+    assert got["src"].startswith("data:image/jpeg;base64,")
+
+
+def test_the_enlarged_live_preview_is_labelled_as_a_preview(loaded_page):
+    """The lightbox is where a render gets judged. A thumbnail opened
+    there under the same title as a real frame would be judged as one."""
+    page, _ = loaded_page
+    got = _open_live_tile(page)
+    assert "live preview" in got["title"]
+    assert "not the full-resolution frame" in got["sub"]
+    assert "still rendering" in got["sub"]
+    assert got["live"] is True, "the lightbox did not mark this as a preview"
+    assert "preview" in got["alt"].lower()

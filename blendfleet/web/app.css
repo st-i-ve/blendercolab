@@ -593,6 +593,44 @@ h2.sec .meta{font-family:var(--mono);font-size:11px;font-weight:400;color:var(--
 .collect-strip .cs-lab{font-family:var(--mono);font-size:11px;color:var(--ink-2);white-space:nowrap}
 .collect-strip .cs-lab b{color:var(--accent-ink)}
 .collect-strip .track{flex:1}
+/* ---- live frame previews (mid-render, over the log stream) ----
+   Sits ABOVE the frame grid inside the same panel: the grid says how many
+   frames exist, this says what they look like, and a preview nobody can
+   find is a preview nobody has. Deliberately understated next to the
+   lightbox -- these are glances at a running render, not the render. */
+.lp-strip{margin-bottom:14px}
+.lp-head{
+  display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+  font-family:var(--mono);font-size:11px;color:var(--ink-2);margin-bottom:8px;
+}
+/* The tag rides WITH the heading rather than in the note underneath,
+   because a heading read on its own must not promise a rendered frame. */
+.lp-tag{
+  font-size:9.5px;letter-spacing:.04em;text-transform:uppercase;
+  color:var(--ink-3);border:1px solid var(--border);border-radius:999px;
+  padding:2px 7px;
+}
+.lp-tiles{display:flex;gap:10px;flex-wrap:wrap}
+.lp-tile{
+  margin:0;width:196px;cursor:pointer;
+  border:1px solid var(--border);border-radius:var(--r-md);overflow:hidden;
+  background:var(--fill);
+}
+.lp-tile:hover{outline:2px solid var(--accent);outline-offset:1px}
+.lp-tile:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+/* 16:9 because that is what a 1920x1080 render is; a preview of any other
+   shape is letterboxed rather than cropped, so nothing is hidden. */
+.lp-tile img{display:block;width:100%;aspect-ratio:16/9;object-fit:contain;
+  background:var(--border-2)}
+.lp-tile figcaption{
+  font-family:var(--mono);font-size:10px;color:var(--ink-3);
+  padding:5px 7px;border-top:1px solid var(--border);
+}
+.lp-tile figcaption b{color:var(--ink-2)}
+.lp-note{
+  font-family:var(--mono);font-size:10px;color:var(--ink-3);
+  margin:9px 0 0;line-height:1.55;max-width:76ch;
+}
 /* ---- frame-by-frame grid ---- */
 .fgrid-wrap{display:none;margin-top:12px;background:var(--fill);border:1px solid var(--border);border-radius:var(--r-md);padding:12px 13px 10px}
 .fgrid-wrap.show{display:block}
@@ -1016,6 +1054,17 @@ button:focus:not(:focus-visible){outline:none}
   object-fit:contain;
   border-radius:var(--r-md);border:1px solid var(--border);
   background:var(--fill);
+}
+/* A LIVE preview in the lightbox, which is a different thing from the
+   frame and must not be able to pass for it. Enlarged to at most twice
+   its own 320 pixels and left PIXELATED rather than smoothed: the
+   blockiness is the point, since a bilinear upscale of a thumbnail looks
+   like a soft render rather than like a thumbnail. The dashed accent
+   border repeats the same fact for anyone who only glances. */
+.lb-stage img.lb-live{
+  width:min(100%, 640px);height:auto;
+  image-rendering:pixelated;
+  border-style:dashed;border-color:var(--accent);
 }
 /* A finished cell is a button; an unfinished one is not, and must not
    pretend otherwise by lighting up under the pointer. */
