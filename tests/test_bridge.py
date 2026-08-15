@@ -2675,3 +2675,127 @@ def test_telemetry_alone_never_touches_the_jobs_file(qapp, tmp_path,
     backend._live_tick()
 
     assert writes == []
+
+
+# ---------------------------------------------------------------------------
+# Live frame previews.
+#
+# Kaggle releases a kernel's output only once its session ends, so a
+# mid-render frame cannot be fetched -- the notebook pushes a small JPEG
+# down the log stream and log_stream reassembles it on a STREAM THREAD.
+# Everything below is about what happens after that: nothing touches a Qt
+# object off the UI thread, and a hundred-frame render must not accumulate
+# a hundred images.
+# ---------------------------------------------------------------------------
+
+def _thumb(frame, jpeg=b"\xff\xd8fake-jpeg"):
+    import base64
+    return {"frame": frame,
+            "jpeg_b64": base64.b64encode(jpeg).decode("ascii"),
+            "bytes": len(jpeg)}
+
+
+def test_a_live_preview_reaches_the_payload_as_a_drawable_image(qapp, tmp_path):
+    backend = make_backend(tmp_path, n=1)
+    backend._thumb_q.put(("acct0", _thumb(7)))
+    backend._live_tick()
+
+    live = json.loads(backend.state())["instances"][0]["live"]
+    assert live["thumb"]["frame"] == 7
+    # A data URL, not a file path: the page draws it directly, and no
+    # frame is written to the user's disk to be looked at once.
+    assert live["thumb"]["dataUrl"].startswith("data:image/jpeg;base64,")
+
+
+def test_the_keys_match_what_log_stream_actually_hands_over(qapp, tmp_path):
+    """Built from a real reassembled preview rather than a hand-made dict,
+    so a rename in log_stream fails HERE instead of silently emptying the
+    tile."""
+    import base64
+
+    from blendfleet.log_stream import ThumbnailAssembler, parse_thumbnail_part
+
+    raw = b"\xff\xd8" + bytes(range(200))
+    b64 = base64.b64encode(raw).decode("ascii")
+    line = ('data: {"stream_name":"stdout","data":"THUMB frame=4 part=1/1 '
+            f'bytes={len(raw)} {b64}"' + "}")
+    record = ThumbnailAssembler().add(parse_thumbnail_part(line))
+    assert record is not None, "the sample line no longer reassembles"
+
+    backend = make_backend(tmp_path, n=1)
+    backend._thumb_q.put(("acct0", record))
+    backend._live_tick()
+
+    thumb = json.loads(backend.state())["instances"][0]["live"]["thumb"]
+    assert thumb["frame"] == 4
+    assert thumb["dataUrl"].endswith(b64)
+
+
+def test_only_the_newest_preview_per_account_is_kept(qapp, tmp_path):
+    """A 100-frame render must not hold 100 images. Each one is ~5 kB of
+    JPEG that is re-serialised into the payload on every tick, and the
+    question this answers -- what is it doing right now -- only the newest
+    frame can answer."""
+    backend = make_backend(tmp_path, n=1)
+    for frame in range(1, 101):
+        backend._thumb_q.put(("acct0", _thumb(frame)))
+    backend._live_tick()
+
+    live = backend._live["acct0"]
+    assert live["thumb"]["frame"] == 100
+    # Not a list, not a dict of frames: one slot, holding one picture.
+    assert isinstance(live["thumb"], dict)
+    assert set(live["thumb"]) == {"frame", "dataUrl", "bytes"}
+
+
+def test_each_account_keeps_its_own_newest_preview(qapp, tmp_path):
+    """Accounts render different stripes of the same scene, so one
+    account's preview must never overwrite another's."""
+    backend = make_backend(tmp_path, n=2)
+    backend._thumb_q.put(("acct0", _thumb(3)))
+    backend._thumb_q.put(("acct1", _thumb(11)))
+    backend._live_tick()
+
+    instances = json.loads(backend.state())["instances"]
+    by_label = {i["label"]: i for i in instances}
+    assert by_label["acct0"]["live"]["thumb"]["frame"] == 3
+    assert by_label["acct1"]["live"]["thumb"]["frame"] == 11
+
+
+def test_an_account_with_no_preview_yet_shows_nothing(qapp, tmp_path):
+    """Never a placeholder. An empty frame-shaped box would imply a frame
+    had rendered, which is the one thing this must not say."""
+    backend = make_backend(tmp_path, n=1)
+    backend._progress_q.put(("acct0", 1, 4))
+    backend._live_tick()
+
+    live = json.loads(backend.state())["instances"][0]["live"]
+    assert live["thumb"] is None
+
+
+def test_a_preview_is_evidence_the_render_has_started(qapp, tmp_path):
+    """A preview only exists because a frame finished inside a running
+    Blender, so it says at least as much as telemetry does."""
+    backend = make_backend(tmp_path, n=1)
+    backend._thumb_q.put(("acct0", _thumb(1)))
+    backend._live_tick()
+    assert json.loads(backend.state())["instances"][0]["live"]["phase"] \
+        == "rendering"
+
+
+def test_a_preview_never_touches_the_payload_from_the_stream_thread(qapp,
+                                                                    tmp_path):
+    """The discipline that stopped this app crashing: a stream thread puts
+    on a queue and nothing else. Asserted by pushing from a real thread and
+    checking the payload is untouched until the UI thread ticks."""
+    backend = make_backend(tmp_path, n=1)
+
+    thread = threading.Thread(
+        target=lambda: backend._thumb_q.put(("acct0", _thumb(2))))
+    thread.start()
+    thread.join()
+
+    assert json.loads(backend.state())["instances"][0]["live"] is None
+    backend._live_tick()
+    assert json.loads(backend.state())["instances"][0]["live"]["thumb"][
+        "frame"] == 2

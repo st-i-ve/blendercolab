@@ -263,6 +263,12 @@ class Backend(QObject):
         self._telemetry_q: "queue.Queue[tuple[str, dict]]" = queue.Queue()
         self._system_q: "queue.Queue[tuple[str, dict]]" = queue.Queue()
         self._hardware_q: "queue.Queue[tuple[str, dict]]" = queue.Queue()
+        # Complete live frame previews, reassembled from the chunked THUMB
+        # lines by log_stream.ThumbnailAssembler on the stream thread.
+        # Queued like everything else: a QWebChannel payload built from a
+        # stream thread is the crash class this app spent a release
+        # getting rid of.
+        self._thumb_q: "queue.Queue[tuple[str, dict]]" = queue.Queue()
         # Notifications raised BY a stream thread (a hardware check
         # that could not be watched). Queued like everything else so
         # the signal is emitted on the UI thread, never from the
@@ -556,6 +562,12 @@ class Backend(QObject):
             "ramUsed": slot["ramUsed"],
             "cpuPct": slot["cpuPct"],
             "preflight": slot["preflight"],
+            # A LOW-RESOLUTION preview of the newest frame this account
+            # finished, or None -- never a placeholder. A frame with no
+            # preview yet must show nothing, because an empty tile that
+            # implied a frame had rendered would be a claim this app
+            # cannot make.
+            "thumb": slot["thumb"],
         }
 
     def _emit_state(self) -> None:
@@ -2082,7 +2094,8 @@ class Backend(QObject):
                     on_telemetry=lambda r: self._telemetry_q.put((label, r)),
                     on_system=lambda r: self._system_q.put((label, r)),
                     on_hardware=lambda r: self._hardware_q.put((label, r)),
-                    on_preflight=lambda r: self._preflight_q.put((label, r)))
+                    on_preflight=lambda r: self._preflight_q.put((label, r)),
+                    on_thumbnail=lambda r: self._thumb_q.put((label, r)))
             except Exception as e:      # noqa: BLE001
                 # Still swallowed -- a dead stream must never kill the
                 # render, which keeps going on Kaggle regardless of
@@ -2245,6 +2258,9 @@ class Backend(QObject):
             # SYSTEM line -- never 0, which would read as "no memory
             # in use" rather than "not measured yet".
             "ramUsed": None, "cpuPct": None,
+            # The single most recent live frame preview from this
+            # account, or None. See _live_tick for why exactly one.
+            "thumb": None,
         })
 
     def _live_tick(self) -> None:
@@ -2312,6 +2328,52 @@ class Backend(QObject):
             # 2. Seeing the banner but no telemetry yet means setup.
             if not slot["phase"]:
                 slot["phase"] = "installing Blender"
+            changed = True
+        # LIVE FRAME PREVIEWS, AND WHY ONLY ONE SURVIVES PER ACCOUNT.
+        #
+        # Every one of these is an image -- about 5 kB of JPEG as ~7 kB of
+        # base64 -- and _state_payload is re-serialised whole and pushed
+        # across the QWebChannel on every tick. Keeping a 100-frame
+        # render's previews would be 100 images held forever AND ~700 kB
+        # of JSON crossing the channel every two seconds, for pictures
+        # nobody is looking at.
+        #
+        # So: the NEWEST preview per account, and nothing else. The
+        # question this feature answers is "what is it doing right now",
+        # which only the newest frame can answer; the older ones are
+        # already superseded by the time they would be drawn, and the
+        # full-resolution frames are still all recoverable afterwards
+        # through Collect. Draining in arrival order means the last one
+        # out of the queue wins, which is the newest by construction --
+        # one stdout, in frame order.
+        #
+        # The per-tick cap is about not starving the event loop, NOT about
+        # memory -- memory is bounded by keeping one image per label
+        # however many are drained. It matches the other queues' 200 so a
+        # backlog (a stream that reconnected and replayed, a window that
+        # was busy) is cleared in one tick rather than dribbled out over
+        # several, which would draw previews minutes after the frames they
+        # show were rendered.
+        for _ in range(200):
+            try:
+                label, record = self._thumb_q.get_nowait()
+            except queue.Empty:
+                break
+            slot = self._slot(label)
+            slot["thumb"] = {
+                "frame": record["frame"],
+                # Built HERE rather than on the page: the page should not
+                # have to know this is JPEG, and a data URL is the only
+                # form a QWebChannel string payload can be drawn from
+                # without writing a file per frame to the user's disk.
+                "dataUrl": "data:image/jpeg;base64," + record["jpeg_b64"],
+                "bytes": record["bytes"],
+            }
+            # A preview only exists because a frame finished inside a
+            # running Blender, so its arrival is evidence of the same
+            # thing telemetry is.
+            if not slot["phase"]:
+                slot["phase"] = "rendering"
             changed = True
         for _ in range(200):
             try:
