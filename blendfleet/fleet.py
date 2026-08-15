@@ -315,6 +315,15 @@ class WorkerState:
     frames: list[int]
     state: str = "queued"
     frames_done: int = 0
+    # When frames_done was last written (epoch seconds), 0.0 meaning "never
+    # recorded" -- which is also what a state file written before this
+    # existed loads as. Kept BESIDE the count because a count read back off
+    # disk after a restart is a CACHED reading, not a live one: the stream
+    # that produced it is gone, and the render has kept going on Kaggle in
+    # the meantime. The UI is required to say how old a cached number is
+    # (the same rule the hardware snapshot already follows), and it cannot
+    # do that unless the number carries its timestamp.
+    frames_done_at: float = 0.0
     message: str = ""
     # Epoch seconds. Both default to 0.0, meaning "not recorded" -- which
     # is also what a state file written before these existed will load as,
@@ -631,6 +640,57 @@ class Fleet:
         else:
             jobs.append(st)
         self.save_jobs(jobs)
+
+    def record_progress(self, progress: dict[str, int]) -> list[str]:
+        """Write the live stream's frame counts through to disk.
+
+        The ONLY thing that ever knew how many frames a worker had
+        finished was the SSE log stream, held in memory. Kaggle's
+        kernel-status API does not report a frame count at all -- poll_all()
+        can learn "running", never "9 of 15" -- so closing the app threw
+        away every number the stream had reported, and reopening it showed
+        a job that was demonstrably still rendering with no progress at
+        all. Persisting the count here is what lets a restarted app say
+        something true before any stream has reconnected.
+
+        `progress` is label -> frames done, and each label is applied to
+        the NEWEST tracked job containing it -- the same "a label points at
+        its most recent job" rule the dashboard payload itself uses, so the
+        two cannot disagree about which worker a live reading belongs to.
+
+        Never moves a count BACKWARDS. A resumed stream replays the whole
+        log from the top, and a reconnect mid-replay can briefly report
+        fewer frames than the last complete replay did; a bar that jumps
+        back to 2/15 reads as a render that restarted, which is a lie about
+        somebody's quota. Nothing else about the worker is touched: state
+        and message belong to poll_all(), which talks to Kaggle.
+
+        Returns the labels actually written, so a caller can tell an
+        unchanged no-op (the common case -- nothing is saved at all then)
+        from a real update.
+        """
+        jobs = self.load_jobs()
+        if not jobs:
+            return []
+        # Oldest first, so a label present in more than one job ends up
+        # bound to its most recent one -- see the docstring.
+        newest: dict[str, WorkerState] = {}
+        for st in jobs:
+            for w in st.workers:
+                newest[w.label] = w
+        written: list[str] = []
+        now = time.time()
+        for label, done in progress.items():
+            w = newest.get(label)
+            if w is None or done <= w.frames_done:
+                continue
+            w.frames_done = done
+            w.frames_done_at = now
+            written.append(label)
+        if not written:
+            return []           # nothing moved: do not rewrite the file
+        self.save_jobs(jobs)
+        return written
 
     def forget_job(self, job_id: str | None = None) -> list[WorkerState]:
         """Drop one tracked job WITHOUT stopping anything on Kaggle.
@@ -1976,7 +2036,28 @@ class Fleet:
                     w.finished_at = time.time()
         current = self.load_jobs()
         updated_by_id = {st.job_id: st for st in jobs}
-        merged = [updated_by_id.get(j.job_id, j) for j in current]
+        merged = []
+        for j in current:
+            updated = updated_by_id.get(j.job_id)
+            if updated is None:
+                merged.append(j)
+                continue
+            # frames_done is the one field on a worker that this method
+            # never learns and never sets -- Kaggle's status API does not
+            # report a frame count, only the live log stream does (see
+            # record_progress). `updated` was built from a snapshot read
+            # BEFORE the network round trips above, so a frame the stream
+            # persisted while this poll was in flight is in `j` and not in
+            # `updated`; writing `updated` out verbatim would silently roll
+            # the user's progress bar backwards every 30 seconds. Carried
+            # across per worker, and only ever forwards.
+            by_label = {w.label: w for w in j.workers}
+            for w in updated.workers:
+                was = by_label.get(w.label)
+                if was is not None and was.frames_done > w.frames_done:
+                    w.frames_done = was.frames_done
+                    w.frames_done_at = was.frames_done_at
+            merged.append(updated)
         self.save_jobs(merged)
         return merged
 

@@ -1697,3 +1697,115 @@ def test_the_closing_line_says_who_ended_up_with_the_scene(blend, tmp_path,
     body = _log_text(diagnostic_log)
     assert "sharing finished: 1 of 2 other account(s) can see" in body
     assert "NOT shared with a2" in body
+
+
+# ---------------------------------------------------------------------------
+# Progress that survives a restart.
+#
+# Kaggle's kernel-status API reports a state and a message, never a frame
+# count, so poll_all() cannot learn one -- which meant frames_done was only
+# ever written by the live log stream held in memory, and closing the app
+# threw away every number it had reported. See Fleet.record_progress.
+# ---------------------------------------------------------------------------
+
+def test_a_recorded_frame_count_survives_a_save_and_load(blend, tmp_path):
+    f = Fleet(accounts(2), lambda t: FakeClient(t), tmp_path / "w")
+    st = f.launch(blend, RenderSettings(1920, 1080, 128), 1, 8)
+    label = st.workers[0].label
+
+    f.record_progress({label: 3})
+
+    reloaded = Fleet(accounts(2), lambda t: FakeClient(t),
+                     tmp_path / "w").load()
+    by_label = {w.label: w for w in reloaded.workers}
+    assert by_label[label].frames_done == 3
+    assert by_label[label].frames_done_at > 0
+    # Nobody else was touched: this only ever knows about the labels it
+    # was handed.
+    assert all(w.frames_done == 0 for w in reloaded.workers
+               if w.label != label)
+
+
+def test_a_count_that_did_not_move_writes_nothing(blend, tmp_path):
+    f = Fleet(accounts(1), lambda t: FakeClient(t), tmp_path / "w")
+    st = f.launch(blend, RenderSettings(1920, 1080, 128), 1, 4)
+    label = st.workers[0].label
+    f.record_progress({label: 2})
+    before = f._state_path().read_text(encoding="utf-8")
+
+    assert f.record_progress({label: 2}) == []
+    assert f._state_path().read_text(encoding="utf-8") == before
+
+
+def test_a_replayed_log_never_rolls_the_count_backwards(blend, tmp_path):
+    """A resumed stream replays the whole log from the top, and a
+    reconnect mid-replay can briefly report fewer frames than the last
+    complete pass did. A bar that jumps back reads as a render that
+    restarted -- a lie about somebody's quota."""
+    f = Fleet(accounts(1), lambda t: FakeClient(t), tmp_path / "w")
+    st = f.launch(blend, RenderSettings(1920, 1080, 128), 1, 6)
+    label = st.workers[0].label
+    f.record_progress({label: 5})
+
+    assert f.record_progress({label: 2}) == []
+    assert f.load().workers[0].frames_done == 5
+
+
+def test_progress_lands_on_the_most_recent_job_a_label_is_in(tmp_path):
+    """A label that rendered an older job and is now rendering a newer one
+    points at the newer one -- the same rule the dashboard payload uses,
+    so the two cannot disagree about which worker a reading belongs to."""
+    f = Fleet(accounts(1), lambda t: FakeClient(t), tmp_path / "w")
+    f.save_jobs([
+        FleetState(job_id="old", blend_name="a.blend", start_frame=1,
+                   end_frame=2,
+                   workers=[WorkerState(label="a0", username="u0",
+                                        kernel_slug="u0/a-render-1",
+                                        frames=[1, 2], state="complete")]),
+        FleetState(job_id="new", blend_name="b.blend", start_frame=1,
+                   end_frame=2,
+                   workers=[WorkerState(label="a0", username="u0",
+                                        kernel_slug="u0/b-render-1",
+                                        frames=[1, 2], state="running")]),
+    ])
+
+    f.record_progress({"a0": 1})
+
+    jobs = f.load_jobs()
+    assert jobs[0].workers[0].frames_done == 0
+    assert jobs[1].workers[0].frames_done == 1
+
+
+def test_record_progress_ignores_a_label_that_is_in_no_job(tmp_path):
+    f = Fleet(accounts(1), lambda t: FakeClient(t), tmp_path / "w")
+    assert f.record_progress({"nobody": 4}) == []
+
+
+def test_a_poll_does_not_undo_a_frame_count_saved_while_it_was_in_flight(
+        blend, tmp_path):
+    """poll_all builds its answer from a snapshot read BEFORE the network
+    round trips. Writing that snapshot back verbatim would silently roll
+    the user's progress bar backwards every 30 seconds."""
+    f = Fleet(accounts(1), lambda t: FakeClient(t, "running"),
+              tmp_path / "w")
+    st = f.launch(blend, RenderSettings(1920, 1080, 128), 1, 6)
+    label = st.workers[0].label
+
+    saved: list[int] = []
+
+    class MidPollClient(FakeClient):
+        """Stands in for the live stream landing a frame between
+        poll_all's own load_jobs() and its write-back."""
+
+        def status(self, slug):
+            if not saved:
+                saved.append(1)
+                Fleet(accounts(1), lambda t: FakeClient(t),
+                      tmp_path / "w").record_progress({label: 4})
+            return super().status(slug)
+
+    polled = Fleet(accounts(1), lambda t: MidPollClient(t, "running"),
+                   tmp_path / "w").poll_all()
+
+    assert polled[0].workers[0].frames_done == 4
+    assert f.load().workers[0].frames_done == 4

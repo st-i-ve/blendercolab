@@ -271,6 +271,10 @@ class Backend(QObject):
         self._preflight_q: "queue.Queue[tuple[str, dict]]" = queue.Queue()
         # label -> what we have seen live this run. Cleared per launch.
         self._live: dict[str, dict] = {}
+        # label -> the frame count last written to the jobs file, so a tick
+        # that reports the same number again writes nothing. See
+        # _persist_progress for why that matters.
+        self._persisted_done: dict[str, int] = {}
 
         # A status poll is infrequent and costs a network call per account;
         # the live drain is cheap and purely in-memory. Two timers, two
@@ -2009,6 +2013,54 @@ class Backend(QObject):
             self._stream_threads.append(thread)
             thread.start()
 
+    def _persist_progress(self, advanced: dict[str, int]) -> None:
+        """Write the frame counts this tick learned through to the jobs file.
+
+        WRITE FREQUENCY, deliberately. _live_tick runs every 2 seconds and
+        Fleet.record_progress is a read-merge-write of the whole jobs file,
+        so writing on every tick would be ~1800 rewrites an hour of a file
+        whose loss orphans running kernels. Three things keep it far below
+        that:
+
+          - Only PROGRESS moves this. Telemetry, system RAM and the phase
+            string arrive every few seconds and are deliberately NOT
+            persisted: they are live-only readings, and they are rebuilt
+            from a replayed log rather than from disk. A frame line
+            arrives once per finished frame -- about once a minute at the
+            57s/frame this app measures.
+          - Only a CHANGE writes. _persisted_done remembers what is
+            already on disk, so a re-delivered line (Kaggle replays a log
+            from the top on every reconnect) and an idle fleet both write
+            nothing.
+          - The whole tick is batched into ONE call. Four accounts each
+            finishing a frame in the same 2-second window is one file
+            write, not four.
+
+        So the steady state is roughly one write per completed frame across
+        the whole fleet, which is the same order as the 30-second poll
+        already writes at -- and zero writes whenever nothing is rendering.
+
+        Failure is recorded, never raised: the render is on Kaggle and
+        keeps going regardless, and a state file that cannot be written is
+        not a reason to stop showing live progress. _persisted_done is
+        updated only after a call that did not raise, so a failed write is
+        retried on the next frame rather than assumed done -- and it is
+        updated for every label in the batch, not just the ones
+        record_progress reports writing, because the other outcome is "disk
+        already holds this number or a larger one", which needs no write
+        either.
+        """
+        try:
+            self.fleet_factory(self.store.list()).record_progress(advanced)
+        except Exception as e:      # noqa: BLE001 -- see docstring
+            crash_log.record(self._scrub(
+                "could not save render progress to the jobs file, so a "
+                "restart would show an older frame count for "
+                f"{', '.join(sorted(advanced))}. The render itself is "
+                f"unaffected. {type(e).__name__}: {e}"), critical=True)
+            return
+        self._persisted_done.update(advanced)
+
     def _slot(self, label: str) -> dict:
         return self._live.setdefault(label, {
             "phase": "", "framesDone": 0, "framesTotal": 0,
@@ -2026,6 +2078,9 @@ class Backend(QObject):
         Bounded per tick so a flood of telemetry cannot starve the loop.
         """
         changed = False
+        # Collected across this tick's whole drain and written ONCE at the
+        # end, rather than per line -- see _persist_progress.
+        advanced: dict[str, int] = {}
         for _ in range(200):
             try:
                 label, done, total = self._progress_q.get_nowait()
@@ -2034,7 +2089,11 @@ class Backend(QObject):
             slot = self._slot(label)
             slot["framesDone"], slot["framesTotal"] = done, total
             slot["phase"] = f"rendering · {done}/{total} frames"
+            if done != self._persisted_done.get(label):
+                advanced[label] = done
             changed = True
+        if advanced:
+            self._persist_progress(advanced)
         for _ in range(200):
             try:
                 label, record = self._telemetry_q.get_nowait()

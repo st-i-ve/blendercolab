@@ -2413,3 +2413,113 @@ def test_an_unavailable_quota_says_why_in_the_log(qapp, tmp_path,
     body = _log_text(diagnostic_log)
     assert "acct0 reads 'unavailable'" in body
     assert "429 Too Many Requests" in body
+
+
+# ---------------------------------------------------------------------------
+# Progress that survives closing the app.
+#
+# Reported from the field: "once it closes and when I try to open it again
+# the render progress disappears". Kaggle's kernel-status API reports no
+# frame count, so poll can never learn one -- the live log stream is the
+# only source, and until now it held that number in memory and nothing
+# else, so closing the window threw away every frame it had counted.
+# ---------------------------------------------------------------------------
+
+def _running_job_backend(tmp_path, state="running", frames_done=0,
+                         frames_done_at=0.0, n=2):
+    """One tracked job already on disk, as a restarted app would find it."""
+    backend = make_backend(tmp_path, n=n)
+    fleet = backend.fleet_factory(backend.store.list())
+    fleet.save_jobs([FleetState(
+        job_id="job-1", blend_name="scene.blend", start_frame=1, end_frame=6,
+        workers=[WorkerState(label="acct0", username="user_0",
+                             kernel_slug="user_0/scene-render-1",
+                             frames=[1, 2, 3, 4, 5, 6], state=state,
+                             frames_done=frames_done,
+                             frames_done_at=frames_done_at)])])
+    return backend
+
+
+def test_the_live_tick_writes_the_frame_count_through_to_disk(qapp, tmp_path):
+    """If the live stream does not persist it, nothing does, and a restart
+    is back to showing no progress at all."""
+    backend = _running_job_backend(tmp_path)
+
+    backend._progress_q.put(("acct0", 3, 6))
+    backend._live_tick()
+
+    reloaded = backend.fleet_factory(backend.store.list()).load_jobs()
+    assert reloaded[0].workers[0].frames_done == 3
+    assert reloaded[0].workers[0].frames_done_at > 0
+
+
+def test_a_frame_count_that_has_not_moved_is_not_written_again(
+        qapp, tmp_path, monkeypatch):
+    """The live tick fires every 2 seconds and a save is a read-merge-write
+    of the whole jobs file. Only a CHANGED count may touch the disk, or a
+    progress bar becomes a write storm."""
+    backend = _running_job_backend(tmp_path)
+    writes = []
+    real_save = Fleet.save_jobs
+
+    def counted(self, jobs):
+        writes.append(1)
+        return real_save(self, jobs)
+
+    monkeypatch.setattr(Fleet, "save_jobs", counted)
+
+    backend._progress_q.put(("acct0", 3, 6))
+    backend._live_tick()
+    for _ in range(5):                  # idle ticks: nothing on any queue
+        backend._live_tick()
+    backend._progress_q.put(("acct0", 3, 6))    # a re-delivered line
+    backend._live_tick()
+
+    assert len(writes) == 1, f"{len(writes)} writes for one finished frame"
+
+
+def test_one_write_covers_every_account_that_moved_in_the_same_tick(
+        qapp, tmp_path, monkeypatch):
+    """Several accounts each finishing a frame in the same 2-second window
+    is one file write, not one per account."""
+    backend = make_backend(tmp_path, n=3)
+    fleet = backend.fleet_factory(backend.store.list())
+    fleet.save_jobs([FleetState(
+        job_id="job-1", blend_name="scene.blend", start_frame=1, end_frame=9,
+        workers=[WorkerState(label=f"acct{i}", username=f"user_{i}",
+                             kernel_slug=f"user_{i}/scene-render-1",
+                             frames=[1, 2, 3], state="running")
+                 for i in range(3)])])
+    writes = []
+    real_save = Fleet.save_jobs
+
+    def counted(self, jobs):
+        writes.append(1)
+        return real_save(self, jobs)
+
+    monkeypatch.setattr(Fleet, "save_jobs", counted)
+
+    for i in range(3):
+        backend._progress_q.put((f"acct{i}", 2, 3))
+    backend._live_tick()
+
+    assert len(writes) == 1
+    reloaded = backend.fleet_factory(backend.store.list()).load_jobs()
+    assert [w.frames_done for w in reloaded[0].workers] == [2, 2, 2]
+
+
+def test_telemetry_alone_never_touches_the_jobs_file(qapp, tmp_path,
+                                                     monkeypatch):
+    """GPU load, system RAM and the phase string are live-only readings
+    that a reconnecting stream rebuilds by replaying the log. Persisting
+    them would turn a 2-second tick into a 2-second disk write."""
+    backend = _running_job_backend(tmp_path)
+    writes = []
+    monkeypatch.setattr(Fleet, "save_jobs",
+                        lambda self, jobs: writes.append(1))
+
+    backend._telemetry_q.put(("acct0", {"gpu": 0, "util": 91}))
+    backend._system_q.put(("acct0", {"ram_used": 1, "cpu_pct": 4}))
+    backend._live_tick()
+
+    assert writes == []
