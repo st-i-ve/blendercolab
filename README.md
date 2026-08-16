@@ -58,6 +58,11 @@ Both are *onedir* builds: the `.exe` sits beside an `_internal/` folder and need
 it, so move or shortcut the whole `dist/blendfleetweb/` directory rather than the
 exe alone.
 
+There is also an **Electron shell** in progress (`electron/`), running the
+same dashboard against the same Python backend over a pipe rather than
+through Qt. It builds for Windows, Linux and macOS from one place. See
+*The Electron shell* below.
+
 ### Build it
 
 ```powershell
@@ -160,6 +165,40 @@ a test which opens a socket, leaks a thread, or raises an unstubbed modal dialog
 each is there because that exact failure once made the suite hang or crash
 non-deterministically instead of failing honestly.
 
+### The Electron shell
+
+`electron/` is a second shell over the same core: the Qt window is
+replaced by an Electron one, and QWebChannel by a headless Python
+sidecar speaking one JSON object per line over stdio.
+
+```bash
+cd electron && npm install     # Electron itself, ~150 MB
+npm start                      # runs against blendfleet/web/ and .venv
+npm run backend                # freeze the sidecar -> dist/backend/
+npm run dist                   # package -> dist/electron/
+```
+
+Two things make this affordable rather than a rewrite. The render core
+imports no PySide6 — Qt only ever appears in the entry points and `ui/`
+— so the sidecar is the same `fleet.py`, `uploader.py` and
+`log_stream.py` the Qt build uses. And the dashboard talks to exactly one
+object, `backend`, so `electron/preload.js` rebuilds that object's shape
+on the other side of the pipe and `blendfleet/web/` runs **unchanged**:
+byte for byte the same files both shells serve. Everything
+Electron-specific (the accent ground, the window's drag region) is
+injected from `electron/shell.css`.
+
+The sidecar is worth its own line: **30 MB frozen, with no Qt in it at
+all**, which is what `packaging/blendfleet-backend.spec` excluding
+PySide6 buys. `blendfleet/design.py` is what makes that possible — it
+holds the accent, theme and font *names* so `Settings` can validate them
+without importing the design system.
+
+`dist/blendfleetweb/` is never touched by any of this; the Electron
+output has its own tree. Linux and macOS artifacts come from
+`.github/workflows/electron.yml`, because PyInstaller cannot
+cross-compile: each platform's sidecar has to be frozen on that platform.
+
 ### Changing the UI without rebuilding
 
 The dashboard is `blendfleet/web/{index.html,app.css,app.js}` — plain files, no
@@ -177,6 +216,8 @@ Python, a new bundled font, a new accent (the list lives in `ui/theme.py`, and
 
 ```
 blendfleet/
+  design.py           the accent/theme/font NAMES, with no Qt attached
+  rpc/                the headless backend: session, protocol, sidecar
   uploader.py         resumable upload with progress + resume
   sharing.py          collaborator grants via the dataset metadata API
   fleet.py            stride assignment, launch, poll, cancel
@@ -188,6 +229,7 @@ blendfleet/
   ui/web_host.py      the window around it — tray, context menu, background ground
   ui/bridge.py        every call the page can make, and every signal it receives
   ui/theme.py         accents, themes, typefaces, and the Qt stylesheet
+electron/             the Electron shell: window, tray, dialogs, IPC shim
 ```
 
 ---

@@ -1,0 +1,68 @@
+{
+  "name": "blendfleet",
+  "productName": "BlendFleet",
+  "version": "0.1.0",
+  "description": "Render Blender animations across a fleet of free Kaggle GPUs",
+  "main": "main.js",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "backend": "cd .. && .venv/Scripts/python.exe -m PyInstaller --noconfirm --clean --distpath dist/backend packaging/blendfleet-backend.spec",
+    "dist": "electron-builder --publish never",
+    "backend:posix": "cd .. && .venv/bin/python -m PyInstaller --noconfirm --clean --distpath dist/backend packaging/blendfleet-backend.spec"
+  },
+  "devDependencies": {
+    "electron": "^43.0.0",
+    "electron-builder": "^26.0.0"
+  },
+  "build": {
+    "appId": "com.blendfleet.app",
+    "productName": "BlendFleet",
+    "directories": {
+      "output": "../dist/electron",
+      "buildResources": "../assets/logo"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "shell.css"
+    ],
+    "extraResources": [
+      {
+        "from": "../blendfleet/web",
+        "to": "web"
+      },
+      {
+        "from": "../assets/fonts",
+        "to": "assets/fonts"
+      },
+      {
+        "from": "../assets/logo",
+        "to": "assets/logo"
+      },
+      {
+        "from": "../dist/backend/blendfleet-backend",
+        "to": "backend"
+      }
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": "../assets/logo/blendfleet.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "shortcutName": "BlendFleet"
+    },
+    "linux": {
+      "target": "AppImage",
+      "category": "Graphics",
+      "icon": "../assets/logo/app-icon-256.png"
+    },
+    "mac": {
+      "target": "dmg",
+      "category": "public.app-category.graphics-design",
+      "icon": "../assets/logo/app-icon-512.png"
+    }
+  }
+}

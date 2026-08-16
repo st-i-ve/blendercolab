@@ -6,3 +6,6 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 *.spec.bak
+
+# Electron's dependencies: ~200 MB, restored by `npm install`
+node_modules/

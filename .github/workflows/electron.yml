@@ -1,0 +1,94 @@
+# Builds the Electron app for the three platforms.
+#
+# The matrix is not a convenience here, it is a requirement: PyInstaller
+# cannot cross-compile. The sidecar is a native binary of the machine
+# that froze it, so a Linux AppImage needs its backend built ON Linux and
+# a macOS dmg needs one built on macOS. That is the whole reason this
+# file exists rather than a line in the README saying "run it yourself".
+#
+# Each job does the same three things in the same order: freeze the
+# backend, install Electron, package. The Python suite runs first on one
+# platform only -- it is the same 1421 tests everywhere and running them
+# three times buys nothing that a green Windows run has not already
+# bought.
+name: electron
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install PySide6 kaggle pytest
+      - name: Test
+        env:
+          QT_QPA_PLATFORM: offscreen
+          QTWEBENGINE_CHROMIUM_FLAGS: --disable-gpu --no-sandbox
+        run: pytest tests/ -q
+
+  build:
+    needs: test
+    strategy:
+      # One platform failing should not cancel the other two: a macOS
+      # signing problem is not a reason to lose a working Linux build.
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            python: .venv/Scripts/python.exe
+          - os: ubuntu-latest
+            python: .venv/bin/python
+          - os: macos-latest
+            python: .venv/bin/python
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Create the virtualenv the specs expect
+        run: |
+          python -m venv .venv
+          ${{ matrix.python }} -m pip install --upgrade pip
+          ${{ matrix.python }} -m pip install PySide6 kaggle pyinstaller
+
+      # No PySide6 in this one -- see packaging/blendfleet-backend.spec,
+      # where excluding it is an assertion rather than an optimisation.
+      - name: Freeze the backend
+        run: ${{ matrix.python }} -m PyInstaller --noconfirm --clean --distpath dist/backend packaging/blendfleet-backend.spec
+
+      - name: Check the backend answers before packaging it around it
+        shell: bash
+        run: |
+          echo '{"id":1,"call":"preferences"}' \
+            | ./dist/backend/blendfleet-backend/blendfleet-backend* \
+            | grep -q '"ok": true'
+
+      - name: Package
+        working-directory: electron
+        run: |
+          npm install --no-audit --no-fund
+          npm run dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: blendfleet-${{ matrix.os }}
+          path: |
+            dist/electron/*.exe
+            dist/electron/*.AppImage
+            dist/electron/*.dmg
+          if-no-files-found: error

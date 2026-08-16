@@ -1,0 +1,50 @@
+/* What the page cannot know about itself, injected by preload.js.
+   blendfleet/web/ stays byte for byte the file the Qt build serves. */
+
+/* THE AMBIENT ACCENT WASH.
+   The Qt build paints this in the window (ui/web_host.Shell), because its
+   title bar sits OUTSIDE the page and a wash that began at the page's top
+   edge left a hard seam across the window. Here the window is the page,
+   so it goes back to being what it always was: two soft ellipses bleeding
+   in from opposite corners, behind everything, at z-index -1. */
+html.electron body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    radial-gradient(760px 360px at 88% -6%, var(--accent-soft), transparent 65%),
+    radial-gradient(640px 320px at -6% 108%, var(--accent-soft), transparent 65%);
+}
+
+/* THE DRAG REGION.
+   A frameless window has nothing to grab unless the page names a title
+   bar. The dashboard's header row is that bar -- and everything in it
+   that can be clicked has to opt back out, or the buttons become handles
+   that move the window instead of pressing. */
+html.electron .head-row {
+  -webkit-app-region: drag;
+  /* Room for the window controls Electron draws over the top right. */
+  padding-right: 150px;
+}
+html.electron .head-row button,
+html.electron .head-row .wifi-btn,
+html.electron .head-row .icon-btn {
+  -webkit-app-region: no-drag;
+}
+/* The sidebar is not a title bar: dragging the window by the nav would
+   mean a mis-click on Dashboard moves the whole window. */
+html.electron .side {
+  -webkit-app-region: no-drag;
+}
+
+/* A frameless window has no rounded corners of its own on Windows 10,
+   and the shell paints its own ground, so the page keeps its edges. */
+html.electron body {
+  overflow: hidden;
+}
+html.electron .app {
+  height: 100vh;
+  overflow: auto;
+}
