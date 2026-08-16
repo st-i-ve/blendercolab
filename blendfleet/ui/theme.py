@@ -33,6 +33,8 @@ from PySide6.QtGui import QColor, QFont, QFontDatabase, QIcon, QPainter, QPixmap
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import QApplication
 
+from blendfleet import design
+
 
 # ---------------- themes ----------------
 @dataclass(frozen=True)
@@ -103,7 +105,7 @@ THEMES: dict[str, ThemePalette] = {
         warn="#DEA85A", warn_t="#2A2419", warn_ink="#E5BE84",
         bg_translucent="rgba(0, 0, 0, 0.72)"),
 }
-DEFAULT_THEME = "light"
+DEFAULT_THEME = design.DEFAULT_THEME
 
 # The theme in effect app-wide right now -- one writer (apply()), any
 # number of readers, exactly like _active_accent_name below.
@@ -247,6 +249,10 @@ def _accent(base: str, ink_light: str, ink_dark: str) -> AccentPalette:
 # and every ink for >= 4.5:1 against its own theme's surfaces, in
 # tests/test_theme.py -- using the WCAG relative-luminance formula, not
 # eyeballed.
+# One palette per name in design.ACCENT_NAMES, which is what Settings
+# validates against -- tests/test_theme.py asserts the two agree, because
+# a colour in one and not the other is either selectable and unpaintable
+# or paintable and rejected the moment it is saved.
 ACCENTS: dict[str, AccentPalette] = {
     "orange": _accent("#E8935A", "#C06F38", "#F0AC7C"),   # blender
     "blue":   _accent("#5A9BD8", "#3D7BB8", "#8CBCE8"),   # sky
@@ -261,7 +267,7 @@ ACCENTS: dict[str, AccentPalette] = {
     "dark-red":    _accent("#A2464B", "#8E3B41", "#DE8C92"),  # oxblood
     "slate":       _accent("#5A6BA8", "#4A5A96", "#98A6DC"),  # deep indigo
 }
-DEFAULT_ACCENT = "orange"
+DEFAULT_ACCENT = design.DEFAULT_ACCENT
 
 
 def resolve_accent(name: str) -> AccentPalette:
@@ -369,13 +375,14 @@ def account_color(index: int) -> QColor:
 # The window chrome and the page always show the SAME face: the shell
 # reading in one typeface around a page in another is the "some parts
 # switched and some did not" complaint in a different key.
-FONTS: dict[str, str] = {
-    "heebo": "Heebo",      # the base: Roboto's proportions, a little tighter
-    "inter": "Inter",      # neutral UI face, generous at small sizes
-    "arimo": "Arimo",      # metric-compatible with Arial; the familiar one
-    "oswald": "Oswald",    # condensed display face, narrow and tall
-}
-DEFAULT_FONT = "heebo"
+# heebo: the base, Roboto's proportions a little tighter. inter: a
+# neutral UI face, generous at small sizes. arimo: metric-compatible with
+# Arial, the familiar one. oswald: condensed display face, narrow and
+# tall. The mapping lives in blendfleet/design.py, which has no Qt in it,
+# because Settings validates against these names and must not drag a
+# widget toolkit in to do it.
+FONTS: dict[str, str] = dict(design.FONT_FAMILIES)
+DEFAULT_FONT = design.DEFAULT_FONT
 
 # The face in effect app-wide right now -- one writer (apply()), any
 # number of readers, exactly like the accent and theme names.

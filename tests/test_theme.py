@@ -84,6 +84,35 @@ ACCENT_NAMES = ["orange", "green", "purple", "blue", "red",
                 "dark-orange", "dark-red", "slate"]
 
 
+def test_the_names_settings_validates_are_the_names_that_can_be_painted():
+    """Settings checks an accent, theme or font against blendfleet/design,
+    which has no Qt in it (the headless sidecar reads settings and must
+    not drag PySide6 in). ui/theme builds the palettes. A name in one and
+    not the other is either selectable and unpaintable, or paintable and
+    rejected the moment it is saved."""
+    from blendfleet import design
+    assert set(ACCENTS) == set(design.ACCENT_NAMES)
+    assert set(THEMES) == set(design.THEME_NAMES)
+    assert FONTS == design.FONT_FAMILIES
+    assert DEFAULT_ACCENT == design.DEFAULT_ACCENT
+    assert DEFAULT_THEME == design.DEFAULT_THEME
+    assert DEFAULT_FONT == design.DEFAULT_FONT
+
+
+def test_the_sidecar_reads_settings_without_pulling_in_qt():
+    """The whole point of design.py. Checked by import graph rather than
+    by eye: `import blendfleet.settings` in a fresh interpreter must not
+    bring PySide6 with it, or the Electron backend ships Qt for nothing."""
+    import subprocess
+    import sys
+    result = subprocess.run(
+        [sys.executable, "-c",
+         "import blendfleet.settings, sys;"
+         " print(any('PySide6' in m or 'shiboken' in m for m in sys.modules))"],
+        capture_output=True, text=True, check=True)
+    assert result.stdout.strip() == "False", result.stdout
+
+
 def test_every_named_accent_exists():
     """The five from the reference, plus this app's own darker three."""
     assert set(ACCENTS) == set(ACCENT_NAMES)

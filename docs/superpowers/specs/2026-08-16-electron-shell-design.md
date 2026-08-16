@@ -39,9 +39,11 @@ story.
 2. **`dist/blendfleetweb/` is never written to.** Electron output goes to
    `dist/electron/`, the sidecar to `dist/backend/<platform>/`.
 3. **The dashboard is not edited for Electron.** If `blendfleet/web/`
-   needs a change to work under Electron, that is a bug in the adapter,
-   not a job for the page -- with one deliberate exception, noted under
-   *The accent ground* below.
+   needs a change to work under Electron, that is a bug in the shell, not
+   a job for the page. Held completely: `blendfleet/web/` is byte for
+   byte the file the Qt build serves, and everything Electron-specific
+   (the accent ground, the drag region) is injected by `preload.js` from
+   `electron/shell.css`.
 4. **No new honesty.** Every payload the page receives means exactly what
    it means today: a cached reading still says how old it is, an unknown
    count still refuses to draw a bar. The adapter is a transport, not a
@@ -73,6 +75,16 @@ A new package, `blendfleet/rpc/`, with no Qt import anywhere in it.
 what replaces `Signal`. Handlers run on the calling thread; the sidecar
 serialises everything through one writer, so no handler ever races
 another.
+
+### `design.py` (found during stage 1, not planned)
+
+`Settings` validated an accent, theme and font against `ui/theme.py` --
+which imports PySide6. That made Qt a dependency of anything reading
+settings, including this sidecar, whose whole point is not shipping it.
+The NAMES now live in `blendfleet/design.py`, which imports nothing;
+`ui/theme.py` builds its palettes for those names, and a test asserts the
+two agree exactly. A colour in one and not the other would be either
+selectable and unpaintable, or paintable and rejected on save.
 
 ### `session.py`
 
@@ -174,10 +186,11 @@ leaves a seam across the window. Under Electron there is no strip outside
 the page: the whole window is the page. So the wash returns to CSS as
 `body::before`, exactly where it began, and the seam cannot occur.
 
-This is the one edit to `blendfleet/web/` this project makes, and it is
-additive -- the rule is restored, not changed, and the Qt build keeps
-painting its own ground underneath a page that no longer draws one.
-Both shells are checked for the seam before this is called done.
+Built as an injection rather than an edit: `electron/shell.css` carries
+the rule and `preload.js` adds it at DOMContentLoaded, so the page stays
+identical for both shells and the Qt build keeps painting its own ground
+underneath a page that does not draw one. Both shells are checked for the
+seam before this is called done.
 
 ### Stage 2 is done when
 
@@ -222,5 +235,10 @@ lock stops a second window adopting a first sidecar.
 never a socket -- that is why stdio was chosen over a localhost server --
 and error strings stay scrubbed by `_tokenless`.
 
-**Size.** Electron (~150 MB) plus sidecar (~200 MB) against today's
-~200 MB. Named here so it is not discovered at install time.
+**Size.** Estimated at ~350 MB when this was written, on the assumption
+the sidecar would cost what the Qt build costs. Measured after stage 1:
+the frozen sidecar is **30 MB**, because excluding PySide6 is real once
+`blendfleet/design.py` breaks Settings' dependency on `ui/theme`. So
+Electron (~150 MB) plus 30 MB lands near today's ~200 MB rather than
+double it. Recorded rather than quietly corrected: the estimate was
+wrong, and by enough to have changed the argument.

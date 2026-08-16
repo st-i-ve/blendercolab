@@ -16,8 +16,13 @@ from pathlib import Path
 
 from blendfleet.blender_versions import DEFAULT_VERSION, validate_version
 from blendfleet.platform_paths import config_dir
-from blendfleet.ui.theme import (ACCENTS, DEFAULT_ACCENT, DEFAULT_FONT,
-                                  DEFAULT_THEME, FONTS, THEMES)
+# The NAMES only, from a module with no Qt in it -- see blendfleet/design.
+# Importing ui.theme here would make PySide6 a dependency of anything that
+# reads settings, including the headless sidecar that exists to avoid it.
+from blendfleet.design import (ACCENT_NAMES as ACCENTS, DEFAULT_ACCENT,
+                               DEFAULT_FONT, DEFAULT_THEME,
+                               FONT_FAMILIES as FONTS,
+                               THEME_NAMES as THEMES)
 
 FILENAME = "settings.json"
 
