@@ -199,6 +199,14 @@ output has its own tree. Linux and macOS artifacts come from
 `.github/workflows/electron.yml`, because PyInstaller cannot
 cross-compile: each platform's sidecar has to be frozen on that platform.
 
+> **Installer status.** `npm start` and `npm run backend` work; `npm run
+> dist` has not yet produced an installer on this machine. electron-builder
+> keeps its own caches and every miss is a download that has to finish
+> inside its 600-second timeout, which this connection does not manage —
+> priming the Electron zip, winCodeSign and NSIS by hand got it further
+> but not past. On a CI runner none of that applies, which is what the
+> workflow is for.
+
 ### Changing the UI without rebuilding
 
 The dashboard is `blendfleet/web/{index.html,app.css,app.js}` — plain files, no

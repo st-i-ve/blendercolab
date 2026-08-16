@@ -218,6 +218,23 @@ running.
 `npm run dist` on Windows produces an installer that installs, launches,
 renders, and uninstalls -- and the workflow file builds the other two.
 
+**Where it actually stands (2026-08-17).** The configuration and the
+workflow are written; the local installer build is not done, and the
+reason is the network rather than the config. electron-builder keeps its
+own caches, separate from npm's, and every miss is a download this
+connection cannot finish inside its 600-second timeout. Three of them
+were primed by hand and verified in place -- the Electron zip in
+`%LOCALAPPDATA%\electron\Cache\<sha256-of-url>\`, winCodeSign and NSIS
+under `%LOCALAPPDATA%\electron-builder\Cache\` -- and the build still
+stops immediately after `downloaded label=electron progress=100%` on a
+further request, including with `ELECTRON_MIRROR` and
+`ELECTRON_BUILDER_BINARIES_MIRROR` pointed at a mirror.
+
+So the artifact is a CI job away rather than a config change away, which
+is exactly what the matrix exists for. What IS verified locally is
+everything the installer would wrap: the shell runs the real dashboard
+against the real backend, and the frozen sidecar answers the protocol.
+
 ---
 
 ## Risks, named
