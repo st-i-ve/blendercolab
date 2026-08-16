@@ -634,6 +634,29 @@ class Backend(QObject):
     def state(self) -> str:
         return json.dumps(self._state_payload())
 
+    def live_renders(self) -> dict:
+        """What is still going, for the window to ask about on close.
+
+        Plain Python rather than a Slot: the closing window is Qt, not
+        the page, and by the time it asks the page may already be gone.
+
+        "Live" is the same test the dashboard applies -- a worker with a
+        state that is not terminal -- and NOT "not idle": a kernel Kaggle
+        has accepted but not started answers `not_started`, which is
+        neither active nor finished, and is exactly the case where
+        closing would abandon a render that is about to start spending
+        quota (see kaggle_client's own note on PENDING_STATES).
+        """
+        scenes: list[str] = []
+        accounts = 0
+        for job in self.fleet_factory(self.store.list()).load_jobs():
+            live = [w for w in job.workers if w.state not in TERMINAL_STATES]
+            if not live:
+                continue
+            scenes.append(job.scene_key)
+            accounts += len(live)
+        return {"scenes": scenes, "accounts": accounts}
+
     @Slot()
     def ready(self) -> None:
         """The page has connected AND wired up every signal handler.
@@ -859,6 +882,9 @@ class Backend(QObject):
             "sound": self.settings.sound,
             "minGpus": self.settings.min_gpus,
             "fullscreen": self.settings.fullscreen,
+            "frameThumbnails": self.settings.frame_thumbnails,
+            "font": self.settings.font,
+            "closeAction": self.settings.close_action,
         })
 
     @Slot(result=str)
@@ -1226,7 +1252,9 @@ class Backend(QObject):
             decoded = value
         mapping = {"accent": "accent", "theme": "theme",
                    "translucent": "translucent", "sound": "sound",
-                   "minGpus": "min_gpus", "blenderVersion": "blender_version"}
+                   "minGpus": "min_gpus", "blenderVersion": "blender_version",
+                   "frameThumbnails": "frame_thumbnails", "font": "font",
+                   "closeAction": "close_action"}
         field = mapping.get(key)
         if field is None:
             return
@@ -1240,13 +1268,13 @@ class Backend(QObject):
         # without applying it leaves all of that on the old theme, which
         # is exactly the "background does not change" bug. theme.apply()
         # also fires theme_signal, which is what WebHost listens to.
-        if field in ("theme", "accent"):
+        if field in ("theme", "accent", "font"):
             from PySide6.QtWidgets import QApplication
             from blendfleet.ui import theme as theme_module
             app = QApplication.instance()
             if app is not None:
                 theme_module.apply(app, self.settings.accent,
-                                   self.settings.theme)
+                                   self.settings.theme, self.settings.font)
         self.settingsChanged.emit(self.preferences())
 
     @Slot()

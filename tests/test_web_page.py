@@ -389,11 +389,29 @@ def test_an_unmeasured_duration_shows_nothing_rather_than_zero(loaded_page):
 
 
 def test_a_finished_card_says_how_long_it_took(card):
+    """The figure lives in the head now, beside the state icon, and in
+    two units at most -- three ("1h 5m 20s") read as a serial number at
+    that size. The exact duration stays available in its tooltip."""
     done = LIVE_INSTANCE.replace(
         "framesDone: 1, message: ''",
         "framesDone: 4, message: '', elapsed: 320, finished: true")
     html = card(done)
-    assert "finished in 5:20" in html
+    assert "5m 20s" in html
+    assert 'class="dur"' in html
+
+
+def test_a_long_render_drops_the_seconds_rather_than_the_hours(card):
+    """Renders here run for hours; the seconds in "1h 37m 44s" are noise
+    beside a status icon and the hours are not. The exact figure is not
+    lost -- it moves into the tooltip, which is where the test looks for
+    it, so "shorter" cannot quietly become "less true"."""
+    done = LIVE_INSTANCE.replace(
+        "framesDone: 1, message: ''",
+        "framesDone: 4, message: '', elapsed: 5864, finished: true")
+    html = card(done)
+    assert ">1h 37m<" in html
+    assert ">1h 37m 44s<" not in html, "three units beside the icon"
+    assert "This render took 1h 37m 44s" in html
 
 
 def test_a_running_card_shows_the_same_field_as_a_stopwatch(card):
@@ -401,7 +419,7 @@ def test_a_running_card_shows_the_same_field_as_a_stopwatch(card):
         "framesDone: 1, message: ''",
         "framesDone: 1, message: '', elapsed: 95, finished: false")
     html = card(running)
-    assert "1:35" in html
+    assert "1m 35s" in html
     assert "finished in" not in html
 
 
@@ -427,18 +445,15 @@ def _stopped_instance(source, frames_done=1):
 
 
 def test_a_finished_card_shows_the_count_read_from_its_own_log(card):
+    """The count itself is what matters, and it is the CORRECTED one --
+    the render's own final word, not whatever the live stream last
+    saved. A count read from the finished kernel's log needs no label of
+    its own (the state icon already says the render ended), but a cached
+    live reading still does, and must never be confused for this."""
     html = card(_stopped_instance("final", frames_done=2))
     assert "2 / 2" in html
-    assert "final count" in html
-    assert "saved 1h ago" not in html, (
-        "a count read from the finished kernel's log is not a cached "
-        "live reading and must not be labelled as one")
-
-
-def test_the_waiting_sentence_follows_the_corrected_count(card):
-    html = card(_stopped_instance("final", frames_done=2))
-    assert "2 of 2 frames are waiting on Kaggle" in html
-    assert "1 of 2 frames" not in html
+    assert "1 / 2" not in html
+    assert "saved 1h ago" not in html
 
 
 def test_an_unreadable_log_shows_the_count_as_not_known_not_stale(card):
@@ -449,9 +464,16 @@ def test_an_unreadable_log_shows_the_count_as_not_known_not_stale(card):
     assert "&mdash; / 2" in html or "— / 2" in html or "— / 2" in html
 
 
-def test_an_unknown_count_draws_no_progress_bar(card):
+def test_a_card_draws_no_progress_bar_at_all(card):
+    """The per-card bar is gone from the design: the frame count says
+    how far it got, and the job's own frame grid below shows it cell by
+    cell. What must never come back is a bar drawn from a number nobody
+    measured -- an unknown count once forced one to 0%, which reads as
+    "nothing rendered" for a render that may well have finished."""
     html = card(_stopped_instance("unknown", frames_done=1))
-    assert 'class="assign-progress"><i style="width:0%"' in html
+    assert "assign-progress" not in html
+    html = card(_stopped_instance("final", frames_done=2))
+    assert "assign-progress" not in html
 
 
 def test_an_unknown_count_points_at_collect_frames(card):
@@ -630,7 +652,7 @@ def test_a_non_owner_card_is_not_badged(card):
 # fetched rather than the whole job's output.
 # ---------------------------------------------------------------------------
 
-def _grid_html(page, job_js, instances_js):
+def _grid_html(page, job_js, instances_js, before=""):
     """Render one job's own frame grid by calling the page's own
     renderFrameGrid(job, instances) -- PURE now, like instanceCard(), so
     the concurrent-scenes rewrite (Task 7) can call it once per job
@@ -641,7 +663,7 @@ def _grid_html(page, job_js, instances_js):
     out = {}
     loop = QEventLoop()
     page.runJavaScript(
-        "(() => { try { return String(renderFrameGrid("
+        "(() => { try { " + before + " return String(renderFrameGrid("
         f"{job_js}, {instances_js}));"
         " } catch (e) { return 'THREW ' + e; } })()",
         lambda r: (out.__setitem__("v", r or ""), loop.quit()))
@@ -675,6 +697,156 @@ def test_a_finished_frame_is_reachable_by_keyboard(loaded_page):
     page, _ = loaded_page
     html = _grid_html(page, FOUR_FRAME_JOB, TWO_DONE)
     assert 'role="button"' in html and 'tabindex="0"' in html
+
+
+# ---------------------------------------------------------------------------
+# The thumbnail view of a job's frames.
+#
+# The grid says HOW MANY frames are done; this says what they look like.
+# What governs every decision in it is that Kaggle serves no thumbnail:
+# the only file it will hand over is the frame itself, ~2 MB of PNG. So
+# tiles load lazily, one at a time, against a budget -- and the tile keeps
+# a shrunk copy while the full-resolution original stays on disk for the
+# preview modal.
+# ---------------------------------------------------------------------------
+
+FINISHED_OWNER = ("[{label:'acct0', worker:{state:'complete',"
+                  " frames:[1,2,3,4], framesDone:2, finished:true}}]")
+STILL_RENDERING_OWNER = ("[{label:'acct0', worker:{state:'running',"
+                         " frames:[1,2,3,4], framesDone:2, finished:false},"
+                         " live:{framesDone:2, framesTotal:4}}]")
+
+
+def _strip_html(page, job_js, instances_js, done_js="new Set([1,2])",
+                before=""):
+    """frameStripHtml(job, instances, done) -- pure, like renderFrameGrid
+    and instanceCard, so a test can hand it the same `done` set the grid
+    shades and read the markup back."""
+    out = {}
+    loop = QEventLoop()
+    page.runJavaScript(
+        "(() => { try { " + before + " return String(frameStripHtml("
+        f"{job_js}, {instances_js}, {done_js}));"
+        " } catch (e) { return 'THREW ' + e; } })()",
+        lambda r: (out.__setitem__("v", r or ""), loop.quit()))
+    QTimer.singleShot(5000, loop.quit)
+    loop.exec()
+    assert "v" in out and not out["v"].startswith("THREW"), out.get("v")
+    return out["v"]
+
+
+def test_a_finished_frame_gets_a_tile_to_fetch(loaded_page):
+    page, _ = loaded_page
+    html = _strip_html(page,
+                       "{jobId:'j1', blend:'x.blend', startFrame:1, endFrame:4}",
+                       FINISHED_OWNER)
+    assert 'data-thumb-frame="1"' in html and 'data-thumb-frame="2"' in html
+    assert 'role="button"' in html and 'tabindex="0"' in html
+    assert "full-resolution frame" in html
+
+
+def test_an_unrendered_frame_gets_no_tile(loaded_page):
+    """Same rule the grid's clickable cells follow: there is nothing on
+    Kaggle to fetch for a frame nobody has rendered."""
+    page, _ = loaded_page
+    html = _strip_html(page,
+                       "{jobId:'j2', blend:'x.blend', startFrame:1, endFrame:4}",
+                       FINISHED_OWNER)
+    assert 'data-thumb-frame="3"' not in html
+    assert 'data-thumb-frame="4"' not in html
+
+
+def test_a_frame_on_a_running_session_is_not_offered_for_fetching(loaded_page):
+    """Kaggle releases a kernel's output only once the session ENDS, so a
+    frame belonging to an account still rendering cannot be fetched at
+    all. The tile says which of the two reasons it is blank rather than
+    queueing a request that could only fail."""
+    page, _ = loaded_page
+    html = _strip_html(page,
+                       "{jobId:'j3', blend:'x.blend', startFrame:1, endFrame:4}",
+                       STILL_RENDERING_OWNER)
+    assert "when the session ends" in html
+    assert 'data-thumb-frame=' not in html, (
+        "a frame whose session is still running must not be queued")
+
+
+def test_a_job_with_nothing_finished_says_so_rather_than_showing_an_empty_rail(
+        loaded_page):
+    page, _ = loaded_page
+    html = _strip_html(page,
+                       "{jobId:'j4', blend:'x.blend', startFrame:1, endFrame:4}",
+                       FINISHED_OWNER, done_js="new Set()")
+    assert "Nothing to show yet" in html
+    assert "its session has ended" in html
+
+
+def test_the_loading_budget_stops_and_asks_rather_than_pulling_the_render(
+        loaded_page):
+    """A wall of tiles is half a gigabyte on a long render. The queue
+    stops after its budget and offers to keep going -- it must never
+    quietly download the lot."""
+    page, _ = loaded_page
+    html = _strip_html(page,
+                       "{jobId:'j5', blend:'x.blend', startFrame:1, endFrame:4}",
+                       FINISHED_OWNER,
+                       before="thumbState('j5').capped = true;")
+    assert "Keep loading" in html
+    assert 'data-thumb-more="j5"' in html
+    assert "hundreds of megabytes" in html
+    # And without the cap the offer is not on screen at all.
+    clean = _strip_html(page,
+                        "{jobId:'j6', blend:'x.blend', startFrame:1, endFrame:4}",
+                        FINISHED_OWNER)
+    assert 'class="fstrip-more" hidden' in clean
+
+
+def test_a_loaded_thumbnail_survives_the_next_live_tick(loaded_page):
+    """The card grid is discarded and rebuilt every two seconds while a
+    render runs. If the pictures lived in the markup they would be
+    re-fetched every tick -- at ~2 MB each. They live in frameThumbs, and
+    hydrateFrameStrips puts them back."""
+    page, _ = loaded_page
+    result = _preview_state(page,
+        "const host = document.getElementById('instances');"
+        " host.innerHTML = renderFrameGrid("
+        "   {jobId:'j7', blend:'x.blend', startFrame:1, endFrame:4},"
+        f"  {FINISHED_OWNER});"
+        f" thumbState('j7').small[1] = '{TINY_JPEG_URL}';"
+        " hydrateFrameStrips();"
+        " const tile = host.querySelector('[data-thumb-frame=\"1\"]')"
+        "   || host.querySelector('.fthumb.has-image');"
+        " return JSON.stringify({"
+        "   src: tile.querySelector('img').getAttribute('src'),"
+        "   marked: tile.classList.contains('has-image')});")
+    import json as _json
+    got = _json.loads(result)
+    assert got["src"] == TINY_JPEG_URL
+    assert got["marked"] is True
+
+
+def test_the_frame_section_can_be_collapsed_and_the_count_stays(loaded_page):
+    """Collapsed, it keeps the one thing that is the answer most of the
+    time -- how many frames are done -- and drops what takes the room."""
+    page, _ = loaded_page
+    html = _grid_html(page,
+                      "{jobId:'j8', blend:'x.blend', startFrame:1, endFrame:4}",
+                      TWO_DONE)
+    assert 'data-fg-collapse="j8"' in html
+    assert "2/4 frames" in html
+    assert 'aria-expanded="true"' in html
+
+
+def test_turning_thumbnails_off_removes_the_view_switch_entirely(loaded_page):
+    """Off means off: not a disabled button, not an empty strip -- the
+    grid, as it was before any of this existed."""
+    page, _ = loaded_page
+    job = "{jobId:'j9', blend:'x.blend', startFrame:1, endFrame:4}"
+    on = _grid_html(page, job, TWO_DONE)
+    assert 'data-fg-view="thumbs"' in on
+    off = _grid_html(page, job, TWO_DONE,
+                     before="prefs.frameThumbnails = false;")
+    assert 'data-fg-view=' not in off
+    assert 'class="fgrid"' in off, "the grid itself must be untouched"
 
 
 # ---------------------------------------------------------------------------
@@ -925,6 +1097,43 @@ def test_opening_a_preview_shows_the_frame_and_who_rendered_it(loaded_page):
     assert got["src"].endswith("f_0007.png")
 
 
+def test_the_page_offers_every_typeface_set_in_its_own_face(loaded_page):
+    """A list of font names all drawn in the same font tells you nothing,
+    so each button is set in the face it selects."""
+    page, _ = loaded_page
+    result = _preview_state(page,
+        "const buttons = Array.from(document.querySelectorAll('#faces .face'));"
+        " return JSON.stringify({"
+        "  names: buttons.map(b => b.dataset.v),"
+        "  faces: buttons.map(b =>"
+        "    getComputedStyle(b).fontFamily.replace(/[\"']/g, '')"
+        "      .split(',')[0].trim().toLowerCase())});")
+    import json as _json
+    got = _json.loads(result)
+    assert got["names"] == ["heebo", "inter", "arimo", "oswald"]
+    assert got["faces"] == got["names"], (
+        "each button must be drawn in the face it selects")
+
+
+def test_choosing_a_typeface_restyles_the_whole_page(loaded_page):
+    """applyPrefs is what the bridge calls on startup with the saved
+    preference, so this is also "the face you picked survives a restart"."""
+    page, _ = loaded_page
+    result = _preview_state(page,
+        "const was = prefs.font;"
+        " applyPrefs({font: 'oswald'});"
+        " const picked = {attr: document.documentElement.dataset.font,"
+        "   body: getComputedStyle(document.body).fontFamily};"
+        " applyPrefs({font: was || 'heebo'});"
+        " return JSON.stringify({picked: picked,"
+        "   back: getComputedStyle(document.body).fontFamily});")
+    import json as _json
+    got = _json.loads(result)
+    assert got["picked"]["attr"] == "oswald"
+    assert "Oswald" in got["picked"]["body"]
+    assert "Heebo" in got["back"], "the default face is Heebo"
+
+
 def test_the_page_offers_a_blender_version_picker(loaded_page):
     page, _ = loaded_page
     out = {}
@@ -971,6 +1180,68 @@ def test_the_launch_options_carry_the_chosen_blender_version(loaded_page):
     import json as _json
     got = _json.loads(result)
     assert got["blenderVersion"] == "4.2.9"
+
+
+def test_the_preview_opens_before_the_picture_arrives(loaded_page):
+    """Fetching a frame off Kaggle takes seconds. The box used to appear
+    only once the ~2 MB had landed, so the click that asked for it looked
+    like it had done nothing at all -- the complaint this fixes. It opens
+    on the click now, holding its shape, with the placeholder running and
+    no image behind it yet."""
+    page, _ = loaded_page
+    result = _preview_state(page,
+        "openPreviewLoading(7, 'job-1');"
+        " return JSON.stringify({"
+        "  hidden: document.getElementById('lightbox').hidden,"
+        "  state: document.getElementById('lb-stage').dataset.state,"
+        "  title: document.getElementById('lb-title').textContent,"
+        "  src: document.getElementById('lb-img').getAttribute('src')});")
+    import json as _json
+    got = _json.loads(result)
+    assert got["hidden"] is False
+    assert got["state"] == "loading"
+    assert got["title"] == "frame 7"
+    assert got["src"] is None, "an empty box must not carry the last frame"
+
+
+def test_the_placeholder_stays_up_until_the_picture_has_decoded(loaded_page):
+    """A 2 MB PNG is not on screen the instant its src is set. Swapping
+    to the picture on `src` rather than on `load` leaves an empty stage
+    for the decode, which reads as a frame that came back blank."""
+    page, _ = loaded_page
+    result = _preview_state(page,
+        "openPreviewLoading(7, 'job-1');"
+        " openPreview(7, 'file:///tmp/f_0007.png', 'stive');"
+        " const during = document.getElementById('lb-stage').dataset.state;"
+        " document.getElementById('lb-img').onload();"
+        " return JSON.stringify({during: during,"
+        "  after: document.getElementById('lb-stage').dataset.state});")
+    import json as _json
+    got = _json.loads(result)
+    assert got["during"] == "loading"
+    assert got["after"] == "ready"
+
+
+def test_a_frame_that_never_arrives_says_so_inside_the_box(loaded_page):
+    """The box is already open by the time Kaggle refuses, so it has to
+    be able to report that itself -- an open box with a placeholder
+    running for ever is a worse lie than the wait it replaced."""
+    page, _ = loaded_page
+    result = _preview_state(page,
+        "openPreviewLoading(7, 'job-1');"
+        " failPreview('Frame 7 did not come back — the message that just "
+        "appeared says what Kaggle answered.');"
+        " return JSON.stringify({"
+        "  hidden: document.getElementById('lightbox').hidden,"
+        "  state: document.getElementById('lb-stage').dataset.state,"
+        "  msg: document.getElementById('lb-fail-msg').textContent,"
+        "  retry: document.getElementById('lb-retry').hidden});")
+    import json as _json
+    got = _json.loads(result)
+    assert got["hidden"] is False, "it must not vanish and leave nothing"
+    assert got["state"] == "failed"
+    assert "did not come back" in got["msg"]
+    assert got["retry"] is False, "asking again is the one useful action"
 
 
 def test_closing_a_preview_drops_the_image(loaded_page):
@@ -1655,19 +1926,21 @@ def test_the_preview_sits_on_its_own_layer_above_the_modal(loaded_page):
     result = _preview_state(page,
         "const modal = document.createElement('div');"
         " modal.className = 'modal';"
-        " const tipped = document.createElement('div');"
-        " tipped.setAttribute('data-tip', 'x');"
         " document.body.appendChild(modal);"
-        " document.body.appendChild(tipped);"
         " const lb = document.getElementById('lightbox');"
         " const was = lb.hidden; lb.hidden = false;"
+        # The tooltip is ONE element owned by the page (app.js builds
+        # it at load and parks it on <body>), not a ::after on each
+        # control -- that is what stops .panel's overflow:hidden from
+        # clipping it.
         " const out = {"
         "   modal: getComputedStyle(modal).zIndex,"
         "   lightbox: getComputedStyle(lb).zIndex,"
         "   toasts: getComputedStyle("
         "     document.getElementById('toast-stack')).zIndex,"
-        "   tooltip: getComputedStyle(tipped, '::after').zIndex};"
-        " lb.hidden = was; modal.remove(); tipped.remove();"
+        "   tooltip: getComputedStyle("
+        "     document.querySelector('.tip')).zIndex};"
+        " lb.hidden = was; modal.remove();"
         " return JSON.stringify(out);")
     import json as _json
     got = _json.loads(result)
@@ -1733,10 +2006,10 @@ def test_the_open_preview_has_nothing_left_to_re_blur(loaded_page):
     for mode, seen in got.items():
         assert seen["filter"] == "none", \
             f"the preview still carries a backdrop-filter in {mode}: {seen}"
-        assert _alpha_of(seen["bg"]) == 1.0, \
-            f"the preview backdrop is still translucent in {mode} "\
-            f"({seen['bg']}), so the dashboard behind it still forces a "\
-            "re-composite"
+        alpha = _alpha_of(seen["bg"])
+        assert 0 < alpha < 1, \
+            f"the preview scrim in {mode} is {seen['bg']}: a modal has to "\
+            "dim what is behind it, not paint over it and not vanish"
 
 
 def test_an_unchanged_payload_does_not_rebuild_every_card(loaded_page):
@@ -1862,20 +2135,26 @@ FINISHED_INSTANCE = """({
 })"""
 
 
-def test_a_finished_card_says_finished_rather_than_reconnecting(card):
+def test_a_finished_card_never_claims_to_still_be_rendering(card):
+    """The bug this guards is unchanged: a finished worker whose
+    replayed log left "rendering · 15/15 frames" behind was the
+    "everything is stuck" report. How it went is now carried by the
+    state icon and the duration beside it, so the card prints no phase
+    at all once the session has ended -- and a phase is only ever true
+    of a session that is still going."""
     html = card(FINISHED_INSTANCE)
-    assert "render finished" in html
-    assert "finished in 5:20" in html
     assert "reconnecting" not in html
     assert "rendering ·" not in html
+    assert "5m 20s" in html, "how long it took is still on the card"
 
 
-def test_a_finished_card_says_the_frames_are_collectable(card):
-    """The one thing left to do. The frames sit on Kaggle until they are
-    collected, and a card that only says "done" does not say that."""
-    html = card(FINISHED_INSTANCE)
-    assert "4 of 4 frames are waiting on Kaggle" in html
-    assert "Collect frames" in html
+def test_a_finished_card_carries_no_leftover_phase_from_its_log(card):
+    """The same guard where it actually bites: a replayed log HAS put a
+    phase in the payload, and the card must still refuse to print it."""
+    replayed = FINISHED_INSTANCE.replace(
+        "phase:''", "phase:'rendering · 4/4 frames'")
+    html = card(replayed)
+    assert "rendering ·" not in html
 
 
 def test_a_finished_card_shows_no_live_gpu_rows(card):
@@ -1887,14 +2166,17 @@ def test_a_finished_card_shows_no_live_gpu_rows(card):
 
 
 def test_a_render_that_stopped_early_is_not_called_finished(card):
-    """"complete" and "error" are different outcomes and the card must not
-    round one into the other -- but the frames it did manage are still
-    collectable."""
+    """"complete" and "error" are different outcomes and the card must
+    not round one into the other. The distinction is carried by the
+    state icon -- a warning triangle, not a tick -- and by its label,
+    which is the accessible name a screen reader reads out."""
     stopped = FINISHED_INSTANCE.replace("state:'complete'", "state:'error'")
     html = card(stopped)
-    assert "stopped before finishing" in html
-    assert "render finished" not in html
-    assert "Collect frames" in html
+    assert 'aria-label="error"' in html
+    assert "badge ico warn" in html
+    done = card(FINISHED_INSTANCE)
+    assert 'aria-label="complete"' in done
+    assert "badge ico complete" in done
 
 
 # ---------------------------------------------------------------------------

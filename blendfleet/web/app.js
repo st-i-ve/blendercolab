@@ -23,7 +23,8 @@ let unread = 0;
    tone() reads prefs.sound, and an undefined key is falsy -- which
    silently disabled every sound in the app until this was set. */
 let prefs = { theme: 'light', accent: 'orange', translucent: false,
-              sound: true };
+              sound: true, frameThumbnails: true, font: 'heebo',
+              closeAction: 'ask' };
 const history = { inst: [], run: [], gpus: [], frames: [] };
 
 /* kaggle_client.TERMINAL_STATES, mirrored here because the page has to
@@ -82,6 +83,11 @@ function tone(freq, dur, vol = 0.022, when = 0, attack = 0.05) {
 }
 const sfx = {
   done:     () => { tone(660, 0.18); tone(880, 0.22, 0.018, 0.09); },
+  /* The reference's own "tiny toggle click", value for value (its
+     sfx.switch): two very short tones, the second lower, with an 8ms
+     attack so it reads as a click rather than a note. */
+  toggle:   () => { tone(740, 0.08, 0.016, 0, 0.008);
+                    tone(555, 0.12, 0.014, 0.05, 0.008); },
   error:    () => { tone(300, 0.26, 0.03); tone(220, 0.3, 0.025, 0.12); },
   reconnect:() => { tone(520, 0.16); tone(780, 0.2, 0.018, 0.08); },
   notify:   () => { tone(720, 0.14, 0.016); },
@@ -92,6 +98,7 @@ function applyPrefs(p) {
   prefs = Object.assign(prefs, p);
   document.documentElement.dataset.theme = prefs.theme;
   document.documentElement.dataset.accent = prefs.accent;
+  document.documentElement.dataset.font = prefs.font || 'heebo';
   document.body.classList.toggle('glass', !!prefs.translucent);
 }
 
@@ -112,14 +119,34 @@ document.getElementById('btn-collapse').addEventListener('click', () => {
   document.getElementById('sidebar').classList.toggle('collapsed');
 });
 
-const themeBtn = document.getElementById('btn-theme');
-themeBtn.addEventListener('click', () => {
-  const next = prefs.theme === 'dark' ? 'light' : 'dark';
-  themeBtn.classList.add('spin');
+/* ONE way in and out of a theme change, so the sound, the transition
+   and the saved preference cannot get out of step with each other.
+   `theming` puts every element on the same transition for the length of
+   the switch (see app.css) and is taken straight off again -- without it
+   the page ground faded over .3s under panels that had already snapped,
+   which is what "some parts switch faster than others" was. */
+function setTheme(next) {
+  if (!next || next === prefs.theme) return;
+  const root = document.documentElement;
+  /* Suppress every transition, change the theme, force the style to be
+     recalculated while they are still off, and only then release them.
+     Without the forced reflow the browser is free to batch the class
+     removal with the theme change and animate anyway. */
+  root.classList.add('theme-snap');
+  sfx.toggle();
   applyPrefs({ theme: next });
+  void root.offsetWidth;
+  requestAnimationFrame(() => root.classList.remove('theme-snap'));
   /* Persisted through Settings, not localStorage: the Qt host reads the
      same file to decide the window's own chrome (Mica, dark title bar). */
   if (backend) backend.setPreference('theme', JSON.stringify(next));
+  syncSettingsControls();
+}
+
+const themeBtn = document.getElementById('btn-theme');
+themeBtn.addEventListener('click', () => {
+  themeBtn.classList.add('spin');
+  setTheme(prefs.theme === 'dark' ? 'light' : 'dark');
 });
 themeBtn.addEventListener('animationend', () => themeBtn.classList.remove('spin'));
 
@@ -150,6 +177,114 @@ document.getElementById('np-clear').addEventListener('click', () => {
 });
 document.getElementById('hp-rerun').addEventListener('click', () => backend && backend.poll());
 document.getElementById('btn-retry').addEventListener('click', () => backend && backend.poll());
+
+/* ---------------- tooltips ----------------------------------------------
+ *
+ * Two problems this solves, both visible on screen before it existed:
+ *
+ *  1. THE BLACK BOX. A `title=` attribute is drawn by the operating
+ *     system. It ignores the theme, arrives as a black slab in the
+ *     middle of a warm light UI, and lands ON TOP of ours because
+ *     nothing in CSS can out-rank a native widget. So a title is now
+ *     MOVED onto the element (data-tip) the first time the pointer
+ *     reaches it and the attribute removed -- the words survive, the
+ *     black box is never drawn again.
+ *
+ *  2. THE CLIPPED ONE. The tooltip used to be a ::after on the control
+ *     itself, so it lived inside whatever the control lived inside --
+ *     and .panel is overflow:hidden, which cut the tooltip of every
+ *     button near a panel edge in half. There is exactly one tooltip
+ *     element now, it is a child of <body>, and it is positioned in
+ *     viewport coordinates: nothing can clip it and nothing can cover
+ *     it (z-index 200 -- see STACKING ORDER in app.css).
+ */
+const tipEl = document.createElement('div');
+tipEl.className = 'tip';
+tipEl.setAttribute('role', 'tooltip');
+tipEl.setAttribute('aria-hidden', 'true');
+document.body.appendChild(tipEl);
+let tipFor = null;
+
+/* The words, wherever they were written -- and the native tooltip
+   defused on the way past. */
+function tipTextFor(el) {
+  const native = el.getAttribute('title');
+  if (native !== null) {
+    el.removeAttribute('title');
+    const text = native.replace(/\s+/g, ' ').trim();
+    if (text && !el.dataset.tip) el.dataset.tip = text;
+  }
+  return el.dataset.tip || '';
+}
+
+/* Every title in a freshly built subtree, defused before the pointer
+   ever reaches it. Hovering is too late on its own: the cards are
+   rebuilt under a resting pointer on every live tick, and a rebuilt
+   element arrives carrying a fresh title= with no pointerover to
+   follow -- which is exactly when the black box used to appear. */
+function defuseTitles(root) {
+  if (!root || root.nodeType !== 1) return;
+  if (root.hasAttribute('title')) tipTextFor(root);
+  root.querySelectorAll('[title]').forEach(tipTextFor);
+}
+defuseTitles(document.body);
+new MutationObserver(records => {
+  records.forEach(r => r.addedNodes.forEach(defuseTitles));
+}).observe(document.body, { childList: true, subtree: true });
+
+function showTip(el) {
+  const text = tipTextFor(el);
+  if (!text) return;
+  tipFor = el;
+  tipEl.textContent = text;
+  tipEl.classList.add('show');
+  const r = el.getBoundingClientRect();
+  const t = tipEl.getBoundingClientRect();
+  const pad = 8;
+  /* Beside a collapsed sidebar item, below anything else -- and above
+     instead when there is no room below, which is where a button in the
+     last row of a long list always is. */
+  const aside = el.closest('.side.collapsed');
+  let left, top;
+  if (aside) {
+    left = r.right + 10;
+    top = r.top + (r.height - t.height) / 2;
+  } else {
+    left = r.left + (r.width - t.width) / 2;
+    top = r.bottom + 8;
+    if (top + t.height > window.innerHeight - pad) top = r.top - t.height - 8;
+  }
+  tipEl.style.left = Math.max(pad, Math.min(left, window.innerWidth - t.width - pad)) + 'px';
+  tipEl.style.top = Math.max(pad, top) + 'px';
+}
+
+function hideTip() {
+  tipFor = null;
+  tipEl.classList.remove('show');
+}
+
+document.addEventListener('pointerover', e => {
+  const el = e.target.closest && e.target.closest('[data-tip],[title]');
+  if (!el) { if (tipFor) hideTip(); return; }
+  if (el !== tipFor) showTip(el);
+});
+document.addEventListener('pointerout', e => {
+  if (tipFor && (!e.relatedTarget || !tipFor.contains(e.relatedTarget))) hideTip();
+});
+/* Keyboard reaches the same tips: they are the only name an icon-only
+   button has on screen. :focus-visible, not :focus -- the app moves
+   focus itself when a dialog opens, and a tip that popped up next to a
+   button nobody pointed at is noise. */
+document.addEventListener('focusin', e => {
+  const el = e.target.closest && e.target.closest('[data-tip],[title]');
+  if (el && el.matches(':focus-visible')) showTip(el);
+});
+document.addEventListener('focusout', hideTip);
+document.addEventListener('keydown', e => { if (e.key === 'Escape') hideTip(); });
+/* Anything that moves the control out from under the tooltip. */
+window.addEventListener('scroll', hideTip, true);
+window.addEventListener('resize', hideTip);
+document.addEventListener('click', hideTip, true);
 
 function updateBubble() {
   const el = document.getElementById('n-count');
@@ -242,6 +377,11 @@ function renderState(json) {
       wrap.innerHTML = '<div class="empty">No accounts yet — add one under Instances to start rendering.</div>';
     } else {
       wrap.innerHTML = renderJobSections(state);
+      /* The sections were just discarded and rebuilt, taking every
+         loaded thumbnail's <img src> with them. The pictures themselves
+         are held outside the payload, so they go straight back rather
+         than being fetched again. */
+      hydrateFrameStrips();
     }
     lastRenderedJson = json;
   }
@@ -371,21 +511,24 @@ function jobSectionHtml(job, instances) {
      where the reason lives. */
   const cancellable = instances.some(isLive);
   const cancelBtn = cancellable
-    ? `<button class="btn sm danger" data-job-cancel="${esc(job.jobId)}"
-         title="Cancel every account rendering this scene">Cancel</button>`
-    : `<button class="btn sm danger" disabled
+    ? `<button class="btn ico sm danger" data-job-cancel="${esc(job.jobId)}"
+         aria-label="Cancel" data-tip="Cancel this render"
+         title="Cancel every account rendering this scene">${ACT.stop}</button>`
+    : `<button class="btn ico sm danger" disabled aria-label="Cancel"
          title="Nothing left to cancel: every account on this scene has
                 already stopped on Kaggle, so no session is still spending
                 quota. Their frames are waiting there — use “Collect
-                frames…” to download them.">Cancel</button>`;
+                frames…” to download them.">${ACT.stop}</button>`;
   return `<section class="job-group">
     <div class="job-head">
       <h3 class="job-title">${esc(job.scene)}</h3>
       <span class="job-sub">${esc(job.blend)} · frames ${job.startFrame}-${job.endFrame}</span>
       ${elapsed}
       <div class="job-actions">
-        <button class="btn sm" data-job-collect="${esc(job.jobId)}"
-          title="Download this scene's rendered frames">Collect frames…</button>
+        <button class="btn ico sm" data-job-collect="${esc(job.jobId)}"
+          aria-label="Collect frames" data-tip="Collect frames…"
+          title="Collect frames — download this scene's rendered frames">${
+            ACT.download}</button>
         ${cancelBtn}
       </div>
     </div>
@@ -443,6 +586,58 @@ const ICON = {
     + ' stroke-linecap="round"/></svg>',
 };
 
+/* The mark that stands in front of a hardware reading.
+ *
+ * Deliberately OURS and not the manufacturer's: NVIDIA's logo is a
+ * trademark, it is not in this repo, and vendoring it off the web into a
+ * shipped binary is not a thing to do quietly. This is a die-on-a-board
+ * silhouette drawn in currentColor, so it inherits the accent, follows
+ * the theme, and stays legible on both grounds -- which the wordmark, an
+ * image with its own fixed colours, would not.
+ */
+const GPU_MARK = '<svg class="gpu-mark" width="13" height="13"'
+  + ' viewBox="0 0 16 16" fill="none" aria-hidden="true">'
+  + '<rect x="1.4" y="3.6" width="13.2" height="9" rx="1.8"'
+  + ' stroke="currentColor" stroke-width="1.3"/>'
+  + '<rect x="4.6" y="6.4" width="6.8" height="4.2" rx="1"'
+  + ' stroke="currentColor" stroke-width="1.2"/>'
+  + '<path d="M4.6 3.6V2.2M11.4 3.6V2.2M4.6 13.8v-1.2M11.4 13.8v-1.2"'
+  + ' stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>';
+
+/* Icons for the ACTIONS a row offers, as against the states above.
+   Same 16x16 stroked idiom, so a button drawn from one of these sits
+   at the same weight as the status glyph beside it. Every use pairs
+   the glyph with an aria-label and a tooltip carrying the same words
+   the button used to print. */
+const ACT = {
+  play: '<svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">'
+    + '<path d="M5.2 3.4l7 4.6-7 4.6V3.4z" stroke="currentColor"'
+    + ' stroke-width="1.5" stroke-linejoin="round"/></svg>',
+  trash: '<svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">'
+    + '<path d="M3.2 4.6h9.6M6.4 4.6V3.2h3.2v1.4M4.6 4.6l.5 8.2h5.8l.5-8.2"'
+    + ' stroke="currentColor" stroke-width="1.4" stroke-linecap="round"'
+    + ' stroke-linejoin="round"/></svg>',
+  download: '<svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">'
+    + '<path d="M8 2.6v7M8 9.6L5.2 6.8M8 9.6l2.8-2.8M2.8 11.4v1.2c0 .6.5 1 1 1h8.4c.6 0 1-.4 1-1v-1.2"'
+    + ' stroke="currentColor" stroke-width="1.4" stroke-linecap="round"'
+    + ' stroke-linejoin="round"/></svg>',
+  chip: '<svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">'
+    + '<rect x="4.6" y="4.6" width="6.8" height="6.8" rx="1.4" stroke="currentColor"'
+    + ' stroke-width="1.4"/><path d="M6.6 2.2v2.4M9.4 2.2v2.4M6.6 11.4v2.4M9.4 11.4v2.4'
+    + 'M2.2 6.6h2.4M2.2 9.4h2.4M11.4 6.6h2.4M11.4 9.4h2.4" stroke="currentColor"'
+    + ' stroke-width="1.3" stroke-linecap="round"/></svg>',
+  stop: '<svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">'
+    + '<rect x="4.4" y="4.4" width="7.2" height="7.2" rx="1.5" stroke="currentColor"'
+    + ' stroke-width="1.5"/></svg>',
+  refresh: '<svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">'
+    + '<path d="M13.4 8a5.4 5.4 0 11-1.6-3.8M13.4 2.6v2.6h-2.6" stroke="currentColor"'
+    + ' stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  user: '<svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">'
+    + '<circle cx="8" cy="5.6" r="2.6" stroke="currentColor" stroke-width="1.4"/>'
+    + '<path d="M3 13.4c.6-2.4 2.6-3.6 5-3.6s4.4 1.2 5 3.6" stroke="currentColor"'
+    + ' stroke-width="1.4" stroke-linecap="round"/></svg>',
+};
+
 function instanceCard(inst) {
   const worker = inst.worker;
   const state = worker ? worker.state : 'idle';
@@ -466,10 +661,10 @@ function instanceCard(inst) {
   /* Last-KNOWN hardware, with its age, or an honest blank. Never dressed
      up as what the account is running right now. */
   const hw = inst.hardware
-    ? `${inst.hardware.gpus.map(g => esc(g.model || 'GPU')).join(', ')}`
+    ? `${GPU_MARK}${inst.hardware.gpus.map(g => esc(g.model || 'GPU')).join(', ')}`
       + (inst.hardware.cpuCount ? ` · ${inst.hardware.cpuCount} vCPU` : '')
       + (inst.hardware.ramTotal ? ` · ${inst.hardware.ramTotal.toFixed(1)} GB` : '')
-      + ` <b>${fmtAge(inst.hardware.ageSeconds)}</b>`
+      + ` <span class="age">${fmtAge(inst.hardware.ageSeconds)}</span>`
     : 'never run — launch to see specs';
 
   /* Live beats polled. The 30s status poll can only say queued/running --
@@ -491,10 +686,6 @@ function instanceCard(inst) {
              : (worker ? worker.framesDone : 0);
   const total = liveFrames ? live.framesTotal
               : (worker ? worker.frames.length : 0);
-  /* A bar drawn from a number the app does not know is an invented
-     reading, so an unknown count draws no bar at all rather than the
-     stale one's width. */
-  const progress = (total && !unknown) ? Math.round(100 * done / total) : 0;
   const doneText = unknown ? '—' : done;
 
   /* Where that number came from, said out loud whenever it is NOT live.
@@ -509,12 +700,14 @@ function instanceCard(inst) {
          ''} finished is not known. The last number a live connection${
          ''} saved is from before it ended and would be wrong to show as a${
          ''} count. “Collect frames…” is the authoritative list of what${
-         ''} actually exists.">count not known</span>`
+         ''} exists.">count not known</span>`
+    /* A count read from the finished kernel's own log needs no label:
+       it is the render's last word, and the state icon in the head
+       already says the render ended. Only a number that is NOT a
+       current reading -- a stale saved one, or none at all -- has to
+       say so, which is what the other two branches are for. */
     : source === 'final'
-    ? `<span class="frange dim" title="The render's own final count, read${
-         ''} from its kernel log on Kaggle after it stopped — not a saved${
-         ''} live reading. “Collect frames…” is still the authoritative${
-         ''} list of what exists.">final count</span>`
+    ? ''
     : (!liveFrames && worker && worker.framesDoneAge != null)
     ? `<span class="frange dim" title="Saved by the last live connection.${
          ''} Kaggle's status API reports no frame count, so this is the${
@@ -538,11 +731,12 @@ function instanceCard(inst) {
   const cpuCount = (preflight && preflight.cpu_count) || (live && live.cpuCount);
   const ramTotal = (preflight && preflight.ram_total) || (live && live.ramTotal);
   const liveHw = (gpuNames || cpuCount || ramTotal)
-    ? `<div class="hw-row"><span class="hw-chip live">This session <b>${
-        gpuNames ? esc(gpuNames.join(', ') || 'CPU only') : 'running'}</b>${
-        cpuCount ? ` · ${cpuCount} vCPU` : ''}${
-        ramTotal ? ` · ${ramTotal.toFixed(1)} GB RAM` : ''
-      }</span></div>`
+    ? `<div class="m wide live"><span class="k">This session</span>
+        <span class="v">${gpuNames || cpuCount ? GPU_MARK : ''}${
+          gpuNames ? esc(gpuNames.join(', ') || 'CPU only') : 'running'}${
+          cpuCount ? ` · ${cpuCount} vCPU` : ''}${
+          ramTotal ? ` · ${ramTotal.toFixed(1)} GB RAM` : ''
+        }</span></div>`
     : '';
 
   /* One row per physical GPU, never combined -- an average across two
@@ -603,60 +797,44 @@ function instanceCard(inst) {
       </div>`
     : '';
 
-  /* Elapsed time, and after it stops, the total. "finished in 5:20" is
-     the benchmark; while it runs the same number is the stopwatch, so
-     one field serves both and they cannot disagree. */
-  const elapsed = worker && worker.elapsed != null
-    ? `<span class="elapsed">${worker.finished ? 'finished in ' : ''}${
-        fmtDuration(worker.elapsed)}</span>`
+  /* Elapsed time, and after it stops, the total -- one field serving
+     both, so the stopwatch and the benchmark can never disagree.
+     It rides in the HEAD, beside the state icon: the two together are
+     the whole of "how did this machine do", and it is two units at most
+     (fmtDurationShort) because that is what fits beside a 14px glyph.
+     The exact figure, to the second, is in its tooltip. */
+  const dur = worker && worker.elapsed != null
+    ? `<span class="dur" title="${
+        worker.finished ? 'This render took ' : 'Running for '}${
+        fmtDuration(worker.elapsed)}">${fmtDurationShort(worker.elapsed)}</span>`
     : '';
+  /* A session that has ENDED says nothing here at all: the state icon
+     and the duration beside it, in the head, are what report how it
+     went, and the frame count is on its own line above. The card used
+     to close with four lines of prose (state, elapsed, and a sentence
+     about collecting) which repeated all three.
+     `ended` is still checked FIRST, and that is not cosmetic: a
+     finished worker whose replayed log left "rendering · 15/15 frames"
+     behind was the "everything is stuck" report -- a card that had in
+     fact finished hours ago. A phase belongs to a session that is still
+     going, so a finished one is never allowed to print one. */
+  const ended = !!(worker && worker.finished);
   /* The window after a restart, before the replayed log has rebuilt
      anything. The render never stopped -- only this app's view of it did
      -- and a card that simply sat blank there was read as a stuck render
      and is the whole reason this text exists. It says what is happening,
      why there is nothing to show yet, and that there is nothing to do. */
-  /* A session that has ENDED, said as an ending. Checked BEFORE the live
-     phase and before `reconnecting`, both of which describe a session that
-     is still going: a finished worker whose replayed log left "rendering ·
-     15/15 frames" behind was the "everything is stuck" report -- a card
-     that had, in fact, finished hours ago and said so nowhere. The payload
-     no longer carries those readings once finished_at is stamped (see
-     Backend._live_payload), so this is what the card falls to, and it has
-     to name the state, the time it took, and the one thing left to do:
-     the frames are still on Kaggle until they are collected. */
-  const endedFoot = worker && worker.finished
-    ? `<div class="inst-foot"><b>${
-        worker.state === 'complete' ? 'render finished'
-        : worker.state === 'error' ? 'stopped before finishing'
-        : 'stopped'}</b>${elapsed}<span class="sub">${
-        /* This sentence follows the CORRECTED count, never the stale one
-           it used to quote: with the log unreadable there is no honest
-           "N of M" to say at all, so it says that instead of guessing. */
-        worker.state === 'complete' && !unknown
-          ? `${done} of ${total} frames are waiting on Kaggle — “Collect`
-            + ` frames…” above downloads them.`
-          : worker.state === 'complete'
-          ? `How many of its ${total} frames finished is not known: this`
-            + ` render's log on Kaggle could not be read, and Kaggle's`
-            + ` status API reports no frame count. Whatever it made is`
-            + ` still waiting there — “Collect frames…” above is the`
-            + ` authoritative list of what exists.`
-          : `Any frames it did finish are still on Kaggle — “Collect frames…”`
-            + ` above will fetch them.`
-      }</span></div>`
-    : '';
-
-  const phase = endedFoot
-    ? endedFoot
+  const phase = ended
+    ? ''
     : live && live.phase
-    ? `<div class="inst-foot"><b>${esc(live.phase)}</b>${elapsed}</div>`
+    ? `<div class="inst-foot"><b>${esc(live.phase)}</b></div>`
     : inst.reconnecting
       ? `<div class="inst-foot"><b>reconnecting — replaying this session's`
-        + ` log from Kaggle to catch up</b>${elapsed}<span class="sub">The`
+        + ` log from Kaggle to catch up</b><span class="sub">The`
         + ` render never stopped; nothing to restart.</span></div>`
     : (worker && worker.state === 'queued'
        ? '<div class="inst-foot">queued — waiting for Kaggle to allocate a machine</div>'
-       : (elapsed ? `<div class="inst-foot">${elapsed}</div>` : ''));
+       : '');
 
   return `<div class="inst">
     <div class="inst-head">
@@ -683,28 +861,33 @@ function instanceCard(inst) {
           ? '<span class="badge bad"><i></i>token revoked</span>'
           : inst.verified ? '' : '<span class="badge warn"><i></i>not verified</span>'}
         ${inst.username ? '' : '<span class="badge warn"><i></i>needs username</span>'}
+        ${dur}
         <span class="badge ico ${badge[0]}" title="${esc(badge[1])}"
               role="img" aria-label="${esc(badge[1])}">${badge[2]}</span>
+        ${/* An icon, in the head, beside the state it is about to
+              change -- it used to be a full-width "CHECK HARDWARE"
+              button wedged next to the hardware line, which made the
+              cached reading look like a control rather than a fact. */
+          (!inst.revoked && inst.username && !worker)
+          ? `<button class="btn ico sm" data-hwcheck="${esc(inst.label)}"
+               aria-label="Check hardware" data-tip="Check hardware"
+               title="Check hardware — Kaggle decides what a session gets, and it varies run to run. This starts a one-minute check so you know before committing a render.">${ACT.chip}</button>`
+          : ''}
       </span>
     </div>
     <div class="inst-body">
-      <div class="hw-row">
-        <span class="hw-chip">Quota (API) <b>${esc(inst.quota || '—')}</b></span>
+      <div class="meta">
+        <div class="m"><span class="k">Quota (API)</span>
+          <span class="v">${esc(inst.quota || '—')}</span></div>
+        <div class="m"><span class="k">Last known hardware</span>
+          <span class="v">${hw}</span></div>
+        ${liveHw}
       </div>
-      <div class="hw-row">
-        <span class="hw-chip">${hw}</span>
-        ${(!inst.revoked && inst.username && !worker)
-          ? `<button class="btn sm" data-hwcheck="${esc(inst.label)}"
-               title="Kaggle decides what hardware a session gets, and it varies run to run. This starts a one-minute check so you know before committing a render.">Check hardware</button>`
-          : ''}
-      </div>
-      ${liveHw}
       ${worker ? `
       <div class="assign">
         <div class="wrapc">
           <div class="l1"><span class="flab">Frames</span>
             <span class="frange">${doneText} / ${total}</span>${savedFrames}</div>
-          <div class="assign-progress"><i style="width:${progress}%"></i></div>
         </div>
       </div>` : ''}
       ${gpuRows}
@@ -800,6 +983,24 @@ function fmtDuration(seconds) {
   const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
   if (h) return `${h}h ${m}m ${sec}s`;
   return `${m}:${String(sec).padStart(2, '0')}`;
+}
+/* The same duration, at a glance, in TWO units at most.
+ *
+ * fmtDuration above is the long form ("1h 5m 20s"), which is right in a
+ * sentence and wrong beside a status icon: three units read as a serial
+ * number at 10px. Renders here run for hours, so the seconds in "1h 37m
+ * 44s" are noise -- what is being judged is roughly how long a machine
+ * took. Under an hour the seconds ARE the interesting half, so the pair
+ * shifts down rather than dropping a unit. Under a minute there is only
+ * one honest unit and it says so, rather than padding to "0m 9s".
+ */
+function fmtDurationShort(seconds) {
+  if (seconds == null || !isFinite(seconds) || seconds < 0) return '';
+  const s = Math.round(seconds);
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  if (h) return `${h}h ${m}m`;
+  if (m) return `${m}m ${sec}s`;
+  return `${sec}s`;
 }
 function esc(text) {
   return String(text).replace(/[&<>"']/g, c =>
@@ -1115,6 +1316,8 @@ function showUploadStage(p) {
   const [title, detail] = describe ? describe(p.detail || '') : [p.stage, ''];
   const pct = p.total ? Math.round(100 * p.uploaded / p.total) : null;
 
+  /* Something is uploading now, so the bar has something to measure. */
+  document.getElementById('up-item').classList.remove('idle');
   document.getElementById('up-name').textContent =
     pct === null ? title : `${title}`;
   document.getElementById('up-pct').textContent =
@@ -1209,11 +1412,15 @@ function sceneRowHtml(scene) {
         <span class="lock" title="The '-blend' name is a naming convention this app applies to its own uploads, not proof this dataset actually contains a .blend. That is only confirmed by listing its real files, which happens automatically right before rendering it.">(unverified)</span>
       </div>
     </div>
-    <button class="btn sm" data-scene-render="${esc(scene.slug)}"
-      title="Renders this scene straight from Kaggle, with no re-upload. Sharing is re-checked for every account before anything starts.">Render this</button>
-    <button class="btn sm danger" data-scene-delete="${esc(scene.slug)}"
-      data-scene-name="${esc(scene.name)}" data-scene-size="${scene.sizeBytes}"
-      title="Permanently deletes this dataset from Kaggle.">Delete…</button>
+    <div class="row-actions">
+      <button class="btn ico sm" data-scene-render="${esc(scene.slug)}"
+        aria-label="Render this" data-tip="Render this"
+        title="Render this — renders this scene straight from Kaggle, with no re-upload. Sharing is re-checked for every account before anything starts.">${ACT.play}</button>
+      <button class="btn ico sm danger" data-scene-delete="${esc(scene.slug)}"
+        data-scene-name="${esc(scene.name)}" data-scene-size="${scene.sizeBytes}"
+        aria-label="Delete scene" data-tip="Delete…"
+        title="Delete — permanently deletes this dataset from Kaggle.">${ACT.trash}</button>
+    </div>
   </div>`;
 }
 
@@ -1493,9 +1700,12 @@ function outputRowHtml(o) {
       <div class="out-prog" data-jdl="${esc(o.jobId)}">${dl}</div>
       ${resultHtml}
     </div>
-    <button class="btn sm" data-out-download="${esc(o.jobId)}"
-      title="Downloads every frame this render produced into one zip in a
-             folder you choose.">Download</button>
+    <div class="row-actions">
+      <button class="btn ico sm" data-out-download="${esc(o.jobId)}"
+        aria-label="Download" data-tip="Download"
+        title="Download — packs every frame this render produced into one zip
+               in a folder you choose.">${ACT.download}</button>
+    </div>
   </div>`;
 }
 
@@ -1607,23 +1817,308 @@ function renderFrameGrid(job, instances) {
     } title="frame ${f}${isDone ? ' — click to preview' : ''}"></div>`);
   }
   const total = job.endFrame - job.startFrame + 1;
-  return `<div class="fgrid-wrap show">
-    ${livePreviewStrip(instances)}
-    <div class="fgrid" data-job="${esc(job.jobId || '')}">${cells.join('')}</div>
-    <div class="fgrid-legend">
-      <span><i style="background:var(--accent)"></i>done <b>(approximate)</b></span>
-      <span><i style="background:var(--fill)"></i>not yet</span>
+  const jobId = job.jobId || '';
+  const view = frameView(jobId);
+  const open = !frameSectionCollapsed(jobId);
+  /* Both views are built every time and one is shown, rather than one
+     being built on demand: this whole section is discarded and rebuilt on
+     every live tick, so there is no "on demand" to hold on to. What has
+     to survive a rebuild lives in frameThumbs[jobId], and
+     hydrateFrameStrips() puts the pictures back afterwards. */
+  return `<div class="fgrid-wrap show" data-fg="${esc(jobId)}" data-view="${view}"${
+      open ? '' : ' data-collapsed'}>
+    <div class="fg-head">
+      <button class="fg-collapse" data-fg-collapse="${esc(jobId)}"
+        aria-expanded="${open}"
+        title="${open ? 'Hide' : 'Show'} this scene's frames">
+        <svg class="chev" width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true"><path d="M3 4.5L6 7.5l3-3" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span class="fg-count">${done.size}/${total} frames</span>
+      </button>
+      ${prefs.frameThumbnails === false ? '' : `<div class="seg sm fg-views">
+        <button data-fg-view="grid" data-job="${esc(jobId)}"${
+          view === 'grid' ? ' class="on"' : ''} aria-label="Grid" data-tip="Grid">
+          <svg width="13" height="13" viewBox="0 0 16 16" fill="none"><rect x="2" y="2" width="4.6" height="4.6" rx="1" stroke="currentColor" stroke-width="1.4"/><rect x="9.4" y="2" width="4.6" height="4.6" rx="1" stroke="currentColor" stroke-width="1.4"/><rect x="2" y="9.4" width="4.6" height="4.6" rx="1" stroke="currentColor" stroke-width="1.4"/><rect x="9.4" y="9.4" width="4.6" height="4.6" rx="1" stroke="currentColor" stroke-width="1.4"/></svg>
+        </button>
+        <button data-fg-view="thumbs" data-job="${esc(jobId)}"${
+          view === 'thumbs' ? ' class="on"' : ''} aria-label="Thumbnails"
+          data-tip="Thumbnails">
+          <svg width="13" height="13" viewBox="0 0 16 16" fill="none"><rect x="1.6" y="3.4" width="12.8" height="9.2" rx="1.4" stroke="currentColor" stroke-width="1.4"/><path d="M1.6 10.6l3.2-2.9 2.6 2.2 2.8-2.6 4.2 3.7" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>
+        </button>
+      </div>`}
     </div>
-    <div class="fg-meta">${done.size}/${total} frames · ${esc(job.blend)}
-      — a failed frame shifts every later cell for that account; Collect
-      frames is the authoritative list of what exists.${unknownLabels.length
-        ? ` ${unknownLabels.length} account(s) are not counted here at all
-            (${unknownLabels.map(esc).join(', ')}): they have stopped, but
-            their logs on Kaggle could not be read, so how many frames they
-            finished is not known — their cells are left blank rather than
-            guessed, and Collect frames will show what they actually made.`
-        : ''}</div>
+    <div class="fg-body">
+      ${livePreviewStrip(instances)}
+      <div class="fgrid" data-job="${esc(jobId)}">${cells.join('')}</div>
+      ${frameStripHtml(job, instances, done)}
+      <div class="fgrid-legend">
+        <span><i style="background:var(--accent)"></i>done <b>(approximate)</b></span>
+        <span><i style="background:var(--fill)"></i>not yet</span>
+      </div>
+      <div class="fg-meta">${done.size}/${total} frames · ${esc(job.blend)}
+        — a failed frame shifts every later cell for that account; Collect
+        frames is the authoritative list of what exists.${unknownLabels.length
+          ? ` ${unknownLabels.length} account(s) are not counted here at all
+              (${unknownLabels.map(esc).join(', ')}): they have stopped, but
+              their logs on Kaggle could not be read, so how many frames they
+              finished is not known — their cells are left blank rather than
+              guessed, and Collect frames will show what they actually made.`
+          : ''}</div>
+    </div>
   </div>`;
+}
+
+/* ---------------- the thumbnail view of a job's frames -------------------
+ *
+ * The grid says HOW MANY frames are done; this says what they look like.
+ *
+ * The cost is the thing to understand before reading the rest: Kaggle
+ * serves no thumbnail. The only file it will hand over is the frame
+ * itself, ~2 MB of PNG, so a wall of 250 tiles is half a gigabyte and
+ * being lazy here is the design rather than an optimisation. Hence: a
+ * tile is fetched only once it is actually scrolled to, one fetch at a
+ * time, and the queue stops and asks after THUMB_BUDGET network fetches.
+ * A frame already in the app's own cache costs nothing (previewFrame
+ * answers it without touching the network) and is deliberately not
+ * counted against that budget.
+ *
+ * What is HELD is a shrunk copy, not the frame: each picture is redrawn
+ * to a canvas at THUMB_WIDTH and kept as a small JPEG, and the
+ * full-resolution original is dropped. Twenty-four 1080p PNGs decoded in
+ * a scroller is ~190 MB of bitmap; the same twenty-four at 320px is a
+ * few hundred KB. Clicking a tile opens the REAL frame in the preview
+ * modal, read back from the cache -- so the strip never passes a scaled
+ * copy off as the thing itself, and its own caption says as much.
+ */
+const THUMB_BUDGET = 24;      /* network fetches before it stops to ask */
+const THUMB_WIDTH = 320;      /* the kept copy's width, in pixels */
+
+/* Per job, and deliberately OUTSIDE the payload: the card grid is rebuilt
+   from scratch on every live tick, and the pictures must not be fetched
+   again every two seconds. */
+const frameThumbs = {};
+
+function thumbState(jobId) {
+  if (!frameThumbs[jobId]) {
+    frameThumbs[jobId] = {
+      view: 'grid', collapsed: false,
+      small: {},        /* frame -> shrunk data URL, what a tile shows */
+      full: {},         /* frame -> file URL, what the modal opens */
+      failed: {},       /* frame -> true: asked, and Kaggle had nothing */
+      budget: THUMB_BUDGET,
+      capped: false,    /* budget ran out with tiles still unfetched */
+    };
+  }
+  return frameThumbs[jobId];
+}
+
+function frameView(jobId) {
+  /* Turning the preference off does not discard the choice, it stops
+     honouring it -- turning it back on returns to whatever was open. */
+  if (prefs.frameThumbnails === false) return 'grid';
+  return thumbState(jobId).view;
+}
+
+function frameSectionCollapsed(jobId) {
+  return thumbState(jobId).collapsed;
+}
+
+/* Which account owns each frame, and whether that account's session has
+   ENDED. Kaggle releases a kernel's output only once its session stops,
+   so a frame belonging to a still-running account cannot be fetched at
+   all -- those tiles say so rather than queueing a request that could
+   only ever fail. */
+function frameOwners(instances) {
+  const owners = {};
+  instances.forEach(i => {
+    if (!i.worker || !i.worker.frames) return;
+    i.worker.frames.forEach(f => {
+      owners[f] = { label: i.label, finished: !!i.worker.finished };
+    });
+  });
+  return owners;
+}
+
+/* Pure, like renderFrameGrid itself: reads the job, its instances and the
+   same `done` set the grid shades, so a test can drive it directly. */
+function frameStripHtml(job, instances, done) {
+  const jobId = job.jobId || '';
+  const state = thumbState(jobId);
+  const owners = frameOwners(instances);
+  const tiles = [];
+  let fetchable = 0;
+  for (let f = job.startFrame; f <= job.endFrame; f++) {
+    if (!done.has(f)) continue;          /* nothing rendered, nothing to show */
+    const owner = owners[f];
+    if (owner && !owner.finished) {
+      tiles.push(`<figure class="fthumb waiting" title="Frame ${f} is on ${
+        esc(owner.label)}, whose session is still running — Kaggle releases a session's frames only once it ends."><figcaption>${
+        f}<span class="fw">when the session ends</span></figcaption></figure>`);
+      continue;
+    }
+    if (state.failed[f]) {
+      tiles.push(`<figure class="fthumb gone" title="Kaggle had no file for frame ${
+        f} — that session's output may have expired."><figcaption>${
+        f}<span class="fw">not on Kaggle</span></figcaption></figure>`);
+      continue;
+    }
+    fetchable++;
+    tiles.push(`<figure class="fthumb" data-thumb-frame="${f}"
+      data-thumb-job="${esc(jobId)}" role="button" tabindex="0"
+      title="Frame ${f} — click for the full-resolution frame">
+      <div class="skel"></div><img alt="Frame ${f}, reduced">
+      <figcaption>${f}</figcaption></figure>`);
+  }
+  if (!tiles.length) {
+    return '<div class="fstrip-wrap"><div class="fstrip-empty">'
+      + 'Nothing to show yet — a picture exists here once an account has'
+      + ' finished a frame AND its session has ended, which is when Kaggle'
+      + ' releases the file.</div></div>';
+  }
+  const loaded = Object.keys(state.small).length;
+  return `<div class="fstrip-wrap">
+    <button class="fstrip-nav prev" data-strip-slide="-1" aria-label="Earlier frames" data-tip="Earlier frames" disabled>
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M10 3.5L5.5 8l4.5 4.5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </button>
+    <button class="fstrip-nav next" data-strip-slide="1" aria-label="Later frames" data-tip="Later frames">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M6 3.5L10.5 8 6 12.5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </button>
+    <div class="fstrip">${tiles.join('')}</div>
+    <div class="fstrip-note">Reduced copies — click one for the full-resolution frame.</div>
+    <div class="fstrip-more"${state.capped && fetchable > loaded ? '' : ' hidden'}>
+      <span>${loaded} frame(s) fetched. Loading is paused so a long render cannot quietly pull hundreds of megabytes.</span>
+      <button class="btn sm" data-thumb-more="${esc(jobId)}">Keep loading</button>
+    </div>
+  </div>`;
+}
+
+/* ---- putting the pictures back after a rebuild ---- */
+let thumbObserver = null;
+
+/* An arrow is only offered while there is something that way to go. */
+function syncStripNav(rail) {
+  const wrap = rail.closest('.fstrip-wrap');
+  if (!wrap) return;
+  const max = rail.scrollWidth - rail.clientWidth;
+  const prev = wrap.querySelector('.fstrip-nav.prev');
+  const next = wrap.querySelector('.fstrip-nav.next');
+  if (prev) prev.disabled = rail.scrollLeft <= 2;
+  if (next) next.disabled = rail.scrollLeft >= max - 2;
+}
+
+function hydrateFrameStrips() {
+  document.querySelectorAll('.fthumb[data-thumb-frame]').forEach(tile => {
+    const jobId = tile.dataset.thumbJob;
+    const frame = Number(tile.dataset.thumbFrame);
+    const small = thumbState(jobId).small[frame];
+    if (!small) return;
+    const img = tile.querySelector('img');
+    if (img && img.getAttribute('src') !== small) img.src = small;
+    tile.classList.add('has-image');
+  });
+  observeThumbs();
+  document.querySelectorAll('.fstrip').forEach(rail => {
+    syncStripNav(rail);
+    if (rail.dataset.navBound) return;
+    rail.dataset.navBound = '1';
+    /* Scrolling is also how tiles come into view, so the same handler
+       keeps the arrows honest and lets the observer do its work. */
+    rail.addEventListener('scroll', () => syncStripNav(rail), { passive: true });
+  });
+}
+
+/* Fetch what is actually looked at, and nothing else. */
+function observeThumbs() {
+  if (!('IntersectionObserver' in window)) return;
+  if (!thumbObserver) {
+    thumbObserver = new IntersectionObserver(entries => {
+      entries.forEach(entry => {
+        if (!entry.isIntersecting) return;
+        queueThumb(entry.target.dataset.thumbJob,
+                   Number(entry.target.dataset.thumbFrame));
+      });
+    }, { rootMargin: '200px' });
+  }
+  thumbObserver.disconnect();
+  document.querySelectorAll('.fthumb[data-thumb-frame]:not(.has-image)')
+    .forEach(tile => thumbObserver.observe(tile));
+}
+
+/* ---- the queue: one fetch at a time, and a budget ---- */
+const thumbQueue = [];
+
+function queueThumb(jobId, frame) {
+  if (!backend || !jobId || !frame) return;
+  const state = thumbState(jobId);
+  if (state.small[frame] || state.failed[frame]) return;
+  if (thumbQueue.some(q => q.jobId === jobId && q.frame === frame)) return;
+  thumbQueue.push({ jobId, frame });
+  pumpThumbs();
+}
+
+function pumpThumbs() {
+  if (!backend || frameFetchInFlight()) return;
+  while (thumbQueue.length) {
+    const next = thumbQueue[0];
+    const state = thumbState(next.jobId);
+    if (state.small[next.frame] || state.failed[next.frame]) {
+      thumbQueue.shift();
+      continue;
+    }
+    if (state.budget <= 0) {
+      /* Stop, say so, and wait to be asked again. Nothing is dropped:
+         the queue simply is not pumped until Keep loading tops it up. */
+      if (!state.capped) {
+        state.capped = true;
+        showThumbCap(next.jobId);
+      }
+      return;
+    }
+    thumbQueue.shift();
+    askForFrame(next.frame, next.jobId, false);
+    return;
+  }
+}
+
+function showThumbCap(jobId) {
+  const wraps = Array.from(document.querySelectorAll('.fgrid-wrap[data-fg]'))
+    .filter(el => el.dataset.fg === jobId);
+  wraps.forEach(wrap => {
+    const more = wrap.querySelector('.fstrip-more');
+    if (more) more.hidden = false;
+  });
+}
+
+/* ---- one frame arrives ---- */
+function takeFrameThumb(jobId, frame, url) {
+  const state = thumbState(jobId);
+  state.full[frame] = url;
+  shrinkFrame(url, small => {
+    state.small[frame] = small || url;
+    hydrateFrameStrips();
+  });
+}
+
+/* The picture, redrawn small, so the page holds a thumbnail rather than a
+   1080p bitmap. Falls back to the original URL if the canvas refuses (a
+   tainted canvas throws on toDataURL) -- a working tile at the wrong size
+   beats no tile at all. */
+function shrinkFrame(url, done) {
+  const img = new Image();
+  img.onload = () => {
+    try {
+      const w = THUMB_WIDTH;
+      const h = Math.max(1, Math.round(img.naturalHeight * w / img.naturalWidth));
+      const canvas = document.createElement('canvas');
+      canvas.width = w;
+      canvas.height = h;
+      canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+      done(canvas.toDataURL('image/jpeg', 0.72));
+    } catch (e) {
+      done(url);
+    }
+  };
+  img.onerror = () => done(null);
+  img.src = url;
 }
 
 /* ---------------- instances page ---------------------------------------- */
@@ -1653,16 +2148,28 @@ function renderFleetTable(state) {
         : i.verified ? '' : ' <span class="badge warn"><i></i>unverified</span>'}${warm ? ' <span class="badge accent"><i></i>warm</span>' : ''}</td>
       <td>${i.username
         ? esc(i.username)
-        : `<button class="btn sm danger" data-username="${esc(i.label)}">Set username</button>`}</td>
+        : `<button class="btn ico sm danger" data-username="${esc(i.label)}"
+             aria-label="Set username" data-tip="Set username"
+             title="Set username — Kaggle only reveals a handle through something the account owns.">${ACT.user}</button>`}</td>
       <td>${esc(i.quota || '—')}</td>
       <td>${hw}</td>
       <td>${esc(state_)}</td>
       <td style="text-align:right;white-space:nowrap">
-        ${stoppable
-          ? `<button class="btn sm" data-cancel="${esc(i.label)}">Stop</button>`
-          : `<button class="btn sm" data-start="${esc(i.label)}">Start</button>`}
-        <button class="btn sm" data-download="${esc(i.label)}">Download</button>
-        <button class="btn sm danger" data-remove="${esc(i.label)}">Remove</button>
+        <div class="row-actions">
+          ${stoppable
+            ? `<button class="btn ico sm" data-cancel="${esc(i.label)}"
+                 aria-label="Stop" data-tip="Stop"
+                 title="Stop this account's session on Kaggle">${ACT.stop}</button>`
+            : `<button class="btn ico sm" data-start="${esc(i.label)}"
+                 aria-label="Start" data-tip="Start"
+                 title="Start a warm machine on this account">${ACT.play}</button>`}
+          <button class="btn ico sm" data-download="${esc(i.label)}"
+            aria-label="Download" data-tip="Download"
+            title="Download this account's rendered frames">${ACT.download}</button>
+          <button class="btn ico sm danger" data-remove="${esc(i.label)}"
+            aria-label="Remove account" data-tip="Remove"
+            title="Remove this account from the fleet">${ACT.trash}</button>
+        </div>
       </td></tr>`;
   }).join('');
 }
@@ -1739,7 +2246,75 @@ document.getElementById('btn-add').onclick = () => {
    The live one is also shown at its own size and never stretched up to
    fill the stage -- see .lb-stage img in app.css for the same rule
    applied to the real thing. */
+/* WHICH FRAME THIS BOX IS CURRENTLY WAITING FOR.
+   `{frame, jobId, started}` while a fetch is outstanding, null once the
+   picture has arrived or the wait has been given up on. `started` is
+   set by busyChanged: previewFrame answers some cases (no job, a frame
+   assigned to nobody, an account since removed) with a notification and
+   no worker at all, so "the request never even started" is a distinct
+   outcome from "it started and failed", and only one of them is worth
+   offering Try again for. */
+let previewWait = null;
+/* What Try again would ask for. Kept past the failure that offers it --
+   `previewWait` is cleared the moment the wait ends, one way or the
+   other, and a retry button has to outlive that. */
+let previewAsked = null;
+let previewTimers = [];
+
+function clearPreviewTimers() {
+  previewTimers.forEach(clearTimeout);
+  previewTimers = [];
+}
+
+/* loading | ready | failed -- the stage shows exactly one of the three. */
+function setPreviewState(state) {
+  const stage = document.getElementById('lb-stage');
+  stage.dataset.state = state;
+}
+
+/* Open NOW, on the click, with the box empty and a placeholder running.
+   The picture follows through framePreview whenever Kaggle hands it
+   over; this is what makes the click feel answered. */
+function openPreviewLoading(frame, jobId) {
+  clearPreviewTimers();
+  previewWait = { frame, jobId, started: false };
+  previewAsked = { frame, jobId };
+  document.getElementById('lb-title').textContent = `frame ${frame}`;
+  document.getElementById('lb-sub').textContent = 'fetching from Kaggle…';
+  const img = document.getElementById('lb-img');
+  img.removeAttribute('src');
+  img.classList.remove('lb-live');
+  setPreviewState('loading');
+  const box = document.getElementById('lightbox');
+  box.setAttribute('aria-label', 'Rendered frame');
+  box.hidden = false;
+  document.querySelector('.lb-box').focus();
+  /* A request that never reached a worker has nothing left to report,
+     so the placeholder must not run for ever waiting on it. */
+  previewTimers.push(setTimeout(() => {
+    if (previewWait && !previewWait.started) {
+      failPreview(`Frame ${frame} could not be requested — the message that `
+                  + 'just appeared says why.', false);
+    }
+  }, 1500));
+}
+
+function failPreview(message, retryable = true) {
+  clearPreviewTimers();
+  previewWait = null;
+  if (document.getElementById('lightbox').hidden) return;
+  document.getElementById('lb-fail-msg').textContent = message;
+  document.getElementById('lb-retry').hidden = !retryable;
+  document.getElementById('lb-sub').textContent = '';
+  setPreviewState('failed');
+}
+
+/* `live` marks the small JPEG the notebook pushed down the log stream
+   while the render was still going, as opposed to the full-resolution
+   file fetched from a finished session. */
 function openPreview(frame, url, label, live) {
+  clearPreviewTimers();
+  previewWait = null;
   document.getElementById('lb-title').textContent =
     live ? `frame ${frame} · live preview` : `frame ${frame}`;
   document.getElementById('lb-sub').textContent = live
@@ -1748,21 +2323,31 @@ function openPreview(frame, url, label, live) {
       + 'only once that session ends'
     : (label ? `rendered by ${label}` : '');
   const img = document.getElementById('lb-img');
+  /* The placeholder stays up until the picture has actually DECODED --
+     a 2 MB PNG is not on screen the instant its src is set, and an
+     empty stage in that gap reads as a frame that came back blank. */
+  setPreviewState('loading');
+  img.onload = () => setPreviewState('ready');
+  img.onerror = () => failPreview(
+    `Frame ${frame} arrived but could not be displayed.`);
   img.src = url;
   img.alt = live
     ? `Small live preview of frame ${frame}`
     : `Rendered frame ${frame}`;
   img.classList.toggle('lb-live', !!live);
+  if (img.complete && img.naturalWidth) setPreviewState('ready');
   /* The dialog's own name, not just its contents: a screen reader
      announcing "Rendered frame" over a thumbnail would make exactly the
      mistake the visible labels are here to prevent. */
   const box = document.getElementById('lightbox');
   box.setAttribute('aria-label', live ? 'Live frame preview' : 'Rendered frame');
   box.hidden = false;
-  document.getElementById('lb-close').focus();
+  document.querySelector('.lb-box').focus();
 }
 
 function closePreview() {
+  clearPreviewTimers();
+  previewWait = null;
   document.getElementById('lightbox').hidden = true;
   /* Dropped so the next open cannot flash the previous frame while the
      new one decodes. */
@@ -1770,6 +2355,16 @@ function closePreview() {
 }
 
 document.getElementById('lb-close').addEventListener('click', closePreview);
+document.getElementById('lb-retry').addEventListener('click', () => {
+  if (!backend || !previewAsked) return;
+  const { frame, jobId } = previewAsked;
+  /* A frame that answered "not on Kaggle" is remembered as such, and Try
+     again is precisely the request to find out whether that is still
+     true -- so the memory is dropped rather than short-circuiting it. */
+  delete thumbState(jobId).failed[frame];
+  openPreviewLoading(frame, jobId);
+  askForFrame(frame, jobId, true);
+});
 document.getElementById('lightbox').addEventListener('click', e => {
   if (e.target.id === 'lightbox') closePreview();   // click the backdrop
 });
@@ -1794,9 +2389,124 @@ document.addEventListener('keydown', e => {
    whenever B was the more recently launched of the two. The grid has
    carried data-job since this task's first draft; only the click
    handler was never taught to read it. */
+/* ---- every frame this page has asked for and not yet heard back about,
+   keyed "<jobId>|<frame>" --------------------------------------------
+   One record per frame, carrying who is waiting for it. Two things ask
+   for frames now -- the preview modal and the thumbnail strip -- and
+   previewFrame() is a NO-OP when a fetch for the same frame is already
+   running: bridge._start skips it and emits nothing at all, so a second
+   asker would wait for a signal that never comes. Going through one
+   record means the second asker joins the first instead. */
+const frameFetches = new Map();
+
+function frameKey(jobId, frame) { return `${jobId || ''}|${frame}`; }
+
+/* The strip pauses while anything is in flight -- one frame at a time is
+   what keeps a scroll from firing forty parallel downloads at Kaggle. */
+function frameFetchInFlight() { return frameFetches.size > 0; }
+
+function frameFetchFor(frame) {
+  for (const rec of frameFetches.values()) {
+    if (rec.frame === frame) return rec;
+  }
+  return null;
+}
+
+/* `forModal` says whether the answer should also open the preview box.
+   A tile scrolling into view wants the picture but not the dialog. */
+function askForFrame(frame, jobId, forModal) {
+  if (!backend) return;
+  const key = frameKey(jobId, frame);
+  const existing = frameFetches.get(key);
+  if (existing) {
+    existing.forModal = existing.forModal || forModal;
+    return;
+  }
+  const rec = { frame, jobId, forModal, started: false, timers: [] };
+  frameFetches.set(key, rec);
+  /* A request that never reaches a worker (no job, a frame assigned to
+     nobody, an account since removed) answers with a notification and
+     no signals at all, so it needs its own way of ending. */
+  rec.timers.push(setTimeout(() => {
+    if (frameFetches.get(key) === rec && !rec.started) {
+      failFrameFetch(rec, `Frame ${frame} could not be requested — the message`
+                          + ' that just appeared says why.', false);
+    }
+  }, 1500));
+  backend.previewFrame(frame, jobId);
+}
+
+function clearFrameFetch(rec) {
+  rec.timers.forEach(clearTimeout);
+  rec.timers = [];
+  frameFetches.delete(frameKey(rec.jobId, rec.frame));
+}
+
+/* Kaggle handed the picture over. It fills the tile it belongs to
+   whether or not a tile asked for it -- a frame fetched for the modal is
+   already paid for, so the strip may as well show it. */
+function settleFrameFetch(rec, url, label) {
+  clearFrameFetch(rec);
+  /* Only a fetch that actually went to the network spends the budget.
+     A frame already on disk answers with no busyChanged at all, which is
+     exactly what `started` records. */
+  if (rec.started) thumbState(rec.jobId).budget -= 1;
+  takeFrameThumb(rec.jobId, rec.frame, url);
+  if (rec.forModal) openPreview(rec.frame, url, label);
+  pumpThumbs();
+}
+
+function failFrameFetch(rec, message, retryable) {
+  clearFrameFetch(rec);
+  if (rec.started) thumbState(rec.jobId).budget -= 1;
+  thumbState(rec.jobId).failed[rec.frame] = true;
+  markThumbGone(rec.jobId, rec.frame);
+  if (rec.forModal) failPreview(message, retryable);
+  pumpThumbs();
+}
+
+/* The tile, patched where it stands. A full rebuild would work too, but
+   it would also throw away every other tile's picture for one that came
+   back empty. */
+function markThumbGone(jobId, frame) {
+  document.querySelectorAll('.fthumb[data-thumb-frame]').forEach(tile => {
+    if (tile.dataset.thumbJob !== jobId
+        || Number(tile.dataset.thumbFrame) !== frame) return;
+    tile.classList.add('gone');
+    tile.removeAttribute('data-thumb-frame');
+    tile.title = `Kaggle had no file for frame ${frame} — that session's`
+      + ' output may have expired.';
+    tile.innerHTML = `<figcaption>${frame}<span class="fw">not on`
+      + ' Kaggle</span></figcaption>';
+  });
+}
+
+/* Open the box, THEN ask. The order is the whole point: fetching a
+   ~2 MB frame off Kaggle takes seconds, and a click that shows nothing
+   for those seconds reads as a click that did nothing. */
+function requestPreview(frame, jobId) {
+  openPreviewLoading(frame, jobId);
+  askForFrame(frame, jobId, true);
+}
+
 function jobIdOfCell(cell) {
   const grid = cell.closest('.fgrid');
   return (grid && grid.dataset.job) || '';
+}
+
+/* A tile shows a reduced copy; the modal must show the frame. If this
+   page still has the full-resolution URL for it there is nothing to
+   fetch -- the file is on disk -- so it opens instantly. Otherwise it
+   goes through the ordinary request, box first. */
+function openThumb(tile) {
+  const jobId = tile.dataset.thumbJob;
+  const frame = Number(tile.dataset.thumbFrame);
+  const full = thumbState(jobId).full[frame];
+  if (full) {
+    openPreview(frame, full);
+    return;
+  }
+  requestPreview(frame, jobId);
 }
 
 /* A live tile opens the picture it is ALREADY showing, larger -- it never
@@ -1811,6 +2521,62 @@ function openLiveTile(tile) {
 }
 
 document.getElementById('instances').addEventListener('click', e => {
+  const collapse = e.target.closest('[data-fg-collapse]');
+  if (collapse) {
+    const jobId = collapse.dataset.fgCollapse;
+    const state = thumbState(jobId);
+    state.collapsed = !state.collapsed;
+    const wrap = collapse.closest('.fgrid-wrap');
+    if (wrap) {
+      wrap.toggleAttribute('data-collapsed', state.collapsed);
+      collapse.setAttribute('aria-expanded', String(!state.collapsed));
+    }
+    /* Nothing loads while it is shut: the observer only ever sees tiles
+       that are on screen, and a collapsed section has none. */
+    if (!state.collapsed) observeThumbs();
+    return;
+  }
+  const viewBtn = e.target.closest('[data-fg-view]');
+  if (viewBtn) {
+    const jobId = viewBtn.dataset.job;
+    thumbState(jobId).view = viewBtn.dataset.fgView;
+    const wrap = viewBtn.closest('.fgrid-wrap');
+    if (wrap) {
+      wrap.dataset.view = viewBtn.dataset.fgView;
+      wrap.querySelectorAll('[data-fg-view]').forEach(b =>
+        b.classList.toggle('on', b === viewBtn));
+    }
+    /* Only now do any tiles have a size, so only now can the observer
+       tell which of them are actually on screen. */
+    observeThumbs();
+    return;
+  }
+  const slide = e.target.closest('[data-strip-slide]');
+  if (slide) {
+    const rail = slide.closest('.fstrip-wrap').querySelector('.fstrip');
+    /* One viewport of tiles, less a sliver, so the tile at the edge is
+       not left half-shown and forgotten. */
+    rail.scrollBy({ left: Number(slide.dataset.stripSlide)
+                          * Math.max(120, rail.clientWidth - 40),
+                    behavior: 'smooth' });
+    return;
+  }
+  const more = e.target.closest('[data-thumb-more]');
+  if (more) {
+    const state = thumbState(more.dataset.thumbMore);
+    state.budget = THUMB_BUDGET;
+    state.capped = false;
+    const box = more.closest('.fstrip-more');
+    if (box) box.hidden = true;
+    observeThumbs();
+    pumpThumbs();
+    return;
+  }
+  const thumb = e.target.closest('[data-thumb-frame]');
+  if (thumb) {
+    openThumb(thumb);
+    return;
+  }
   const tile = e.target.closest('[data-live-frame]');
   if (tile) {
     openLiveTile(tile);
@@ -1818,7 +2584,7 @@ document.getElementById('instances').addEventListener('click', e => {
   }
   const cell = e.target.closest('[data-frame]');
   if (cell && backend) {
-    backend.previewFrame(Number(cell.dataset.frame), jobIdOfCell(cell));
+    requestPreview(Number(cell.dataset.frame), jobIdOfCell(cell));
     return;
   }
   const collectBtn = e.target.closest('[data-job-collect]');
@@ -1857,6 +2623,12 @@ document.getElementById('instances').addEventListener('click', e => {
 });
 document.getElementById('instances').addEventListener('keydown', e => {
   if (e.key !== 'Enter' && e.key !== ' ') return;
+  const thumb = e.target.closest('[data-thumb-frame]');
+  if (thumb) {
+    e.preventDefault();
+    openThumb(thumb);
+    return;
+  }
   const tile = e.target.closest('[data-live-frame]');
   if (tile) {
     e.preventDefault();
@@ -1866,7 +2638,7 @@ document.getElementById('instances').addEventListener('keydown', e => {
   const cell = e.target.closest('[data-frame]');
   if (cell && backend) {
     e.preventDefault();
-    backend.previewFrame(Number(cell.dataset.frame), jobIdOfCell(cell));
+    requestPreview(Number(cell.dataset.frame), jobIdOfCell(cell));
   }
 });
 
@@ -1896,6 +2668,14 @@ function bindToggle(id, key) {
     if (backend) backend.setPreference(key, JSON.stringify(next));
     if (key === 'sound') prefs.sound = next;
     if (key === 'translucent') document.body.classList.toggle('glass', next);
+    if (key === 'frameThumbnails') {
+      prefs.frameThumbnails = next;
+      /* The sections carry the view switch, so they have to be rebuilt
+         for it to appear or go. Turning it off does not discard what a
+         strip already loaded -- that lives in frameThumbs, and turning
+         it back on shows it again without re-fetching a thing. */
+      repaintCards();
+    }
   };
   el.addEventListener('click', flip);
   el.addEventListener('keydown', e => {
@@ -1904,12 +2684,23 @@ function bindToggle(id, key) {
 }
 bindToggle('tgl-glass', 'translucent');
 bindToggle('tgl-sound', 'sound');
+bindToggle('tgl-thumbs', 'frameThumbnails');
 
 document.getElementById('seg-theme').addEventListener('click', e => {
-  const value = e.target.dataset.v;
-  if (!value) return;
-  applyPrefs({ theme: value });
-  backend && backend.setPreference('theme', JSON.stringify(value));
+  setTheme(e.target.dataset.v);
+});
+document.getElementById('faces').addEventListener('click', e => {
+  const value = e.target.closest('[data-v]') && e.target.closest('[data-v]').dataset.v;
+  if (!value || value === prefs.font) return;
+  /* Type changes the size of everything, so it lands in one frame like a
+     theme change does rather than reflowing under a transition. */
+  const root = document.documentElement;
+  root.classList.add('theme-snap');
+  sfx.toggle();
+  applyPrefs({ font: value });
+  backend && backend.setPreference('font', JSON.stringify(value));
+  void root.offsetWidth;
+  requestAnimationFrame(() => root.classList.remove('theme-snap'));
   syncSettingsControls();
 });
 document.getElementById('swatches').addEventListener('click', e => {
@@ -1917,6 +2708,13 @@ document.getElementById('swatches').addEventListener('click', e => {
   if (!value) return;
   applyPrefs({ accent: value });
   backend && backend.setPreference('accent', JSON.stringify(value));
+  syncSettingsControls();
+});
+document.getElementById('seg-close').addEventListener('click', e => {
+  const value = e.target.dataset.v;
+  if (!value) return;
+  prefs.closeAction = value;
+  backend && backend.setPreference('closeAction', JSON.stringify(value));
   syncSettingsControls();
 });
 document.getElementById('min-gpus').addEventListener('change', e => {
@@ -1934,8 +2732,14 @@ function syncSettingsControls() {
     b.classList.toggle('on', b.dataset.v === prefs.theme));
   document.querySelectorAll('#swatches .swatch').forEach(b =>
     b.classList.toggle('on', b.dataset.v === prefs.accent));
+  document.querySelectorAll('#faces .face').forEach(b =>
+    b.classList.toggle('on', b.dataset.v === (prefs.font || 'heebo')));
+  document.querySelectorAll('#seg-close button').forEach(b =>
+    b.classList.toggle('on', b.dataset.v === (prefs.closeAction || 'ask')));
   document.getElementById('tgl-glass').classList.toggle('on', !!prefs.translucent);
   document.getElementById('tgl-sound').classList.toggle('on', prefs.sound !== false);
+  document.getElementById('tgl-thumbs')
+    .classList.toggle('on', prefs.frameThumbnails !== false);
   if (prefs.minGpus !== undefined) {
     document.getElementById('min-gpus').value = prefs.minGpus;
   }
@@ -2014,6 +2818,31 @@ new QWebChannel(qt.webChannelTransport, channel => {
     const id = map[key];
     if (id) document.getElementById(id).disabled = busy;
     if (key.indexOf('verify:') === 0) document.getElementById('btn-add').disabled = busy;
+    /* A frame fetch, told what became of it. bridge's _start emits
+       busy=false BEFORE the handler that emits the picture, so
+       "finished" is not yet "failed" -- the short wait is for the
+       framePreview that normally lands immediately after and settles the
+       record. busy=true is also the only signal that says a request
+       actually went to the NETWORK rather than being served from the
+       cache, which is what the strip's budget counts. */
+    if (key.indexOf('preview:') === 0) {
+      const rec = frameFetchFor(Number(key.slice('preview:'.length)));
+      if (rec) {
+        if (busy) {
+          rec.started = true;
+          rec.timers.forEach(clearTimeout);
+          rec.timers = [];
+        } else {
+          rec.timers.push(setTimeout(() => {
+            if (frameFetches.get(frameKey(rec.jobId, rec.frame)) === rec) {
+              failFrameFetch(rec, `Frame ${rec.frame} did not come back — the `
+                             + 'message that just appeared says what Kaggle '
+                             + 'answered.', true);
+            }
+          }, 400));
+        }
+      }
+    }
     /* A finished collect must not leave a bar frozen at whatever it
        reached -- including a failed one, which would otherwise sit at 68%
        for ever, looking like it was still going. */
@@ -2077,6 +2906,14 @@ new QWebChannel(qt.webChannelTransport, channel => {
 
   backend.framePreview.connect(json => {
     const p = JSON.parse(json);
+    const rec = frameFetchFor(p.frame);
+    if (rec) {
+      settleFrameFetch(rec, p.path, p.label);
+      return;
+    }
+    /* Nothing on this page is waiting for it -- which today means it was
+       asked for before a reload. Showing it is still the right answer:
+       the user asked for this frame. */
     openPreview(p.frame, p.path, p.label);
   });
 

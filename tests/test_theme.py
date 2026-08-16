@@ -14,11 +14,14 @@ import pytest
 from PySide6.QtWidgets import QApplication
 
 import blendfleet.ui.theme as theme
-from blendfleet.ui.theme import (ACCENTS, DEFAULT_ACCENT, DEFAULT_THEME,
-                                  ICON_NAMES, THEMES, apply, current_accent,
-                                  current_accent_name, current_theme,
-                                  current_theme_name, icon, resolve_accent,
-                                  resolve_theme, theme_signal)
+from blendfleet.ui.theme import (ACCENTS, DEFAULT_ACCENT, DEFAULT_FONT,
+                                  DEFAULT_THEME, FONTS, ICON_NAMES, THEMES,
+                                  apply, current_accent, current_accent_name,
+                                  current_font, current_font_name,
+                                  current_theme, current_theme_name, icon,
+                                  register_fonts, resolve_accent,
+                                  resolve_font, resolve_theme, theme_signal,
+                                  ui_font)
 
 
 @pytest.fixture(scope="module")
@@ -74,11 +77,59 @@ def _contrast_ratio(hex_a: str, hex_b: str) -> float:
 
 # ---------------- Step 1: ACCENTS shape / fallback ----------------
 
-def test_five_named_accents_exist():
-    assert set(ACCENTS) == {"orange", "green", "purple", "blue", "red"}
+# Every accent by name, in one place, so the contrast tests below cover
+# each new colour automatically instead of quietly skipping it -- which is
+# what a hand-maintained parametrize list does the day somebody adds one.
+ACCENT_NAMES = ["orange", "green", "purple", "blue", "red",
+                "dark-orange", "dark-red", "slate"]
+
+
+def test_every_named_accent_exists():
+    """The five from the reference, plus this app's own darker three."""
+    assert set(ACCENTS) == set(ACCENT_NAMES)
+    assert len(ACCENT_NAMES) == len(set(ACCENT_NAMES))
 
 
 # ---------------- themes ----------------
+
+# ---------------- the selectable typefaces ----------------
+
+def test_every_selectable_face_exists_and_heebo_is_the_base():
+    assert set(FONTS) == {"heebo", "inter", "arimo", "oswald"}
+    assert DEFAULT_FONT == "heebo"
+    assert FONTS[DEFAULT_FONT] == "Heebo"
+
+
+def test_unknown_font_name_falls_back_rather_than_raising():
+    """A settings.json from a future build naming a face this one has
+    never heard of must not brick startup -- the same rule the accent and
+    theme names follow."""
+    assert resolve_font("papyrus") == FONTS[DEFAULT_FONT]
+    assert resolve_font("") == FONTS[DEFAULT_FONT]
+
+
+@pytest.mark.parametrize("name", ["heebo", "inter", "arimo", "oswald"])
+def test_apply_puts_the_chosen_face_in_effect(qapp, name):
+    """current_font() is what ui_font() and the stylesheet both read, so
+    this is the whole of "the window is in the face you picked"."""
+    apply(qapp, DEFAULT_ACCENT, DEFAULT_THEME, name)
+    assert current_font_name() == name
+    assert current_font() == FONTS[name]
+    assert ui_font().families()[0] == FONTS[name]
+
+
+def test_apply_with_an_unknown_face_does_not_raise(qapp):
+    apply(qapp, DEFAULT_ACCENT, DEFAULT_THEME, "comic-sans-please")
+    assert current_font_name() == DEFAULT_FONT
+
+
+def test_every_bundled_face_registers_with_qt(qapp):
+    """A face that Qt could not parse would silently become a system
+    fallback -- the exact failure register_fonts() exists to make loud."""
+    families = register_fonts()
+    for family in FONTS.values():
+        assert family in families, f"{family} did not register"
+
 
 def test_both_themes_exist_and_light_is_the_default():
     assert set(THEMES) == {"light", "dark"}
@@ -178,26 +229,31 @@ def test_status_inks_are_legible_on_their_own_wash(name):
             f"{name}.{ink} on {name}.{wash} is only {ratio:.2f}:1")
 
 
-@pytest.mark.parametrize("name", ["orange", "green", "purple", "blue", "red"])
+@pytest.mark.parametrize("name", ACCENT_NAMES)
 def test_the_primary_button_label_meets_aa_on_every_accent(name):
     """The single most important button in the app ("RENDER ACROSS FLEET")
     must be readable on every accent, in both themes.
 
     The reference sets this label white, which measures 2.40:1 on its
-    orange accent -- the worst pairing in the whole design. We keep its
-    fill exactly and use a fixed near-black label instead, which clears AA
-    on all five. The label is deliberately NOT the active theme's ink: that
-    is near-white in the dark theme, which would reintroduce the very
-    problem this avoids.
+    orange accent -- the worst pairing in the whole design. The answer was
+    a fixed near-black, which clears AA on all five of the reference's
+    pale accents; it does NOT clear it on the darker ones added since
+    (3.15:1 on oxblood), where white is the readable choice at 5.98:1. So
+    the label is now chosen per accent, and this asserts the CHOICE, not a
+    constant: whichever ink_on names must clear AA, and it must be the
+    better of the two candidates. The label is still never the active
+    theme's ink -- that is near-white in dark, which is where we came in.
     """
-    label = THEMES["dark"].bg
-    ratio = _contrast_ratio(label, ACCENTS[name].base)
+    accent = ACCENTS[name]
+    black, white = THEMES["dark"].bg, "#FFFFFF"
+    assert accent.ink_on in (black, white), accent.ink_on
+    ratio = _contrast_ratio(accent.ink_on, accent.base)
     assert ratio >= 4.5, (
         f"the primary button label on the {name} accent is only "
         f"{ratio:.2f}:1")
-    assert _contrast_ratio("#FFFFFF", ACCENTS[name].base) < ratio, (
-        "white would be no worse than the chosen label -- if that is now "
-        "true, the simpler white label is the better answer")
+    other = white if accent.ink_on == black else black
+    assert _contrast_ratio(other, accent.base) <= ratio, (
+        f"{name} picked the less readable of the two labels")
 
 
 def test_default_accent_is_orange():
@@ -210,7 +266,7 @@ def test_every_accent_defines_the_full_token_set():
     they are real, distinct hex colours rather than a placeholder that
     silently aliases the base."""
     for name, palette in ACCENTS.items():
-        for field in ("base", "hover", "pressed", "disabled"):
+        for field in ("base", "hover", "pressed", "disabled", "ink_on"):
             value = getattr(palette, field)
             assert isinstance(value, str) and value.startswith("#") and len(value) == 7, (
                 f"{name}.{field} is not a hex colour: {value!r}")
@@ -249,7 +305,7 @@ def test_current_accent_defaults_to_the_default_accent():
     assert current_accent() == ACCENTS[DEFAULT_ACCENT]
 
 
-@pytest.mark.parametrize("name", ["orange", "green", "purple", "blue", "red"])
+@pytest.mark.parametrize("name", ACCENT_NAMES)
 def test_current_accent_follows_apply_unlike_the_frozen_constant(qapp, name):
     apply(qapp, name)
     assert current_accent_name() == name
@@ -281,7 +337,7 @@ def test_apply_emits_theme_signal_with_the_new_accent_already_in_effect(qapp):
 
 # ---------------- Step 4: contrast ----------------
 
-@pytest.mark.parametrize("name", ["orange", "green", "purple", "blue", "red"])
+@pytest.mark.parametrize("name", ACCENT_NAMES)
 @pytest.mark.parametrize("theme_name", ["light", "dark"])
 def test_accent_ink_beats_accent_base_as_text(name, theme_name):
     """The whole reason AccentPalette carries ink_light/ink_dark.

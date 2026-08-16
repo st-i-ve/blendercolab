@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="light" data-accent="orange">
+<html lang="en" data-theme="light" data-accent="orange" data-font="heebo">
 <head>
 <meta charset="UTF-8">
 <title>BlendFleet</title>
@@ -158,7 +158,11 @@
       <!-- ============ FILES ============ -->
       <div class="page" id="page-files">
         <div class="two-col">
-          <div>
+          <!-- The column is a flex column so the drop target can take
+               whatever height the settings panel beside it needs. The
+               page's primary action being the biggest, calmest area on
+               it is the point; the alternative was 250px of nothing. -->
+          <div class="col">
             <h2 class="sec">Project <span class="meta">.blend scene</span></h2>
             <!-- A native file chooser, not an <input type=file>: the page
                  has no filesystem access, and the upload needs a real path
@@ -180,7 +184,11 @@
                 <span>Dataset <b id="ds-slug">not uploaded this session</b></span>
                 <span>Size <b id="ds-size">—</b></span>
               </div>
-              <div class="up-item" style="border:none;padding:8px 0 0">
+              <!-- `idle` until an upload actually reports: a progress bar
+                   sitting at zero for something that is not happening is
+                   the same invented reading this app refuses everywhere
+                   else. uploadProgress() drops the class on first tick. -->
+              <div class="up-item idle" id="up-item">
                 <div class="l"><b id="up-name">no upload in progress</b><span id="up-pct"></span></div>
                 <div class="track"><i id="up-bar"></i></div>
               </div>
@@ -205,12 +213,18 @@
           <div>
             <h2 class="sec">Render settings</h2>
             <div class="panel form">
-              <div class="f-row"><label>Start frame</label><input id="f-start" type="number" min="1" value="1"></div>
-              <div class="f-row"><label>End frame</label><input id="f-end" type="number" min="1" value="250"></div>
-              <div class="f-row"><label>Width</label><input id="f-rx" type="number" min="64" value="1920"></div>
-              <div class="f-row"><label>Height</label><input id="f-ry" type="number" min="64" value="1080"></div>
-              <div class="f-row"><label>Samples</label><input id="f-spp" type="number" min="1" value="128"></div>
-              <div class="f-row"><label>Format</label><select id="f-fmt"><option>PNG</option><option>JPEG</option></select></div>
+              <!-- Paired, because they are read in pairs: a frame RANGE,
+                   a frame SIZE. Nine full-width boxes down a column made
+                   the panel twice as tall as the work beside it and hid
+                   the render button below the fold. -->
+              <div class="f-grid">
+                <div class="f-row"><label>Start frame</label><input id="f-start" type="number" min="1" value="1"></div>
+                <div class="f-row"><label>End frame</label><input id="f-end" type="number" min="1" value="250"></div>
+                <div class="f-row"><label>Width</label><input id="f-rx" type="number" min="64" value="1920"></div>
+                <div class="f-row"><label>Height</label><input id="f-ry" type="number" min="64" value="1080"></div>
+                <div class="f-row"><label>Samples</label><input id="f-spp" type="number" min="1" value="128"></div>
+                <div class="f-row"><label>Format</label><select id="f-fmt"><option>PNG</option><option>JPEG</option></select></div>
+              </div>
               <div class="f-row"><label>Blender</label><select id="sel-blender"></select></div>
               <!-- One checkbox per account, so this scene lands only on
                    machines actually chosen for it. Absent selection means
@@ -224,10 +238,20 @@
                 <div id="assign-list" class="assign-list"></div>
               </div>
               <div class="dz-sub" id="eta" style="margin:6px 0 12px"></div>
+              <!-- One word-button for the thing that starts spending
+                   quota; the two that only ever follow it are glyphs. -->
               <div class="fr-actions">
                 <button class="btn primary" id="btn-render">Render across fleet</button>
-                <button class="btn" id="btn-cancel">Cancel all</button>
-                <button class="btn" id="btn-collect">Collect frames…</button>
+                <button class="btn ico" id="btn-collect" data-tip="Collect frames…"
+                  aria-label="Collect frames"
+                  title="Collect frames — download the rendered frames from every account">
+                  <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M8 2.6v7M8 9.6L5.2 6.8M8 9.6l2.8-2.8M2.8 11.4v1.2c0 .6.5 1 1 1h8.4c.6 0 1-.4 1-1v-1.2" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                </button>
+                <button class="btn ico danger" id="btn-cancel" data-tip="Cancel all"
+                  aria-label="Cancel all"
+                  title="Cancel all — stop every account rendering right now">
+                  <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><rect x="4.4" y="4.4" width="7.2" height="7.2" rx="1.5" stroke="currentColor" stroke-width="1.5"/></svg>
+                </button>
               </div>
             </div>
           </div>
@@ -251,11 +275,16 @@
              launched (bridge.outputs() -> Fleet.load_jobs()), so it is a
              record of what BlendFleet rendered, never a browse of Kaggle.
              -->
-        <h2 class="sec" style="margin-top:26px">Renders <span class="meta">packed outputs · every render BlendFleet has run · newest first</span></h2>
-        <div class="out-head">
-          <span class="dz-sub">Download packs a render's frames into one zip. Kaggle deletes a kernel's output after a while — a render whose frames are gone stays listed here and says so.</span>
+        <!-- The action rides on the heading's own rule rather than
+             floating in the middle of the sentence below it. The word
+             "Re-check" stays on it, because a row further down tells
+             the reader to press exactly that. -->
+        <h2 class="sec" style="margin-top:26px">Renders <span class="meta">packed outputs · every render BlendFleet has run · newest first</span>
           <button class="btn sm" id="btn-recheck-outputs"
             title="Ask Kaggle again which of these renders it still has frames for.">Re-check</button>
+        </h2>
+        <div class="out-head">
+          <span class="dz-sub">Download packs a render's frames into one zip. Kaggle deletes a kernel's output after a while — a render whose frames are gone stays listed here and says so.</span>
         </div>
         <div class="panel" id="output-list"></div>
       </div>
@@ -335,10 +364,26 @@
               <button class="swatch" data-v="green" style="background:#4DB690" data-tip="Green"></button>
               <button class="swatch" data-v="purple" style="background:#9B7FD4" data-tip="Purple"></button>
               <button class="swatch" data-v="red" style="background:#D4708F" data-tip="Red"></button>
+              <!-- The darker three. Each one's label colour is measured,
+                   not assumed -- see --accent-on in app.css. -->
+              <button class="swatch" data-v="dark-orange" style="background:#C2703A" data-tip="Dark orange"></button>
+              <button class="swatch" data-v="dark-red" style="background:#A2464B" data-tip="Dark red"></button>
+              <button class="swatch" data-v="slate" style="background:#5A6BA8" data-tip="Slate"></button>
+            </div>
+          </div>
+          <!-- Type. Each button is set in the face it selects: a list of
+               font names all drawn in the same font tells you nothing. -->
+          <div class="set-row">
+            <div class="st"><h4>Typeface</h4><p>The whole app, window chrome included.</p></div>
+            <div class="faces" id="faces">
+              <button class="face" data-v="heebo" style="font-family:'Heebo',sans-serif" data-tip="Heebo">Heebo</button>
+              <button class="face" data-v="inter" style="font-family:'Inter',sans-serif" data-tip="Inter">Inter</button>
+              <button class="face" data-v="arimo" style="font-family:'Arimo',sans-serif" data-tip="Arimo">Arimo</button>
+              <button class="face" data-v="oswald" style="font-family:'Oswald',sans-serif" data-tip="Oswald">Oswald</button>
             </div>
           </div>
           <div class="set-row">
-            <div class="st"><h4>Translucent surfaces</h4><p>Let the desktop show through the app shell. Panels and cards stay solid so text never lands on your wallpaper. Needs Windows 11.</p></div>
+            <div class="st"><h4>Glass surfaces</h4><p>Frost the panels so the desktop shows through them — blurred and lifted, with a lit edge. Every pane stays opaque enough that text never competes with your wallpaper. Needs Windows 11.</p></div>
             <div class="toggle" id="tgl-glass" role="switch" tabindex="0"></div>
           </div>
         </div>
@@ -353,6 +398,26 @@
 
         <h2 class="sec">Rendering</h2>
         <div class="panel set-card">
+          <!-- The thumbnail view is opt-out rather than always-on: every
+               tile is a full-size frame pulled from Kaggle (there is no
+               thumbnail to ask for), so somebody on a metered connection
+               is entitled to take the option off the screen rather than
+               be careful around it. -->
+          <div class="set-row">
+            <div class="st"><h4>Frame thumbnails</h4><p>Offer a picture view of a scene's frames next to the grid on the Dashboard. Each thumbnail is a full-size frame fetched from Kaggle once and kept on disk — the view loads them only as you scroll to them, and stops to ask after 24.</p></div>
+            <div class="toggle" id="tgl-thumbs" role="switch" tabindex="0"></div>
+          </div>
+          <!-- A choice made in a dialog has to be findable afterwards,
+               or "remember my choice" is a trap rather than a
+               convenience. -->
+          <div class="set-row">
+            <div class="st"><h4>Closing the window</h4><p>While a render is still going. BlendFleet running in the notification area keeps following it, chimes when it finishes, and can collect its frames; quitting leaves the render on Kaggle either way. With nothing rendering, closing always quits.</p></div>
+            <div class="seg" id="seg-close">
+              <button data-v="ask">Ask</button>
+              <button data-v="background">Keep running</button>
+              <button data-v="quit">Quit</button>
+            </div>
+          </div>
           <div class="set-row">
             <div class="st"><h4>Minimum GPUs required</h4><p>Kaggle can silently fall back to a single P100 when the requested hardware is unavailable. A render will not start on an account reporting fewer GPUs than this. 0 turns the check off.</p></div>
             <input id="min-gpus" type="number" min="0" max="8" style="width:90px">
@@ -401,15 +466,45 @@
 <div class="toast-stack" id="toast-stack"></div>
 
 <!-- One rendered frame, fetched on demand. Looking at a frame should not
-     mean choosing a folder and downloading everybody's output. -->
+     mean choosing a folder and downloading everybody's output.
+
+     A MODAL over the dashboard, not a takeover of the window: what is
+     being looked at is one picture, and the fleet it came from stays
+     visible around it.
+
+     It opens on the CLICK, not on the answer. Kaggle takes seconds to
+     hand over a ~2 MB PNG, and until this box appeared at the end of
+     that wait a click looked like it had done nothing at all -- so the
+     box opens straight away with a placeholder in it and the picture
+     arrives into a frame that is already on screen. -->
 <div class="lightbox" id="lightbox" hidden role="dialog" aria-modal="true"
      aria-label="Rendered frame">
-  <div class="lb-bar">
-    <b id="lb-title">frame</b>
-    <span id="lb-sub"></span>
-    <button class="btn sm" id="lb-close" aria-label="Close preview">Close</button>
+  <!-- Focus lands on the dialog itself, not on its Close button: the
+       app is moving focus here, nobody pointed at Close, and focusing a
+       control pops that control's tooltip open unbidden. -->
+  <div class="lb-box" tabindex="-1">
+    <div class="lb-bar">
+      <b id="lb-title">frame</b>
+      <span id="lb-sub"></span>
+      <button class="btn ico" id="lb-close" aria-label="Close preview"
+              data-tip="Close">
+        <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M4.2 4.2l7.6 7.6M11.8 4.2l-7.6 7.6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+      </button>
+    </div>
+    <div class="lb-stage" id="lb-stage">
+      <!-- Holds the box's shape while the picture is still coming, so
+           nothing jumps when it lands. -->
+      <div class="lb-skel skel" aria-hidden="true"></div>
+      <img id="lb-img" alt="">
+      <!-- Kaggle answered, and the answer was no. The notification says
+           why in full; this says which frame it was about and offers
+           the one useful thing: ask again. -->
+      <div class="lb-fail">
+        <p id="lb-fail-msg"></p>
+        <button class="btn sm" id="lb-retry">Try again</button>
+      </div>
+    </div>
   </div>
-  <div class="lb-stage"><img id="lb-img" alt=""></div>
 </div>
 
 <script src="app.js"></script>

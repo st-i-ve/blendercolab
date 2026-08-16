@@ -4,7 +4,7 @@ import pytest
 
 import blendfleet.platform_paths as pp
 from blendfleet.settings import DEFAULT_MIN_GPUS, Settings
-from blendfleet.ui.theme import ACCENTS, DEFAULT_ACCENT
+from blendfleet.ui.theme import ACCENTS, DEFAULT_ACCENT, DEFAULT_FONT, FONTS
 
 
 # No per-module config_dir redirect needed here: conftest.py's autouse
@@ -28,6 +28,77 @@ def test_load_with_no_file_returns_defaults():
 
 def test_defaults_accent_is_a_real_accent():
     assert Settings().accent in ACCENTS
+
+
+def test_closing_asks_by_default_and_remembers_what_it_is_told(tmp_path):
+    """"Remember my choice" writes here, and the Settings page reads the
+    same field -- which is what makes a remembered choice undoable."""
+    assert Settings().close_action == "ask"
+    for choice in ("background", "quit", "ask"):
+        Settings(close_action=choice).save()
+        assert Settings.load().close_action == choice
+
+
+@pytest.mark.parametrize("bad", ["minimise", "", 1, None, [], {"a": 1}])
+def test_malformed_close_action_falls_back_to_asking(bad):
+    """The safe one of the three: a corrupt value costs a dialog, never a
+    silently abandoned render or a silently resident app."""
+    assert Settings(close_action=bad).close_action == "ask"
+
+
+def test_a_settings_file_from_before_the_close_choice_still_loads(
+        tmp_path, monkeypatch):
+    import blendfleet.settings as settings_mod
+    monkeypatch.setattr(settings_mod, "config_dir", lambda: tmp_path)
+    (tmp_path / settings_mod.FILENAME).write_text(
+        json.dumps({"accent": "blue"}), encoding="utf-8")
+    assert Settings.load().close_action == "ask"
+
+
+def test_the_chosen_face_is_remembered(tmp_path):
+    assert Settings().font == DEFAULT_FONT
+    Settings(font="oswald").save()
+    assert Settings.load().font == "oswald"
+
+
+@pytest.mark.parametrize("bad", ["papyrus", "", 7, None, [], {"a": 1}])
+def test_malformed_font_falls_back_rather_than_raising(bad):
+    assert Settings(font=bad).font == DEFAULT_FONT
+
+
+def test_every_real_face_name_round_trips(tmp_path):
+    for name in FONTS:
+        Settings(font=name).save()
+        assert Settings.load().font == name
+
+
+def test_frame_thumbnails_is_on_by_default_and_round_trips(tmp_path):
+    """It costs nothing until the view is opened, so the option is there
+    out of the box -- but it IS an option, because opening it pulls
+    full-size frames off Kaggle one at a time."""
+    assert Settings().frame_thumbnails is True
+    Settings(frame_thumbnails=False).save()
+    assert Settings.load().frame_thumbnails is False
+
+
+@pytest.mark.parametrize("bad", ["yes", 1, None, [], {"a": 1}])
+def test_malformed_frame_thumbnails_falls_back_rather_than_raising(bad):
+    """Same total guard as every other field: a hand-edited config, or a
+    malformed value sent through setPreference from the page, must never
+    brick the app."""
+    assert Settings(frame_thumbnails=bad).frame_thumbnails is True
+
+
+def test_a_settings_file_from_before_frame_thumbnails_still_loads(tmp_path,
+                                                                  monkeypatch):
+    """Every settings.json already on disk predates this field."""
+    import blendfleet.settings as settings_mod
+    monkeypatch.setattr(settings_mod, "config_dir", lambda: tmp_path)
+    (tmp_path / settings_mod.FILENAME).write_text(
+        json.dumps({"accent": "blue", "theme": "dark"}), encoding="utf-8")
+    loaded = Settings.load()
+    assert loaded.frame_thumbnails is True
+    assert loaded.accent == "blue"
 
 
 def test_defaults_min_gpus_requires_at_least_one_gpu():

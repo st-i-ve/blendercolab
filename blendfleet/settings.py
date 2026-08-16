@@ -16,13 +16,18 @@ from pathlib import Path
 
 from blendfleet.blender_versions import DEFAULT_VERSION, validate_version
 from blendfleet.platform_paths import config_dir
-from blendfleet.ui.theme import (ACCENTS, DEFAULT_ACCENT, DEFAULT_THEME,
-                                  THEMES)
+from blendfleet.ui.theme import (ACCENTS, DEFAULT_ACCENT, DEFAULT_FONT,
+                                  DEFAULT_THEME, FONTS, THEMES)
 
 FILENAME = "settings.json"
 
 
 DEFAULT_MIN_GPUS = 1
+
+# What closing the window may do, and the default. Named here rather than
+# in the UI so Settings can validate itself without importing a widget.
+CLOSE_ACTIONS = ("ask", "background", "quit")
+DEFAULT_CLOSE_ACTION = "ask"
 
 
 @dataclass
@@ -62,6 +67,27 @@ class Settings:
     # blendfleet/blender_versions.py for why an unlisted version is still
     # allowed.
     blender_version: str = DEFAULT_VERSION
+    # Whether the dashboard offers the thumbnail view of a job's frames at
+    # all. ON by default -- it costs nothing until it is opened -- but it
+    # is a preference rather than a permanent fixture because the pictures
+    # are full-size frames pulled from Kaggle one at a time, and somebody
+    # on a metered or slow connection is entitled to take the option off
+    # the screen entirely rather than be careful around it.
+    frame_thumbnails: bool = True
+    # Which typeface the whole app is set in -- window chrome and page
+    # alike. Guarded exactly the way accent is, and for the same reason:
+    # a name this build has never heard of falls back rather than
+    # bricking startup.
+    font: str = DEFAULT_FONT
+    # What the window's close button does while a render is still going:
+    #   "ask"        -- the default: put the choice, once, with the scene
+    #                   and the account count in it
+    #   "background" -- hide to the notification area and keep following
+    #   "quit"       -- close and stop, the way it always did
+    # Closing with NOTHING rendering always quits, whatever this says --
+    # there is nothing to keep running for, and a tray icon for an idle
+    # app is litter.
+    close_action: str = "ask"
 
     def __post_init__(self) -> None:
         # Total, not just "wrong value": a hand-edited or forward-dated
@@ -81,6 +107,19 @@ class Settings:
             self.translucent = False
         if not isinstance(self.sound, bool):
             self.sound = True
+        # Same total guard as sound above.
+        if not isinstance(self.frame_thumbnails, bool):
+            self.frame_thumbnails = True
+        # Same total guard as accent above: any JSON-representable value,
+        # not only the hashable ones.
+        if not isinstance(self.font, str) or self.font not in FONTS:
+            self.font = DEFAULT_FONT
+        # Same total guard again. "ask" is the safe fallback of the three:
+        # a corrupt value can only ever cost a dialog, never a silently
+        # abandoned render or a silently resident app.
+        if (not isinstance(self.close_action, str)
+                or self.close_action not in CLOSE_ACTIONS):
+            self.close_action = DEFAULT_CLOSE_ACTION
         # Same principle as accent above: a hand-edited or forward-dated
         # config must never brick the app. bool is technically an int
         # subclass in Python, so it is excluded explicitly rather than
@@ -130,4 +169,7 @@ class Settings:
             fullscreen=bool(data.get("fullscreen", False)),
             min_gpus=data.get("min_gpus", DEFAULT_MIN_GPUS),
             blender_version=data.get("blender_version", DEFAULT_VERSION),
+            frame_thumbnails=data.get("frame_thumbnails", True),
+            font=data.get("font", DEFAULT_FONT),
+            close_action=data.get("close_action", DEFAULT_CLOSE_ACTION),
         )

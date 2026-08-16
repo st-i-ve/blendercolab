@@ -17,6 +17,7 @@ import blendfleet.platform_paths as pp
 import blendfleet.ui.theme as theme
 from blendfleet.settings import Settings
 from blendfleet.ui.settings_view import SettingsView
+from blendfleet.ui.theme import ACCENTS
 
 
 @pytest.fixture(autouse=True)
@@ -72,9 +73,15 @@ def close_views(qapp):
 
 # ---------------- Step 1: labelled swatches ----------------
 
-def test_five_swatches_exist_one_per_accent(qapp):
+def test_a_swatch_exists_for_every_accent(qapp):
+    """Every accent the app knows about is offered -- the picker is built
+    from ACCENTS rather than from a list kept in step by hand, which is
+    what stops a new colour existing everywhere except where it is
+    chosen."""
     dlg = make_view(Settings())
-    assert set(dlg._swatches) == {"orange", "green", "purple", "blue", "red"}
+    assert set(dlg._swatches) == set(ACCENTS)
+    assert {"orange", "green", "purple", "blue", "red",
+            "dark-orange", "dark-red", "slate"} == set(ACCENTS)
 
 
 def test_every_swatch_is_labelled_with_its_name_not_colour_alone(qapp):
@@ -83,7 +90,10 @@ def test_every_swatch_is_labelled_with_its_name_not_colour_alone(qapp):
     the picker itself -- a coloured square with no text would fail it."""
     dlg = make_view(Settings())
     for name, swatch in dlg._swatches.items():
-        assert swatch.name_label.text() == name.capitalize()
+        assert swatch.name_label.text() == name.replace("-", " ").capitalize()
+    # And the hyphen never reaches the screen: "dark-orange" is a value in
+    # settings.json, not a colour anybody writes.
+    assert dlg._swatches["dark-orange"].name_label.text() == "Dark orange"
 
 
 def test_default_settings_pre_selects_the_orange_swatch(qapp):

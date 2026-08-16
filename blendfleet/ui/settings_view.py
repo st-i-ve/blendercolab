@@ -29,6 +29,12 @@ SWATCH_SIZE = 56
 SPIN_WIDTH = 160
 
 
+def accent_label(name: str) -> str:
+    """An accent key as a person would write it: "dark-orange" is a
+    settings.json value, "Dark orange" is a colour."""
+    return name.replace("-", " ").capitalize()
+
+
 class _AccentSwatch(QWidget):
     """One accent: a coloured square, its name underneath, and a check
     icon that only appears on the selected one. Clicking anywhere on the
@@ -65,7 +71,7 @@ class _AccentSwatch(QWidget):
         self.button.clicked.connect(lambda: self.picked.emit(name))
         v.addWidget(self.button, 0, Qt.AlignmentFlag.AlignHCenter)
 
-        self.name_label = QLabel(name.capitalize())
+        self.name_label = QLabel(accent_label(name))
         self.name_label.setFont(ui_font(9))
         self.name_label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         v.addWidget(self.name_label)

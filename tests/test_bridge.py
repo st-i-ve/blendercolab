@@ -3549,3 +3549,76 @@ def test_a_download_that_wrote_no_zip_does_not_name_one(qapp, tmp_path,
 
     assert done and done[0]["archivePath"] == ""
     assert done[0]["destination"] == str(tmp_path / "out")
+
+
+# ---------------- what is still running, for the close dialog ----------
+# The window asks this when its close button is pressed. It is plain
+# Python rather than a Slot on purpose: the page may already be gone by
+# then, and the question is being asked BY the Qt window.
+
+def test_live_renders_names_the_scene_and_counts_the_machines(qapp, tmp_path):
+    backend = make_backend(tmp_path, n=2)
+    fleet = backend.fleet_factory(backend.store.list())
+    fleet.save_jobs([FleetState(
+        job_id="job", blend_name="waydown.blend", start_frame=1, end_frame=8,
+        workers=[
+            WorkerState(label="acct0", username="user_0",
+                        kernel_slug="user_0/k", frames=[1, 2], state="running"),
+            WorkerState(label="acct1", username="user_1",
+                        kernel_slug="user_1/k", frames=[3, 4], state="queued"),
+        ])])
+    live = backend.live_renders()
+    assert live["scenes"] == ["waydown"]
+    assert live["accounts"] == 2
+
+
+def test_live_renders_ignores_a_job_that_has_finished(qapp, tmp_path):
+    """Closing on a finished render loses nothing, so it must not be
+    reported as something to stay open for."""
+    backend = make_backend(tmp_path, n=2)
+    fleet = backend.fleet_factory(backend.store.list())
+    fleet.save_jobs([FleetState(
+        job_id="job", blend_name="waydown.blend", start_frame=1, end_frame=4,
+        workers=[
+            WorkerState(label="acct0", username="user_0",
+                        kernel_slug="user_0/k", frames=[1, 2],
+                        state="complete"),
+            WorkerState(label="acct1", username="user_1",
+                        kernel_slug="user_1/k", frames=[3, 4], state="error"),
+        ])])
+    assert backend.live_renders() == {"scenes": [], "accounts": 0}
+
+
+def test_live_renders_counts_a_kernel_kaggle_has_not_started_yet(qapp,
+                                                                tmp_path):
+    """`not_started` is neither active nor finished -- and it is exactly
+    the case where closing would walk away from a render that is about to
+    start spending quota."""
+    backend = make_backend(tmp_path, n=1)
+    fleet = backend.fleet_factory(backend.store.list())
+    fleet.save_jobs([FleetState(
+        job_id="job", blend_name="waydown.blend", start_frame=1, end_frame=2,
+        workers=[WorkerState(label="acct0", username="user_0",
+                             kernel_slug="user_0/k", frames=[1],
+                             state="not_started")])])
+    assert backend.live_renders()["accounts"] == 1
+
+
+def test_live_renders_reports_every_scene_that_is_going(qapp, tmp_path):
+    backend = make_backend(tmp_path, n=2)
+    fleet = backend.fleet_factory(backend.store.list())
+    fleet.save_jobs([
+        FleetState(job_id="a", blend_name="alpha.blend", start_frame=1,
+                   end_frame=2,
+                   workers=[WorkerState(label="acct0", username="user_0",
+                                        kernel_slug="user_0/a", frames=[1],
+                                        state="running")]),
+        FleetState(job_id="b", blend_name="beta.blend", start_frame=1,
+                   end_frame=2,
+                   workers=[WorkerState(label="acct1", username="user_1",
+                                        kernel_slug="user_1/b", frames=[1],
+                                        state="running")]),
+    ])
+    live = backend.live_renders()
+    assert sorted(live["scenes"]) == ["alpha", "beta"]
+    assert live["accounts"] == 2

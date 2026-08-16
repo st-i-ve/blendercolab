@@ -32,18 +32,71 @@
   src:url('../../assets/fonts/RobotoMono-Regular.ttf') format('truetype')}
 @font-face{font-family:'Roboto Mono';font-weight:500;font-style:normal;
   src:url('../../assets/fonts/RobotoMono-Medium.ttf') format('truetype')}
+/* THE SELECTABLE FACES.
+   Four, chosen the way an accent is chosen -- see [data-font] below.
+   Every one is vendored from Google Fonts rather than <link>ed to them:
+   a desktop app must not need the network to render its own text, which
+   is the rule the Roboto files above are here for too. Each is one
+   variable file covering its whole weight range, latin subset, so every
+   weight the UI asks for is real rather than synthesised. */
+@font-face{font-family:'Heebo';font-weight:100 900;font-style:normal;
+  font-display:swap;
+  src:url('../../assets/fonts/Heebo-Variable.woff2') format('woff2')}
+@font-face{font-family:'Inter';font-weight:100 900;font-style:normal;
+  font-display:swap;
+  src:url('../../assets/fonts/Inter-Variable.woff2') format('woff2')}
+@font-face{font-family:'Arimo';font-weight:400 700;font-style:normal;
+  font-display:swap;
+  src:url('../../assets/fonts/Arimo-Variable.woff2') format('woff2')}
+@font-face{font-family:'Oswald';font-weight:200 700;font-style:normal;
+  font-display:swap;
+  src:url('../../assets/fonts/Oswald-Variable.woff2') format('woff2')}
 
 /* ============================================================
    THEME TOKENS
    ============================================================ */
 :root{
   --r-lg:22px; --r-md:14px; --r-sm:10px;
-  --font:'Roboto',sans-serif;
-  --mono:'Roboto Mono',monospace;
-  --cond:'Roboto',sans-serif;   /* see note 1 above */
+  /* One family, three roles -- see [data-font] for how the family is
+     chosen. The roles stay separate variables because they mean
+     different things (prose, label chrome, readings) and because a
+     future face may want to split them again. */
+  --face:'Heebo','Roboto',sans-serif;
+  --font:var(--face);
+  /* The DATA voice: readings, ids, timestamps, machine output. Oswald
+     too, now -- it was Roboto Mono, and Roboto Mono draws a SLASHED
+     zero, which is what gave the dashboard two different-looking sets of
+     digits. One face for everything is the point of choosing one.
+     Oswald has no tabular-figure feature (measured: "111111" is 27%
+     narrower than "000000"), so wherever a figure ticks in place -- the
+     clocks, the log's timestamps, the GPU percentages -- its column is
+     given a fixed width below rather than left to the glyphs. */
+  --data:var(--face);
+  --cond:var(--face);
 }
+
+/* ------------------------------------------------------------------
+   ONE SURFACE, NO NESTING.
+   ------------------------------------------------------------------
+   Every reading on a card used to arrive inside a box of its own --
+   a bordered chip for quota, another for hardware, a filled well for
+   the frame counter, all of them inside a bordered card, inside a
+   bordered panel. Four frames around one number.
+
+   The rule now: a surface is a surface, and nothing inside it is
+   boxed. Facts are a label above a value; separation is space, or at
+   most one hairline where a list genuinely has rows. Colour is spent
+   only on STATE -- the status dot, a badge, the progress rail -- so
+   anything coloured on screen is something that is happening.
+
+   The rail is the signature: a rendering card carries its progress as
+   its own bottom edge, so a glance down a column of cards reads as a
+   bar chart of how far each machine has got. A card with no render
+   has no edge at all. Nothing is drawn for a figure nobody measured
+   (see instanceCard's own comments) -- that discipline is unchanged,
+   it just costs no chrome now. */
 [data-theme="light"]{
-  --bg:#F3F3F0; --card:#FDFDFC; --card-glass:rgba(253,253,252,.68);
+  --bg:#F3F3F0; --card:#FDFDFC; --card-glass:rgba(253,253,252,.72);
   --border:#E7E7E2; --border-2:#DCDCD6;
   --ink:#3A3A36; --ink-2:#6E6E68; --ink-3:#9A9A93; --ink-4:#C6C6C0;
   --fill:#EFEFEB; --bar:#8A8A83;
@@ -54,11 +107,16 @@
   --paused-t:rgba(150,150,145,.15); --paused-ink:#7A7A74;
   --warn-t:rgba(222,168,90,.16); --warn-ink:#A9752E;
 }
+/* Black, not charcoal. The grey ground was the reference's, and against
+   it a "dark" card at #191B19 is a barely-there step -- the whole screen
+   sat in a narrow band with no contrast to spend on the things that
+   matter. Ground goes to true black and every surface above it steps up
+   from there, so a card reads as a card and a fill reads as a fill. */
 [data-theme="dark"]{
-  --bg:#101210; --card:#191B19; --card-glass:rgba(25,27,25,.62);
-  --border:#262926; --border-2:#313431;
-  --ink:#E4E5E2; --ink-2:#A5A79F; --ink-3:#767871; --ink-4:#4A4C47;
-  --fill:#222422; --bar:#6E706A;
+  --bg:#000000; --card:#0D0F0D; --card-glass:rgba(13,15,13,.66);
+  --border:#1C1F1C; --border-2:#262926;
+  --ink:#EDEEEB; --ink-2:#A8AAA2; --ink-3:#7A7C75; --ink-4:#4E504B;
+  --fill:#171917; --bar:#6E706A;
   --shadow:0 1px 3px rgba(0,0,0,.3);
   --shadow-lg:0 16px 44px rgba(0,0,0,.55);
   --active:#57BE8B; --active-t:rgba(87,190,139,.14); --active-ink:#7FD3A9;
@@ -66,24 +124,144 @@
   --paused-t:rgba(140,142,136,.16); --paused-ink:#A9ABA3;
   --warn-t:rgba(222,168,90,.15); --warn-ink:#E5BE84;
 }
-[data-accent="orange"]{--accent:#E8935A;--accent-soft:rgba(232,147,90,.14);--accent-ink:#C06F38}
-[data-accent="blue"]    {--accent:#5A9BD8;--accent-soft:rgba(90,155,216,.14);--accent-ink:#3D7BB8}
-[data-accent="green"]   {--accent:#4DB690;--accent-soft:rgba(77,182,144,.14);--accent-ink:#33936F}
-[data-accent="purple"] {--accent:#9B7FD4;--accent-soft:rgba(155,127,212,.15);--accent-ink:#7A5CB8}
-[data-accent="red"]   {--accent:#D4708F;--accent-soft:rgba(212,112,143,.14);--accent-ink:#B34E6F}
-[data-theme="dark"][data-accent="orange"]{--accent-ink:#F0AC7C}
+/* --accent-on is the LABEL that sits on an accent fill, and it is per
+   accent rather than fixed: white on the pale orange measures 2.40:1 (the
+   worst pairing in the reference design), and near-black on the dark ones
+   below measures 3.15:1. Each colour takes whichever of the two actually
+   reads on it -- the same choice, from the same measurements, that
+   theme.py's _label_on makes for the Qt side. */
+/* THE FONT SWITCH. One declaration per face, the same shape as the
+   accent rules below it, so choosing type and choosing colour are the
+   same kind of act in the same place. Heebo is the base: Roboto's
+   proportions -- the metrics this layout was built against -- drawn a
+   little tighter. */
+[data-font="heebo"]{--face:'Heebo','Roboto',sans-serif}
+[data-font="inter"]{--face:'Inter','Roboto',sans-serif}
+[data-font="arimo"]{--face:'Arimo','Roboto',sans-serif}
+/* Oswald is condensed and TALL, so the caps-and-tracking labels it was
+   chosen for come out noticeably smaller at the same pixel size than the
+   others do. The label sizes are nudged back up for it alone rather than
+   every face carrying Oswald's compromise. */
+[data-font="oswald"]{--face:'Oswald','Roboto',sans-serif}
+[data-font="oswald"] h2.sec{font-size:12.5px}
+[data-font="oswald"] .nav-btn{font-size:12.5px}
+[data-font="oswald"] .btn{font-size:12.5px}
+[data-font="oswald"] .meta .k,[data-font="oswald"] .assign .flab{font-size:10px}
+[data-font="oswald"] .sum .lab{font-size:10.5px}
+
+[data-accent="orange"]{--accent:#E8935A;--accent-soft:rgba(232,147,90,.14);--accent-ink:#C06F38;--accent-on:#101210}
+[data-accent="blue"]    {--accent:#5A9BD8;--accent-soft:rgba(90,155,216,.14);--accent-ink:#3D7BB8;--accent-on:#101210}
+[data-accent="green"]   {--accent:#4DB690;--accent-soft:rgba(77,182,144,.14);--accent-ink:#33936F;--accent-on:#101210}
+[data-accent="purple"] {--accent:#9B7FD4;--accent-soft:rgba(155,127,212,.15);--accent-ink:#7A5CB8;--accent-on:#101210}
+[data-accent="red"]   {--accent:#D4708F;--accent-soft:rgba(212,112,143,.14);--accent-ink:#B34E6F;--accent-on:#101210}
+/* The darker three: this app's own, not the reference's. */
+[data-accent="dark-orange"]{--accent:#C2703A;--accent-soft:rgba(194,112,58,.16);--accent-ink:#9A5628;--accent-on:#101210}
+[data-accent="dark-red"]{--accent:#A2464B;--accent-soft:rgba(162,70,75,.16);--accent-ink:#8E3B41;--accent-on:#FFFFFF}
+[data-accent="slate"]{--accent:#5A6BA8;--accent-soft:rgba(90,107,168,.16);--accent-ink:#4A5A96;--accent-on:#FFFFFF}
+[data-theme="dark"]/* THE FONT SWITCH. One declaration per face, the same shape as the
+   accent rules below it, so choosing type and choosing colour are the
+   same kind of act in the same place. Heebo is the base: Roboto's
+   proportions -- the metrics this layout was built against -- drawn a
+   little tighter. */
+[data-font="heebo"]{--face:'Heebo','Roboto',sans-serif}
+[data-font="inter"]{--face:'Inter','Roboto',sans-serif}
+[data-font="arimo"]{--face:'Arimo','Roboto',sans-serif}
+/* Oswald is condensed and TALL, so the caps-and-tracking labels it was
+   chosen for come out noticeably smaller at the same pixel size than the
+   others do. The label sizes are nudged back up for it alone rather than
+   every face carrying Oswald's compromise. */
+[data-font="oswald"]{--face:'Oswald','Roboto',sans-serif}
+[data-font="oswald"] h2.sec{font-size:12.5px}
+[data-font="oswald"] .nav-btn{font-size:12.5px}
+[data-font="oswald"] .btn{font-size:12.5px}
+[data-font="oswald"] .meta .k,[data-font="oswald"] .assign .flab{font-size:10px}
+[data-font="oswald"] .sum .lab{font-size:10.5px}
+
+[data-accent="orange"]{--accent-ink:#F0AC7C}
 [data-theme="dark"][data-accent="blue"]{--accent-ink:#8CBCE8}
 [data-theme="dark"][data-accent="green"]{--accent-ink:#7DD0B0}
 [data-theme="dark"][data-accent="purple"]{--accent-ink:#BCA5E8}
 [data-theme="dark"][data-accent="red"]{--accent-ink:#E89AB4}
+[data-theme="dark"][data-accent="dark-orange"]{--accent-ink:#E09A63}
+[data-theme="dark"][data-accent="dark-red"]{--accent-ink:#DE8C92}
+[data-theme="dark"][data-accent="slate"]{--accent-ink:#98A6DC}
 
-/* glass mode — includes notifications, toasts & health popup */
+/* ============================================================
+   GLASS
+   ============================================================
+   What made a surface "translucent" before was one declaration: a
+   slightly see-through background and a blur. That is a window, not
+   glass. Glass has three parts, and this has all three:
+
+     1. THE PANE -- blurred and saturated, so what is behind reads as
+        colour and light rather than as detail. Saturation is pushed
+        past 1 because blurring alone washes colour out.
+     2. THE EDGE -- a hairline of light along the top and left, where a
+        real pane catches it, and nothing along the bottom. This is what
+        separates one sheet from the sheet behind it; without it a stack
+        of glass surfaces reads as one grey fog.
+     3. THE LIFT -- a deeper, softer shadow than a solid card needs,
+        because a pane you can see through has to be held off its
+        background by something other than its own colour.
+
+   The opacity floor is deliberate and is where this stops being a
+   fashion: card text still lands on a surface at least ~72% opaque in
+   light and ~66% in dark, so a wallpaper underneath can tint the pane
+   but can never compete with the words on it. */
+body.glass{--glass-edge:rgba(255,255,255,.62);--glass-lip:rgba(255,255,255,.34)}
+[data-theme="dark"] body.glass,body.glass[data-theme="dark"]{
+  --glass-edge:rgba(255,255,255,.10);--glass-lip:rgba(255,255,255,.05);
+}
 body.glass .panel,body.glass .sum,body.glass .inst,body.glass .file-row-card,
-body.glass .modal-box,body.glass .toast,body.glass .notif-panel,body.glass .health-panel,
-body.glass .side,body.glass .offline-banner{
+body.glass .modal-box,body.glass .toast,body.glass .notif-panel,
+body.glass .health-panel,body.glass .side,body.glass .offline-banner,
+body.glass .lb-box{
   background:var(--card-glass);
-  backdrop-filter:blur(16px) saturate(1.25);
-  -webkit-backdrop-filter:blur(16px) saturate(1.25);
+  backdrop-filter:blur(22px) saturate(1.6);
+  -webkit-backdrop-filter:blur(22px) saturate(1.6);
+  border:1px solid var(--glass-edge);
+  box-shadow:0 18px 42px rgba(0,0,0,.16),
+             inset 0 1px 0 var(--glass-lip),
+             inset 1px 0 0 var(--glass-lip);
+}
+[data-theme="dark"] body.glass .panel,[data-theme="dark"] body.glass .sum,
+[data-theme="dark"] body.glass .inst,[data-theme="dark"] body.glass .modal-box,
+[data-theme="dark"] body.glass .toast,[data-theme="dark"] body.glass .notif-panel,
+[data-theme="dark"] body.glass .health-panel,[data-theme="dark"] body.glass .side,
+[data-theme="dark"] body.glass .offline-banner,[data-theme="dark"] body.glass .lb-box{
+  box-shadow:0 20px 48px rgba(0,0,0,.55),
+             inset 0 1px 0 var(--glass-lip),
+             inset 1px 0 0 var(--glass-lip);
+}
+/* The wells INSIDE a pane go quieter still, so a card does not read as
+   glass stacked on glass -- one sheet, with recesses cut into it. */
+body.glass .meta .m,body.glass .assign-list,body.glass .fgrid-wrap,
+body.glass .f-row input,body.glass .f-row select,body.glass .fs-row .fi{
+  background:color-mix(in srgb,var(--fill) 55%,transparent);
+}
+/* A pane is only glass while there is something behind it to blur. The
+   scrim under a dialog is that something, so it stays. */
+body.glass .lightbox{backdrop-filter:none}
+/* Text that is NOT on a pane is on the desktop, and the muted greys this
+   app uses on its own card were chosen against a known surface. Anything
+   sitting on the bare ground moves up a step so it keeps its contrast
+   against a wallpaper nobody here chose. */
+body.glass h2.sec,body.glass .job-head .job-title,body.glass .page-title,
+body.glass .fg-collapse{color:var(--ink)}
+body.glass h2.sec .meta,body.glass .job-head .job-sub,
+body.glass .fstrip-note,body.glass .fg-meta,body.glass .dz-sub{color:var(--ink-2)}
+body.glass h2.sec::after{background:var(--ink-4)}
+/* Inside a pane the same problem is smaller but real: the faintest ink
+   in the ramp was picked for a solid card. */
+body.glass .log .t,body.glass .notif-item .ni-time{color:var(--ink-3)}
+@supports not (backdrop-filter:blur(1px)){
+  /* No blur, no glass -- fall back to the solid card rather than to a
+     see-through panel with sharp wallpaper behind its text. */
+  body.glass .panel,body.glass .sum,body.glass .inst,body.glass .modal-box,
+  body.glass .toast,body.glass .notif-panel,body.glass .health-panel,
+  body.glass .side,body.glass .offline-banner,body.glass .lb-box{
+    background:var(--card);
+  }
 }
 
 /* ============================================================
@@ -94,7 +272,9 @@ body.glass .side,body.glass .offline-banner{
    which is how .lightbox and .modal both ended up on 120, leaving "which
    one covers the other" to DOM order rather than to a decision.
 
-     -1   body::before   the ambient accent wash, behind the whole app
+          (the ambient accent wash was here, at -1. It is painted by
+           the window now -- see web_host.Shell -- so the page has no
+           layer below 0 at all any more.)
       2   .fthumb .fnum/.fown, and
       3   .lb-nav/.lb-count -- all four stack only inside their own
                          positioned parent, so they never reach this scale
@@ -107,7 +287,8 @@ body.glass .side,body.glass .offline-banner{
     130   .lightbox      a frame preview covers the dashboard AND any modal:
                          it is opened deliberately, to look at one picture,
                          and half a modal bleeding through it is noise
-    200   [data-tip]     tooltips belong to controls at EVERY level above,
+    200   .tip           the one tooltip element, a child of <body>:
+                         tooltips belong to controls at EVERY level above,
                          including the lightbox's own Close button, so they
                          sit above all of them
 
@@ -118,17 +299,36 @@ body{
   background:var(--bg);color:var(--ink);
   font-family:var(--font);font-size:14px;line-height:1.5;
   -webkit-font-smoothing:antialiased;
-  transition:background .3s,color .3s;
 }
-body::before{
-  content:"";position:fixed;inset:0;z-index:-1;
-  background:
-    radial-gradient(760px 360px at 88% -6%, var(--accent-soft), transparent 65%),
-    radial-gradient(640px 320px at -6% 108%, var(--accent-soft), transparent 65%);
+/* THEME SWITCHING, IN ONE FRAME.
+   A theme change used to arrive as a ripple, and animating it did not
+   fix that -- it could not. Three things repaint on a switch and only
+   one of them is CSS: the page, the Qt window chrome around it (title
+   bar, shell, Mica), and the accent washes in body::before, which are
+   GRADIENTS and cannot transition at all. Anything with a duration
+   therefore lands after the parts that have none, which is exactly what
+   "the cards fall behind" was: .btn/.icon-btn/.wifi-btn carry
+   `transition:all .15s`, .dropzone .2s, the toggles .2s, and each of
+   them was quietly animating its own colours while the rest snapped.
+   So the switch takes NO time at all. Every transition is suppressed
+   for the one frame the change lands in, and released immediately
+   after, which leaves hover and focus animation untouched the rest of
+   the time. */
+html.theme-snap *,html.theme-snap *::before,html.theme-snap *::after{
+  transition:none !important;
+  animation-duration:0s !important;
 }
-.mono{font-family:var(--mono)}
+/* The ambient accent wash USED to be here, as a fixed layer behind the
+   page. It has moved to the window itself (web_host.Shell), and the
+   reason is a seam: this layer could only ever start at the top of the
+   web view, and the title bar above it is painted by Qt in the flat
+   shell colour -- so the wash ended in a hard horizontal line straight
+   across the window. Painted by the window, it runs behind the title
+   bar and the page as one field. The page stays transparent (below), so
+   what it is drawn on is that same ground. */
+.mono{font-family:var(--data)}
 button{font-family:var(--cond);cursor:pointer}
-input,select{font-family:var(--mono)}
+input,select{font-family:var(--data)}
 
 /* ---- thin, auto-hiding scrollbars ---- */
 *{scrollbar-width:thin;scrollbar-color:transparent transparent}
@@ -155,7 +355,7 @@ html,body{background:transparent}
   height:calc(100vh - 28px);
   margin:14px 0 14px 14px;
   width:216px;flex:none;
-  background:var(--card);border:1px solid var(--border);
+  background:var(--card);
   border-radius:var(--r-lg);box-shadow:var(--shadow);
   padding:16px 12px;display:flex;flex-direction:column;gap:4px;
   transition:width .25s ease;overflow:hidden;z-index:40;
@@ -182,7 +382,10 @@ html,body{background:transparent}
   border-radius:50%;padding:0;
 }
 .side .brand{display:flex;align-items:center;gap:10px;padding:2px 6px 16px}
-.brand-mark{width:34px;height:34px;border-radius:11px;background:var(--fill);border:1px solid var(--border);display:grid;place-items:center;flex:none}
+/* The collapsed rail's mark is the one that reads -- a big circle with
+   the mark centred in it -- so the expanded sidebar uses the same shape
+   at the same size rather than a smaller rounded square. */
+.brand-mark{width:44px;height:44px;border-radius:50%;background:var(--fill);display:grid;place-items:center;flex:none}
 .brand-txt h1{font-family:var(--cond);font-size:15.5px;font-weight:700;letter-spacing:.1em;white-space:nowrap}
 .brand-txt h1 em{font-style:normal;color:var(--accent)}
 .brand-txt small{font-size:9px;letter-spacing:.2em;color:var(--ink-3);white-space:nowrap}
@@ -196,18 +399,18 @@ html,body{background:transparent}
 .nav-btn:hover{background:var(--fill);color:var(--ink)}
 .nav-btn.on{background:var(--accent-soft);color:var(--accent-ink)}
 .nav-btn.on svg{opacity:1}
-.nav-btn .pill{margin-left:auto;font-family:var(--mono);font-size:10px;font-weight:500;background:var(--fill);color:var(--ink-2);border-radius:10px;padding:1px 7px}
+.nav-btn .pill{margin-left:auto;font-family:var(--data);font-size:10px;font-weight:500;background:var(--fill);color:var(--ink-2);border-radius:10px;padding:1px 7px}
 .nav-btn .pill.alert{background:var(--offline-t);color:var(--offline-ink)}
 .collapse-btn{
   margin-top:auto;width:100%;display:flex;align-items:center;justify-content:center;gap:8px;
-  padding:9px;border-radius:12px;border:1px solid var(--border-2);
+  padding:9px;border-radius:12px;border:none;
   background:transparent;color:var(--ink-3);
   font-size:10px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;
 }
-.collapse-btn:hover{color:var(--ink);border-color:var(--ink-3)}
+.collapse-btn:hover{color:var(--ink);background:var(--fill)}
 .collapse-btn svg{transition:transform .25s}
 .side.collapsed .collapse-btn svg{transform:rotate(180deg)}
-.side-foot{padding:12px 8px 2px;font-family:var(--mono);font-size:10px;color:var(--ink-3);line-height:1.8;white-space:nowrap}
+.side-foot{padding:12px 8px 2px;font-family:var(--data);font-size:10.5px;color:var(--ink-3);line-height:1.8;white-space:nowrap;letter-spacing:.04em}
 
 .main{flex:1;min-width:0;padding:14px 18px 40px 18px}
 .head-row{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:10px 6px 20px}
@@ -217,14 +420,14 @@ html,body{background:transparent}
 /* wifi health button */
 .wifi-btn{
   display:flex;align-items:center;gap:9px;
-  border:1px solid var(--border-2);border-radius:14px;
-  padding:9px 14px;background:var(--card);box-shadow:var(--shadow);
+  border:none;border-radius:14px;
+  padding:9px 14px;background:transparent;
   color:var(--ink-2);transition:all .15s;
 }
-.wifi-btn:hover{border-color:var(--ink-3);color:var(--ink)}
+.wifi-btn:hover{background:var(--fill);color:var(--ink)}
 .wifi-btn svg{color:var(--active)}
 .wifi-btn.bad svg{color:var(--offline)}
-.wifi-btn .ms{font-family:var(--mono);font-size:12px;font-weight:700;color:var(--ink)}
+.wifi-btn .ms{font-family:var(--data);font-size:12px;font-weight:700;color:var(--ink);min-width:46px;text-align:right}
 .wifi-btn.bad .ms{color:var(--offline-ink)}
 /* reconnecting: arcs light up bottom → top in a wave */
 .wifi-btn.reconnecting .wa{animation:warc 1.2s infinite}
@@ -235,11 +438,11 @@ html,body{background:transparent}
 @keyframes warc{0%,100%{opacity:.2}30%{opacity:1}}
 
 .icon-btn{
-  width:40px;height:40px;border-radius:14px;border:1px solid var(--border-2);
-  background:var(--card);color:var(--ink-2);display:grid;place-items:center;position:relative;
-  box-shadow:var(--shadow);transition:all .15s;
+  width:40px;height:40px;border-radius:14px;border:none;
+  background:transparent;color:var(--ink-2);display:grid;place-items:center;position:relative;
+  transition:all .15s;
 }
-.icon-btn:hover{border-color:var(--ink-3);color:var(--ink)}
+.icon-btn:hover{background:var(--fill);color:var(--ink)}
 /* ---- subtle icon animations ---- */
 .icon-btn svg,.wifi-btn svg,.nav-btn svg,.mini-btn svg,.dropzone > svg{transition:transform .25s ease}
 #btn-theme.spin svg{animation:themeSpin .5s cubic-bezier(.3,1.4,.5,1)}
@@ -260,8 +463,8 @@ html,body{background:transparent}
 .n-count{
   position:absolute;top:-6px;right:-6px;
   min-width:18px;height:18px;border-radius:10px;
-  background:var(--accent);color:#fff;
-  font-family:var(--mono);font-size:10px;font-weight:700;
+  background:var(--accent);color:var(--accent-on);
+  font-family:var(--data);font-size:10px;font-weight:700;
   display:none;align-items:center;justify-content:center;
   padding:0 5px;border:2px solid var(--bg);
 }
@@ -278,7 +481,7 @@ html,body{background:transparent}
 .offline-banner.show{display:flex}
 .offline-banner b{font-weight:700}
 .offline-banner .ob-txt{font-size:13px;line-height:1.45}
-.offline-banner .ob-sub{font-family:var(--mono);font-size:11px;opacity:.85}
+.offline-banner .ob-sub{font-family:var(--data);font-size:11px;opacity:.85}
 .offline-banner .ob-actions{margin-left:auto;display:flex;gap:8px}
 .offline-banner button.ob-ico{
   width:40px;height:40px;border-radius:12px;padding:0;
@@ -299,15 +502,15 @@ html,body{background:transparent}
 }
 .unreadable-banner.show,.unshared-banner.show{display:flex}
 .unreadable-row{display:flex;gap:12px;align-items:flex-start}
-.unreadable-row:not(:last-child){padding-bottom:10px;border-bottom:1px dashed var(--border)}
+.unreadable-row:not(:last-child){padding-bottom:10px;border-bottom:1px solid var(--border)}
 .unreadable-row .warn-ico{width:17px;height:17px;flex:none;margin-top:2px;color:var(--warn-ink)}
 .unreadable-row .warn-ico svg{width:100%;height:100%}
 .unreadable-body{flex:1;min-width:0;font-size:12.5px;line-height:1.5;color:var(--ink)}
-.unreadable-links{font-family:var(--mono);font-size:11px;margin-top:4px;word-break:break-all}
+.unreadable-links{font-family:var(--data);font-size:11px;margin-top:4px;word-break:break-all}
 .unreadable-links a{color:var(--warn-ink)}
 .unshared-head{font-size:13px;color:var(--warn-ink)}
-.unshared-row{font-family:var(--mono);font-size:11.5px;color:var(--ink)}
-.unshared-note{font-family:var(--mono);font-size:10.5px;color:var(--ink-3);margin-top:4px}
+.unshared-row{font-family:var(--data);font-size:11.5px;color:var(--ink)}
+.unshared-note{font-family:var(--data);font-size:10.5px;color:var(--ink-3);margin-top:4px}
 /* A REAL confirmation ("shared with everyone"), not a warning -- distinct
    tokens so it cannot be mistaken for the same severity as the row above. */
 .unshared-banner.ok{border-color:color-mix(in srgb,var(--active) 40%,transparent)}
@@ -325,28 +528,52 @@ h2.sec{
 }
 h2.sec:first-child{margin-top:0}
 h2.sec::after{content:"";flex:1;height:1px;background:var(--border)}
-h2.sec .meta{font-family:var(--mono);font-size:11px;font-weight:400;color:var(--ink-3);letter-spacing:0;text-transform:none}
-.panel{background:var(--card);border:1px solid var(--border);border-radius:var(--r-lg);box-shadow:var(--shadow);overflow:hidden}
+h2.sec .meta{font-family:var(--data);font-size:11px;font-weight:400;color:var(--ink-3);letter-spacing:0;text-transform:none}
+/* A section's own action rides on its rule, at the far end of it. */
+h2.sec .btn{align-self:center;flex:none}
+.panel{background:var(--card);border-radius:var(--r-lg);box-shadow:var(--shadow);overflow:hidden}
+/* A button is a shape of colour, not an outline. Filled where it acts,
+   bare where it merely offers -- so a row of controls reads as one
+   quiet strip until the eye reaches the thing that starts a render. */
 .btn{
   font-size:11.5px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;
-  border:1px solid var(--border-2);border-radius:12px;
-  background:var(--card);color:var(--ink-2);padding:9px 15px;transition:all .15s;
+  border:1px solid transparent;border-radius:12px;
+  background:var(--fill);color:var(--ink-2);padding:9px 15px;transition:all .15s;
 }
-.btn:hover{border-color:var(--ink-3);color:var(--ink)}
+.btn:hover{background:var(--border);color:var(--ink)}
 .btn:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
-.btn.primary:hover{filter:brightness(1.07)}
-.btn.ghost-accent{border-color:color-mix(in srgb,var(--accent) 50%,transparent);color:var(--accent-ink);background:var(--accent-soft)}
-.btn.danger{color:var(--offline-ink);border-color:color-mix(in srgb,var(--offline) 45%,transparent)}
+.btn.primary{background:var(--accent);color:var(--accent-on)}
+.btn.primary:hover{background:var(--accent);filter:brightness(1.07)}
+.btn.ghost-accent{color:var(--accent-ink);background:var(--accent-soft)}
+.btn.ghost-accent:hover{background:var(--accent-soft);filter:brightness(.97)}
+/* Destructive, but not loud: the colour is in the word, and the red
+   ground only arrives under the pointer. A row of three filled red
+   buttons reads as three warnings on a page where nothing is wrong. */
+.btn.danger{color:var(--offline-ink);background:var(--fill)}
+.btn.danger:hover{background:var(--offline-t);filter:none}
 .btn.sm{padding:6px 11px;font-size:10.5px;border-radius:10px}
 .btn:disabled{opacity:.45;cursor:not-allowed}
-/* icon-only action buttons */
+/* Icon-only action buttons. The word survives as the tooltip and the
+   accessible name (see [data-tip] and aria-label at every call site) --
+   a row that repeats "RENDER THIS / DELETE…" down a list is reading the
+   same two words over and over to find one row. */
 .btn.ico{
-  width:34px;height:31px;padding:0;
-  display:inline-grid;place-items:center;
+  width:32px;height:32px;padding:0;background:transparent;
+  color:var(--ink-2);display:inline-grid;place-items:center;
 }
+.btn.ico:hover{background:var(--fill);color:var(--ink)}
+.btn.ico.danger{background:transparent;color:var(--ink-3)}
+.btn.ico.danger:hover{background:var(--offline-t);color:var(--offline-ink);filter:none}
 .btn.ico svg{display:block}
-.btn.ico.on{background:var(--accent-soft);border-color:color-mix(in srgb,var(--accent) 50%,transparent);color:var(--accent-ink)}
+.btn.ico.on{background:var(--accent-soft);color:var(--accent-ink)}
+/* A glyph standing alone next to a primary button, or on the page's own
+   ground rather than inside a list, needs to look pressable: it gets the
+   card surface under it. Inside a list, hover is enough -- forty raised
+   squares down a table is the chrome this redesign is removing. */
+.fr-actions .btn.ico,.job-actions .btn.ico{background:var(--card);box-shadow:var(--shadow)}
+.fr-actions .btn.ico:hover,.job-actions .btn.ico:hover{background:var(--fill)}
+.fr-actions .btn.ico.danger:hover,.job-actions .btn.ico.danger:hover{background:var(--offline-t)}
+.fr-actions .btn.ico:disabled:hover,.job-actions .btn.ico:disabled:hover{background:var(--card)}
 .badge{
   font-family:var(--cond);font-size:10px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;
   padding:3px 10px;border-radius:20px;display:inline-flex;align-items:center;gap:6px;
@@ -384,45 +611,58 @@ h2.sec .meta{font-family:var(--mono);font-size:11px;font-weight:400;color:var(--
    ============================================================ */
 .summary{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
 @media(max-width:900px){.summary{grid-template-columns:repeat(2,1fr)}}
-.sum{background:var(--card);border:1px solid var(--border);border-radius:var(--r-lg);padding:15px 19px;box-shadow:var(--shadow)}
-.sum .lab{font-family:var(--cond);font-size:10px;letter-spacing:.2em;text-transform:uppercase;color:var(--ink-3)}
-.sum .val{font-family:var(--mono);font-size:23px;font-weight:700;margin-top:3px}
+.sum{background:var(--card);border-radius:var(--r-lg);padding:16px 20px 15px;box-shadow:var(--shadow)}
+.sum .lab{font-family:var(--cond);font-size:9.5px;letter-spacing:.2em;text-transform:uppercase;color:var(--ink-3)}
+.sum .val{font-family:var(--data);font-size:27px;font-weight:700;margin-top:5px;font-variant-numeric:tabular-nums;letter-spacing:-.01em}
 .sum .val small{font-size:12px;font-weight:400;color:var(--ink-3)}
 .sum-top{display:flex;align-items:center;justify-content:space-between;gap:8px}
 .sum-mid{display:flex;align-items:flex-end;justify-content:space-between;gap:10px}
-.sum-spark{flex:none;width:110px;height:30px;opacity:.9}
+.sum-spark{flex:none;width:110px;height:30px;opacity:.75}
+/* The delta since the last poll. A number, not a pill: it changes on
+   every tick, and a box around it made four surfaces flicker. */
 .trend{
-  font-family:var(--mono);font-size:10px;font-weight:700;
-  padding:2px 8px;border-radius:12px;
-  background:var(--fill);color:var(--ink-3);
+  font-family:var(--data);font-size:10.5px;font-weight:700;
+  color:var(--ink-4);
   display:inline-flex;align-items:center;gap:3px;white-space:nowrap;
 }
-.trend.up{background:var(--active-t);color:var(--active-ink)}
-.trend.down{background:var(--offline-t);color:var(--offline-ink)}
-.dash-grid{display:grid;grid-template-columns:1fr 336px;gap:20px;align-items:start}
+.trend.up{color:var(--active-ink)}
+.trend.down{color:var(--offline-ink)}
+.dash-grid{display:grid;grid-template-columns:minmax(0,1fr) 336px;gap:20px;align-items:start}
+.dash-grid > *{min-width:0}
 @media(max-width:1080px){.dash-grid{grid-template-columns:1fr}}
-.instances{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:15px}
+/* Cards take their own height. Stretching them to the tallest in the
+   row left a finished card with 150px of nothing above its rail --
+   and the rail reads as an edge wherever it lands. */
+.instances{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:16px;align-items:start}
 /* One section per running scene, stacked (never side by side -- see the
    comment on #instances in index.html for why this is a separate class
    from .instances, the CARD grid reused unchanged inside each section). */
 .job-list{display:flex;flex-direction:column;gap:26px}
 .job-group{padding-top:2px}
 .job-head{
-  display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;
-  padding:0 2px 10px;margin-bottom:14px;border-bottom:1px solid var(--border);
+  display:flex;align-items:center;gap:12px;flex-wrap:wrap;
+  padding:0 2px 9px;margin-bottom:14px;border-bottom:1px solid var(--border);
 }
+/* Row actions, everywhere they appear: icon buttons packed tight so the
+   group reads as one control cluster rather than three separate words. */
+.row-actions{display:flex;align-items:center;gap:2px;flex:none;justify-content:flex-end}
 .job-head .job-title{
   font-family:var(--cond);font-size:13.5px;font-weight:700;
   letter-spacing:.08em;text-transform:uppercase;color:var(--ink);
 }
-.job-head .job-sub{font-family:var(--mono);font-size:11px;color:var(--ink-3)}
+.job-head .job-sub{font-family:var(--data);font-size:11px;color:var(--ink-3)}
 .job-head .job-actions{margin-left:auto;display:flex;gap:8px}
 .job-group.idle .job-head .job-title{color:var(--ink-3)}
 .job-group .fgrid-wrap{margin-top:16px}
-.inst{border:1px solid var(--border);border-radius:var(--r-lg);background:var(--card);overflow:hidden;box-shadow:var(--shadow)}
+/* One simple border, and everything sits inside it. */
+.inst{
+  border:1px solid var(--border);border-radius:var(--r-lg);
+  background:var(--card);overflow:hidden;
+  display:flex;flex-direction:column;
+}
 .inst.offline .inst-body{opacity:.4}
 .inst.paused .inst-body{opacity:.65}
-.inst-head{display:flex;align-items:center;gap:10px;padding:12px 15px;border-bottom:1px solid var(--border)}
+.inst-head{display:flex;align-items:center;gap:10px;padding:15px 18px 0}
 /* glowing status dot */
 .status-dot{
   width:8px;height:8px;border-radius:50%;flex:none;
@@ -453,7 +693,7 @@ h2.sec .meta{font-family:var(--mono);font-size:11px;font-weight:400;color:var(--
 @keyframes glowRed{from{box-shadow:0 0 2px 0 color-mix(in srgb,var(--offline) 40%,transparent);opacity:.55}to{box-shadow:0 0 9px 2px color-mix(in srgb,var(--offline) 55%,transparent);opacity:1}}
 /* file being rendered — header tag */
 .htag{
-  font-family:var(--mono);font-size:10px;font-weight:700;
+  font-family:var(--data);font-size:10px;font-weight:700;
   color:var(--accent-ink);background:var(--accent-soft);
   border-radius:12px;padding:1px 8px;
   max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
@@ -468,14 +708,21 @@ h2.sec .meta{font-family:var(--mono);font-size:11px;font-weight:400;color:var(--
    narrower -- and the username, the one part that can lose characters
    harmlessly, is the only thing allowed to shrink. It ellipsises.
    Badges keep their full width and wrap before anything is ever cut. */
-.inst-head .name{font-family:var(--mono);font-size:13px;font-weight:700;flex:none}
+.inst-head .name{font-family:var(--data);font-size:13.5px;font-weight:700;flex:none;letter-spacing:-.01em}
 .inst-head .sub{
-  font-family:var(--mono);font-size:10.5px;color:var(--ink-3);
+  font-family:var(--data);font-size:10.5px;color:var(--ink-3);
   flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
 }
 .inst-head .right{
   margin-left:auto;display:flex;align-items:center;gap:8px;
   flex:none;flex-wrap:wrap;justify-content:flex-end;row-gap:6px;
+}
+/* How long it has been going, or how long it took -- beside the state
+   icon, because the two are read together. Tabular so a column of cards
+   lines up. */
+.inst-head .dur{
+  font-family:var(--data);font-size:11px;font-weight:500;color:var(--ink-2);
+  white-space:nowrap;min-width:46px;text-align:right;
 }
 /* Icon-only badge: a square of colour carrying a glyph, not a pill of
    text. Sized so it matches the height of the text badges beside it. */
@@ -485,50 +732,76 @@ h2.sec .meta{font-family:var(--mono);font-size:11px;font-weight:400;color:var(--
 @media (prefers-reduced-motion:reduce){
   .badge.ico.rendering svg{animation:none}
 }
-.mini-btn{width:29px;height:29px;border-radius:10px;border:1px solid var(--border-2);background:transparent;color:var(--ink-2);display:grid;place-items:center}
-.mini-btn:hover{border-color:var(--accent);color:var(--accent-ink)}
-.inst-body{padding:13px 15px 15px}
-.hw-row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
-.hw-chip{font-family:var(--mono);font-size:10px;color:var(--ink-2);background:var(--fill);border:1px solid var(--border);border-radius:8px;padding:3px 9px}
-.hw-chip b{color:var(--ink);font-weight:700}
+.mini-btn{width:29px;height:29px;border-radius:10px;border:none;background:transparent;color:var(--ink-3);display:grid;place-items:center}
+.mini-btn:hover{background:var(--fill);color:var(--ink)}
+.inst-body{padding:14px 18px 16px;flex:1}
+/* ---- the card's facts: quota and last-known hardware, two boxes side
+   by side, each a label above its value. A value that is a list of
+   hardware wraps inside its own box rather than pushing the other one
+   off the card. */
+.meta{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.meta .m{
+  min-width:0;background:var(--fill);border-radius:12px;padding:9px 12px 10px;
+}
+.meta .k{
+  display:block;font-family:var(--cond);font-size:9px;font-weight:700;
+  letter-spacing:.18em;text-transform:uppercase;color:var(--ink-3);
+}
+.meta .v{
+  display:block;font-family:var(--data);font-size:11.5px;color:var(--ink);
+  margin-top:2px;line-height:1.45;overflow-wrap:anywhere;
+}
+.meta .v .age{color:var(--ink-3)}
+/* The mark sits ON the line, not above it: it is part of the reading,
+   the way a currency symbol is part of a price. */
+.meta .v .gpu-mark{display:inline-block;vertical-align:-2px;margin-right:5px;color:var(--ink-3)}
+.meta .m.live .v .gpu-mark{color:var(--accent)}
+/* One fact that is worth the full width on its own row: what THIS
+   session was actually given, as against the cached last-known line. */
+.meta .m.wide{grid-column:1/-1}
+.meta .m.live .v{color:var(--accent-ink)}
+
 /* sparkline */
 .spark-wrap{
-  background:var(--fill);border:1px solid var(--border);
+  background:var(--fill);
   border-radius:var(--r-md);padding:9px 12px 6px;margin-bottom:12px;
 }
 .spark-lab{display:flex;justify-content:space-between;font-family:var(--cond);font-size:9px;letter-spacing:.16em;text-transform:uppercase;color:var(--ink-3);margin-bottom:3px}
-.spark-lab .v{font-family:var(--mono);letter-spacing:0;text-transform:none;color:var(--ink-2)}
+.spark-lab .v{font-family:var(--data);letter-spacing:0;text-transform:none;color:var(--ink-2)}
 .spark{display:block;width:100%;height:36px}
-.assign{display:flex;align-items:center;gap:10px;background:var(--fill);border:1px solid var(--border);border-radius:var(--r-md);padding:9px 13px;margin-bottom:12px}
+/* The frame count. The number is the content, so it is set at the size
+   of one -- and it sits on the card's own surface, not in a well. */
+.assign{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin:14px 0 0}
 .assign .wrapc{flex:1;min-width:0}
-.assign .l1{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}
-.assign .flab{font-family:var(--cond);font-size:9px;letter-spacing:.16em;text-transform:uppercase;color:var(--ink-3)}
-.assign .fname{font-family:var(--mono);font-size:11px;font-weight:700;color:var(--accent-ink);max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.assign .frange{font-family:var(--mono);font-size:11px;font-weight:700}
-.assign .fnow{margin-left:auto;font-family:var(--mono);font-size:10.5px;color:var(--ink-2)}
+.assign .l1{display:flex;align-items:baseline;gap:9px;flex-wrap:wrap}
+.assign .flab{font-family:var(--cond);font-size:9px;font-weight:700;letter-spacing:.18em;text-transform:uppercase;color:var(--ink-3)}
+.assign .fname{font-family:var(--data);font-size:11px;font-weight:700;color:var(--accent-ink);max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.assign .frange{font-family:var(--data);font-size:15px;font-weight:700;font-variant-numeric:tabular-nums}
+.assign .frange.dim{font-size:10.5px;font-weight:400;color:var(--ink-3)}
+.assign .fnow{margin-left:auto;font-family:var(--data);font-size:10.5px;color:var(--ink-2)}
 .assign .fnow b{color:var(--accent-ink)}
-.assign-progress{height:4px;border-radius:2px;background:var(--border);overflow:hidden;margin-top:6px}
-.assign-progress i{display:block;height:100%;width:0%;background:var(--accent);transition:width .5s;border-radius:2px}
-.gpu-line{display:grid;grid-template-columns:52px 1fr 40px;align-items:center;gap:9px;margin-bottom:6px}
-.gpu-line .tag{font-family:var(--mono);font-size:10.5px;color:var(--ink-3)}
-.gpu-line .tag.on{color:var(--ink);font-weight:500}
-.gpu-line .pct{font-family:var(--mono);font-size:10.5px;text-align:right;color:var(--ink-2)}
-.res-block{margin-top:11px;padding-top:10px;border-top:1px dashed var(--border-2)}
+.gpu-line{display:grid;grid-template-columns:96px 1fr 56px;align-items:center;gap:10px;margin-top:7px}
+.gpu-line .tag{font-family:var(--cond);font-size:9px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-3);white-space:nowrap}
+.gpu-line .tag.on{color:var(--ink-2)}
+.gpu-line .pct{font-family:var(--data);font-size:10.5px;text-align:right;color:var(--ink-2);font-variant-numeric:tabular-nums}
+.res-block{margin-top:11px;padding-top:10px;border-top:1px solid var(--border)}
 .res-lab{display:flex;justify-content:space-between;font-family:var(--cond);font-size:9.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--ink-3);margin-bottom:5px}
-.res-lab .v{font-family:var(--mono);letter-spacing:0;text-transform:none;color:var(--ink-2)}
+.res-lab .v{font-family:var(--data);letter-spacing:0;text-transform:none;color:var(--ink-2)}
 .res-lab .v.low{color:var(--warn-ink);font-weight:700}
-.inst-foot{display:flex;gap:12px;font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:10px;flex-wrap:wrap}
-/* Pushed to the far end so the elapsed time lines up down a column of
-   cards, readable as a benchmark rather than as trailing prose. */
-.inst-foot .elapsed{margin-left:auto;font-variant-numeric:tabular-nums}
-.inst-foot b{color:var(--ink-2);font-weight:500}
-.log-card .log{padding:12px 17px;font-family:var(--mono);font-size:10.5px;line-height:2;color:var(--ink-2);max-height:300px;overflow:hidden;position:relative}
+.inst-foot{display:flex;gap:12px;font-family:var(--data);font-size:10.5px;color:var(--ink-3);margin-top:13px;flex-wrap:wrap;align-items:baseline}
+.inst-foot b{color:var(--ink);font-weight:700}
+/* The sentence that says what is left to do. Its own line, quiet, and
+   never squeezed into the flex row beside the stopwatch. */
+.inst-foot .sub{flex-basis:100%;color:var(--ink-3);font-size:10px;line-height:1.55;margin-top:1px}
+.log-card .log{padding:12px 17px;font-family:var(--data);font-size:10.5px;line-height:2;color:var(--ink-2);max-height:300px;overflow:hidden;position:relative}
 .log-card .log::after{content:"";position:absolute;left:0;right:0;bottom:0;height:44px;background:linear-gradient(transparent,var(--card));pointer-events:none}
-.log .t{color:var(--ink-4)}
+/* A timestamp column, so every line starts at the same x whatever the
+   digits are -- what a monospaced face used to do for free. */
+.log .t{color:var(--ink-4);display:inline-block;width:58px}
 .log .ok{color:var(--active-ink)} .log .warn{color:var(--accent-ink)} .log .err{color:var(--offline-ink)}
 .log-head{padding:12px 17px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center}
 .log-head h3{font-family:var(--cond);font-size:10.5px;font-weight:700;letter-spacing:.2em;text-transform:uppercase;color:var(--ink-2)}
-.log-head .clock{font-family:var(--mono);font-size:11px;color:var(--ink-3)}
+.log-head .clock{font-family:var(--data);font-size:11px;color:var(--ink-3);min-width:60px;text-align:right}
 
 /* ============================================================
    LOGS PAGE
@@ -540,18 +813,18 @@ h2.sec .meta{font-family:var(--mono);font-size:11px;font-weight:400;color:var(--
 .err-row .ed{width:8px;height:8px;border-radius:50%;margin-top:6px;flex:none;background:var(--offline)}
 .err-row.warn .ed{background:var(--warn-ink)}
 .err-row .em{font-size:12.5px}
-.err-row .em b{font-family:var(--mono);font-weight:700}
-.err-row .es{font-family:var(--mono);font-size:10.5px;color:var(--ink-3);margin-top:2px}
+.err-row .em b{font-family:var(--data);font-weight:700}
+.err-row .es{font-family:var(--data);font-size:10.5px;color:var(--ink-3);margin-top:2px}
 .err-row .tag{margin-left:auto;flex:none}
 .fail-group{border-bottom:1px solid var(--border)}
 .fail-group:last-child{border-bottom:none}
-.fail-group summary{list-style:none;display:flex;align-items:center;gap:10px;padding:13px 17px;cursor:pointer;font-family:var(--mono);font-size:12.5px;font-weight:700}
+.fail-group summary{list-style:none;display:flex;align-items:center;gap:10px;padding:13px 17px;cursor:pointer;font-family:var(--data);font-size:12.5px;font-weight:700}
 .fail-group summary::-webkit-details-marker{display:none}
 .fail-group summary .cnt{margin-left:auto;font-size:10.5px;font-weight:500;color:var(--ink-3)}
 .fail-group summary .chev{transition:transform .2s;color:var(--ink-3)}
 .fail-group[open] summary .chev{transform:rotate(90deg)}
 .fail-group .fg-body{padding:0 17px 12px 38px}
-.fail-item{font-family:var(--mono);font-size:11px;color:var(--ink-2);padding:5px 0;border-bottom:1px dashed var(--border)}
+.fail-item{font-family:var(--data);font-size:11px;color:var(--ink-2);padding:5px 0;border-bottom:1px solid var(--border)}
 .fail-item:last-child{border-bottom:none}
 .fail-item .ft{color:var(--ink-4);margin-right:8px}
 .fail-item .fk{color:var(--offline-ink);font-weight:700}
@@ -560,37 +833,52 @@ h2.sec .meta{font-family:var(--mono);font-size:11px;font-weight:400;color:var(--
 /* ============================================================
    FILES PAGE
    ============================================================ */
-.two-col{display:grid;grid-template-columns:1fr 1fr;gap:20px;align-items:start}
-@media(max-width:1000px){.two-col{grid-template-columns:1fr}}
+.two-col{display:grid;grid-template-columns:1fr 1fr;gap:20px;align-items:stretch}
+@media(max-width:1000px){.two-col{grid-template-columns:1fr;align-items:start}}
+/* A column that fills its row: the drop target takes the slack, so the
+   two halves end level instead of leaving a quarter of the page blank. */
+.two-col .col{display:flex;flex-direction:column}
+.two-col .col .dropzone{flex:1;display:flex;flex-direction:column;justify-content:center;min-height:150px}
+@media(max-width:1000px){.two-col .col .dropzone{flex:none}}
+/* The one dashed edge left in the app, and it earns it: this is a drop
+   TARGET, and the dashes are what say so before anything is dragged. */
 .dropzone{
   border:1.5px dashed var(--border-2);border-radius:var(--r-lg);
-  padding:34px 20px;text-align:center;color:var(--ink-3);
+  padding:26px 20px;text-align:center;color:var(--ink-3);
   background:var(--card);transition:all .2s;cursor:pointer;
 }
 .dropzone:hover,.dropzone.drag{border-color:var(--accent);background:var(--accent-soft);color:var(--accent-ink)}
 .dropzone .dz-title{font-family:var(--cond);font-size:13px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;margin-top:10px;color:var(--ink-2)}
-.dropzone .dz-sub{font-family:var(--mono);font-size:11px;margin-top:4px}
+/* The app's note voice, wherever a note appears -- it only ever had a
+   rule INSIDE the dropzone, so the same class set at 14px body sans
+   under "Renders" and beside the render button, twice the size of the
+   data it was explaining. */
+.dz-sub{font-family:var(--data);font-size:11px;color:var(--ink-3);line-height:1.6}
+.dropzone .dz-sub{margin-top:4px}
 .up-list{margin-top:14px;display:flex;flex-direction:column;gap:10px}
-.up-item{background:var(--card);border:1px solid var(--border);border-radius:var(--r-md);padding:10px 14px}
-.up-item .l{display:flex;justify-content:space-between;font-family:var(--mono);font-size:11.5px;margin-bottom:6px}
+.up-item{background:var(--card);border-radius:var(--r-md);padding:8px 0 0}
+/* Nothing uploading: the row says so in words and shows no bar. */
+.up-item.idle .track{display:none}
+.up-item.idle .l b{color:var(--ink-3);font-weight:400}
+.up-item .l{display:flex;justify-content:space-between;font-family:var(--data);font-size:11.5px;margin-bottom:6px}
 .up-item .l b{font-weight:700}
 .up-item .l span{color:var(--ink-3)}
 .file-list{display:flex;flex-direction:column;gap:12px}
-.file-row-card{background:var(--card);border:1px solid var(--border);border-radius:var(--r-lg);box-shadow:var(--shadow);padding:15px 17px}
+.file-row-card{background:var(--card);border-radius:var(--r-lg);box-shadow:var(--shadow);padding:15px 17px}
 .fr-top{display:flex;align-items:center;gap:11px;flex-wrap:wrap}
 .fr-icon{width:36px;height:36px;border-radius:12px;background:var(--accent-soft);display:grid;place-items:center;flex:none;color:var(--accent-ink);font-family:var(--cond);font-size:9px;font-weight:700}
-.fr-name{font-family:var(--mono);font-size:13px;font-weight:700;word-break:break-all}
-.fr-meta{font-family:var(--mono);font-size:10.5px;color:var(--ink-3)}
+.fr-name{font-family:var(--data);font-size:13px;font-weight:700;word-break:break-all}
+.fr-meta{font-family:var(--data);font-size:10.5px;color:var(--ink-3)}
 .fr-top .badge{margin-left:auto}
-.fr-stats{display:flex;gap:16px;font-family:var(--mono);font-size:11px;color:var(--ink-2);margin:11px 0 7px;flex-wrap:wrap}
+.fr-stats{display:flex;gap:22px;font-family:var(--data);font-size:11px;color:var(--ink-3);margin:0 0 12px;flex-wrap:wrap}
 .fr-stats b{color:var(--ink);font-weight:700}
 .fr-assigned{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}
-.inst-chip{font-family:var(--mono);font-size:10px;background:var(--fill);color:var(--ink-2);border:1px solid var(--border);border-radius:14px;padding:2px 9px}
+.inst-chip{font-family:var(--data);font-size:10px;background:var(--fill);color:var(--ink-2);border-radius:14px;padding:2px 9px}
 .inst-chip.live{background:var(--accent-soft);color:var(--accent-ink);border-color:transparent}
 .fr-actions{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}
-.collect-strip{display:none;align-items:center;gap:12px;margin-top:12px;background:var(--fill);border:1px solid var(--border);border-radius:var(--r-md);padding:10px 14px}
+.collect-strip{display:none;align-items:center;gap:12px;margin-top:12px;background:var(--fill);border-radius:var(--r-md);padding:10px 14px}
 .collect-strip.show{display:flex}
-.collect-strip .cs-lab{font-family:var(--mono);font-size:11px;color:var(--ink-2);white-space:nowrap}
+.collect-strip .cs-lab{font-family:var(--data);font-size:11px;color:var(--ink-2);white-space:nowrap}
 .collect-strip .cs-lab b{color:var(--accent-ink)}
 .collect-strip .track{flex:1}
 /* ---- live frame previews (mid-render, over the log stream) ----
@@ -601,14 +889,14 @@ h2.sec .meta{font-family:var(--mono);font-size:11px;font-weight:400;color:var(--
 .lp-strip{margin-bottom:14px}
 .lp-head{
   display:flex;align-items:center;gap:8px;flex-wrap:wrap;
-  font-family:var(--mono);font-size:11px;color:var(--ink-2);margin-bottom:8px;
+  font-family:var(--data);font-size:11px;color:var(--ink-2);margin-bottom:8px;
 }
 /* The tag rides WITH the heading rather than in the note underneath,
    because a heading read on its own must not promise a rendered frame. */
 .lp-tag{
   font-size:9.5px;letter-spacing:.04em;text-transform:uppercase;
-  color:var(--ink-3);border:1px solid var(--border);border-radius:999px;
-  padding:2px 7px;
+  color:var(--ink-3);background:var(--fill);border-radius:999px;
+  padding:2px 8px;
 }
 .lp-tiles{display:flex;gap:10px;flex-wrap:wrap}
 .lp-tile{
@@ -623,17 +911,118 @@ h2.sec .meta{font-family:var(--mono);font-size:11px;font-weight:400;color:var(--
 .lp-tile img{display:block;width:100%;aspect-ratio:16/9;object-fit:contain;
   background:var(--border-2)}
 .lp-tile figcaption{
-  font-family:var(--mono);font-size:10px;color:var(--ink-3);
+  font-family:var(--data);font-size:10px;color:var(--ink-3);
   padding:5px 7px;border-top:1px solid var(--border);
 }
 .lp-tile figcaption b{color:var(--ink-2)}
 .lp-note{
-  font-family:var(--mono);font-size:10px;color:var(--ink-3);
+  font-family:var(--data);font-size:10px;color:var(--ink-3);
   margin:9px 0 0;line-height:1.55;max-width:76ch;
 }
 /* ---- frame-by-frame grid ---- */
-.fgrid-wrap{display:none;margin-top:12px;background:var(--fill);border:1px solid var(--border);border-radius:var(--r-md);padding:12px 13px 10px}
+.fgrid-wrap{display:none;margin-top:12px;background:var(--fill);border-radius:var(--r-md);padding:11px 15px 12px}
 .fgrid-wrap.show{display:block}
+.fgrid-wrap{min-width:0}
+.job-group,.job-group .fg-body{min-width:0}
+/* ---- the section's own head: how far along, and how to look at it ----
+   A collapsed section keeps its count on screen and drops everything
+   else, because "6/6 frames" is the answer most of the time and the
+   pictures are what take the room. */
+.fg-head{display:flex;align-items:center;gap:10px;min-height:30px}
+.fg-collapse{
+  display:flex;align-items:center;gap:8px;flex:1;min-width:0;
+  border:none;background:transparent;padding:2px 0;text-align:left;
+  font-family:var(--cond);font-size:9.5px;font-weight:700;
+  letter-spacing:.18em;text-transform:uppercase;color:var(--ink-3);
+}
+.fg-collapse:hover{color:var(--ink)}
+.fg-collapse .chev{transition:transform .2s;flex:none}
+.fgrid-wrap[data-collapsed] .fg-collapse .chev{transform:rotate(-90deg)}
+.fgrid-wrap[data-collapsed] .fg-body{display:none}
+.fg-body{padding-top:11px}
+/* A second, smaller segmented control -- the same object as Settings'
+   theme switch, sized for a section head. */
+.seg.sm{padding:2px;flex:none}
+.seg.sm button{padding:5px 9px;display:grid;place-items:center;border-radius:8px}
+.seg.sm button svg{display:block}
+/* One view at a time. Both are always in the DOM: this whole section is
+   rebuilt on every live tick, so "build the other one on demand" has no
+   meaning here -- see renderFrameGrid. */
+.fgrid-wrap[data-view="thumbs"] .fgrid,
+.fgrid-wrap[data-view="thumbs"] .fgrid-legend,
+.fgrid-wrap[data-view="grid"] .fstrip-wrap{display:none}
+
+/* ---- the thumbnail strip ----
+   IT SLIDES; IT DOES NOT STRETCH. A flex row of fixed-width tiles is
+   wider than its container by design, and in a CSS grid track that
+   width becomes the track's minimum -- so opening the view pushed the
+   whole dashboard wider and put a scrollbar under the window. min-width:0
+   is what lets the rail be narrower than its content; the content then
+   scrolls inside it, left to right, and the page keeps the width it had
+   with the grid showing. */
+.fstrip-wrap{min-width:0;overflow:hidden;position:relative}
+.fstrip{
+  display:flex;gap:10px;overflow-x:auto;padding-bottom:8px;
+  scroll-snap-type:x proximity;scroll-behavior:smooth;
+  min-width:0;max-width:100%;
+}
+/* Slide by the pointer as well as by the wheel: the arrows step one
+   viewport of tiles at a time and hide themselves at each end. */
+.fstrip-nav{
+  position:absolute;top:calc(50% - 26px);transform:translateY(-50%);z-index:2;
+  width:32px;height:32px;border-radius:50%;border:none;
+  background:var(--card);color:var(--ink-2);box-shadow:var(--shadow-lg);
+  display:grid;place-items:center;opacity:0;transition:opacity .15s;
+}
+.fstrip-wrap:hover .fstrip-nav{opacity:1}
+.fstrip-nav:focus-visible{opacity:1}
+.fstrip-nav:hover{color:var(--ink)}
+.fstrip-nav[disabled]{display:none}
+.fstrip-nav.prev{left:2px}
+.fstrip-nav.next{right:2px}
+.fstrip .fthumb{
+  position:relative;flex:0 0 172px;aspect-ratio:16/9;margin:0;
+  border-radius:10px;overflow:hidden;background:var(--border);
+  scroll-snap-align:start;cursor:pointer;
+}
+.fstrip .fthumb .skel{position:absolute;inset:0}
+.fstrip .fthumb.has-image .skel{display:none}
+.fstrip .fthumb img{
+  position:absolute;inset:0;width:100%;height:100%;object-fit:cover;
+  opacity:0;transition:opacity .35s ease;
+}
+.fstrip .fthumb.has-image img{opacity:1}
+.fstrip .fthumb figcaption{
+  position:absolute;left:0;right:0;bottom:0;z-index:2;
+  display:flex;align-items:baseline;gap:7px;
+  padding:4px 7px;font-family:var(--data);font-size:9.5px;color:#fff;
+  background:linear-gradient(transparent,rgba(0,0,0,.55));
+}
+.fstrip .fthumb:hover{outline:2px solid var(--accent);outline-offset:-2px}
+.fstrip .fthumb:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+/* A tile with no picture to wait for: nothing is loading, so nothing
+   shimmers, and the caption says which of the two reasons it is. */
+.fstrip .fthumb.waiting,.fstrip .fthumb.gone{
+  background:var(--card);cursor:default;display:grid;place-items:center;
+}
+.fstrip .fthumb.waiting figcaption,.fstrip .fthumb.gone figcaption{
+  position:static;display:block;text-align:center;background:none;
+  color:var(--ink-3);line-height:1.5;
+}
+.fstrip .fthumb.gone figcaption{color:var(--offline-ink)}
+.fstrip .fthumb .fw{display:block;font-size:9px;color:var(--ink-4)}
+.fstrip .fthumb.gone .fw{color:var(--offline-ink);opacity:.8}
+.fstrip .fthumb:hover.waiting,.fstrip .fthumb:hover.gone{outline:none}
+.fstrip-note,.fstrip-empty{
+  font-family:var(--data);font-size:10px;color:var(--ink-3);
+  line-height:1.6;margin-top:8px;max-width:84ch;
+}
+.fstrip-empty{margin:0;padding:14px 0}
+.fstrip-more{
+  display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:10px;
+  font-family:var(--data);font-size:10.5px;color:var(--ink-2);
+}
+.fstrip-more[hidden]{display:none}
 .fgrid{
   display:grid;
   grid-template-columns:repeat(auto-fill,minmax(9px,1fr));
@@ -650,14 +1039,14 @@ h2.sec .meta{font-family:var(--mono);font-size:11px;font-weight:400;color:var(--
 @keyframes cellpulse{from{opacity:.35}to{opacity:1}}
 .fgrid-legend{
   display:flex;gap:14px;flex-wrap:wrap;margin-top:9px;
-  font-family:var(--mono);font-size:10px;color:var(--ink-3);
+  font-family:var(--data);font-size:10px;color:var(--ink-3);
 }
 .fgrid-legend span{display:flex;align-items:center;gap:5px}
 .fgrid-legend i{width:8px;height:8px;border-radius:2px;display:inline-block}
 /* The caveat that used to sit under the (single) Files-page grid, now
    travelling inside each job's own fragment (renderFrameGrid in app.js)
    since there can be several grids on screen at once. */
-.fg-meta{font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:8px;line-height:1.5}
+.fg-meta{font-family:var(--data);font-size:10px;color:var(--ink-3);margin-top:8px;line-height:1.5}
 /* ---- rendered frame previews (skeleton loading) ---- */
 @keyframes shimmer{0%{background-position:-200% 0}100%{background-position:200% 0}}
 .skel{
@@ -665,7 +1054,7 @@ h2.sec .meta{font-family:var(--mono);font-size:11px;font-weight:400;color:var(--
   background-size:200% 100%;
   animation:shimmer 1.3s infinite linear;
 }
-.fpreview-wrap{display:none;margin-top:12px;background:var(--fill);border:1px solid var(--border);border-radius:var(--r-md);padding:12px 13px}
+.fpreview-wrap{display:none;margin-top:12px;background:var(--fill);border-radius:var(--r-md);padding:12px 13px}
 .fpreview-wrap.show{display:block}
 .fpv-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:9px}
 .fpv-head .t{font-family:var(--cond);font-size:9.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--ink-3)}
@@ -697,16 +1086,15 @@ h2.sec .meta{font-family:var(--mono);font-size:11px;font-weight:400;color:var(--
 .fthumb img.loaded{opacity:1}
 .fthumb .fnum{
   position:absolute;left:5px;bottom:4px;z-index:2;
-  font-family:var(--mono);font-size:9px;font-weight:700;color:#fff;
+  font-family:var(--data);font-size:9px;font-weight:700;color:#fff;
   background:rgba(0,0,0,.45);border-radius:6px;padding:1px 6px;
   backdrop-filter:blur(2px);
 }
 .fthumb .fown{position:absolute;right:5px;top:5px;z-index:2;width:8px;height:8px;border-radius:2px;border:1px solid rgba(255,255,255,.6)}
 .fthumb:hover img.loaded{transform:scale(1.04)}
 .fthumb img{transition:opacity .45s ease,transform .3s ease}
-.fpreview-note{font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:8px}
+.fpreview-note{font-family:var(--data);font-size:10px;color:var(--ink-3);margin-top:8px}
 /* lightbox */
-.lb-box{max-width:900px}
 .lb-img-wrap{position:relative;aspect-ratio:16/9;background:var(--fill);overflow:hidden}
 .lb-img-wrap .skel{position:absolute;inset:0}
 .lb-img-wrap img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:0;transition:opacity .5s ease}
@@ -724,10 +1112,10 @@ h2.sec .meta{font-family:var(--mono);font-size:11px;font-weight:400;color:var(--
 .lb-nav.next{right:12px}
 .lb-count{
   position:absolute;right:12px;top:10px;z-index:3;
-  font-family:var(--mono);font-size:10.5px;color:#fff;
+  font-family:var(--data);font-size:10.5px;color:#fff;
   background:rgba(0,0,0,.42);border-radius:10px;padding:2px 9px;backdrop-filter:blur(3px);
 }
-.lb-cap{display:flex;align-items:center;gap:9px;padding:13px 19px;font-family:var(--mono);font-size:12px;color:var(--ink-2);border-bottom:1px solid var(--border)}
+.lb-cap{display:flex;align-items:center;gap:9px;padding:13px 19px;font-family:var(--data);font-size:12px;color:var(--ink-2);border-bottom:1px solid var(--border)}
 .lb-cap b{color:var(--ink)}
 .lb-cap .oc{width:10px;height:10px;border-radius:3px;flex:none}
 .lb-details{
@@ -737,14 +1125,14 @@ h2.sec .meta{font-family:var(--mono);font-size:11px;font-weight:400;color:var(--
 @media(max-width:600px){.lb-details{grid-template-columns:repeat(2,1fr)}}
 .lb-details .dt{padding:5px 0}
 .lb-details .dl{font-family:var(--cond);font-size:9.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--ink-3)}
-.lb-details .dv{font-family:var(--mono);font-size:12px;font-weight:500;color:var(--ink);margin-top:1px}
+.lb-details .dv{font-family:var(--data);font-size:12px;font-weight:500;color:var(--ink);margin-top:1px}
 .lb-details .dv .oc2{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:6px;vertical-align:-1px}
 .dl-row{display:flex;align-items:center;gap:11px;padding:12px 17px;border-bottom:1px solid var(--border)}
 .dl-row:last-child{border-bottom:none}
-.dl-row .dn{font-family:var(--mono);font-size:12px;font-weight:700}
-.dl-row .ds{font-family:var(--mono);font-size:10.5px;color:var(--ink-3)}
+.dl-row .dn{font-family:var(--data);font-size:12px;font-weight:700}
+.dl-row .ds{font-family:var(--data);font-size:10.5px;color:var(--ink-3)}
 .dl-row .grow{flex:1}
-.empty{padding:26px 16px;text-align:center;font-family:var(--mono);font-size:11.5px;color:var(--ink-3)}
+.empty{padding:26px 16px;text-align:center;font-family:var(--data);font-size:11.5px;color:var(--ink-3)}
 
 /* ============================================================
    INSTANCES PAGE
@@ -753,27 +1141,40 @@ h2.sec .meta{font-family:var(--mono);font-size:11px;font-weight:400;color:var(--
 @media(max-width:1000px){.setup-grid{grid-template-columns:1fr}}
 .form{padding:19px}
 .f-row{margin-bottom:14px}
-.f-row label{display:block;font-family:var(--cond);font-size:10px;font-weight:700;letter-spacing:.18em;text-transform:uppercase;color:var(--ink-3);margin-bottom:6px}
+/* DIRECT children only. The account checkboxes inside "Render on" are
+   <label>s too, and they were inheriting the field-name treatment --
+   which is why every account read as A SHOUTED FIELD NAME rather than
+   as its own handle. */
+.f-row > label{display:block;font-family:var(--cond);font-size:10px;font-weight:700;letter-spacing:.18em;text-transform:uppercase;color:var(--ink-3);margin-bottom:6px}
+/* A field is a filled well, not an outlined one: the fill is what says
+   "type here", and it lets nine of them sit in a panel without adding
+   nine rectangles of chrome to the page. */
 .f-row input,.f-row select{
-  width:100%;padding:10px 13px;border-radius:12px;
-  border:1px solid var(--border-2);background:var(--bg);color:var(--ink);
-  font-size:12.5px;outline:none;transition:border-color .15s;
+  width:100%;padding:10px 13px;border-radius:10px;
+  border:1px solid transparent;background:var(--fill);color:var(--ink);
+  font-size:12.5px;outline:none;transition:border-color .15s,background .15s;
 }
-.f-row input:focus,.f-row select:focus{border-color:var(--accent)}
+.f-row input:hover,.f-row select:hover{background:var(--border)}
+.f-row input:focus,.f-row select:focus{border-color:var(--accent);background:var(--fill)}
 .f-row input.invalid{border-color:var(--offline)}
+/* Frame range, size and sampling are read as PAIRS -- start with end,
+   width with height -- so they are set as pairs rather than as a
+   column of nine full-width boxes. */
+.f-grid{display:grid;grid-template-columns:1fr 1fr;gap:0 14px}
+@media(max-width:520px){.f-grid{grid-template-columns:1fr}}
 .f-err{
-  display:none;font-family:var(--mono);font-size:10.5px;
+  display:none;font-family:var(--data);font-size:10.5px;
   color:var(--offline-ink);margin-top:5px;
 }
 .f-err.show{display:block}
 .m-hint{
-  display:none;font-family:var(--mono);font-size:11px;
+  display:none;font-family:var(--data);font-size:11px;
   color:var(--offline-ink);padding:0 19px 10px;
 }
 .m-hint.show{display:block}
 .key-row{display:flex;gap:8px}
 .key-row input{flex:1}
-.key-status{display:none;align-items:center;gap:8px;margin-top:8px;font-family:var(--mono);font-size:11px;border-radius:10px;padding:8px 12px}
+.key-status{display:none;align-items:center;gap:8px;margin-top:8px;font-family:var(--data);font-size:11px;border-radius:10px;padding:8px 12px}
 .key-status.show{display:flex}
 .key-status.testing{background:var(--fill);color:var(--ink-2)}
 .key-status.ok{background:var(--active-t);color:var(--active-ink)}
@@ -781,8 +1182,12 @@ h2.sec .meta{font-family:var(--mono);font-size:11px;font-weight:400;color:var(--
 .spinner{width:12px;height:12px;border:2px solid currentColor;border-top-color:transparent;border-radius:50%;animation:spin .7s linear infinite;flex:none}
 @keyframes spin{to{transform:rotate(360deg)}}
 .inst-table{width:100%;border-collapse:collapse}
-.inst-table th{font-family:var(--cond);font-size:10px;font-weight:700;letter-spacing:.18em;text-transform:uppercase;color:var(--ink-3);text-align:left;padding:12px 17px;border-bottom:1px solid var(--border)}
-.inst-table td{padding:12px 17px;border-bottom:1px solid var(--border);font-family:var(--mono);font-size:11.5px;vertical-align:middle}
+.inst-table th{font-family:var(--cond);font-size:10px;font-weight:700;letter-spacing:.18em;text-transform:uppercase;color:var(--ink-3);text-align:left;padding:13px 18px;border-bottom:1px solid var(--border);white-space:nowrap}
+.inst-table td{padding:13px 18px;border-bottom:1px solid var(--border);font-family:var(--data);font-size:11.5px;vertical-align:middle}
+/* A quota reading is one figure; wrapping "0.2 / 30.0 h" across two
+   lines made it look like two. */
+.inst-table td:nth-child(3),.inst-table td:nth-child(5){white-space:nowrap}
+.inst-table tbody tr:hover td{background:var(--fill)}
 .inst-table tr:last-child td{border-bottom:none}
 .inst-table td b{font-weight:700}
 .inst-table .dim{color:var(--ink-3)}
@@ -795,24 +1200,44 @@ h2.sec .meta{font-family:var(--mono);font-size:11px;font-weight:400;color:var(--
 .set-row:last-child{border-bottom:none}
 .set-row .st{flex:1}
 .set-row .st h4{font-size:13.5px;font-weight:700}
-.set-row .st p{font-size:12px;color:var(--ink-3);margin-top:2px}
-.seg{display:flex;border:1px solid var(--border-2);border-radius:12px;overflow:hidden}
-.seg button{font-size:11px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;padding:8px 16px;border:none;background:transparent;color:var(--ink-3)}
-.seg button.on{background:var(--accent);color:#fff}
+.set-row .st p{font-size:12px;color:var(--ink-3);margin-top:2px;max-width:78ch}
+/* Settings has one bare input (minimum GPUs) that never sat in a
+   .f-row, so it kept the browser's own default box -- the one white
+   rectangle with a grey outline left anywhere in the app. */
+.set-row input{
+  padding:9px 12px;border-radius:10px;border:1px solid transparent;
+  background:var(--fill);color:var(--ink);font-family:var(--data);
+  font-size:12.5px;outline:none;text-align:center;
+}
+.set-row input:focus{border-color:var(--accent)}
+.seg{display:flex;background:var(--fill);border-radius:12px;overflow:hidden;padding:2px;flex:none}
+.seg button{white-space:nowrap}
+.seg button{font-size:11px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;padding:7px 16px;border:none;border-radius:10px;background:transparent;color:var(--ink-3)}
+.seg button.on{background:var(--accent);color:var(--accent-on)}
+/* A face is chosen by looking at it, so the control is a row of names
+   each drawn in its own type -- the type IS the swatch. */
+.faces{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+.face{
+  border:none;border-radius:10px;background:var(--fill);color:var(--ink-2);
+  padding:8px 13px;font-size:14px;line-height:1.1;transition:all .15s;
+}
+.face:hover{background:var(--border);color:var(--ink)}
+.face.on{background:var(--accent-soft);color:var(--accent-ink)}
+.face:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .swatches{display:flex;gap:9px}
 .swatch{width:30px;height:30px;border-radius:50%;border:2px solid transparent;cursor:pointer}
 .swatch.on{border-color:var(--ink);box-shadow:0 0 0 2px var(--card) inset}
-.toggle{width:46px;height:26px;border-radius:14px;background:var(--fill);border:1px solid var(--border-2);position:relative;cursor:pointer;transition:background .2s}
-.toggle::after{content:"";position:absolute;top:2px;left:2px;width:20px;height:20px;border-radius:50%;background:var(--card);border:1px solid var(--border-2);transition:left .2s}
+.toggle{width:46px;height:26px;border-radius:14px;background:var(--border);border:none;position:relative;cursor:pointer;transition:background .2s}
+.toggle::after{content:"";position:absolute;top:3px;left:3px;width:20px;height:20px;border-radius:50%;background:var(--card);box-shadow:var(--shadow);transition:left .2s}
 .toggle.on{background:var(--accent);border-color:var(--accent)}
-.toggle.on::after{left:22px;border-color:transparent}
+.toggle.on::after{left:23px}
 
 /* ============================================================
    NOTIFICATIONS — bubbles, no side borders
    ============================================================ */
 .toast-stack{position:fixed;right:20px;bottom:20px;z-index:100;display:flex;flex-direction:column;gap:10px;max-width:340px}
 .toast{
-  background:var(--card);border:1px solid var(--border);
+  background:var(--card);
   border-radius:16px;box-shadow:var(--shadow-lg);
   padding:12px 15px;display:flex;gap:11px;align-items:flex-start;
   animation:toastIn .25s ease;
@@ -827,7 +1252,7 @@ h2.sec .meta{font-family:var(--mono);font-size:11px;font-weight:400;color:var(--
 .toast .tx{margin-left:auto;background:none;border:none;color:var(--ink-3);font-size:15px;line-height:1;padding:2px;cursor:pointer}
 @keyframes toastIn{from{transform:translateY(8px);opacity:0}to{transform:none;opacity:1}}
 
-.notif-panel{position:fixed;top:70px;right:22px;width:330px;z-index:90;background:var(--card);border:1px solid var(--border);border-radius:var(--r-lg);box-shadow:var(--shadow-lg);display:none;overflow:hidden}
+.notif-panel{position:fixed;top:70px;right:22px;width:330px;z-index:90;background:var(--card);border-radius:var(--r-lg);box-shadow:var(--shadow-lg);display:none;overflow:hidden}
 .notif-panel.show{display:block}
 .notif-panel .np-head{display:flex;justify-content:space-between;align-items:center;padding:12px 16px;border-bottom:1px solid var(--border)}
 .notif-panel .np-head h4{font-family:var(--cond);font-size:11px;font-weight:700;letter-spacing:.18em;text-transform:uppercase;color:var(--ink-2)}
@@ -849,14 +1274,14 @@ h2.sec .meta{font-family:var(--mono);font-size:11px;font-weight:400;color:var(--
 .notif-item>div{min-width:0}
 .notif-item .ni-t{font-size:12px;font-weight:700}
 .notif-item .ni-m{font-size:11.5px;color:var(--ink-2);overflow-wrap:anywhere}
-.notif-item .ni-time{font-family:var(--mono);font-size:10px;color:var(--ink-4);margin-top:2px}
+.notif-item .ni-time{font-family:var(--data);font-size:10px;color:var(--ink-4);margin-top:2px}
 
 /* ============================================================
    HEALTH POPUP (wifi diagnosis)
    ============================================================ */
 .health-panel{
   position:fixed;top:70px;right:22px;width:340px;z-index:92;
-  background:var(--card);border:1px solid var(--border);
+  background:var(--card);
   border-radius:var(--r-lg);box-shadow:var(--shadow-lg);
   display:none;overflow:hidden;
 }
@@ -870,17 +1295,17 @@ h2.sec .meta{font-family:var(--mono);font-size:11px;font-weight:400;color:var(--
 .hp-verdict .vd{width:10px;height:10px;border-radius:50%;background:var(--active);flex:none}
 .hp-verdict.bad .vd{background:var(--offline)}
 .hp-verdict.warnv .vd{background:var(--warn-ink)}
-.hp-sub{font-family:var(--mono);font-size:10.5px;color:var(--ink-3);margin-top:3px}
+.hp-sub{font-family:var(--data);font-size:10.5px;color:var(--ink-3);margin-top:3px}
 .hp-body{padding:8px 17px 12px}
-.hp-row{display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px dashed var(--border)}
+.hp-row{display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid var(--border)}
 .hp-row:last-child{border-bottom:none}
 .hp-row .hl{font-family:var(--cond);font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-3);width:110px;flex:none}
-.hp-row .hv{font-family:var(--mono);font-size:11.5px;font-weight:500}
+.hp-row .hv{font-family:var(--data);font-size:11.5px;font-weight:500}
 .hp-row .hv.good{color:var(--active-ink)}
 .hp-row .hv.bad{color:var(--offline-ink)}
 .hp-row .hv.warnc{color:var(--warn-ink)}
 .hp-pings{padding:4px 17px 14px}
-.hp-pings .pg{display:flex;align-items:center;gap:9px;font-family:var(--mono);font-size:11px;color:var(--ink-2);padding:4px 0}
+.hp-pings .pg{display:flex;align-items:center;gap:9px;font-family:var(--data);font-size:11px;color:var(--ink-2);padding:4px 0}
 .hp-pings .pg .pd{width:6px;height:6px;border-radius:50%;background:var(--active)}
 .hp-pings .pg.off .pd{background:var(--offline)}
 .hp-pings .pg .pn{width:74px;font-weight:700}
@@ -893,17 +1318,17 @@ h2.sec .meta{font-family:var(--mono);font-size:11px;font-weight:400;color:var(--
 /* 120: see STACKING ORDER at the top of this file. */
 .modal{position:fixed;inset:0;background:rgba(0,0,0,.35);z-index:120;display:none;align-items:center;justify-content:center;padding:20px}
 .modal.show{display:flex}
-.modal-box{background:var(--card);border:1px solid var(--border);border-radius:20px;box-shadow:var(--shadow-lg);width:100%;max-width:420px;overflow:hidden}
+.modal-box{background:var(--card);border-radius:20px;box-shadow:var(--shadow-lg);width:100%;max-width:420px;overflow:hidden}
 .modal-box .mh{padding:16px 19px;border-bottom:1px solid var(--border)}
 .modal-box .mh h3{font-family:var(--cond);font-size:12px;font-weight:700;letter-spacing:.18em;text-transform:uppercase;color:var(--ink-2)}
-.modal-box .mh .mf{font-family:var(--mono);font-size:12.5px;font-weight:700;margin-top:3px}
+.modal-box .mh .mf{font-family:var(--data);font-size:12.5px;font-weight:700;margin-top:3px}
 .modal-box .mb{padding:12px 19px;max-height:300px;overflow:auto}
 .assign-opt{display:flex;align-items:center;gap:11px;padding:10px 4px;border-bottom:1px solid var(--border)}
 .assign-opt:last-child{border-bottom:none}
 .assign-opt input{width:16px;height:16px;accent-color:var(--accent)}
-.assign-opt .an{font-family:var(--mono);font-size:12px;font-weight:700}
-.assign-opt .ad{font-family:var(--mono);font-size:10.5px;color:var(--ink-3);margin-left:auto}
-.assign-opt .busy{margin-left:auto;font-family:var(--mono);font-size:10px;color:var(--accent-ink)}
+.assign-opt .an{font-family:var(--data);font-size:12px;font-weight:700}
+.assign-opt .ad{font-family:var(--data);font-size:10.5px;color:var(--ink-3);margin-left:auto}
+.assign-opt .busy{margin-left:auto;font-family:var(--data);font-size:10px;color:var(--accent-ink)}
 /* An account already spending quota on another scene: greyed rather than
    removed, so it is still visible as PART of the fleet, just not
    offered as a choice for this one -- see :has()'s existing precedent on
@@ -912,26 +1337,38 @@ h2.sec .meta{font-family:var(--mono);font-size:11px;font-weight:400;color:var(--
 /* The render-panel checkbox list (Files page). Its own scroll container so
    a long fleet cannot push the render button off the bottom of the panel. */
 .assign-list{
-  display:flex;flex-direction:column;max-height:220px;overflow-y:auto;
-  border:1px solid var(--border-2);border-radius:12px;padding:2px 12px;
+  display:grid;grid-template-columns:1fr 1fr;gap:0 14px;
+  max-height:220px;overflow-y:auto;
+  background:var(--fill);border-radius:10px;padding:6px 12px;
 }
+@media(max-width:520px){.assign-list{grid-template-columns:1fr}}
+.assign-list .assign-opt{border-bottom:none;padding:6px 2px;gap:9px}
+.assign-list .assign-opt input{width:15px;height:15px}
+.assign-list .assign-opt .an{font-size:11.5px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.assign-list .assign-opt .ad{font-size:10px}
 .modal-box .mfoot{display:flex;gap:9px;padding:15px 19px;border-top:1px solid var(--border);justify-content:flex-end}
 /* ---- instance file system ---- */
-.fs-disk{font-family:var(--mono);font-size:10.5px;color:var(--ink-3);margin-top:4px}
-.fs-row{display:flex;align-items:center;gap:11px;padding:11px 4px;border-bottom:1px solid var(--border)}
+.fs-disk{font-family:var(--data);font-size:10.5px;color:var(--ink-3);margin-top:4px}
+/* A list of files: one hairline between rows, and nothing else. The
+   hairline stays because rows are genuinely separate records -- it is
+   the one place in this UI where a rule carries structure rather than
+   drawing a box. */
+.fs-row{display:flex;align-items:center;gap:13px;padding:13px 18px;border-bottom:1px solid var(--border)}
 .fs-row:last-child{border-bottom:none}
+.fs-row:hover{background:var(--fill)}
 .fs-row .fi{
-  width:30px;height:30px;border-radius:9px;flex:none;
+  width:32px;height:32px;border-radius:10px;flex:none;
   display:grid;place-items:center;
   background:var(--fill);color:var(--ink-3);
-  font-family:var(--cond);font-size:8px;font-weight:700;
+  font-family:var(--cond);font-size:8px;font-weight:700;letter-spacing:.06em;
 }
+.fs-row:hover .fi{background:var(--border)}
 .fs-row .fi.scene{background:var(--accent-soft);color:var(--accent-ink)}
 .fs-row .fi.frames{background:var(--active-t);color:var(--active-ink)}
-.fs-row .fn2{font-family:var(--mono);font-size:11.5px;font-weight:700;word-break:break-all}
-.fs-row .fs2{font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:1px}
+.fs-row .fn2{font-family:var(--data);font-size:12.5px;font-weight:700;word-break:break-all}
+.fs-row .fs2{font-family:var(--data);font-size:10px;color:var(--ink-3);margin-top:3px;line-height:1.6}
 .fs-row .grow{flex:1;min-width:0}
-.fs-row .lock{font-family:var(--mono);font-size:10px;color:var(--ink-4)}
+.fs-row .lock{font-family:var(--data);font-size:10px;color:var(--ink-3)}
 
 /* ---- renders / packed outputs (Files page) ----
    Deliberately built from the .fs-row vocabulary the scene library
@@ -940,12 +1377,12 @@ h2.sec .meta{font-family:var(--mono);font-size:11px;font-weight:400;color:var(--
    looks like a rendering instance rather than like a new thing. Nothing
    here introduces a colour or a z-index. */
 .out-head{display:flex;align-items:flex-start;gap:12px;margin:-4px 2px 12px}
-.out-head .dz-sub{flex:1;min-width:0}
+.out-head .dz-sub{flex:1;min-width:0;max-width:88ch;line-height:1.6}
 .out-head .btn{flex:none}
 .out-row{align-items:flex-start}
 .out-row .fi{margin-top:2px}
-.out-row .out-state{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin-top:6px}
-.out-row .out-state .lock{flex:1;min-width:140px;line-height:1.5}
+.out-row .out-state{display:flex;align-items:baseline;gap:9px;flex-wrap:wrap;margin-top:8px}
+.out-row .out-state .lock{flex:1;min-width:180px;line-height:1.6;max-width:80ch}
 /* Empty until a download for THIS render starts, so an idle row shows
    nothing at all rather than a bar at zero. */
 .out-row .out-prog:empty,.job-dl:empty{display:none}
@@ -953,15 +1390,18 @@ h2.sec .meta{font-family:var(--mono);font-size:11px;font-weight:400;color:var(--
   display:grid;grid-template-columns:auto 1fr auto;
   align-items:center;gap:9px;margin-top:8px;
 }
-.out-row .out-prog .tag,.job-dl .tag{font-family:var(--mono);font-size:10.5px;color:var(--ink);font-weight:500}
-.out-row .out-prog .pct,.job-dl .pct{font-family:var(--mono);font-size:10.5px;color:var(--ink-2);text-align:right}
+.out-row .out-prog .tag,.job-dl .tag{font-family:var(--data);font-size:10.5px;color:var(--ink);font-weight:500}
+.out-row .out-prog .pct,.job-dl .pct{font-family:var(--data);font-size:10.5px;color:var(--ink-2);text-align:right}
 /* The "no honest percentage yet" sentence takes the bar's place, so it
    spans the row rather than being squeezed into one column. */
 .out-row .out-prog .out-note,.job-dl .out-note{grid-column:1/-1;margin-top:0}
 .job-dl{margin:0 2px 12px}
-.out-row .out-note{
-  font-family:var(--mono);font-size:10px;color:var(--ink-3);
-  margin-top:6px;line-height:1.55;word-break:break-word;
+/* The note voice again -- it, too, only ever had a rule inside .out-row,
+   so the same sentence rendered as 14px body sans when a job-level
+   download printed it on the dashboard. */
+.out-note{
+  font-family:var(--data);font-size:10px;color:var(--ink-3);
+  margin-top:6px;line-height:1.6;word-break:break-word;max-width:84ch;
 }
 .out-row .out-note.ok{color:var(--active-ink)}
 .out-row .out-note.bad{color:var(--offline-ink)}
@@ -977,11 +1417,11 @@ flat white with the shape carried entirely in the alpha channel, so a CSS
 mask tints it to whichever accent is active -- one file, every colour, the
 same contract theme.brand_icon() uses on the Qt side. */
 .brand-mark .mark{
-  display:block;width:20px;height:20px;background:var(--accent);
+  display:block;width:26px;height:26px;background:var(--accent);
   -webkit-mask:url('../../assets/logo/mark-white.png') center/contain no-repeat;
   mask:url('../../assets/logo/mark-white.png') center/contain no-repeat;
 }
-.side.collapsed .brand-mark .mark{width:24px;height:24px}
+.side.collapsed .brand-mark .mark{width:26px;height:26px}
 
 /* Toasts. The reference animates these in its own stack; ours are driven
    from Dashboard-side notify() calls, so only the in/out states are here. */
@@ -994,23 +1434,20 @@ title= is drawn by the operating system: it cannot be themed, it ignores
 the accent, and it arrives as a black box in the middle of a warm light
 UI. These are ours -- same tokens as every other surface, and they animate
 like the rest of the app instead of appearing after a system delay. */
-[data-tip]{position:relative}
-[data-tip]::after{
-  content:attr(data-tip);position:absolute;left:50%;top:calc(100% + 8px);
-  transform:translateX(-50%) translateY(-4px);
-  background:var(--card);color:var(--ink-2);border:1px solid var(--border-2);
+/* ONE element, a child of <body>, positioned in viewport coordinates by
+   showTip() in app.js. It used to be a ::after on each control, which
+   put it inside .panel's own overflow:hidden -- so the tooltip of every
+   button near a panel edge was cut in half. Nothing clips this one, and
+   at z-index 200 nothing covers it either. */
+.tip{
+  position:fixed;left:0;top:0;z-index:200;
+  background:var(--card);color:var(--ink);border:1px solid var(--border-2);
   border-radius:var(--r-sm);box-shadow:var(--shadow-lg);
-  font-family:var(--font);font-size:11px;font-weight:400;letter-spacing:0;
-  text-transform:none;white-space:nowrap;padding:6px 10px;
-  opacity:0;pointer-events:none;transition:opacity .15s,transform .15s;
-  z-index:200;
+  font-family:var(--font);font-size:11.5px;font-weight:400;letter-spacing:0;
+  line-height:1.5;text-transform:none;padding:7px 11px;max-width:300px;
+  opacity:0;pointer-events:none;transition:opacity .12s;
 }
-[data-tip]:hover::after{opacity:1;transform:translateX(-50%) translateY(0)}
-/* The collapsed sidebar has no room below an item, so its tips go beside. */
-.side.collapsed [data-tip]::after{
-  left:calc(100% + 10px);top:50%;transform:translateY(-50%) translateX(-4px);
-}
-.side.collapsed [data-tip]:hover::after{transform:translateY(-50%) translateX(0)}
+.tip.show{opacity:1}
 
 /* A click should not leave a ring behind. Keyboard focus still shows one --
    that is what :focus-visible is for -- but Chromium also paints it after a
@@ -1034,7 +1471,7 @@ button:focus:not(:focus-visible){outline:none}
 .share-list{list-style:none;margin:10px 0 0;padding:0;display:flex;flex-direction:column;gap:4px}
 .share-row{
   display:flex;align-items:center;gap:8px;
-  font-family:var(--mono);font-size:10.5px;color:var(--ink-2);
+  font-family:var(--data);font-size:10.5px;color:var(--ink-2);
   padding:4px 8px;border-radius:8px;background:var(--fill);
 }
 .share-mark{display:grid;place-items:center;width:14px;height:14px;flex:none;line-height:0}
@@ -1054,33 +1491,70 @@ button:focus:not(:focus-visible){outline:none}
 
 /* ---- one rendered frame -------------------------------------------------
    Fetched on demand from Kaggle (bridge.previewFrame): a single ~2 MB PNG
-   rather than the whole job's output. Fills the window because the point
-   is to look at the picture, not at chrome around it. */
+   rather than the whole job's output.
+
+   A MODAL over the dashboard, where this used to take the whole window:
+   one picture is being looked at, and the fleet it came from is worth
+   keeping in view around it. */
 .lightbox{
   position:fixed;inset:0;z-index:130;   /* see STACKING ORDER, top of file */
-  /* Opaque, where this used to be 82% --bg over blur(10px). A
-     backdrop-filter has to be re-sampled by the compositor every time
-     ANYTHING behind it repaints, and what is behind this is the whole
-     dashboard -- every .inst card rebuilt on each 2-second live tick of a
-     running render, each of those a blurred layer of its own in glass
-     mode. Solid ground costs nothing to hold on screen, and it is also
-     the honest background for the job: judging a render against a
-     moving, tinted backdrop is judging it against the wrong thing.
-     --bg follows the theme, so this stays right in light, dark and
-     glass alike. */
-  background:var(--bg);
-  display:flex;flex-direction:column;
+  /* A scrim that DIMS, and nothing more. This once carried
+     backdrop-filter: blur(10px), which the compositor has to re-sample
+     every time anything behind it repaints -- and behind it sits the
+     whole dashboard, every card rebuilt on each 2-second live tick of a
+     running render. A flat translucent colour is one cheap layer, and
+     it is the same one .modal already uses, so the two kinds of dialog
+     sit on the same ground. */
+  background:rgba(0,0,0,.42);
+  display:flex;align-items:center;justify-content:center;padding:26px;
   animation:toastIn .16s ease;
 }
 .lightbox[hidden]{display:none}
+.lb-box{
+  background:var(--card);border-radius:20px;box-shadow:var(--shadow-lg);
+  outline:none;
+  width:min(920px,100%);max-height:100%;
+  display:flex;flex-direction:column;overflow:hidden;
+}
 .lb-bar{
   display:flex;align-items:center;gap:12px;
-  padding:12px 16px;border-bottom:1px solid var(--border);
-  font-family:var(--mono);font-size:11px;color:var(--ink-2);
+  padding:13px 12px 13px 18px;border-bottom:1px solid var(--border);
+  font-family:var(--data);font-size:11px;color:var(--ink-3);
 }
-.lb-bar b{font-size:12px;color:var(--ink)}
-.lb-bar #lb-close{margin-left:auto}
-.lb-stage{flex:1;min-height:0;display:grid;place-items:center;padding:16px}
+.lb-bar b{font-size:12.5px;color:var(--ink)}
+/* The subtitle is the long half (what a live preview is NOT), so it is
+   the half that gives way rather than pushing Close off the edge. */
+.lb-bar span{flex:1;min-width:0;line-height:1.45}
+.lb-bar #lb-close{margin-left:auto;flex:none}
+/* The stage holds the box's shape from the moment it opens -- 16:9,
+   because that is what a 1920x1080 render is -- so the picture arrives
+   into a frame already on screen instead of resizing it. */
+.lb-stage{
+  position:relative;flex:1;min-height:0;
+  display:grid;place-items:center;padding:16px;
+}
+/* 16:9 up to a ceiling, so a short window shrinks the box instead
+   of pushing its own chrome off the screen. */
+.lb-stage::before{content:"";display:block;aspect-ratio:16/9;width:100%;
+  max-height:68vh;grid-area:1/1}
+.lb-stage > *{grid-area:1/1}
+.lb-stage .lb-skel{width:100%;height:100%;border-radius:var(--r-md)}
+.lb-stage .lb-fail{
+  display:none;text-align:center;align-self:center;justify-self:center;
+  font-family:var(--data);font-size:11.5px;color:var(--ink-2);
+  max-width:46ch;line-height:1.6;
+}
+.lb-stage .lb-fail p{margin-bottom:12px}
+/* Exactly one of the three is on screen at a time. */
+.lb-stage[data-state="loading"] img,
+.lb-stage[data-state="failed"] img{display:none}
+.lb-stage[data-state="ready"] .lb-skel,
+.lb-stage[data-state="failed"] .lb-skel{display:none}
+.lb-stage[data-state="failed"] .lb-fail{display:block}
+/* Nothing arrived, so nothing needs a 16:9 hole kept open for it: the
+   box shrinks to the size of what it has to say. */
+.lb-stage[data-state="failed"]::before{display:none}
+.lb-stage[data-state="failed"]{min-height:170px}
 /* Contained, never cropped or upscaled past its own pixels -- a render is
    being inspected here, and a stretched one would misrepresent it. */
 .lb-stage img{

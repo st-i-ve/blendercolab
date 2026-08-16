@@ -87,18 +87,21 @@ THEMES: dict[str, ThemePalette] = {
         paused_t="#E8E8E5", paused_ink="#7A7A74",
         warn="#DEA85A", warn_t="#F8EEDF", warn_ink="#A9752E",
         bg_translucent="rgba(243, 243, 240, 0.72)"),
+    # Black, not charcoal -- and the WINDOW must agree with the page, or
+    # the shell reads as a lighter frame around a darker app. These are
+    # the same values app.css sets for [data-theme="dark"].
     "dark": ThemePalette(
         name="dark",
-        bg="#101210", card="#191B19", fill="#222422",
-        border="#262926", border_2="#313431",
-        ink="#E4E5E2", ink_2="#A5A79F", ink_3="#767871", ink_4="#4A4C47",
+        bg="#000000", card="#0D0F0D", fill="#171917",
+        border="#1C1F1C", border_2="#262926",
+        ink="#EDEEEB", ink_2="#A8AAA2", ink_3="#7A7C75", ink_4="#4E504B",
         bar="#6E706A",
         active="#57BE8B", active_t="#1B2A22", active_ink="#7FD3A9",
         idle="#5A5C57",
         offline="#D8807F", offline_t="#2C1F1E", offline_ink="#E5A2A1",
         paused_t="#232522", paused_ink="#A9ABA3",
         warn="#DEA85A", warn_t="#2A2419", warn_ink="#E5BE84",
-        bg_translucent="rgba(16, 18, 16, 0.70)"),
+        bg_translucent="rgba(0, 0, 0, 0.72)"),
 }
 DEFAULT_THEME = "light"
 
@@ -167,6 +170,9 @@ class AccentPalette:
     disabled: str
     ink_light: str
     ink_dark: str
+    # The label ON the fill -- see _accent for why this is computed per
+    # accent rather than fixed.
+    ink_on: str
 
     def ink(self) -> str:
         """The accent as legible TEXT in the active theme."""
@@ -179,6 +185,40 @@ def _mix(a: QColor, b: QColor, t: float) -> str:
     g = round(a.green() * (1 - t) + b.green() * t)
     bch = round(a.blue() * (1 - t) + b.blue() * t)
     return QColor(r, g, bch).name()
+
+
+def _label_on(base: str) -> str:
+    """Whichever of near-black or white is actually readable on `base`.
+
+    This used to be a constant: a fixed near-black, chosen because the
+    reference's white label measures 2.40:1 on its pale orange fill --
+    the worst pairing in the design. That reasoning is sound and it is
+    still what wins on every PALE accent. It inverts on a dark one: near
+    black on oxblood is 3.15:1 and white on the same fill is 5.98:1, so
+    keeping the constant would have re-created the exact defect it was
+    introduced to fix, one accent later. Measured, not assumed.
+    """
+    dark_label = THEMES["dark"].bg
+    return dark_label if _contrast(dark_label, base) >= _contrast("#FFFFFF", base)         else "#FFFFFF"
+
+
+def _luminance(hex_colour: str) -> float:
+    """WCAG relative luminance. Mirrors tests/test_theme.py's own
+    independent implementation deliberately -- the test must not simply
+    call this and agree with itself."""
+    c = QColor(hex_colour)
+
+    def channel(v: int) -> float:
+        f = v / 255
+        return f / 12.92 if f <= 0.04045 else ((f + 0.055) / 1.055) ** 2.4
+
+    return (0.2126 * channel(c.red()) + 0.7152 * channel(c.green())
+            + 0.0722 * channel(c.blue()))
+
+
+def _contrast(a: str, b: str) -> float:
+    la, lb = _luminance(a), _luminance(b)
+    return (max(la, lb) + 0.05) / (min(la, lb) + 0.05)
 
 
 def _accent(base: str, ink_light: str, ink_dark: str) -> AccentPalette:
@@ -194,6 +234,7 @@ def _accent(base: str, ink_light: str, ink_dark: str) -> AccentPalette:
         disabled=_mix(c, QColor("#8A8A83"), 0.6),
         ink_light=ink_light,
         ink_dark=ink_dark,
+        ink_on=_label_on(base),
     )
 
 
@@ -212,6 +253,13 @@ ACCENTS: dict[str, AccentPalette] = {
     "green":  _accent("#4DB690", "#33936F", "#7DD0B0"),   # mint
     "purple": _accent("#9B7FD4", "#7A5CB8", "#BCA5E8"),   # violet
     "red":    _accent("#D4708F", "#B34E6F", "#E89AB4"),   # rose
+    # Darker shades, this app's own rather than the reference's. Each was
+    # measured against both theme backgrounds and both cards before being
+    # added, and each carries its own label colour (see _label_on): the
+    # two darkest take a white label where the five above take near-black.
+    "dark-orange": _accent("#C2703A", "#9A5628", "#E09A63"),  # burnt amber
+    "dark-red":    _accent("#A2464B", "#8E3B41", "#DE8C92"),  # oxblood
+    "slate":       _accent("#5A6BA8", "#4A5A96", "#98A6DC"),  # deep indigo
 }
 DEFAULT_ACCENT = "orange"
 
@@ -311,20 +359,72 @@ def account_color(index: int) -> QColor:
 # happens to have installed -- Segoe UI Variable/Cascadia Mono are Windows
 # names that would silently be a different look (or a different font
 # entirely) on the Linux build this app is headed for. See register_fonts().
-UI_FONT_FAMILY = "Roboto"
-UI_FONT_FALLBACK = "Segoe UI"
-MONO_FONT_FAMILY = "Roboto Mono"
-MONO_FONT_FALLBACK = "Consolas"
+# ---------------- the chosen typeface ----------------
+# Four faces, picked the same way an accent is picked: by name, from a
+# whitelist, with an unknown name falling back rather than raising. Each
+# one is vendored in BOTH formats -- a variable TTF for Qt's font
+# database, which does not take woff2, and the woff2 latin subset for the
+# web view, which is a tenth of the size.
+#
+# The window chrome and the page always show the SAME face: the shell
+# reading in one typeface around a page in another is the "some parts
+# switched and some did not" complaint in a different key.
+FONTS: dict[str, str] = {
+    "heebo": "Heebo",      # the base: Roboto's proportions, a little tighter
+    "inter": "Inter",      # neutral UI face, generous at small sizes
+    "arimo": "Arimo",      # metric-compatible with Arial; the familiar one
+    "oswald": "Oswald",    # condensed display face, narrow and tall
+}
+DEFAULT_FONT = "heebo"
+
+# The face in effect app-wide right now -- one writer (apply()), any
+# number of readers, exactly like the accent and theme names.
+_active_font_name: str = DEFAULT_FONT
+
+
+def resolve_font(name: str) -> str:
+    """The family for `name`, or the default's.
+
+    Falls back rather than raising for the same reason resolve_accent
+    does: a hand-edited or forward-dated settings.json must never brick
+    the app on startup with no UI left to fix it from.
+    """
+    return FONTS.get(name, FONTS[DEFAULT_FONT])
+
+
+def current_font() -> str:
+    """The family Qt should be drawing right now."""
+    return resolve_font(_active_font_name)
+
+
+def current_font_name() -> str:
+    return _active_font_name if _active_font_name in FONTS else DEFAULT_FONT
+
+
+UI_FONT_FALLBACK = "Roboto"
+# The numeric/machine face is the same family, so the window chrome and
+# the page inside it speak with one voice. Roboto Mono stays bundled and
+# stays the fallback: it is what renders if a build ever ships without a
+# chosen face, and a missing face is the one failure register_fonts() is
+# here to make loud rather than silent.
+MONO_FONT_FALLBACK = "Roboto Mono"
 
 ASSETS_DIR = Path(__file__).resolve().parents[2] / "assets"
 FONTS_DIR = ASSETS_DIR / "fonts"
 ICONS_DIR = ASSETS_DIR / "icons"
 LOGO_DIR = ASSETS_DIR / "logo"
 
-# The five TTFs vendored under assets/fonts/ (Apache-2.0) -- every one of
+# The faces vendored under assets/fonts/ (Oswald: OFL 1.1; Roboto:
+# Apache-2.0) -- every one of
 # them must register, not just enough to make the family name resolve, so
 # that requesting the Medium/Bold weights doesn't silently synthesise them.
 FONT_FILES = [
+    # Every selectable face, as a variable TTF: one file covers each
+    # family's whole weight range, so no weight is ever synthesised.
+    "Heebo-Variable.ttf",
+    "Inter-Variable.ttf",
+    "Arimo-Variable.ttf",
+    "Oswald-Variable.ttf",
     "Roboto-Regular.ttf",
     "Roboto-Medium.ttf",
     "Roboto-Bold.ttf",
@@ -372,8 +472,9 @@ def mono_font(point_size: int = 9) -> QFont:
     """The font for every numeric/machine value: byte counts, rates, frame
     numbers, GPU stats, quota. Tabular figures so digits never reflow as
     they tick over."""
-    font = QFont(MONO_FONT_FAMILY)
-    font.setFamilies([MONO_FONT_FAMILY, MONO_FONT_FALLBACK, "monospace"])
+    family = current_font()
+    font = QFont(family)
+    font.setFamilies([family, MONO_FONT_FALLBACK, "monospace"])
     font.setPointSize(point_size)
     font.setStyleHint(QFont.StyleHint.Monospace)
     font.setStyleStrategy(QFont.StyleStrategy.PreferDefault)
@@ -381,8 +482,9 @@ def mono_font(point_size: int = 9) -> QFont:
 
 
 def ui_font(point_size: int = 9) -> QFont:
-    font = QFont(UI_FONT_FAMILY)
-    font.setFamilies([UI_FONT_FAMILY, UI_FONT_FALLBACK, "sans-serif"])
+    family = current_font()
+    font = QFont(family)
+    font.setFamilies([family, UI_FONT_FALLBACK, "sans-serif"])
     font.setPointSize(point_size)
     return font
 
@@ -390,13 +492,14 @@ def ui_font(point_size: int = 9) -> QFont:
 def tracked_font(point_size: int = 8, *,
                  weight: QFont.Weight = QFont.Weight.Bold,
                  tracking: float = 12.0) -> QFont:
-    """Uppercase, letter-spaced Roboto -- navigation items, section headers,
-    the page title, button labels.
+    """Uppercase, letter-spaced label type -- navigation items, section
+    headers, the page title, button labels.
 
-    This is how the app gets the reference design's condensed-caps character
-    WITHOUT vendoring a second typeface: bold Roboto, set uppercase and
-    opened up with tracking, reads as deliberate label chrome rather than as
-    body text, which is the whole job those labels do.
+    Set in whichever face is chosen, uppercased and opened up with
+    tracking, which reads as deliberate label chrome rather than as body
+    text -- the whole job those labels do. It carries the condensed-caps
+    character of the reference design in every face, including the ones
+    that are not themselves condensed.
 
     It has to be a QFont rather than a stylesheet rule because Qt Style
     Sheets implement neither `letter-spacing` nor `text-transform` -- there
@@ -408,8 +511,9 @@ def tracked_font(point_size: int = 8, *,
     `tracking` is in percent ADDED to normal spacing (12.0 -> 112% of
     normal), matching the .12em the reference uses on nav items.
     """
-    font = QFont(UI_FONT_FAMILY)
-    font.setFamilies([UI_FONT_FAMILY, UI_FONT_FALLBACK, "sans-serif"])
+    family = current_font()
+    font = QFont(family)
+    font.setFamilies([family, UI_FONT_FALLBACK, "sans-serif"])
     font.setPointSize(point_size)
     font.setWeight(weight)
     font.setCapitalization(QFont.Capitalization.AllUppercase)
@@ -463,7 +567,7 @@ def _stylesheet(accent: AccentPalette, t: ThemePalette) -> str:
     return f"""
 * {{
     color: {t.ink};
-    font-family: "{UI_FONT_FAMILY}", "{UI_FONT_FALLBACK}", sans-serif;
+    font-family: "{current_font()}", "{UI_FONT_FALLBACK}", sans-serif;
     font-size: 10pt;
 }}
 
@@ -484,10 +588,36 @@ QMainWindow, QDialog, QMenu {{
     background-color: {t.bg};
 }}
 
+/* A menu is a floating SURFACE, so it takes the card colour, not the
+window's -- and it says so at full opacity. QWidget's own
+`background-color: transparent` above applies to it too, and a
+transparent popup over a Mica backdrop (or over the black dark theme)
+composites to a black slab with unreadable text: exactly what Chromium's
+own context menu looked like before this app stopped showing it. Every
+colour here is stated rather than inherited for that reason. */
 QMenu {{
-    border: 1px solid {t.border};
+    background-color: {t.card};
+    color: {t.ink};
+    border: 1px solid {t.border_2};
     border-radius: {RADIUS_SM}px;
-    padding: 4px;
+    padding: 5px;
+}}
+
+QMenu::item {{
+    background-color: transparent;
+    color: {t.ink};
+    padding: 7px 16px;
+    border-radius: 6px;
+}}
+
+QMenu::item:disabled {{
+    color: {t.ink_4};
+}}
+
+QMenu::separator {{
+    height: 1px;
+    background-color: {t.border};
+    margin: 4px 8px;
 }}
 
 QMenu::item:selected {{
@@ -594,17 +724,18 @@ QListWidget:focus, QTableWidget:focus {{
     border: 2px solid {accent.base};
 }}
 
-/* The label is a fixed near-black, NOT white and NOT the active theme's
-ink. The reference sets white here, which measures 2.40:1 on the orange
-accent -- the worst pairing in the whole design, on the app's single most
-important button. A dark label on the same fill measures 5.72-7.84 across
-all five accents and both themes, so the fill stays exactly the
-reference's and only the text changes. It cannot be current_theme().ink
-either: that is near-white in the dark theme, which puts us straight back
-where we started. */
+/* The label is whichever of near-black or white actually reads on THIS
+accent's fill (accent.ink_on, measured -- see _label_on). It is never
+white by default: the reference sets white here, which measures 2.40:1 on
+the pale orange accent, the worst pairing in the whole design on the app's
+single most important button. It is never a fixed near-black either, which
+was the previous answer and inverts on the darker accents added since
+(3.15:1 on oxblood, where white gets 5.98:1). And it can never be
+current_theme().ink -- that is near-white in the dark theme, which puts us
+straight back where we started. */
 #primaryButton {{
     background-color: {accent.base};
-    color: {THEMES["dark"].bg};
+    color: {accent.ink_on};
     font-weight: 700;
     border: 1px solid {accent.base};
 }}
@@ -662,7 +793,7 @@ QLineEdit, QSpinBox, QComboBox {{
     border-radius: {RADIUS_SM}px;
     padding: 7px 10px;
     color: {t.ink};
-    font-family: "{MONO_FONT_FAMILY}", "{MONO_FONT_FALLBACK}", monospace;
+    font-family: "{current_font()}", "{MONO_FONT_FALLBACK}", monospace;
     selection-background-color: {accent.base};
     selection-color: #FFFFFF;
 }}
@@ -1011,7 +1142,7 @@ STYLESHEET = _stylesheet(ACCENTS[DEFAULT_ACCENT], THEMES[DEFAULT_THEME])
 
 
 def apply(app: QApplication, accent: str = DEFAULT_ACCENT,
-          theme: str = DEFAULT_THEME) -> None:
+          theme: str = DEFAULT_THEME, font: str = DEFAULT_FONT) -> None:
     """Apply the BlendFleet design system to the whole application, for the
     given accent and theme, registering the bundled fonts on first call.
 
@@ -1027,16 +1158,21 @@ def apply(app: QApplication, accent: str = DEFAULT_ACCENT,
     (SetupDialog) opened later -- that is the mechanism that guarantees no
     dialog is ever left unstyled.
 
-    Updates the module globals `_active_accent_name` and
-    `_active_theme_name` (what current_accent()/current_theme() read) and
+    Updates the module globals `_active_accent_name`, `_active_theme_name`
+    and `_active_font_name` (what current_accent()/current_theme()/
+    current_font() read) and
     emits `theme_signal.changed`, in that order, BEFORE returning -- so a
     connected slot that calls either during the signal handler already sees
     the new values, not the ones being replaced.
     """
-    global _active_accent_name, _active_theme_name
+    global _active_accent_name, _active_theme_name, _active_font_name
     register_fonts()
     _active_accent_name = accent if accent in ACCENTS else DEFAULT_ACCENT
     _active_theme_name = theme if theme in THEMES else DEFAULT_THEME
+    # Set BEFORE the stylesheet is derived: _stylesheet() reads
+    # current_font(), so a face applied after it would style the window
+    # in the previous one until something else re-applied.
+    _active_font_name = font if font in FONTS else DEFAULT_FONT
     app.setStyle("Fusion")
     app.setFont(ui_font())
     app.setStyleSheet(_stylesheet(ACCENTS[_active_accent_name],

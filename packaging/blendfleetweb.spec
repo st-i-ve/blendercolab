@@ -32,8 +32,13 @@ datas += [
 # require remembering to add it here.
 datas += [(str(p), "assets/icons")
           for p in (_HERE / "../assets/icons").glob("*.svg")]
+# Every weight AND every format: Oswald ships as a variable woff2, and
+# a glob for *.ttf alone would leave it out of the build -- the app would
+# then fall back to a system face in the packaged exe while looking right
+# when run from the repo.
 datas += [(str(p), "assets/fonts")
-          for p in (_HERE / "../assets/fonts").glob("*.ttf")]
+          for p in (_HERE / "../assets/fonts").iterdir()
+          if p.suffix.lower() in (".ttf", ".woff2")]
 # The web UI. Kept at blendfleet/web/ in the bundle because app.css reaches
 # the vendored fonts and the brand mark with ../../assets/... -- the same
 # relative layout as the source tree, so one set of paths works in both.

@@ -42,7 +42,7 @@ def main() -> int:
     # around the web view (title bar, Mica, and any Qt dialog such as
     # SetupDialog or QFileDialog) is Qt, and must match the theme the page
     # is about to render itself in.
-    apply(app, settings.accent, settings.theme)
+    apply(app, settings.accent, settings.theme, settings.font)
 
     from blendfleet.__main__ import _icon_path
     from PySide6.QtGui import QIcon
@@ -65,6 +65,11 @@ def main() -> int:
                      cache_dir() / "work")
 
     host = WebHost(store, fleet_factory, verify_token, settings)
+    # Hiding the window to the tray closes the last window, which would
+    # otherwise end the process -- the one thing "keep running" must not
+    # do. Set AFTER the setup dialog above, so cancelling that still
+    # exits rather than leaving a headless process behind.
+    app.setQuitOnLastWindowClosed(False)
     host.show_at_startup()
     code = app.exec()
 
