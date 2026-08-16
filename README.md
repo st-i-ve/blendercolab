@@ -11,7 +11,7 @@
 
 [![Windows](https://img.shields.io/badge/Windows-desktop_app-F5792A?style=for-the-badge&labelColor=16181D)](#install)
 [![Linux](https://img.shields.io/badge/Linux-build_script-4A96F0?style=for-the-badge&labelColor=16181D)](#install)
-[![Tests](https://img.shields.io/badge/tests-480_passing-3DBF7A?style=for-the-badge&labelColor=16181D)](#developing)
+[![Tests](https://img.shields.io/badge/tests-1391_passing-3DBF7A?style=for-the-badge&labelColor=16181D)](#developing)
 [![Python](https://img.shields.io/badge/Python-3.11+-9B7AE8?style=for-the-badge&labelColor=16181D)](#developing)
 
 </div>
@@ -32,11 +32,14 @@ animation instead of one missing chunk, and whatever finished is still usable.
 
 |  | |
 |---|---|
-| 🎞️ **Frame filmstrip** | every frame as a cell, tinted by *which account rendered it* |
+| 🎞️ **Frame grid** | every frame as a cell, or as thumbnails you can scroll |
+| 🖼️ **Frame preview** | open any finished frame full size, without collecting the job |
 | 📤 **Resumable uploads** | a break at 90% resumes at 90%, with live speed and ETA |
 | 🔗 **Automatic sharing** | one upload; friends granted read access over the API |
-| 📊 **Per-GPU telemetry** | utilisation, VRAM and temperature per physical GPU, live |
-| 🎨 **Five accent colours** | applied instantly, no restart |
+| 📊 **Per-GPU telemetry** | utilisation and VRAM per physical GPU, live |
+| 🌙 **Themes that switch as one** | light, black, or frosted glass over your desktop |
+| 🎨 **Eight accents, four typefaces** | applied instantly, no restart |
+| 🔕 **Keeps running** | close mid-render and it follows the job from the tray |
 
 </div>
 
@@ -44,32 +47,60 @@ animation instead of one missing chunk, and whatever finished is still usable.
 
 ## Install
 
-Grab `blendfleet.exe` from the build, or build it yourself:
+There are **two builds of the same app**, sharing one backend:
+
+| | | |
+|---|---|---|
+| **`blendfleetweb.exe`** | the current UI — Qt window, HTML dashboard inside | recommended |
+| `blendfleet.exe` | the original all-Qt UI | still builds, no longer developed |
+
+Both are *onedir* builds: the `.exe` sits beside an `_internal/` folder and needs
+it, so move or shortcut the whole `dist/blendfleetweb/` directory rather than the
+exe alone.
+
+### Build it
 
 ```powershell
+# Windows — from a clean checkout
 python -m venv .venv
 .venv\Scripts\python.exe -m pip install PySide6 kaggle pyinstaller
-powershell -ExecutionPolicy Bypass -File packaging/build_windows.ps1
+.venv\Scripts\python.exe -m PyInstaller --noconfirm --clean packaging/blendfleetweb.spec
+# -> dist/blendfleetweb/blendfleetweb.exe
 ```
 
 ```bash
 # Linux
 python3 -m venv .venv && .venv/bin/python -m pip install PySide6 kaggle pyinstaller
-./packaging/build_linux.sh
+.venv/bin/python -m PyInstaller --noconfirm --clean packaging/blendfleetweb.spec
 ```
 
-The build scripts refuse to run against the wrong interpreter and fail on a
-suspiciously small binary — PyInstaller freezes whatever environment it runs
-*in*, and a build missing PySide6 still reports success.
+`packaging/build_windows.ps1` and `build_linux.sh` build the **Qt** app
+(`blendfleet.spec`) with extra safety checks — they refuse to run against the
+wrong interpreter and fail on a suspiciously small binary, because PyInstaller
+freezes whatever environment it runs *in* and a build missing PySide6 still
+reports success. The web build is the PyInstaller line above; run it against the
+project's own `.venv` for the same reason.
 
 ## Setup
 
 1. Each person generates a Kaggle API token at
    [kaggle.com/settings](https://www.kaggle.com/settings) → **API** →
    *Create New Token*.
-2. Add them in **Manage accounts**. Each is verified against Kaggle on the spot —
-   a bad token is rejected, not stored.
-3. Pick a `.blend`, set the frame range, press render.
+2. Add them under **Instances → Add account** (**Verify & add**). Each token is
+   checked against Kaggle on the spot — one that cannot render is rejected rather
+   than stored, because an account that sits in the fleet looking merely idle is
+   worse than an absent one.
+3. Pick a `.blend`, set the frame range, press **Render across fleet**.
+
+While it runs, the dashboard shows a card per account and a grid of every frame;
+switch that grid to thumbnails to see the frames themselves, or click one to open
+it full size. Frames stay on Kaggle until you press **Collect frames**, which
+packs them into a single zip.
+
+Closing the window mid-render offers to keep BlendFleet running in the
+notification area, so it keeps following the job and can still collect it. The
+render is on Kaggle either way — quitting never cancels it, it only stops this
+app watching.
 
 > **A Kaggle API token grants full access to that account.** Only accept tokens
 > from people who understand that. They can revoke one at any time from the same
@@ -107,14 +138,42 @@ across three accounts.
 
 ## Developing
 
+### Run it from source
+
+No build needed — this is the same app the exe wraps:
+
 ```bash
+.venv/Scripts/python.exe -m blendfleet.web_main    # the web UI (current)
+.venv/Scripts/python.exe -m blendfleet             # the all-Qt UI
+```
+
+### Run the tests
+
+```bash
+.venv/Scripts/python.exe -m pip install pytest
 QT_QPA_PLATFORM=offscreen .venv/Scripts/python.exe -m pytest tests/ -q
 ```
 
-The suite runs entirely offline. `tests/conftest.py` installs autouse guards that
-fail a test which opens a socket, leaks a thread, or raises an unstubbed modal
-dialog — each one is there because that exact failure once made the suite hang or
-crash non-deterministically instead of failing honestly.
+1391 tests, entirely offline — including the browser ones, which drive the real
+page in a real QtWebEngine. `tests/conftest.py` installs autouse guards that fail
+a test which opens a socket, leaks a thread, or raises an unstubbed modal dialog:
+each is there because that exact failure once made the suite hang or crash
+non-deterministically instead of failing honestly.
+
+### Changing the UI without rebuilding
+
+The dashboard is `blendfleet/web/{index.html,app.css,app.js}` — plain files, no
+bundler, no build step. Because the exe is a *onedir* build and those ship as
+data, an edit reaches an installed copy by being copied over:
+
+```bash
+cp blendfleet/web/*.{html,css,js} dist/blendfleetweb/_internal/blendfleet/web/
+```
+
+Relaunch and the change is there. **A rebuild is required** for anything else —
+Python, a new bundled font, a new accent (the list lives in `ui/theme.py`, and
+`Settings` rejects a name it does not know), or a new preference key (mapped in
+`bridge.setPreference`).
 
 ```
 blendfleet/
@@ -124,24 +183,40 @@ blendfleet/
   log_stream.py       SSE: progress, telemetry, hardware banner
   instance_state.py   last-known hardware per account
   notebook_builder.py generates the Kaggle notebook that does the rendering
-  ui/                 dashboard, instance cards, filmstrip, settings, theme
+  settings.py         the persisted preferences, each guarded against a bad file
+  web/                the dashboard: index.html, app.css, app.js
+  ui/web_host.py      the window around it — tray, context menu, background ground
+  ui/bridge.py        every call the page can make, and every signal it receives
+  ui/theme.py         accents, themes, typefaces, and the Qt stylesheet
 ```
 
 ---
 
-## Accent colours
+## Looks
 
-<div align="center">
+Eight accents and four typefaces, in **Settings → Appearance**, applied instantly
+and remembered — window chrome included, so the shell never ends up in a
+different colour or face from the page inside it.
 
-<img src="assets/logo/mark-orange.png" width="52"> <img src="assets/logo/mark-green.png" width="52"> <img src="assets/logo/mark-purple.png" width="52"> <img src="assets/logo/mark-blue.png" width="52"> <img src="assets/logo/mark-red.png" width="52">
+| accent | | accent | |
+|---|---|---|---|
+| orange | `#E8935A` | dark orange | `#C2703A` |
+| blue | `#5A9BD8` | dark red | `#A2464B` |
+| green | `#4DB690` | slate | `#5A6BA8` |
+| purple | `#9B7FD4` | | |
+| red | `#D4708F` | | |
 
-`#F5792A` &nbsp;&nbsp; `#3DBF7A` &nbsp;&nbsp; `#9B7AE8` &nbsp;&nbsp; `#4A96F0` &nbsp;&nbsp; `#E85454`
+Every one is measured, not eyeballed: `tests/test_theme.py` computes WCAG
+contrast for each accent's text colour on both themes, and for the label that
+sits *on* the accent fill. That label is picked per accent from the measurement
+rather than fixed — black on the six paler fills, white on dark red and slate,
+where black measures 3.15:1 and white 5.98:1. Warnings stay amber independently
+of your choice, including when the accent *is* red, so an error never blends
+into ordinary chrome.
 
-</div>
-
-All five clear WCAG 4.5:1 against the app background. Warnings stay amber
-independently of your choice — including when the accent *is* red — so an error
-never blends into ordinary chrome.
+Typefaces are Heebo (the base), Inter, Arimo and Oswald. Each ships twice — a
+variable TTF for Qt, a woff2 latin subset for the page — because the app must
+render its own text without a network.
 
 ---
 
@@ -154,5 +229,10 @@ never blends into ordinary chrome.
 
 ## Credits
 
-Type is [Roboto](https://fonts.google.com/specimen/Roboto) (Apache-2.0), icons are
-[Lucide](https://lucide.dev) (ISC). Licences are vendored beside the assets.
+Type is [Heebo](https://fonts.google.com/specimen/Heebo),
+[Inter](https://fonts.google.com/specimen/Inter),
+[Arimo](https://fonts.google.com/specimen/Arimo) and
+[Oswald](https://fonts.google.com/specimen/Oswald) (all OFL-1.1), with
+[Roboto Mono](https://fonts.google.com/specimen/Roboto+Mono) (Apache-2.0) as the
+fallback; icons are [Lucide](https://lucide.dev) (ISC). Licences are vendored
+beside the assets in `assets/fonts/LICENSE.md`.
