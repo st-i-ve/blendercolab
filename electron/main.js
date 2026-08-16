@@ -12,7 +12,7 @@
  * holding a render's state with no window left to show it.
  */
 const { app, BrowserWindow, Menu, Tray, dialog, ipcMain, nativeImage,
-        shell } = require('electron');
+        session, shell } = require('electron');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
@@ -162,6 +162,19 @@ function createWindow() {
   win.webContents.on('did-finish-load', () => {
     win.webContents.insertCSS(
       fs.readFileSync(path.join(__dirname, 'shell.css'), 'utf8'));
+  });
+
+  /* The page's own console, where the person running from source can
+     see it. A renderer that throws on line one otherwise fails in
+     complete silence -- the window renders, nothing populates, and
+     nothing anywhere says why. */
+  win.webContents.on('console-message', (_event, level, message, line,
+                                         source) => {
+    if (level >= 2) {
+      console.error(`[page] ${message} (${source}:${line})`);
+    } else if (process.env.BLENDFLEET_VERBOSE) {
+      console.log(`[page] ${message}`);
+    }
   });
 
   /* A development affordance, not a feature: BLENDFLEET_SHOT=<path>
@@ -388,6 +401,28 @@ if (!app.requestSingleInstanceLock()) {
   app.on('second-instance', showFromTray);
 
   app.whenReady().then(() => {
+    /* A Content-Security-Policy, set as a HEADER rather than a <meta> in
+       index.html, because the page belongs to both shells and this is
+       true of only one of them. The dashboard loads nothing from a
+       network: its fonts, styles and scripts are all beside it on disk,
+       and the only images it shows are file:// frames out of the app's
+       own cache and the data: URLs it makes itself. Saying so costs
+       nothing and means a compromised payload cannot phone anywhere. */
+    session.defaultSession.webRequest.onHeadersReceived((details, done) => {
+      done({
+        responseHeaders: {
+          ...details.responseHeaders,
+          'Content-Security-Policy': [
+            "default-src 'self'; "
+            + "img-src 'self' file: data:; "
+            + "style-src 'self' 'unsafe-inline'; "
+            + "font-src 'self' file:; "
+            + "script-src 'self'; "
+            + "connect-src 'none'",
+          ],
+        },
+      });
+    });
     startBackend();
     createWindow();
   });

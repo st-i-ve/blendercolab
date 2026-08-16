@@ -111,7 +111,38 @@ backend.collect = async (label = '', jobId = '') => {
   return call('collect', [label, jobId, destination]);
 };
 
-contextBridge.exposeInMainWorld('backend', backend);
+/* HOW THE PAGE ACTUALLY GETS HOLD OF IT.
+ *
+ * app.js does not read window.backend. Its last line is
+ *
+ *     new QWebChannel(qt.webChannelTransport, channel => {
+ *       backend = channel.objects.backend; ...
+ *
+ * -- so the way to leave the page untouched is not to hand it a global
+ * called `backend`, it is to BE QWebChannel. The shim below is the whole
+ * of that API as this page uses it: a constructor that takes a transport
+ * it does not need and calls back with an object whose `objects.backend`
+ * is the shape built above.
+ *
+ * AND IT MUST NOT BE CALLED `backend`. Exposing window.backend seemed
+ * free -- pokeable from devtools, costs nothing -- and it broke the
+ * entire page: app.js opens with `let backend = null`, a top-level
+ * declaration that collides with a global of the same name, and the
+ * failure is not a warning about one variable. It is
+ *
+ *     Uncaught SyntaxError: Identifier 'backend' has already been declared
+ *
+ * on line 1, which means the whole 5,700-line file never parses, no
+ * handler is bound, and the window comes up looking perfect and doing
+ * nothing. The devtools convenience is under a name nobody else uses. */
+contextBridge.exposeInMainWorld('blendfleetBackend', backend);
+contextBridge.exposeInMainWorld('qt', { webChannelTransport: {} });
+contextBridge.exposeInMainWorld('QWebChannel', function (transport, ready) {
+  /* Deferred by a tick, exactly as the real one is: app.js finishes
+     defining its handlers after this line, and a callback that ran
+     synchronously would reach them before they existed. */
+  setTimeout(() => ready({ objects: { backend } }), 0);
+});
 
 /* The shell's own affordances, for the parts of the app that are the
    WINDOW rather than the render: the title bar's buttons and the frame
