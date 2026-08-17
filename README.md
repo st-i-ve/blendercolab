@@ -160,9 +160,18 @@ lines it parses, so "the log was unreadable" and "the notebook was changed" stop
 looking identical.
 
 **The base image is pinned per kernel** (`docker_image_pinning_type: original`),
-so a rerun cannot silently land on a new CUDA driver. It does not pin across
-jobs — each render is a new kernel, and Kaggle offers only "original" or
-"latest".
+so a rerun cannot silently land on a new CUDA driver. It does not pin *across*
+jobs — each render is a new kernel. That part is possible and not done yet:
+`kernel-metadata.json` also accepts an explicit `docker_image` digest, which
+would hold every render on one image, but a digest hardcoded in the source would
+rot the day Kaggle retires it with nothing in the UI to explain why renders
+stopped starting. It wants a setting.
+
+**Still on the table, all on the push path the app already uses:** a
+`session_timeout_seconds` cap (via `kernels_push(timeout=…)`), so a hung render
+stops burning quota at a limit you choose instead of Kaggle's; per-render
+`machine_shape`, so T4 ×2 and P100 become a choice rather than the hardcoded
+`NvidiaTeslaT4`; and `delete_kernel` for housekeeping old notebooks.
 
 ---
 

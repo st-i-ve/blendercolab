@@ -597,8 +597,17 @@ print("PROBE_DONE", flush=True)
         # WHAT IT DOES NOT BUY, so nobody expects it to: this pins a kernel
         # to ITS OWN original image, and a render creates a new kernel per
         # job, so two jobs started a month apart can still get different
-        # images. There is no API for "give me the image I used last
-        # month" -- only "original" (this) and "latest".
+        # images.
+        #
+        # PINNING ACROSS JOBS IS POSSIBLE, and deliberately not done here
+        # yet. `ApiSaveKernelRequest` takes an explicit `docker_image`
+        # (a `gcr.io/kaggle-images/python@sha256:...` digest) and
+        # kernels_push reads it straight out of this file -- so naming one
+        # digest would hold every render on it for as long as Kaggle keeps
+        # that image. What is missing is a way for a USER to choose and
+        # update it: hardcoding a digest here would silently rot the day
+        # Kaggle retires it, with no UI to say why a render stopped
+        # starting. Worth doing with a setting, not with a constant.
         "docker_image_pinning_type": "original",
         "dataset_sources": [],
         "competition_sources": [],
@@ -1146,8 +1155,17 @@ print("WORKER stopped", flush=True)
         # WHAT IT DOES NOT BUY, so nobody expects it to: this pins a kernel
         # to ITS OWN original image, and a render creates a new kernel per
         # job, so two jobs started a month apart can still get different
-        # images. There is no API for "give me the image I used last
-        # month" -- only "original" (this) and "latest".
+        # images.
+        #
+        # PINNING ACROSS JOBS IS POSSIBLE, and deliberately not done here
+        # yet. `ApiSaveKernelRequest` takes an explicit `docker_image`
+        # (a `gcr.io/kaggle-images/python@sha256:...` digest) and
+        # kernels_push reads it straight out of this file -- so naming one
+        # digest would hold every render on it for as long as Kaggle keeps
+        # that image. What is missing is a way for a USER to choose and
+        # update it: hardcoding a digest here would silently rot the day
+        # Kaggle retires it, with no UI to say why a render stopped
+        # starting. Worth doing with a setting, not with a constant.
         "docker_image_pinning_type": "original",
         "enable_internet": True,
         # The scene, plus Blender itself when it is being shipped as a
