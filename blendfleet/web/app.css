@@ -330,17 +330,29 @@ html.theme-snap *,html.theme-snap *::before,html.theme-snap *::after{
 button{font-family:var(--cond);cursor:pointer}
 input,select{font-family:var(--data)}
 
-/* ---- thin, auto-hiding scrollbars ---- */
+/* ---- SCROLLBARS THAT ARE NOT THERE UNTIL YOU GO LOOKING ----------------
+   Invisible by default, thin when the pointer is near one or while the
+   page is being scrolled. `html.sb-show` is set by app.js, which is the
+   only way to express "the mouse is NEAR the bar" -- CSS has :hover, and
+   hover on the bar itself is too small a target to find while it is
+   invisible.
+   The 6px is still RESERVED at all times, deliberately: painting the thumb
+   is a colour change and nothing reflows, where a scrollbar that appears
+   and takes width would shift the whole page under the cursor every time
+   it showed. */
 *{scrollbar-width:thin;scrollbar-color:transparent transparent}
-*:hover{scrollbar-color:var(--ink-4) transparent}
+html.sb-show *{scrollbar-color:var(--ink-4) transparent}
 ::-webkit-scrollbar{width:6px;height:6px}
 ::-webkit-scrollbar-track{background:transparent}
 ::-webkit-scrollbar-thumb{
   background:transparent;
   border-radius:10px;
+  /* Fades rather than blinks: the bar arriving under a moving pointer
+     should feel like it was already there. */
+  transition:background .18s ease;
 }
-*:hover::-webkit-scrollbar-thumb{background:var(--ink-4)}
-::-webkit-scrollbar-thumb:hover{background:var(--ink-3)}
+html.sb-show ::-webkit-scrollbar-thumb{background:var(--ink-4)}
+html.sb-show ::-webkit-scrollbar-thumb:hover{background:var(--ink-3)}
 ::-webkit-scrollbar-corner{background:transparent}
 
 /* ============================================================

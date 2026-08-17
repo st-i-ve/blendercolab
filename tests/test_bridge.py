@@ -2044,9 +2044,35 @@ def test_a_worker_stays_tracked_until_run_has_actually_returned(qapp, tmp_path):
 
 
 def test_finished_is_what_untracks_a_worker(qapp, tmp_path):
+    """GATED, and it has to be.
+
+    This used to start `lambda: "done"` and reach for the worker on the
+    next line. That was safe only while the bookkeeping was cleared by a
+    QUEUED Qt signal -- the main thread could not run the clearing handler
+    until it pumped the loop, so the entry was always still there. Since
+    the 2026-08-17 collapse the worker's `finished` handler runs on the
+    worker's OWN thread, so an instant callable can be finished and
+    untracked before the next statement executes: one failure in a full
+    suite run, StopIteration on an empty set, and passing on its own.
+
+    The behaviour is right (a key stops being in flight the moment it
+    stops being in flight); the test just cannot both hold a worker and
+    let it finish. So it holds it until it has one.
+    """
     backend = make_backend(tmp_path, n=1)
-    backend._start("probe", lambda: "done", "probing", lambda _r: None)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def body():
+        entered.set()
+        release.wait(5.0)
+        return "done"
+
+    backend._start("probe", body, "probing", lambda _r: None)
+    assert entered.wait(5.0), "the worker never started"
     worker = backend._workers.get("probe") or next(iter(backend._running_workers))
+
+    release.set()
     worker.wait(5000)
     for _ in range(30):
         QApplication.processEvents()

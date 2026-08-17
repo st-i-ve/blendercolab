@@ -2507,6 +2507,64 @@ document.getElementById('btn-stop-all').onclick = () =>
 document.getElementById('btn-send-job').onclick = () =>
   backend && backend.sendJob(JSON.stringify(renderOptions()));
 
+/* ---- SCROLLBARS ON APPROACH -------------------------------------------
+   The bars are transparent until `sb-show` is on <html> (see app.css).
+   Two things turn it on: the pointer coming within a few pixels of a
+   scrollable edge, and the page actually scrolling -- the second because a
+   bar that stays hidden while the content moves leaves no answer to "how
+   far down am I".
+
+   Why JS at all: CSS can only express hover ON the bar, and a 6px target
+   that is invisible until you hit it is not findable. Proximity is the
+   thing being expressed, and only script can measure it. */
+const SB_NEAR_PX = 26;          // how close counts as "going for it"
+const SB_LINGER_MS = 900;       // how long it stays after you stop
+let sbTimer = null;
+let sbFrame = 0;
+
+function showScrollbars() {
+  document.documentElement.classList.add('sb-show');
+  clearTimeout(sbTimer);
+  sbTimer = setTimeout(
+    () => document.documentElement.classList.remove('sb-show'), SB_LINGER_MS);
+}
+
+function pointerNearAScrollbar(x, y) {
+  /* Walks up from whatever is under the pointer: the page scroller, a log
+     panel and an open dropdown are all scrollable, and each has its bar on
+     its OWN edge rather than the window's. */
+  let node = document.elementFromPoint(x, y);
+  while (node && node !== document.documentElement) {
+    const scrollsY = node.scrollHeight > node.clientHeight;
+    const scrollsX = node.scrollWidth > node.clientWidth;
+    if (scrollsY || scrollsX) {
+      const box = node.getBoundingClientRect();
+      if (scrollsY && box.right - x <= SB_NEAR_PX && x <= box.right) return true;
+      if (scrollsX && box.bottom - y <= SB_NEAR_PX && y <= box.bottom) return true;
+    }
+    node = node.parentElement;
+  }
+  /* The document itself, whose bar sits on the window's right edge. */
+  return (document.scrollingElement
+    && document.scrollingElement.scrollHeight > window.innerHeight
+    && window.innerWidth - x <= SB_NEAR_PX);
+}
+
+document.addEventListener('mousemove', event => {
+  /* One test per frame at most: elementFromPoint plus a walk on every
+     mousemove would be work in the middle of somebody dragging. */
+  if (sbFrame) return;
+  const { clientX, clientY } = event;
+  sbFrame = requestAnimationFrame(() => {
+    sbFrame = 0;
+    if (pointerNearAScrollbar(clientX, clientY)) showScrollbars();
+  });
+}, { passive: true });
+
+/* Capture, because scroll does not bubble from the element that scrolled. */
+document.addEventListener('scroll', showScrollbars,
+                          { passive: true, capture: true });
+
 /* ---- THE DROPDOWN, DRAWN BY THIS APP ---------------------------------
    A native <select> opens an OPERATING-SYSTEM window. `appearance:none`
    restyles the closed control and cannot touch that list, which is why a

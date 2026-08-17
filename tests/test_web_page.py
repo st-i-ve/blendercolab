@@ -104,9 +104,25 @@ def loaded_page():
     # its runJavaScript callback -- which hangs the test run rather than
     # failing it.
     yield page, result
-    view.deleteLater()
-    for _ in range(20):
-        QApplication.processEvents()
+    # THE VIEW IS DELIBERATELY NOT DELETED.
+    #
+    # Deleting it starts QtWebEngine's shutdown, and that shutdown faults:
+    # `Windows fatal exception: access violation` on CrBrowserMain, on Qt
+    # 6.11.1, reproduced identically on commits that predate any of this
+    # app's own threading work. It happens late and asynchronously -- late
+    # enough to land while conftest's exit hook is running, where it raced
+    # that hook for the process's exit code and won often enough to turn a
+    # green 1591-test run into exit 139.
+    #
+    # So nothing here tears Chromium down. The process is about to end
+    # anyway; conftest's pytest_unconfigure terminates it outright, which
+    # takes the browser threads with it before they can begin the shutdown
+    # that crashes. Leaking a widget in the last moments of a test process
+    # is the cheaper half of that trade by a wide margin.
+    #
+    # (Keeping `page` and `view` referenced also keeps them out of Python's
+    # garbage collector's reach, which would call the same destructor.)
+    globals()["_kept_alive"] = (view, page)
 
 
 def json_loads(text):
@@ -3002,3 +3018,60 @@ def test_the_render_page_can_choose_between_local_and_kaggle_scenes(loaded_page)
 
     assert state["values"] == ["local", "kaggle:user_0/supra-blend"]
     assert "no upload" in state["noteForKaggle"]
+
+
+# --------------------------------------------------------------------------
+# Scrollbars. Invisible until the pointer approaches one or the page
+# scrolls -- the previous rule painted the thumb whenever the mouse was
+# anywhere in the window (`*:hover`), which is why one shows in every
+# screenshot ever taken of this app.
+# --------------------------------------------------------------------------
+
+def test_a_scrollbar_is_invisible_until_something_asks_for_it(loaded_page):
+    view, _ = loaded_page
+    answer = _evaluate(view, """
+      (() => {
+        document.documentElement.classList.remove('sb-show');
+        const rules = [...document.styleSheets].flatMap(sheet => {
+          try { return [...sheet.cssRules]; } catch (e) { return []; }
+        }).map(r => r.cssText);
+        return JSON.stringify({
+          hidden: rules.some(r => r.includes('::-webkit-scrollbar-thumb')
+            && r.includes('background: transparent')),
+          shown: rules.some(r => r.includes('sb-show')
+            && r.includes('::-webkit-scrollbar-thumb')),
+          /* The width is reserved at all times: a bar that appears and
+             takes 6px would shift the page under the cursor. */
+          reserved: rules.some(r => r.includes('::-webkit-scrollbar')
+            && r.includes('width: 6px')),
+          onByAnyHover: rules.some(r => r.startsWith('*:hover')
+            && r.includes('scrollbar')),
+        });
+      })()
+    """)
+    state = json_loads(answer)
+
+    assert state["hidden"] is True, "the thumb is painted by default"
+    assert state["shown"] is True, "nothing ever shows it"
+    assert state["reserved"] is True
+    assert state["onByAnyHover"] is False, (
+        "hovering anywhere still paints it -- that is the bug being fixed")
+
+
+def test_scrolling_shows_the_bar_and_it_goes_away_again(loaded_page):
+    view, _ = loaded_page
+    during = _evaluate(view, """
+      (() => {
+        document.documentElement.classList.remove('sb-show');
+        document.dispatchEvent(new Event('scroll'));
+        return document.documentElement.classList.contains('sb-show');
+      })()
+    """)
+    assert during == "true", "a scroll left the bar hidden"
+
+    # It lingers, then leaves -- SB_LINGER_MS is 900ms in app.js.
+    time.sleep(1.3)
+    after = _evaluate(view, """
+      document.documentElement.classList.contains('sb-show')
+    """)
+    assert after == "false", "the bar never went away again"

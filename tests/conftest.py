@@ -626,4 +626,19 @@ def pytest_unconfigure(config):
     _quiet_every_session()
     sys.stdout.flush()
     sys.stderr.flush()
+    if sys.platform == "win32":
+        # TERMINATEPROCESS, NOT os._exit, AND THE REASON IS A MEASURED RACE.
+        # os._exit calls ExitProcess, which asks the other threads to stop;
+        # Chromium's CrBrowserMain is faulting at that exact moment (the
+        # upstream teardown crash this whole hook exists to step over), and
+        # on Windows an unhandled exception in ANY thread can set the
+        # process exit code. Caught on 2026-08-17: the same code path gave
+        # exit 0 on a two-module run and 139 on the full suite, with
+        # faulthandler showing the violation inside this very function.
+        # TerminateProcess sets the code and kills every thread at once, so
+        # there is nothing left to overwrite it.
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        kernel32.TerminateProcess(kernel32.GetCurrentProcess(),
+                                  _PYTEST_EXIT_STATUS)
     os._exit(_PYTEST_EXIT_STATUS)
