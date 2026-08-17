@@ -85,7 +85,10 @@ import blendfleet.fleet as fleet_mod
 import blendfleet.instance_state as instance_state_mod
 import blendfleet.platform_paths as platform_paths_mod
 import blendfleet.settings as settings_mod
-import blendfleet.ui.bridge as bridge_mod
+# The adapter, which is rpc.session since the 2026-08-17 collapse: it is
+# what reads state_dir/log_dir, so it is what has to be redirected at a
+# tmp path. ui.bridge is the Qt face over it and reads neither.
+import blendfleet.rpc.session as bridge_mod
 
 
 class NetworkAccessInTestError(RuntimeError):
@@ -563,3 +566,64 @@ def guard_real_app_dir_untouched():
         before, after,
         app_seen=_app_seen_tracker.seen,
         base=platform_paths_mod.config_dir())
+
+
+_PYTEST_EXIT_STATUS: int | None = None
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Remember the verdict for pytest_unconfigure below to exit with."""
+    global _PYTEST_EXIT_STATUS
+    _PYTEST_EXIT_STATUS = int(exitstatus)
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_unconfigure(config):
+    """Exit with pytest's verdict, not Chromium's.
+
+    QtWebEngine's browser thread (CrBrowserMain) dies with a Windows access
+    violation while Python finalises, AFTER the last test has run and the
+    summary has been printed. Measured on 2026-08-17 against Qt 6.11.1:
+    `pytest tests/test_web_page.py` prints "131 passed" and then exits 139,
+    and it does so identically on the commit BEFORE the adapters were
+    collapsed -- so it is upstream teardown, not this app's code. It had
+    been invisible for the life of this suite because every run was piped
+    through `tail`, which reports its own exit status and not pytest's.
+
+    Left alone, it makes every run end in 139: a green suite and a crashed
+    one become indistinguishable, and CI can only ever be red.
+
+    WHAT THIS DELIBERATELY DOES NOT HIDE. This app's own shutdown work runs
+    first and still crashes the run if it is broken -- which matters,
+    because a segfault at interpreter shutdown is exactly how a real bug in
+    this app's own threads was found earlier the same day (Session's poll
+    and live timers, frozen mid-emit by Python's daemon-thread teardown).
+
+    Ours by name, rather than `atexit._run_exitfuncs()`, which was the
+    first attempt: running EVERY registered handler reached Qt's own and
+    reproduced the very access violation this exists to step over -- the
+    run still exited 139. So only the handler this project registered is
+    invoked, and Qt's C++ teardown is what gets skipped.
+
+    WHY UNCONFIGURE AND NOT SESSIONFINISH. Two earlier attempts lost the
+    "11 passed in 3.02s" line entirely -- a suite that reports nothing is a
+    worse trade than one that exits 139. As `trylast` on sessionfinish it
+    ran before the terminal reporter; as a hookwrapper it ran before it
+    too, because the reporter is ITSELF a wrapper and prints its stats
+    after its own yield, and the inner wrapper's tail goes first.
+    `pytest_unconfigure` is after all of that.
+
+    The access violation itself still happens and faulthandler still prints
+    its trace, deliberately: it is not being hidden, it is being stopped
+    from deciding whether the suite passed.
+    """
+    import os
+
+    from blendfleet.rpc.session import _quiet_every_session
+
+    if _PYTEST_EXIT_STATUS is None:      # never ran a session (e.g. --help)
+        return
+    _quiet_every_session()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(_PYTEST_EXIT_STATUS)

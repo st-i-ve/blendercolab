@@ -21,7 +21,13 @@ from blendfleet.instance_state import GpuSnapshot, InstanceSnapshot
 from blendfleet.kaggle_client import (DatasetInfo, KaggleError, KernelStatus,
                                       Quota)
 from blendfleet.settings import Settings
-from blendfleet.ui import bridge as bridge_mod
+# The module these tests PATCH is the one that implements the behaviour,
+# which since the 2026-08-17 collapse is rpc.session -- ui.bridge is now
+# the Qt face over it (signals, slots, the two native dialogs) and holds
+# no `stream_progress`, `state_dir` or `_STOP_GRACE_MS` of its own to
+# stub. What the tests DRIVE is still the Qt Backend, imported below:
+# every assertion here is about what the page sees through QWebChannel.
+from blendfleet.rpc import session as bridge_mod
 from blendfleet.ui.bridge import Backend
 
 
@@ -37,15 +43,25 @@ class FakeClient:
     def quota(self):
         return Quota(7200, 108000, "soon", "api")
 
+    def machine_shape(self, slug):
+        """Asked once per worker by Fleet._refresh_worker.
+
+        A fake client has to answer it, and None is the honest answer for
+        one that never ran a session: "Kaggle did not say".
+        """
+        return None
+
 
 # Every Backend a test builds, kept alive until that test ends.
 #
-# A Backend parents its worker QThreads to itself. If Python collects the
-# Backend while one of those threads still has a deleteLater queued, the
-# NEXT processEvents() -- in a later test entirely -- walks freed memory
-# and Qt aborts the process rather than raising. Holding a reference and
-# tearing down deterministically is the same fix tests/test_dashboard.py
-# uses for Dashboards.
+# Originally because a Backend parented its worker QThreads to itself, and
+# collecting it with a deleteLater still queued let a LATER test's
+# processEvents() walk freed memory and abort the process. Since the
+# 2026-08-17 collapse the workers are plain threads with no Qt parent, so
+# that particular abort is gone -- but a Backend now owns a Session, whose
+# poll and live timers are real threads, and dropping the last reference to
+# one without stopping it leaves them running into the next test. Same fix,
+# still needed, different reason.
 _LIVE_BACKENDS = []
 
 
@@ -2064,6 +2080,41 @@ def test_stop_waits_for_a_worker_that_is_no_longer_in_workers(qapp, tmp_path):
         "abort when it destroyed it")
 
 
+def test_an_event_after_the_window_is_destroyed_does_not_kill_the_process(
+        qapp, tmp_path):
+    """The regression that cost a segfault, reproduced on purpose.
+
+    A Session's poll and live timers are threads IT owns, and they outlive
+    a Backend whose C++ half Qt has destroyed -- the live one ticks every
+    two seconds, so this is not a narrow race. Before the guard in
+    bridge._forward, the emit below did not raise: it was
+    `Fatal Python error: Aborted` / exit 139, two thirds of the way through
+    the suite, with no failing test name to point at. This test is the
+    reason that is now impossible rather than merely unlikely.
+
+    It also has to leave nothing ticking: a timer firing into a deleted
+    window is wasted work for the life of the process, so the adapter
+    cancels it the first time it notices.
+    """
+    from shiboken6 import delete, isValid
+
+    backend = make_backend(tmp_path, n=1)
+    session = backend._session          # outlives the window, deliberately
+    _LIVE_BACKENDS.remove(backend)      # this test owns the teardown
+
+    delete(backend)                     # exactly what Qt does on shutdown
+    assert not isValid(backend)
+
+    try:
+        session.notification.emit("the window has gone", "offline")
+        session.logLine.emit("and this one too", "active")
+
+        assert session._timers_cancelled, (
+            "the timers must be cancelled once there is nothing to feed")
+    finally:
+        session.stop()
+
+
 def test_stop_clears_its_tracking_so_it_can_be_called_twice(qapp, tmp_path):
     backend = make_backend(tmp_path, n=1)
     backend._start("probe", lambda: "done", "probing", lambda _r: None)
@@ -2115,9 +2166,19 @@ def _unstoppable(backend, release):
 
 def test_stop_cuts_loose_a_worker_that_will_not_stop(qapp, tmp_path,
                                                      monkeypatch):
-    """Qt aborts the instant it destroys a running QThread, and a Kaggle
-    request that has not answered cannot be cancelled. Cutting the thread
-    loose is what turns that abort into an ordinary exit."""
+    """A Kaggle request that has not answered cannot be cancelled, so
+    stop() has to be able to return while one is still in flight.
+
+    This used to also assert `worker.parent() is None`, because a running
+    QThread being destroyed is `qFatal("QThread: Destroyed while thread is
+    still running")` and unparenting was what avoided it. Since the
+    2026-08-17 collapse the worker is a plain daemon thread with no Qt
+    parent to have, so that abort is gone by construction rather than
+    avoided -- there is no longer an assertion to make about it. What
+    still has to hold is below: the thread is tracked rather than
+    forgotten, so nothing collects it mid-request, and stop() returned
+    even though it could not stop it.
+    """
     monkeypatch.setattr(bridge_mod, "_STOP_GRACE_MS", 200)
     backend = make_backend(tmp_path, n=1)
     release = threading.Event()
@@ -2126,11 +2187,10 @@ def test_stop_cuts_loose_a_worker_that_will_not_stop(qapp, tmp_path,
         backend.stop()
 
         assert worker in bridge_mod.orphaned_workers(), (
-            "a worker that outlasted stop() must be cut loose; leaving it "
-            "parented to the Backend is the qFatal abort")
-        assert worker.parent() is None, (
-            "still a child of the Backend -- Qt would delete it during "
-            "teardown and abort")
+            "a worker that outlasted stop() must be cut loose and held, or "
+            "nothing keeps it alive while it is still inside a request")
+        assert worker.isRunning(), (
+            "this test is meant to exercise the worker that will NOT stop")
     finally:
         release.set()
         worker.wait(5000)
@@ -2295,7 +2355,11 @@ def _log_text(path):
 
 def test_an_error_notification_is_recorded(qapp, tmp_path, diagnostic_log):
     backend = make_backend(tmp_path, n=1)
-    backend.notification.emit("Choose a .blend file first.", "offline")
+    # Through the SESSION, which is where every real notification comes
+    # from and where the recorder listens. backend.notification is the Qt
+    # signal the PAGE hears -- the relay's output, not its input -- so
+    # emitting that by hand would exercise a path the app never takes.
+    backend._session.notification.emit("Choose a .blend file first.", "offline")
 
     assert "Choose a .blend file first." in _log_text(diagnostic_log)
 
@@ -2311,8 +2375,8 @@ def test_an_error_tone_is_recorded_prominently(qapp, tmp_path, monkeypatch,
                         seen.append((message, critical)))
     backend = make_backend(tmp_path, n=1)
 
-    backend.notification.emit("Kaggle refused the upload.", "offline")
-    backend.logLine.emit("dataset ready: me/scene-blend", "active")
+    backend._session.notification.emit("Kaggle refused the upload.", "offline")
+    backend._session.logLine.emit("dataset ready: me/scene-blend", "active")
 
     assert ("notification [offline] Kaggle refused the upload.", True) in seen
     assert ("log [active] dataset ready: me/scene-blend", False) in seen
@@ -2324,7 +2388,7 @@ def test_the_same_message_repeating_does_not_bury_the_log(
     identical sentence every 30 seconds."""
     backend = make_backend(tmp_path, n=1)
     for _ in range(20):
-        backend.notification.emit("lost contact with Kaggle", "offline")
+        backend._session.notification.emit("lost contact with Kaggle", "offline")
 
     assert _log_text(diagnostic_log).count("lost contact with Kaggle") == 1
 

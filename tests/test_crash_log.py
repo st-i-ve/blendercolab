@@ -311,9 +311,13 @@ def test_bridge_reports_the_log_location_to_the_page(tmp_path):
     without being read a %APPDATA% path over the phone."""
     import json
 
-    from blendfleet.ui import bridge as bridge_mod
+    # Called unbound, with any object for self, because this answer comes
+    # from the log module rather than from any adapter state. Since the
+    # 2026-08-17 collapse the method lives on Session; the Qt Backend's
+    # slot of the same name forwards to exactly this.
+    from blendfleet.rpc.session import Session
 
     path = crash_log.install(tmp_path)
-    payload = json.loads(bridge_mod.Backend.diagnostics(object()))
+    payload = json.loads(Session.diagnostics(object()))
     assert payload["logFile"] == str(path)
     assert payload["logDir"]

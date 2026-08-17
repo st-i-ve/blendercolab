@@ -1,18 +1,22 @@
-"""The Qt-free adapter, and whether it still tells the truth.
+"""The adapter, and whether both shells still get the same answers.
 
-blendfleet/rpc/session.py is a port of ui/bridge.py with Qt taken out, so
-the dashboard can run under an Electron shell that talks to a headless
-Python sidecar. The port is deliberate duplication -- bridge.py is not
-edited, because the Qt build is what is being used for real renders --
-and duplication drifts.
+blendfleet/rpc/session.py holds the behaviour: every method the page can
+call, every payload, every honesty rule. ui/bridge.py is the Qt face over
+it -- signals QWebChannel can carry, slots it can expose, and the two
+native dialogs a headless process cannot open.
 
-So the tests that matter here are PARITY tests: for the same seeded
-fleet, the two adapters must produce the same payload, byte for byte. A
-difference is either a port bug or a change somebody made to one and not
-the other, and both are worth failing over.
+WHAT THESE TESTS WERE FOR, AND WHAT THEY ARE FOR NOW. Written when the two
+were separate copies, to catch the copies drifting. The copies collapsed
+on 2026-08-17, so byte-identical payloads are no longer a coincidence
+worth checking -- there is one implementation. What the parity tests catch
+now is the DELEGATION: a slot that forwards to the wrong method, forgets
+to return, or was left off the Qt face entirely reads exactly like a
+drifted payload from the page's side, and is just as broken. The contract
+test below is the sharpest of them, because a method the page calls and
+one shell cannot answer is a dead button.
 
-The rest covers what the port genuinely changed: dialogs it can no longer
-open, and the events it now delivers through Emitters.
+The rest covers what only the Session does: take a path instead of opening
+a chooser, and deliver events through Emitters rather than Signals.
 """
 import json
 import os
@@ -62,6 +66,24 @@ def _adapters(tmp_path, n=2):
     qt = Backend(made[0][0], made[0][1], lambda t: "someone", Settings())
     rpc = Session(made[1][0], made[1][1], lambda t: "someone", Settings())
     return qt, rpc, made
+
+
+def _rpc_only(tmp_path, n=2):
+    """A Session on its own, for the tests that are not about parity.
+
+    Those used to take `_adapters()` and throw the Qt half away, which was
+    free while the Qt adapter's timers were QTimers -- Qt objects, not
+    threads, and so invisible to the leaked-thread guard. Since the
+    2026-08-17 collapse a Backend owns a Session, and an unstopped one
+    leaves its poll and live threads running: the guard was right, and the
+    fix is to stop building an adapter the test never looks at.
+    """
+    root = tmp_path / "rpc-only"
+    root.mkdir()
+    store = _store(n)
+    factory = (lambda accounts, root=root: Fleet(
+        accounts, lambda t: FakeClient(t), root / "w"))
+    return Session(store, factory, lambda t: "someone", Settings())
 
 
 def _seed(factory, store, root, workers):
@@ -152,12 +174,17 @@ def _contract(adapter_class):
     Emitters on this one, so they are compared separately below.
     """
     import PySide6.QtCore
+
+    from blendfleet.rpc.protocol import EVENTS
+
     qobject = {n for n in dir(PySide6.QtCore.QObject) if not n.startswith("_")}
-    signals = {"stateChanged", "accountsChanged", "settingsChanged",
-               "telemetry", "uploadProgress", "downloadProgress",
-               "framePreview", "logLine", "notification", "healthChanged",
-               "busyChanged", "scenesChanged", "outputsChanged",
-               "collectFinished"}
+    # Taken from EVENTS rather than written out: this list used to be a
+    # hardcoded copy, and adding a fifteenth event (straySessionsChanged)
+    # made it fail with "the sidecar cannot answer: straySessionsChanged" --
+    # a Qt Signal is a CLASS attribute and an Emitter is an INSTANCE one, so
+    # any event missing from this set reads as a method one adapter lacks.
+    # The one place that names the events is protocol.EVENTS.
+    signals = set(EVENTS)
     return {n for n in dir(adapter_class)
             if not n.startswith("_")
             and callable(getattr(adapter_class, n))} - qobject - signals
@@ -199,7 +226,7 @@ def test_setting_the_blend_takes_a_path_instead_of_opening_a_dialog(qapp,
                                                                     tmp_path):
     blend = tmp_path / "waydown.blend"
     blend.write_bytes(b"BLENDER")
-    _, rpc, _ = _adapters(tmp_path)
+    rpc = _rpc_only(tmp_path)
     try:
         answer = json.loads(rpc.setBlend(str(blend)))
         assert answer["name"] == "waydown.blend"
@@ -213,7 +240,7 @@ def test_a_dismissed_chooser_leaves_the_previous_choice_alone(qapp, tmp_path):
     meant "forget what I picked before"."""
     blend = tmp_path / "waydown.blend"
     blend.write_bytes(b"BLENDER")
-    _, rpc, _ = _adapters(tmp_path)
+    rpc = _rpc_only(tmp_path)
     try:
         rpc.setBlend(str(blend))
         assert json.loads(rpc.setBlend(""))["name"] == "waydown.blend"
@@ -225,7 +252,7 @@ def test_a_collect_with_nowhere_to_put_the_frames_does_not_start(qapp,
                                                                  tmp_path):
     """The destination is the shell's question to ask. No answer means
     the chooser was dismissed."""
-    _, rpc, _ = _adapters(tmp_path)
+    rpc = _rpc_only(tmp_path)
     busy = []
     try:
         rpc.busyChanged.connect(lambda key, state: busy.append((key, state)))
@@ -237,7 +264,7 @@ def test_a_collect_with_nowhere_to_put_the_frames_does_not_start(qapp,
 
 def test_events_reach_a_plain_handler(qapp, tmp_path):
     """The whole point of the Emitter: no Qt, same connect()."""
-    _, rpc, _ = _adapters(tmp_path)
+    rpc = _rpc_only(tmp_path)
     seen = []
     try:
         rpc.notification.connect(lambda message, tone: seen.append((message,
@@ -252,6 +279,6 @@ def test_events_reach_a_plain_handler(qapp, tmp_path):
 def test_stopping_twice_is_harmless(qapp, tmp_path):
     """stop() runs when the pipe closes, and a pipe can close while a
     stop is already under way."""
-    _, rpc, _ = _adapters(tmp_path)
+    rpc = _rpc_only(tmp_path)
     rpc.stop()
     rpc.stop()

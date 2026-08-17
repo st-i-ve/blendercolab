@@ -98,12 +98,24 @@ class Worker:
         # what keeps the process alive after the shell has gone. stop()
         # gives it a grace period first; see Session.stop.
         self._thread = threading.Thread(target=self._run, daemon=True)
+        self._started = False
 
     def start(self) -> None:
+        self._started = True
         self._thread.start()
 
     def isRunning(self) -> bool:            # noqa: N802 -- Qt's own spelling
         return self._thread.is_alive()
+
+    def isFinished(self) -> bool:           # noqa: N802 -- Qt's own spelling
+        """True once the call has returned, as QThread means it.
+
+        Deliberately not `not isRunning()`: a worker that was never
+        started is neither running nor finished, and answering True for it
+        would let stop() report that it had waited for something that
+        never ran.
+        """
+        return self._started and not self._thread.is_alive()
 
     def wait(self, milliseconds: int | None = None) -> bool:
         """Join, returning False if it is still running afterwards."""
@@ -159,6 +171,31 @@ class RepeatingTimer:
         thread, self._thread = self._thread, None
         if thread is not None:
             thread.join(2)
+
+    def settle(self, timeout: float = 1.0) -> None:
+        """Cancel, then wait for a tick already in flight to finish --
+        unless the caller IS that tick, in which case waiting is a deadlock
+        and there is nothing to wait for anyway.
+
+        The difference from stop() is only that this is safe to call from
+        anywhere, including an atexit handler with no idea what is running.
+        """
+        thread, self._thread = self._thread, None
+        self._stop.set()
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout)
+
+    def cancel(self) -> None:
+        """Stop ticking, without waiting for the tick to finish.
+
+        `stop()` joins, which is right when the shell is closing and wrong
+        when the caller IS this timer's own callback -- joining your own
+        thread raises. That case is real: the Qt adapter cancels these from
+        inside a tick when it notices the window it was feeding has been
+        destroyed (see bridge._forward).
+        """
+        self._stop.set()
+        self._thread = None
 
     def _run(self) -> None:
         from blendfleet import crash_log

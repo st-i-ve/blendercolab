@@ -21,12 +21,14 @@ bridge.py's, and stays true here.
 """
 from __future__ import annotations
 
+import atexit
 import json
 import queue
 import threading
 import time
 import traceback
 import uuid
+import weakref
 from pathlib import Path
 from typing import Callable
 
@@ -40,7 +42,8 @@ from blendfleet.fleet import (_capped_stem, _tokenless,
                               fingerprint_unreadable_entry)
 from blendfleet.instance_state import (GpuSnapshot, InstanceSnapshot,
                                        InstanceStore)
-from blendfleet.kaggle_client import PENDING_STATES, TERMINAL_STATES
+from blendfleet.kaggle_client import (PENDING_STATES, TERMINAL_STATES,
+                                      describe_machine)
 from blendfleet.log_stream import stream_progress
 from blendfleet.notebook_builder import RenderSettings
 from blendfleet.platform_paths import log_dir, state_dir
@@ -112,6 +115,33 @@ def _orphan(worker: _Worker) -> None:
         critical=True)
 
 
+_LIVE_SESSIONS: "weakref.WeakSet" = weakref.WeakSet()
+
+
+def _quiet_every_session() -> None:
+    """Stop every Session's timers before the interpreter finalises.
+
+    Registered with atexit, which runs while threads can still be joined --
+    after that, Python freezes its daemon threads wherever they are, and a
+    timer thread frozen inside a Qt emit or a shiboken call takes the
+    process down with a segfault. That is not hypothetical: it is what the
+    suite did on 2026-08-17 once the adapters collapsed and the poll and
+    live timers became real threads instead of QTimers. Every test passed,
+    then exit 139, with no failure to point at.
+
+    A shell that closes properly calls Session.stop() and this finds
+    nothing to do. This exists for the shells and scripts that do not.
+    """
+    for session in list(_LIVE_SESSIONS):
+        try:
+            session.quiet()
+        except Exception:       # noqa: BLE001 -- exiting; nothing to report to
+            pass
+
+
+atexit.register(_quiet_every_session)
+
+
 class Session:
     """Everything the page can ask for, and everything it is told.
 
@@ -167,6 +197,8 @@ class Session:
         self.scenesChanged = Emitter("scenesChanged")  # {"scenes": [...], "errors": {label: why}}
         self.outputsChanged = Emitter("outputsChanged")
         self.collectFinished = Emitter("collectFinished")
+        # Sessions running on Kaggle that no tracked job accounts for.
+        self.straySessionsChanged = Emitter("straySessionsChanged")
         self.store = store
         self.fleet_factory = fleet_factory
         self.verifier = verifier
@@ -294,6 +326,38 @@ class Session:
         self._live_timer = RepeatingTimer(LIVE_INTERVAL_MS, self._live_tick,
                                           "live")
         self._live_timer.start()
+        self._timers_cancelled = False
+        # Weak, so being registered here never keeps a Session alive; the
+        # atexit handler above only quiets the ones still in use.
+        _LIVE_SESSIONS.add(self)
+
+    def quiet(self) -> None:
+        """Stop ticking and wait a moment for the ticks to land.
+
+        For interpreter shutdown (see _quiet_every_session): the timers are
+        daemon threads, so Python does not wait for them -- it freezes them
+        wherever they happen to be, and "wherever" can be inside a Qt emit
+        or a shiboken call. A thread killed mid-C-call is a segfault at
+        exit: every test passing and then exit 139 with no failure to point
+        at, which is exactly what this cost.
+        """
+        self._timers_cancelled = True
+        self._poll_timer.settle()
+        self._live_timer.settle()
+
+    def cancel_timers(self) -> None:
+        """Stop ticking without joining, safe to call from inside a tick.
+
+        For the shell that discovers, mid-tick, that there is nothing left
+        to feed: the Qt adapter's window can be destroyed by Qt while this
+        Session's threads are still running, and a timer that keeps firing
+        into a deleted window is at best wasted work (see bridge._forward,
+        where it is at worst a segfault). stop() is still the ordinary
+        path; it joins, which a tick cannot do to itself.
+        """
+        self._timers_cancelled = True
+        self._poll_timer.cancel()
+        self._live_timer.cancel()
 
     # ---- helpers ------------------------------------------------------
     def _scrub(self, text: str) -> str:
@@ -471,6 +535,25 @@ class Session:
                     # long ago you ran it.
                     "elapsed": _elapsed(worker),
                     "finished": bool(worker.finished_at),
+                    # What machine Kaggle actually gave THIS session, from
+                    # the kernel's metadata rather than from inside the run
+                    # (KaggleClient.machine_shape). Both forms travel: the
+                    # raw name because it is what Kaggle said, and the
+                    # readable one because the page should not have to know
+                    # Kaggle's vocabulary. Empty when it was not read.
+                    #
+                    # No age on purpose, unlike `hardware` below. A kernel
+                    # slug is unique per job, so this is a fact about one
+                    # session -- and the card already shows that session's
+                    # own timing. `hardware` is the opposite: a reading
+                    # cached across runs, which is why it must carry one.
+                    "machineShape": worker.machine_shape or "",
+                    "machine": describe_machine(worker.machine_shape) or "",
+                    # Why a missing frame count may not be the log's fault:
+                    # one sentence, already fit to show, or "" when there is
+                    # nothing to say OR nothing was asked. The page must
+                    # print it verbatim rather than deciding what it means.
+                    "notebookDrift": getattr(worker, "notebook_drift", ""),
                 } if worker is not None else None,
                 # Live, cheap to poll, and never a promise.
                 "quota": self._quota.get(account.label, ""),
@@ -1898,6 +1981,76 @@ class Session:
 
         self._start("cancel", work, "Cancelling the render", ok)
 
+    def findStraySessions(self) -> None:
+        """Look for sessions this app started and lost track of.
+
+        The failure this answers: a job forgotten, or the app killed
+        between pushing a kernel and writing its state file, leaves a
+        render going on Kaggle with nothing on the dashboard to say so. It
+        spends the account's thirty hours a week regardless, and the user
+        finds out when the next render will not start.
+
+        A real network scan per account, so it is a button and not a timer.
+        """
+        accounts = self.store.list()
+        if not accounts:
+            self.notification.emit("Add an account first.", "offline")
+            return
+
+        def work():
+            return self.fleet_factory(accounts).find_stray_sessions()
+
+        def ok(result) -> None:
+            strays, errors = result
+            self.straySessionsChanged.emit(json.dumps({
+                "strays": [{"label": s.label, "slug": s.slug,
+                            "state": s.state} for s in strays],
+                # Named per account: "we could not check acct1" is a
+                # different statement from "acct1 has nothing running", and
+                # only one of them is evidence.
+                "errors": errors,
+            }))
+            if strays:
+                self.notification.emit(
+                    f"{len(strays)} session(s) are running that this app had "
+                    "no record of — they are spending quota now.", "offline")
+            elif errors:
+                self.notification.emit(
+                    f"Could not check {len(errors)} account(s) for stray "
+                    "sessions.", "offline")
+            else:
+                # Said out loud. A scan that finds nothing and says nothing
+                # is indistinguishable from a button that does nothing.
+                self.notification.emit(
+                    "No stray sessions — every running kernel belongs to a "
+                    "job on the dashboard.", "idle")
+
+        self._start("strays", work, "Looking for stray sessions", ok)
+
+    def cancelStraySession(self, label: str, slug: str) -> None:
+        """Stop one stray, named by the list the page was shown."""
+        accounts = self.store.list()
+
+        def work():
+            return self.fleet_factory(accounts).cancel_stray_session(label,
+                                                                     slug)
+
+        def ok(result) -> None:
+            if result.ok:
+                self.notification.emit(
+                    f"Stopped {result.kernel_slug} on {label}.", "idle")
+            else:
+                # Same rule as cancelAll: a cancel that did not work has to
+                # say so, or the user believes quota stopped draining.
+                self.notification.emit(
+                    f"{result.kernel_slug} did NOT stop and may still be "
+                    f"spending quota — {result.error}. Stop it by hand at "
+                    "kaggle.com.", "offline")
+            self.findStraySessions()
+
+        self._start(f"cancel-stray:{slug}", work, "Stopping a stray session",
+                    ok)
+
     def cancelJob(self, job_id: str) -> None:
         """Stop every account rendering job `job_id`, leaving every OTHER
         tracked job's kernels running untouched -- the per-job counterpart
@@ -2820,6 +2973,7 @@ class Session:
         process learns its shell is gone."""
         self._poll_timer.stop()
         self._live_timer.stop()
+        self._timers_cancelled = True
         self._stop.set()        # tells the SSE threads to unwind
         # _running_workers first, and it is the one that matters: see its
         # comment in __init__ for why _workers alone was empty at exactly
