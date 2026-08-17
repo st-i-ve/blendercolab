@@ -1517,6 +1517,11 @@ function fmtBytes(bytes) {
    Files -- two ways to do one thing, in two places, and neither of them
    was on the page called Render. */
 let libraryScenes = [];
+/* Whether scenes() has EVER answered. "No scenes on Kaggle" and "we have
+   not been told yet" are different facts, and the second one must not be
+   reported as the first -- the same rule the storage view and the stray
+   scan keep. */
+let scenesAnswered = false;
 /* The .blend chosen on this machine, as the state payload reports it.
    Kept here so the picker has one source for it rather than reading the
    DOM text that renderDataset happens to have written. */
@@ -1577,7 +1582,9 @@ function renderSceneHits() {
   document.getElementById('scene-q-meta').textContent = query
     ? `${hits.length + (showLocal ? 1 : 0)} of ${
         libraryScenes.length + (local ? 1 : 0)} match`
-    : `${libraryScenes.length} on Kaggle${local ? ', 1 on this machine' : ''}`;
+    : (scenesAnswered
+        ? `${libraryScenes.length} on Kaggle${local ? ', 1 on this machine' : ''}`
+        : 'still asking Kaggle what is up there…');
 
   const rows = [];
   if (showLocal) {
@@ -1593,7 +1600,9 @@ function renderSceneHits() {
   });
   const box = document.getElementById('scene-hits');
   box.innerHTML = rows.join('') || `<div class="empty">${
-    query ? 'Nothing matches that.' : 'No scenes on Kaggle yet.'}</div>`;
+    query ? 'Nothing matches that.'
+          : (scenesAnswered ? 'No scenes on Kaggle yet.'
+                            : 'Reading the scene library…')}</div>`;
   box.querySelectorAll('[data-pick]').forEach(row => {
     row.onclick = () => {
       const select = document.getElementById('render-scene');
@@ -1719,6 +1728,7 @@ function renderScenes(json) {
   /* The Render page's picker lists these too -- scenes() is asked once and
      both readers use the answer, rather than the picker asking again. */
   libraryScenes = scenes;
+  scenesAnswered = true;
   renderScenePicker();
 
   const errBox = document.getElementById('scene-errors');
