@@ -875,7 +875,7 @@ class FakeDatasetClient:
     def dataset_reachable(self, slug):
         return self._reachable
 
-    def push_kernel(self, folder):
+    def push_kernel(self, folder, timeout_seconds=0):
         self.pushed.append(folder)
 
 

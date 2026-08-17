@@ -32,6 +32,34 @@ THEME_NAMES = ("light", "dark", "system")
 PALETTE_THEME_NAMES = ("light", "dark")
 DEFAULT_THEME = "light"
 
+# WHICH MACHINE A RENDER ASKS KAGGLE FOR.
+#
+# Kaggle ships no enum for these -- kaggle_api_extended.py says so at the
+# push site -- so the only source is the docstring on
+# ApiSaveKernelRequest, which lists NvidiaTeslaT4, NvidiaTeslaP100 and
+# Tpu1VmV38. Measured live (docs/machine-shape-findings.md): T4 yields TWO
+# cards and Cycles genuinely splits a frame across both; P100 yields one
+# faster card. Both are worth offering -- two T4s win on throughput, one
+# P100 on a scene that needs its memory undivided.
+#
+# TPU IS DELIBERATELY ABSENT. Cycles cannot render on a TPU, so offering
+# it would be offering a way to spend a session's quota producing nothing.
+# An exact string matters: an invalid one is accepted at push time with no
+# error and silently falls back to a single P100.
+MACHINE_SHAPES = {
+    "NvidiaTeslaT4": "T4 ×2",
+    "NvidiaTeslaP100": "P100",
+}
+DEFAULT_MACHINE_SHAPE = "NvidiaTeslaT4"
+
+# How long a render's session may run before Kaggle stops it, in minutes.
+# 0 means "do not ask", which leaves Kaggle's own limit in force -- hours,
+# during which a hung render spends quota nobody is watching. The cap is
+# 12 hours because that is the longest session Kaggle grants; a larger
+# number would be a request it ignores.
+DEFAULT_SESSION_TIMEOUT_MINUTES = 0
+MAX_SESSION_TIMEOUT_MINUTES = 12 * 60
+
 # key -> the family name as the font itself reports it, which is what
 # both Qt's font database and the page's CSS have to ask for.
 FONT_FAMILIES = {

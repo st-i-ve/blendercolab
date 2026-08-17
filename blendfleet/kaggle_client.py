@@ -1212,8 +1212,25 @@ class KaggleClient:
                 "here should not be possible).")
 
     # ---------------- kernels ----------------
-    def push_kernel(self, folder: Path) -> None:
-        """Always starts a run -- there is no unchanged-content short circuit."""
+    def push_kernel(self, folder: Path,
+                    timeout_seconds: int = 0) -> None:
+        """Always starts a run -- there is no unchanged-content short circuit.
+
+        `timeout_seconds` is Kaggle's own session limit for this run, and 0
+        means "do not ask", which leaves Kaggle's default in force. That
+        default is hours: a render that hangs -- a scene that never
+        finishes a frame, a download that stalls -- spends the account's
+        quota until Kaggle stops it, and the app has no way to shorten
+        that after the fact, because a session cannot be given a limit
+        once it is running.
+
+        Passed as a string because that is what kernels_push takes
+        (`timeout: Optional[str]`, cast with int() at the call site).
+        """
+        if timeout_seconds and timeout_seconds > 0:
+            self.api.kernels_push(folder=str(folder),
+                                  timeout=str(int(timeout_seconds)))
+            return
         self.api.kernels_push(folder=str(folder))
 
     def status(self, slug: str) -> KernelStatus:

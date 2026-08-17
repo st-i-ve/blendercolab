@@ -167,11 +167,23 @@ would hold every render on one image, but a digest hardcoded in the source would
 rot the day Kaggle retires it with nothing in the UI to explain why renders
 stopped starting. It wants a setting.
 
-**Still on the table, all on the push path the app already uses:** a
-`session_timeout_seconds` cap (via `kernels_push(timeout=…)`), so a hung render
-stops burning quota at a limit you choose instead of Kaggle's; per-render
-`machine_shape`, so T4 ×2 and P100 become a choice rather than the hardcoded
-`NvidiaTeslaT4`; and `delete_kernel` for housekeeping old notebooks.
+**Three session controls in Settings, all sent on the push:**
+
+- **Machine to ask for** — T4 ×2 or P100. T4 gets two cards and Cycles splits a
+  frame across both; P100 is one card with its memory undivided. T4 remains the
+  default because it was measured faster. TPU is not offered: Cycles cannot use
+  one, so it would only be a way to spend a session producing nothing.
+- **Stop a session after** *N* minutes — 0 leaves Kaggle's own limit, which is
+  hours. This is the difference between a hung render costing minutes and costing
+  most of an account's week.
+- **Pin the base image** to an exact digest, for a project that needs every
+  render on one CUDA driver. Empty is the right answer unless you have a reason.
+
+An invalid `machine_shape` is accepted by Kaggle at push time with **no error**
+and silently gives a single P100, so that one is whitelisted in Python and the
+page is *sent* the list rather than keeping its own.
+
+**Still unused:** `delete_kernel`, for housekeeping old notebooks.
 
 ---
 

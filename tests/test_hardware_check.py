@@ -134,7 +134,7 @@ class FakeClient:
     def whoami(self):
         return self.username
 
-    def push_kernel(self, work_dir):
+    def push_kernel(self, work_dir, timeout_seconds=0):
         self.pushed.append(Path(work_dir))
 
 

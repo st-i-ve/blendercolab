@@ -442,6 +442,24 @@
             <div class="st"><h4>Minimum GPUs required</h4><p>Kaggle can silently fall back to a single P100 when the requested hardware is unavailable. A render will not start on an account reporting fewer GPUs than this. 0 turns the check off.</p></div>
             <input id="min-gpus" type="number" min="0" max="8" style="width:90px">
           </div>
+          <!-- The machine every render asks for. Measured, not guessed:
+               T4 gets TWO cards and Cycles splits a frame across both;
+               P100 is one faster card with its memory undivided. The
+               options come from Python (preferences.machineShapes) because
+               an invalid shape string is accepted at push time with no
+               error and silently downgrades the hardware. -->
+          <div class="set-row">
+            <div class="st"><h4>Machine to ask for</h4><p>T4 ×2 renders a single frame across two cards and is the faster choice for most scenes. P100 is one card with 16 GB to itself — pick it for a scene that will not fit alongside another render. Kaggle can still give you something else; the card says what each run actually got.</p></div>
+            <div class="seg" id="seg-machine"></div>
+          </div>
+          <div class="set-row">
+            <div class="st"><h4>Stop a session after</h4><p>Minutes. A render that hangs — a frame that never finishes, a download that stalls — keeps spending the account's quota until Kaggle stops it, which takes hours. This caps it at a number you choose. 0 leaves Kaggle's own limit in force, which is what BlendFleet did before this existed.</p></div>
+            <input id="session-timeout" type="number" min="0" max="720" step="15" style="width:90px">
+          </div>
+          <div class="set-row">
+            <div class="st"><h4>Pin the base image</h4><p>Advanced, and empty is the right answer unless you have a reason. Every render already holds the image it started with, but two renders a month apart can get different ones — and the CUDA driver inside is what Blender runs against. Naming an exact image (<code>gcr.io/kaggle-images/python@sha256:…</code>) holds every render on it, until Kaggle retires that image and renders stop starting.</p></div>
+            <input id="docker-image" type="text" placeholder="leave empty to use the current image" style="width:260px">
+          </div>
         </div>
 
         <!-- The app has closed itself mid-render with no message. Every

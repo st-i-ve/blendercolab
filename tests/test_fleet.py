@@ -69,6 +69,7 @@ class FakeClient:
         self.token = token
         self.state = state
         self.pushed = 0
+        self.push_timeouts = []
         self.cancelled = []
         self.dataset_creates = 0
         self.dataset_versions = 0
@@ -120,7 +121,11 @@ class FakeClient:
         if meta.exists():
             return _json.loads(meta.read_text(encoding="utf-8")).get("id", "")
         return ""
-    def push_kernel(self, folder): self.pushed += 1
+    def push_kernel(self, folder, timeout_seconds=0):
+        self.pushed += 1
+        # Recorded so a test can assert the session cap actually
+        # reached the push (see tests/test_session_knobs.py).
+        self.push_timeouts.append(timeout_seconds)
     def status(self, slug): return KernelStatus(state=self.state)
     def cancel(self, slug): self.cancelled.append(slug); return True
     def quota(self): return Quota(0, 21600, "2026-08-01", source="api")
@@ -483,7 +488,7 @@ def test_launch_with_an_explicitly_empty_selection_is_refused_not_widened(
 
 class ExplodingPushClient(FakeClient):
     """Stands in for an account whose token was revoked mid-launch."""
-    def push_kernel(self, folder):
+    def push_kernel(self, folder, timeout_seconds=0):
         raise RuntimeError("401 Unauthorized: token revoked")
 
 

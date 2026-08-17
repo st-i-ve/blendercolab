@@ -1925,7 +1925,11 @@ class Fleet:
                       mode="worker", control_slug=control,
                       token=account.token, worker_label=account.label,
                       blender_slug=blender_slug)
-                client.push_kernel(kern_dir)
+                # The user's session cap, or Kaggle's own when it is 0.
+                # Carried on RenderSettings so every push path picks it up
+                # without a second argument threaded through here.
+                client.push_kernel(
+                    kern_dir, getattr(settings, "session_timeout_seconds", 0))
                 st.workers.append(WorkerState(
                     label=account.label, username=username,
                     kernel_slug=kernel_slug, frames=[], state="queued"))
@@ -2061,7 +2065,11 @@ class Fleet:
                 kern_dir = self.work_dir / f"kern_{account.label}"
                 build(frames, settings, dataset_slug, kern_dir, kernel_slug,
                       blender_slug=blender_slug)
-                client.push_kernel(kern_dir)
+                # The user's session cap, or Kaggle's own when it is 0.
+                # Carried on RenderSettings so every push path picks it up
+                # without a second argument threaded through here.
+                client.push_kernel(
+                    kern_dir, getattr(settings, "session_timeout_seconds", 0))
 
                 st.workers.append(WorkerState(
                     label=account.label, username=username,
@@ -2256,7 +2264,11 @@ class Fleet:
 
                 kern_dir = self.work_dir / f"kern_{account.label}"
                 build(frames, settings, dataset_slug, kern_dir, kernel_slug)
-                client.push_kernel(kern_dir)
+                # The user's session cap, or Kaggle's own when it is 0.
+                # Carried on RenderSettings so every push path picks it up
+                # without a second argument threaded through here.
+                client.push_kernel(
+                    kern_dir, getattr(settings, "session_timeout_seconds", 0))
 
                 st.workers.append(WorkerState(
                     label=account.label, username=username,

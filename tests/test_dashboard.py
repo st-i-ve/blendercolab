@@ -257,7 +257,7 @@ class FakeClient:
     def dataset_version(self, folder, message, on_progress=None):
         self.dataset_create(folder, on_progress=on_progress)
 
-    def push_kernel(self, folder):
+    def push_kernel(self, folder, timeout_seconds=0):
         pass
 
     def status(self, slug):

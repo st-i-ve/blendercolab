@@ -356,6 +356,16 @@ class RenderSettings:
     # the session before Blender is downloaded, rather than discovering the
     # shortfall only from a slow render.
     min_gpus: int = 0
+    # WHICH MACHINE TO ASK KAGGLE FOR, and for how long, and on which base
+    # image. Session-level rather than render-level -- none of the three
+    # appears inside the notebook -- but they belong to the same decision a
+    # caller makes when it starts a render, and carrying them here means
+    # every push path picks them up without a second argument threaded
+    # through Fleet. See design.MACHINE_SHAPES for why the string is exact,
+    # and KaggleClient.push_kernel for what the timeout does.
+    machine_shape: str = MACHINE_SHAPE
+    session_timeout_seconds: int = 0
+    docker_image: str = ""
     # Cycles does per-frame POST-processing on the CPU by default -- the
     # denoiser and the compositor both. Measured on a real session
     # (2026-08-12): the scene ships denoiser=OPENIMAGEDENOISE with
@@ -1143,7 +1153,17 @@ print("WORKER stopped", flush=True)
         # machine_shape: a backend that has not adopted machine_shape yet
         # would otherwise silently fall back to a CPU-only session if this
         # were dropped (docs/machine-shape-findings.md, section 2).
-        "machine_shape": MACHINE_SHAPE,
+        #
+        # The caller's choice now, defaulting to the same MACHINE_SHAPE it
+        # was hardcoded to: two T4s suit throughput, one P100 suits a scene
+        # that needs its memory undivided.
+        "machine_shape": settings.machine_shape or MACHINE_SHAPE,
+        # An exact base image, when one has been named. Empty means "the
+        # current one", and the pinning type below then holds THAT for this
+        # kernel's life -- so an unset value is still pinned, just not
+        # across jobs.
+        **({"docker_image": settings.docker_image}
+           if settings.docker_image else {}),
         # Hold the base image this kernel was created with, instead of
         # taking whatever is newest each time it runs. Kaggle rolls its
         # images without asking, and the CUDA driver in one is what

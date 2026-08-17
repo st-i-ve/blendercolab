@@ -2850,6 +2850,43 @@ document.getElementById('sel-blender').addEventListener('change', e => {
   backend && backend.setPreference('blenderVersion', JSON.stringify(e.target.value));
 });
 
+/* THE MACHINE TO ASK KAGGLE FOR. The buttons are built from what Python
+   sent (preferences.machineShapes), never from a list written here: an
+   invalid shape string is accepted at push time with no error and silently
+   gives a single P100 instead, so the only safe source for these is the
+   same module that validates them. */
+function renderMachineChoices() {
+  const box = document.getElementById('seg-machine');
+  const shapes = prefs.machineShapes || {};
+  const names = Object.keys(shapes);
+  if (!names.length) { box.innerHTML = ''; return; }
+  box.innerHTML = names.map(name =>
+    `<button data-v="${esc(name)}">${esc(shapes[name])}</button>`).join('');
+  box.querySelectorAll('button').forEach(b =>
+    b.classList.toggle('on', b.dataset.v === prefs.machineShape));
+}
+
+document.getElementById('seg-machine').addEventListener('click', e => {
+  const value = e.target.dataset && e.target.dataset.v;
+  if (!value || value === prefs.machineShape) return;
+  prefs.machineShape = value;
+  renderMachineChoices();
+  if (backend) backend.setPreference('machineShape', JSON.stringify(value));
+});
+
+document.getElementById('session-timeout').addEventListener('change', e => {
+  /* Minutes, as typed. Python clamps to Kaggle's 12-hour ceiling and to 0,
+     which is why nothing here tries to: one validator, in the language
+     that also has to defend against a hand-edited settings file. */
+  backend && backend.setPreference('sessionTimeout',
+                                   JSON.stringify(+e.target.value));
+});
+
+document.getElementById('docker-image').addEventListener('change', e => {
+  backend && backend.setPreference('dockerImage',
+                                   JSON.stringify(e.target.value.trim()));
+});
+
 function syncSettingsControls() {
   document.querySelectorAll('#seg-theme button').forEach(b =>
     b.classList.toggle('on', b.dataset.v === prefs.theme));
@@ -2865,6 +2902,20 @@ function syncSettingsControls() {
     .classList.toggle('on', prefs.frameThumbnails !== false);
   if (prefs.minGpus !== undefined) {
     document.getElementById('min-gpus').value = prefs.minGpus;
+  }
+  /* Each guarded on its own key, not on one flag: preferences from an
+     older settings file arrive without these, and an input silently set to
+     `undefined` reads as a blank the user then saves over their real
+     value. */
+  renderMachineChoices();
+  if (prefs.sessionTimeout !== undefined) {
+    document.getElementById('session-timeout').value = prefs.sessionTimeout;
+  }
+  if (prefs.sessionTimeoutMax !== undefined) {
+    document.getElementById('session-timeout').max = prefs.sessionTimeoutMax;
+  }
+  if (prefs.dockerImage !== undefined) {
+    document.getElementById('docker-image').value = prefs.dockerImage;
   }
 }
 

@@ -38,6 +38,7 @@ from blendfleet import crash_log
 from blendfleet.accounts import AccountStore
 from blendfleet.assignment import estimate
 from blendfleet.blender_versions import KNOWN_VERSIONS, validate_version
+from blendfleet.design import MACHINE_SHAPES, MAX_SESSION_TIMEOUT_MINUTES
 from blendfleet.fleet import (_capped_stem, _tokenless,
                               fingerprint_unreadable_entry)
 from blendfleet.instance_state import (GpuSnapshot, InstanceSnapshot,
@@ -936,6 +937,15 @@ class Session:
             "frameThumbnails": self.settings.frame_thumbnails,
             "font": self.settings.font,
             "closeAction": self.settings.close_action,
+            "machineShape": self.settings.machine_shape,
+            "sessionTimeout": self.settings.session_timeout_minutes,
+            "dockerImage": self.settings.docker_image,
+            # The names and labels, sent rather than duplicated in the page:
+            # an exact machine_shape string matters (an invalid one is
+            # accepted at push time and silently downgrades the hardware),
+            # so the page must offer only what Python validates.
+            "machineShapes": dict(MACHINE_SHAPES),
+            "sessionTimeoutMax": MAX_SESSION_TIMEOUT_MINUTES,
         })
 
     def diagnostics(self) -> str:
@@ -1295,7 +1305,10 @@ class Session:
                    "translucent": "translucent", "sound": "sound",
                    "minGpus": "min_gpus", "blenderVersion": "blender_version",
                    "frameThumbnails": "frame_thumbnails", "font": "font",
-                   "closeAction": "close_action"}
+                   "closeAction": "close_action",
+                   "machineShape": "machine_shape",
+                   "sessionTimeout": "session_timeout_minutes",
+                   "dockerImage": "docker_image"}
         field = mapping.get(key)
         if field is None:
             return
@@ -1525,7 +1538,16 @@ class Session:
             int(options.get("samples", 128)), options.get("format", "PNG"),
             blender_version=validate_version(
                 options.get("blenderVersion") or self.settings.blender_version),
-            min_gpus=self.settings.min_gpus)
+            min_gpus=self.settings.min_gpus,
+            # The three session-level choices, read here rather than
+            # defaulted in the builder so a render always reflects what is
+            # currently saved -- including a machine_shape the user changed
+            # a minute ago. Minutes on the way in, seconds on the way out:
+            # the setting is in the unit a person types, the API takes the
+            # unit a machine wants.
+            machine_shape=self.settings.machine_shape,
+            session_timeout_seconds=self.settings.session_timeout_minutes * 60,
+            docker_image=self.settings.docker_image)
         all_accounts = self.store.list()
         blend = self.blend
         # Built once, here, so both the free-accounts check below and
@@ -1652,7 +1674,16 @@ class Session:
             int(options.get("samples", 128)), options.get("format", "PNG"),
             blender_version=validate_version(
                 options.get("blenderVersion") or self.settings.blender_version),
-            min_gpus=self.settings.min_gpus)
+            min_gpus=self.settings.min_gpus,
+            # The three session-level choices, read here rather than
+            # defaulted in the builder so a render always reflects what is
+            # currently saved -- including a machine_shape the user changed
+            # a minute ago. Minutes on the way in, seconds on the way out:
+            # the setting is in the unit a person types, the API takes the
+            # unit a machine wants.
+            machine_shape=self.settings.machine_shape,
+            session_timeout_seconds=self.settings.session_timeout_minutes * 60,
+            docker_image=self.settings.docker_image)
         all_accounts = self.store.list()
         fleet = self.fleet_factory(all_accounts)
 
@@ -1842,7 +1873,16 @@ class Session:
         settings = RenderSettings(
             1920, 1080, 128,
             blender_version=validate_version(self.settings.blender_version),
-            min_gpus=self.settings.min_gpus)
+            min_gpus=self.settings.min_gpus,
+            # The three session-level choices, read here rather than
+            # defaulted in the builder so a render always reflects what is
+            # currently saved -- including a machine_shape the user changed
+            # a minute ago. Minutes on the way in, seconds on the way out:
+            # the setting is in the unit a person types, the API takes the
+            # unit a machine wants.
+            machine_shape=self.settings.machine_shape,
+            session_timeout_seconds=self.settings.session_timeout_minutes * 60,
+            docker_image=self.settings.docker_image)
 
         def work():
             return self.fleet_factory(accounts).start_workers(

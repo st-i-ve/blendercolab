@@ -20,8 +20,12 @@ from blendfleet.platform_paths import config_dir
 # Importing ui.theme here would make PySide6 a dependency of anything that
 # reads settings, including the headless sidecar that exists to avoid it.
 from blendfleet.design import (ACCENT_NAMES as ACCENTS, DEFAULT_ACCENT,
-                               DEFAULT_FONT, DEFAULT_THEME,
+                               DEFAULT_FONT, DEFAULT_MACHINE_SHAPE,
+                               DEFAULT_SESSION_TIMEOUT_MINUTES,
+                               DEFAULT_THEME,
                                FONT_FAMILIES as FONTS,
+                               MACHINE_SHAPES,
+                               MAX_SESSION_TIMEOUT_MINUTES,
                                THEME_NAMES as THEMES)
 
 FILENAME = "settings.json"
@@ -93,6 +97,22 @@ class Settings:
     # there is nothing to keep running for, and a tray icon for an idle
     # app is litter.
     close_action: str = "ask"
+    # Which machine every render asks Kaggle for. Was hardcoded in
+    # notebook_builder; a choice because two T4s and one P100 are genuinely
+    # different trades (see design.MACHINE_SHAPES).
+    machine_shape: str = DEFAULT_MACHINE_SHAPE
+    # Minutes a session may run before Kaggle stops it. 0 leaves Kaggle's
+    # own limit in force, which is what this app did until now -- and a
+    # hung render then spends hours of quota with nobody watching.
+    session_timeout_minutes: int = DEFAULT_SESSION_TIMEOUT_MINUTES
+    # An exact Kaggle base image, e.g.
+    # "gcr.io/kaggle-images/python@sha256:...". Empty means "whatever is
+    # current", which is the default and is what
+    # docker_image_pinning_type=original then holds for that kernel's life.
+    # Naming one pins every render on it across jobs -- until Kaggle
+    # retires it, which is why this is a field a user can change and not a
+    # constant in the source.
+    docker_image: str = ""
 
     def __post_init__(self) -> None:
         # Total, not just "wrong value": a hand-edited or forward-dated
@@ -146,6 +166,36 @@ class Settings:
                 self.blender_version = validate_version(self.blender_version)
             except ValueError:
                 self.blender_version = DEFAULT_VERSION
+        # A whitelist, unlike blender_version, and for the opposite reason:
+        # Kaggle accepts an invalid machine_shape at push time with NO
+        # error and silently gives a single P100 instead. An unrecognised
+        # value here would therefore not fail loudly, it would quietly
+        # halve the hardware -- so only the exact strings measured to work
+        # are allowed through.
+        if (not isinstance(self.machine_shape, str)
+                or self.machine_shape not in MACHINE_SHAPES):
+            self.machine_shape = DEFAULT_MACHINE_SHAPE
+        # Clamped rather than rejected: a number too large is a request
+        # Kaggle ignores, and one too small would stop a render before it
+        # rendered anything. bool excluded explicitly, as min_gpus does.
+        if (not isinstance(self.session_timeout_minutes, int)
+                or isinstance(self.session_timeout_minutes, bool)
+                or self.session_timeout_minutes < 0):
+            self.session_timeout_minutes = DEFAULT_SESSION_TIMEOUT_MINUTES
+        elif self.session_timeout_minutes > MAX_SESSION_TIMEOUT_MINUTES:
+            self.session_timeout_minutes = MAX_SESSION_TIMEOUT_MINUTES
+        # Shape only, not a whitelist: image digests are Kaggle's to mint
+        # and this app has no list of them. Whitespace is stripped because a
+        # pasted digest usually arrives with some, and a value with spaces
+        # inside is not an image reference at all -- that one is dropped
+        # rather than sent, since a malformed image is a render that fails
+        # at session start for a reason the page could not explain.
+        if not isinstance(self.docker_image, str):
+            self.docker_image = ""
+        else:
+            self.docker_image = self.docker_image.strip()
+            if " " in self.docker_image:
+                self.docker_image = ""
 
     def _path(self) -> Path:
         return config_dir() / FILENAME
@@ -177,4 +227,8 @@ class Settings:
             frame_thumbnails=data.get("frame_thumbnails", True),
             font=data.get("font", DEFAULT_FONT),
             close_action=data.get("close_action", DEFAULT_CLOSE_ACTION),
+            machine_shape=data.get("machine_shape", DEFAULT_MACHINE_SHAPE),
+            session_timeout_minutes=data.get(
+                "session_timeout_minutes", DEFAULT_SESSION_TIMEOUT_MINUTES),
+            docker_image=data.get("docker_image", ""),
         )

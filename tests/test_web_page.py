@@ -2580,3 +2580,79 @@ def test_a_download_that_produced_no_zip_does_not_name_a_file(loaded_page):
         "message:'Nothing to collect yet'}})")
     assert "No zip was written" in html
     assert ".zip" not in html.replace("Nothing to collect yet", "")
+
+
+# --------------------------------------------------------------------------
+# The session controls: the machine to ask for, the timeout, the pinned
+# image. Driven in the real page rather than asserted as text, because the
+# thing worth checking is that renderMachineChoices() actually BUILDS the
+# buttons from what Python sent -- the page deliberately keeps no list of
+# machine shapes of its own, since an invalid shape is accepted at push
+# time with no error and silently halves the hardware.
+# --------------------------------------------------------------------------
+
+def _evaluate(page, expression):
+    """One JS expression, stringified, with exceptions surfaced."""
+    out = {}
+    loop = QEventLoop()
+
+    def done(result):
+        out["value"] = result if result is not None else ""
+        loop.quit()
+
+    page.runJavaScript(
+        "(() => { try { return String(" + expression + ");"
+        " } catch (e) { return 'THREW ' + e; } })()", done)
+    QTimer.singleShot(5000, loop.quit)
+    loop.exec()
+    assert "value" in out, "the page never answered runJavaScript"
+    assert not str(out["value"]).startswith("THREW"), out["value"]
+    return out["value"]
+
+
+def test_the_three_session_controls_are_on_the_settings_page(loaded_page):
+    page, _ = loaded_page
+    for control in ("seg-machine", "session-timeout", "docker-image"):
+        assert _evaluate(page, f"!!document.getElementById('{control}')") \
+            == "true", f"{control} is missing from the settings page"
+
+
+def test_the_machine_buttons_are_built_from_what_python_sent(loaded_page):
+    """Two shapes in, two buttons out, labelled as Python labelled them and
+    carrying the exact string Python validates."""
+    page, _ = loaded_page
+    built = _evaluate(page, """
+      (() => {
+        prefs.machineShapes = {NvidiaTeslaT4: 'T4 x2', NvidiaTeslaP100: 'P100'};
+        prefs.machineShape = 'NvidiaTeslaP100';
+        renderMachineChoices();
+        const buttons = [...document.querySelectorAll('#seg-machine button')];
+        return JSON.stringify({
+          values: buttons.map(b => b.dataset.v),
+          labels: buttons.map(b => b.textContent),
+          on: buttons.filter(b => b.classList.contains('on')).map(b => b.dataset.v),
+        });
+      })()
+    """)
+    answer = json_loads(built)
+
+    assert answer["values"] == ["NvidiaTeslaT4", "NvidiaTeslaP100"]
+    assert answer["labels"] == ["T4 x2", "P100"]
+    assert answer["on"] == ["NvidiaTeslaP100"], (
+        "the saved choice is not the one shown as chosen")
+
+
+def test_no_shapes_means_no_buttons_rather_than_an_invented_one(loaded_page):
+    """A payload from an older backend carries no machineShapes. Inventing
+    a button here would offer a value this app cannot promise Kaggle
+    accepts."""
+    page, _ = loaded_page
+    empty = _evaluate(page, """
+      (() => {
+        prefs.machineShapes = {};
+        renderMachineChoices();
+        return document.querySelectorAll('#seg-machine button').length;
+      })()
+    """)
+
+    assert empty == "0"
