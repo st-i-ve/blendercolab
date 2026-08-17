@@ -22,16 +22,17 @@
       <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="1.5" y="1.5" width="5.5" height="5.5" rx="1.6" stroke="currentColor" stroke-width="1.4"/><rect x="9" y="1.5" width="5.5" height="5.5" rx="1.6" stroke="currentColor" stroke-width="1.4"/><rect x="1.5" y="9" width="5.5" height="5.5" rx="1.6" stroke="currentColor" stroke-width="1.4"/><rect x="9" y="9" width="5.5" height="5.5" rx="1.6" stroke="currentColor" stroke-width="1.4"/></svg>
       <span class="nav-txt">Dashboard</span><span class="pill" id="nav-running">0</span>
     </button>
-    <button class="nav-btn" data-page="files" data-tip="Files">
-      <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M2.5 4.5c0-1.1.9-2 2-2h2l1.5 1.8h4c1.1 0 2 .9 2 2v5.2c0 1.1-.9 2-2 2h-7.5c-1.1 0-2-.9-2-2V4.5z" stroke="currentColor" stroke-width="1.4"/></svg>
-      <span class="nav-txt">Files</span><span class="pill" id="nav-files">0</span>
-    </button>
-    <!-- Between Files and Instances because that is the order of the work:
-         get a scene onto Kaggle, decide how to render it, then look at the
-         machines. Lucide's `sliders-horizontal`. -->
+    <!-- Above Files: this is where a render is set up and started, which
+         is what the app is FOR -- and it now picks its own scene, so Files
+         is the library you visit to add to it rather than a step you pass
+         through first. Lucide's `sliders-horizontal`. -->
     <button class="nav-btn" data-page="render" data-tip="Render">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="21" x2="14" y1="4" y2="4"/><line x1="10" x2="3" y1="4" y2="4"/><line x1="21" x2="12" y1="12" y2="12"/><line x1="8" x2="3" y1="12" y2="12"/><line x1="21" x2="16" y1="20" y2="20"/><line x1="12" x2="3" y1="20" y2="20"/><line x1="14" x2="14" y1="2" y2="6"/><line x1="8" x2="8" y1="10" y2="14"/><line x1="16" x2="16" y1="18" y2="22"/></svg>
       <span class="nav-txt">Render</span>
+    </button>
+    <button class="nav-btn" data-page="files" data-tip="Files">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M2.5 4.5c0-1.1.9-2 2-2h2l1.5 1.8h4c1.1 0 2 .9 2 2v5.2c0 1.1-.9 2-2 2h-7.5c-1.1 0-2-.9-2-2V4.5z" stroke="currentColor" stroke-width="1.4"/></svg>
+      <span class="nav-txt">Files</span><span class="pill" id="nav-files">0</span>
     </button>
     <button class="nav-btn" data-page="instances" data-tip="Instances">
       <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="1.5" y="2.5" width="13" height="4.5" rx="1.6" stroke="currentColor" stroke-width="1.4"/><rect x="1.5" y="9" width="13" height="4.5" rx="1.6" stroke="currentColor" stroke-width="1.4"/><circle cx="4.2" cy="4.75" r=".9" fill="currentColor"/><circle cx="4.2" cy="11.25" r=".9" fill="currentColor"/></svg>
@@ -219,7 +220,7 @@
             <div class="panel">
               <div class="fr-actions" style="margin-top:0;align-items:center">
                 <button class="btn" id="btn-pick-many">Choose .blend files…</button>
-                <select id="bulk-account" aria-label="Account to upload to"></select>
+                <select id="bulk-account" aria-label="Account to upload to" data-empty-label="no accounts yet"></select>
                 <button class="btn primary" id="btn-bulk-upload" disabled>Upload them</button>
               </div>
               <div class="dz-sub" style="margin-top:10px">Uploaded one at a time to the account you pick — each becomes its own dataset, ready to render whenever. An account holding nothing has all its Kaggle storage free.</div>
@@ -288,10 +289,23 @@
            quota are a deliberate step rather than something you scroll
            past on the way to the scene library. -->
       <div class="page" id="page-render">
+        <!-- WHAT TO RENDER, chosen here. Before this the page could only
+             render whatever .blend had been picked on Files, and a scene
+             already on Kaggle could only be started from the library --
+             two ways to do one thing, in two places. The picker lists both
+             and the button below renders whichever is chosen. -->
+        <h2 class="sec">Scene <span class="meta" id="scene-pick-meta">nothing chosen</span></h2>
+        <div class="panel" style="padding:14px 17px;margin-bottom:20px">
+          <div class="fr-actions" style="margin-top:0;align-items:center">
+            <select id="render-scene" data-empty-label="no scene yet" aria-label="Scene to render"></select>
+            <button class="btn" id="btn-pick-render">Choose a .blend…</button>
+            <span class="dz-sub" id="render-scene-note">Scenes already on Kaggle render with no upload at all.</span>
+          </div>
+        </div>
+
+        <h2 class="sec">Render settings</h2>
         <div class="render-grid">
-          <div>
-            <h2 class="sec">Render settings</h2>
-            <div class="panel form">
+          <div class="panel form">
               <!-- Paired, because they are read in pairs: a frame RANGE,
                    a frame SIZE. Nine full-width boxes down a column made
                    the panel twice as tall as the work beside it and hid
@@ -302,9 +316,9 @@
                 <div class="f-row"><label>Width</label><input id="f-rx" type="number" min="64" value="1920"></div>
                 <div class="f-row"><label>Height</label><input id="f-ry" type="number" min="64" value="1080"></div>
                 <div class="f-row"><label>Samples</label><input id="f-spp" type="number" min="1" value="128"></div>
-                <div class="f-row"><label>Format</label><select id="f-fmt"><option>PNG</option><option>JPEG</option></select></div>
+                <div class="f-row"><label>Format</label><select id="f-fmt" data-block="1"><option>PNG</option><option>JPEG</option></select></div>
               </div>
-              <div class="f-row"><label>Blender</label><select id="sel-blender"></select></div>
+              <div class="f-row"><label>Blender</label><select id="sel-blender" data-block="1" data-empty-label="asking Kaggle…"></select></div>
               <!-- One checkbox per account, so this scene lands only on
                    machines actually chosen for it. Absent selection means
                    "every free account" (launch()'s own default); an
@@ -312,6 +326,27 @@
                    disabled -- ticking it would spend that account's quota
                    twice for the same output, which is never offered as a
                    choice. -->
+              <!-- Two settings that existed in the backend and never
+                   reached the page: both default to on, both were
+                   therefore unchangeable. Named for what they do to a
+                   render, not for the flag they set. -->
+              <div class="f-row">
+                <label>Extras</label>
+                <div class="opt-row">
+                  <div class="toggle on" id="tgl-post-gpu" role="switch" tabindex="0" aria-checked="true"></div>
+                  <div class="opt-txt"><b>Denoise and composite on the GPU</b>
+                    <span>Cycles does both on the CPU by default, and a Kaggle box has four cores next to two datacentre GPUs. Off only if a scene's compositor misbehaves on GPU.</span></div>
+                </div>
+                <div class="opt-row">
+                  <div class="toggle on" id="tgl-live-previews" role="switch" tabindex="0" aria-checked="true"></div>
+                  <div class="opt-txt"><b>Live frame previews</b>
+                    <span>A small JPEG of each finished frame, pushed down the log stream so a render can be watched while it runs. Kaggle releases a session's real output only when it ends.</span></div>
+                </div>
+              </div>
+            </div>
+
+          <div>
+            <div class="panel form">
               <div class="f-row">
                 <label>Render on</label>
                 <div id="assign-list" class="assign-list"></div>

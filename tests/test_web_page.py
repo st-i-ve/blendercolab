@@ -16,6 +16,8 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu --no-sandbox")
 
+import time
+
 import pytest
 from PySide6.QtCore import QEventLoop, QTimer, QUrl
 from PySide6.QtWidgets import QApplication
@@ -2858,3 +2860,145 @@ def test_number_fields_do_not_show_native_spinners(loaded_page):
     """)
 
     assert appearance in ("textfield", "auto"), appearance
+
+
+# --------------------------------------------------------------------------
+# The dropdown. A native <select> opens an OPERATING-SYSTEM window, which
+# CSS cannot reach into -- so a white list with a bright blue selected row
+# survived two rounds of styling the closed control. These check the part
+# that actually fixes it: the list is in the PAGE, and the <select> is
+# still what holds the value.
+# --------------------------------------------------------------------------
+
+def test_a_dropdowns_list_is_in_the_page_not_the_operating_system(loaded_page):
+    view, _ = loaded_page
+    answer = _evaluate(view, """
+      (() => {
+        const wrap = document.getElementById('f-fmt').closest('.sel-wrap');
+        wrap.querySelector('.sel-btn').click();
+        const rows = [...wrap.querySelectorAll('.sel-opt')];
+        return JSON.stringify({
+          open: wrap.classList.contains('open'),
+          rows: rows.map(r => r.textContent),
+          selected: rows.filter(r => r.getAttribute('aria-selected') === 'true')
+            .map(r => r.textContent),
+          hiddenNative: getComputedStyle(document.getElementById('f-fmt')).opacity,
+        });
+      })()
+    """)
+    state = json_loads(answer)
+
+    assert state["open"] is True
+    assert state["rows"] == ["PNG", "JPEG"], state["rows"]
+    assert state["selected"] == ["PNG"]
+    # The real control is still there -- it holds the value and fires
+    # change -- but it is not what anybody sees.
+    assert state["hiddenNative"] == "0"
+
+
+def test_choosing_a_row_sets_the_select_and_fires_change(loaded_page):
+    """The <select> stays authoritative: renderOptions() reads `.value`,
+    and every existing listener is bound to `change`. A picker that only
+    updated its own label would silently render the wrong format."""
+    view, _ = loaded_page
+    answer = _evaluate(view, """
+      (() => {
+        const select = document.getElementById('f-fmt');
+        select.value = 'PNG';
+        let heard = 0;
+        const listen = () => { heard += 1; };
+        select.addEventListener('change', listen);
+        const wrap = select.closest('.sel-wrap');
+        wrap.querySelector('.sel-btn').click();
+        [...wrap.querySelectorAll('.sel-opt')]
+          .find(r => r.textContent === 'JPEG').click();
+        select.removeEventListener('change', listen);
+        return JSON.stringify({
+          value: select.value,
+          label: wrap.querySelector('.sel-btn').textContent,
+          heard: heard,
+          stillOpen: wrap.classList.contains('open'),
+        });
+      })()
+    """)
+    state = json_loads(answer)
+
+    assert state["value"] == "JPEG"
+    assert state["label"] == "JPEG", "the button did not follow the value"
+    assert state["heard"] == 1, "no change event reached existing listeners"
+    assert state["stillOpen"] is False, "choosing a row must close the list"
+
+
+def test_a_dropdown_filled_after_load_still_gets_its_rows(loaded_page):
+    """Two of these are populated by the backend after the page has loaded
+    (Blender versions, the account list) and one is rebuilt on every state
+    tick, by code that knows nothing about this component."""
+    view, _ = loaded_page
+    # Two evaluations rather than one returning a Promise: runJavaScript
+    # hands back a VALUE, and a promise stringifies as "[object Promise]".
+    # The gap is also what makes this a real test of the MutationObserver --
+    # nothing here dispatches an event to nudge the component.
+    _evaluate(view, """
+      (() => {
+        const select = document.getElementById('sel-blender');
+        select.innerHTML = '<option>5.2.0</option><option>4.5.3</option>';
+        return 'set';
+      })()
+    """)
+    time.sleep(0.2)
+    rows = _evaluate(view, """
+      [...document.getElementById('sel-blender').closest('.sel-wrap')
+        .querySelectorAll('.sel-opt')].map(r => r.textContent).join(',')
+    """)
+
+    assert rows == "5.2.0,4.5.3", rows
+
+
+def test_an_empty_dropdown_says_so_and_opens_nothing(loaded_page):
+    """An empty <select> here means the backend has not answered yet.
+    Inviting a click that opens an empty box is worse than saying so."""
+    view, _ = loaded_page
+    _evaluate(view, "(() => { document.getElementById('sel-blender')"
+                    ".innerHTML = ''; return 'cleared'; })()")
+    time.sleep(0.2)
+    answer = _evaluate(view, """
+      (() => {
+        const wrap = document.getElementById('sel-blender').closest('.sel-wrap');
+        wrap.querySelector('.sel-btn').click();
+        return JSON.stringify({
+          label: wrap.querySelector('.sel-btn').textContent,
+          open: wrap.classList.contains('open'),
+        });
+      })()
+    """)
+    state = json_loads(answer)
+
+    assert state["label"] == "asking Kaggle…"
+    assert state["open"] is False
+
+
+def test_the_render_page_can_choose_between_local_and_kaggle_scenes(loaded_page):
+    """The page called Render is where a render is started, so it is where
+    the scene is chosen. A library scene renders with no upload; the local
+    .blend has to be sent first, and the note says which will happen."""
+    view, _ = loaded_page
+    answer = _evaluate(view, """
+      (() => {
+        chosenBlendName = 'waydown.blend';
+        libraryScenes = [{slug: 'user_0/supra-blend', name: 'supra',
+                          sizeBytes: 1024 * 1024 * 72}];
+        renderScenePicker();
+        const select = document.getElementById('render-scene');
+        const first = [...select.options].map(o => o.value);
+        select.value = 'kaggle:user_0/supra-blend';
+        renderScenePicker();
+        return JSON.stringify({
+          values: first,
+          noteForKaggle: document.getElementById('render-scene-note').textContent,
+        });
+      })()
+    """)
+    state = json_loads(answer)
+
+    assert state["values"] == ["local", "kaggle:user_0/supra-blend"]
+    assert "no upload" in state["noteForKaggle"]

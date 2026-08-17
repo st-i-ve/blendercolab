@@ -1714,7 +1714,13 @@ class Session:
             # unit a machine wants.
             machine_shape=self.settings.machine_shape,
             session_timeout_seconds=self.settings.session_timeout_minutes * 60,
-            docker_image=self.settings.docker_image)
+            docker_image=self.settings.docker_image,
+            # Per-render, from the page's own switches. Both default to the
+            # dataclass default when absent, which is what every caller
+            # that predates them still sends -- so an older page (or the Qt
+            # build mid-upgrade) keeps the behaviour it had.
+            post_on_gpu=bool(options.get("postOnGpu", True)),
+            live_previews=bool(options.get("livePreviews", True)))
         all_accounts = self.store.list()
         blend = self.blend
         # Built once, here, so both the free-accounts check below and
@@ -1850,7 +1856,13 @@ class Session:
             # unit a machine wants.
             machine_shape=self.settings.machine_shape,
             session_timeout_seconds=self.settings.session_timeout_minutes * 60,
-            docker_image=self.settings.docker_image)
+            docker_image=self.settings.docker_image,
+            # Per-render, from the page's own switches. Both default to the
+            # dataclass default when absent, which is what every caller
+            # that predates them still sends -- so an older page (or the Qt
+            # build mid-upgrade) keeps the behaviour it had.
+            post_on_gpu=bool(options.get("postOnGpu", True)),
+            live_previews=bool(options.get("livePreviews", True)))
         all_accounts = self.store.list()
         fleet = self.fleet_factory(all_accounts)
 
@@ -2050,6 +2062,12 @@ class Session:
             machine_shape=self.settings.machine_shape,
             session_timeout_seconds=self.settings.session_timeout_minutes * 60,
             docker_image=self.settings.docker_image)
+        # No post_on_gpu / live_previews here on purpose: a warm worker is
+        # started with NO render in hand -- there is no options payload at
+        # this point, and the job it eventually picks up carries its own
+        # (see sendJob). An earlier edit set them from `options` here and
+        # that name does not exist in this method: warm workers would have
+        # died with a NameError the moment somebody pressed Start.
 
         def work():
             return self.fleet_factory(accounts).start_workers(

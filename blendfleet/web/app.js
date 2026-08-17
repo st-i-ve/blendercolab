@@ -1118,6 +1118,25 @@ let assignTouched = false;
    still defaults to ticked. */
 const assignUnchecked = new Set();
 
+/* Per-render switches, not preferences: they sit with the frame range and
+   the resolution because that is what they are -- how THIS render runs.
+   Nothing is saved, exactly as nothing saves the resolution. */
+function localSwitch(id) {
+  const el = document.getElementById(id);
+  const flip = () => {
+    const next = !el.classList.contains('on');
+    el.classList.toggle('on', next);
+    el.setAttribute('aria-checked', String(next));
+  };
+  el.addEventListener('click', flip);
+  el.addEventListener('keydown', e => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); flip(); }
+  });
+  return () => el.classList.contains('on');
+}
+const postOnGpu = localSwitch('tgl-post-gpu');
+const livePreviews = localSwitch('tgl-live-previews');
+
 function renderOptions() {
   const options = {
     startFrame: +document.getElementById('f-start').value,
@@ -1127,6 +1146,10 @@ function renderOptions() {
     samples: +document.getElementById('f-spp').value,
     format: document.getElementById('f-fmt').value,
     blenderVersion: document.getElementById('sel-blender').value,
+    /* Both existed on RenderSettings and defaulted to true, which meant
+       nobody could turn either off. Sent explicitly now. */
+    postOnGpu: postOnGpu(),
+    livePreviews: livePreviews(),
   };
   if (assignTouched) {
     options.labels = Array.from(
@@ -1408,6 +1431,8 @@ function showUploadStage(p) {
 
 function renderDataset(state) {
   const ds = state.dataset;
+  chosenBlendName = state.blend ? state.blend.name : '';
+  renderScenePicker();
   document.getElementById('ds-blend').textContent =
     state.blend ? state.blend.name : '—';
   document.getElementById('ds-slug').textContent =
@@ -1437,8 +1462,71 @@ function fmtBytes(bytes) {
   return `${n.toFixed(n < 10 && i ? 1 : 0)} ${units[i]}`;
 }
 
-document.getElementById('btn-render').onclick = () =>
-  backend && backend.launch(JSON.stringify(renderOptions()));
+/* ---- WHICH SCENE THIS PAGE RENDERS ------------------------------------
+   Two sources, one picker: the .blend chosen on this machine (which has to
+   be uploaded first, and `launch` does that) and every scene already on
+   Kaggle (which renders with no upload at all, through `renderScene`).
+   Before this, the second kind could only be started from the library on
+   Files -- two ways to do one thing, in two places, and neither of them
+   was on the page called Render. */
+let libraryScenes = [];
+/* The .blend chosen on this machine, as the state payload reports it.
+   Kept here so the picker has one source for it rather than reading the
+   DOM text that renderDataset happens to have written. */
+let chosenBlendName = '';
+
+function renderScenePicker() {
+  const select = document.getElementById('render-scene');
+  const chosen = select.value;
+  const local = chosenBlendName.trim();
+  const rows = [];
+  if (local) {
+    rows.push(`<option value="local">${esc(local)} — on this machine</option>`);
+  }
+  libraryScenes.forEach(scene => {
+    rows.push(`<option value="kaggle:${esc(scene.slug)}">${
+      esc(scene.name)} — on Kaggle (${fmtBytes(scene.sizeBytes)})</option>`);
+  });
+  select.innerHTML = rows.join('');
+  if (chosen) select.value = chosen;
+  if (!select.value && select.options.length) select.selectedIndex = 0;
+
+  const meta = document.getElementById('scene-pick-meta');
+  const note = document.getElementById('render-scene-note');
+  if (!select.options.length) {
+    meta.textContent = 'nothing chosen';
+    note.textContent = 'Choose a .blend here, or upload one on Files to '
+      + 'render it later without sending it again.';
+    return;
+  }
+  const isLocal = select.value === 'local';
+  meta.textContent = select.selectedOptions[0].textContent;
+  /* Says which of the two things pressing Render will do, because one of
+     them uploads 400 MB first and the other does not. */
+  note.textContent = isLocal
+    ? 'Rendering this uploads it to Kaggle first, then starts.'
+    : 'Already on Kaggle — renders with no upload at all.';
+}
+
+document.getElementById('render-scene').addEventListener('change',
+                                                         renderScenePicker);
+document.getElementById('btn-pick-render').onclick = () => {
+  if (backend) backend.pickBlend();
+};
+
+document.getElementById('btn-render').onclick = () => {
+  if (!backend) return;
+  const choice = document.getElementById('render-scene').value;
+  const options = JSON.stringify(renderOptions());
+  if (choice && choice.startsWith('kaggle:')) {
+    backend.renderScene(choice.slice('kaggle:'.length), options);
+    return;
+  }
+  /* No choice at all still means launch(), which refuses with its own
+     message ("Choose a .blend file first") rather than this page inventing
+     one. */
+  backend.launch(options);
+};
 document.getElementById('btn-cancel').onclick = () => backend && backend.cancelAll();
 document.getElementById('btn-collect').onclick = () => backend && backend.collect('');
 
@@ -1506,6 +1594,10 @@ function renderScenes(json) {
   const scenes = payload.scenes || [];
   const errors = payload.errors || {};
   const errNames = Object.keys(errors);
+  /* The Render page's picker lists these too -- scenes() is asked once and
+     both readers use the answer, rather than the picker asking again. */
+  libraryScenes = scenes;
+  renderScenePicker();
 
   const errBox = document.getElementById('scene-errors');
   errBox.classList.toggle('show', errNames.length > 0);
@@ -2282,6 +2374,136 @@ document.getElementById('btn-stop-all').onclick = () =>
   backend && backend.cancelAll();
 document.getElementById('btn-send-job').onclick = () =>
   backend && backend.sendJob(JSON.stringify(renderOptions()));
+
+/* ---- THE DROPDOWN, DRAWN BY THIS APP ---------------------------------
+   A native <select> opens an OPERATING-SYSTEM window. `appearance:none`
+   restyles the closed control and cannot touch that list, which is why a
+   white list with a bright blue selected row survived being "fixed" twice:
+   there was nothing in the page to style.
+
+   So the list is ours, and the <select> stays -- hidden, and still the
+   only thing that holds the value. Everything that already reads or writes
+   these controls (renderOptions, syncSettingsControls, renderBulkAccounts,
+   the change listeners) keeps working with no knowledge of this: choosing
+   a row sets `select.value` and dispatches a real `change` event.
+
+   The options are re-read from the <select> whenever its children change,
+   because two of these are filled by the backend after load (the Blender
+   versions, the account list) and one of them is rebuilt on every state
+   tick. */
+function enhanceSelect(select) {
+  if (select.dataset.enhanced) return;
+  select.dataset.enhanced = '1';
+
+  const wrap = document.createElement('div');
+  wrap.className = 'sel-wrap' + (select.dataset.block ? ' block' : '');
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'sel-btn';
+  button.setAttribute('role', 'combobox');
+  button.setAttribute('aria-expanded', 'false');
+  if (select.getAttribute('aria-label')) {
+    button.setAttribute('aria-label', select.getAttribute('aria-label'));
+  }
+  const menu = document.createElement('div');
+  menu.className = 'sel-menu';
+  menu.setAttribute('role', 'listbox');
+
+  select.parentNode.insertBefore(wrap, select);
+  wrap.append(select, button, menu);
+
+  const close = () => {
+    wrap.classList.remove('open');
+    button.setAttribute('aria-expanded', 'false');
+  };
+
+  function paint() {
+    const options = Array.from(select.options);
+    button.textContent = select.selectedOptions.length
+      ? select.selectedOptions[0].textContent
+      /* Not "Select…": an empty <select> here means the backend has not
+         answered yet, and inviting a click that opens nothing is worse
+         than saying so. */
+      : (select.dataset.emptyLabel || 'none available');
+    menu.innerHTML = '';
+    options.forEach(option => {
+      const row = document.createElement('button');
+      row.type = 'button';
+      row.className = 'sel-opt';
+      row.setAttribute('role', 'option');
+      row.setAttribute('aria-selected', String(option.selected));
+      row.textContent = option.textContent;
+      row.onclick = () => {
+        select.value = option.value;
+        /* A real event, bubbling, so the app's own listeners fire exactly
+           as they did when this was a native control. */
+        select.dispatchEvent(new Event('change', { bubbles: true }));
+        paint();
+        close();
+        button.focus();
+      };
+      menu.append(row);
+    });
+  }
+
+  button.onclick = () => {
+    if (!select.options.length) return;
+    const opening = !wrap.classList.contains('open');
+    /* One open at a time: two menus overlapping is a way to click the
+       wrong one. */
+    document.querySelectorAll('.sel-wrap.open').forEach(other => {
+      other.classList.remove('open');
+      const b = other.querySelector('.sel-btn');
+      if (b) b.setAttribute('aria-expanded', 'false');
+    });
+    wrap.classList.toggle('open', opening);
+    button.setAttribute('aria-expanded', String(opening));
+    if (opening) {
+      const chosen = menu.querySelector('[aria-selected="true"]') || menu.firstChild;
+      if (chosen && chosen.scrollIntoView) chosen.scrollIntoView({ block: 'nearest' });
+    }
+  };
+
+  /* Keyboard, because a <select> had one and losing it would be a
+     regression nobody notices until they cannot use the app without a
+     mouse. Arrow keys move the VALUE when closed, exactly as a native
+     select does. */
+  wrap.addEventListener('keydown', event => {
+    const options = Array.from(select.options);
+    if (!options.length) return;
+    const at = select.selectedIndex;
+    if (event.key === 'Escape') { close(); button.focus(); return; }
+    if (event.key === 'Enter' || event.key === ' ') {
+      if (!wrap.classList.contains('open')) { button.click(); event.preventDefault(); }
+      return;
+    }
+    let next = null;
+    if (event.key === 'ArrowDown') next = Math.min(at + 1, options.length - 1);
+    if (event.key === 'ArrowUp') next = Math.max(at - 1, 0);
+    if (event.key === 'Home') next = 0;
+    if (event.key === 'End') next = options.length - 1;
+    if (next === null) return;
+    event.preventDefault();
+    select.selectedIndex = next;
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+    paint();
+  });
+
+  /* Anywhere else closes it. Captured on the document because the click
+     that closes a menu is by definition not inside it. */
+  document.addEventListener('click', event => {
+    if (!wrap.contains(event.target)) close();
+  });
+
+  /* The three selects here are all filled or rebuilt by code that has no
+     idea this exists (blenderVersions(), renderBulkAccounts()), so the
+     menu follows the <select> rather than being told to. */
+  new MutationObserver(paint).observe(select, { childList: true, subtree: true });
+  select.addEventListener('change', paint);
+  paint();
+}
+
+document.querySelectorAll('select').forEach(enhanceSelect);
 
 /* ---- SEVERAL SCENES AT ONCE ------------------------------------------
    The queue is the backend's, always: this paints what uploadQueueChanged

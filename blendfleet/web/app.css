@@ -1188,6 +1188,54 @@ select{
    page while it is open. */
 select option{background:var(--card);color:var(--ink)}
 
+/* ---- A DROPDOWN THIS APP ACTUALLY DRAWS -------------------------------
+   appearance:none styles the CLOSED control and nothing else: the list a
+   native <select> opens is an operating-system window, and CSS cannot
+   reach inside it. On a black page that meant a white list with a bright
+   blue selected row -- the "legacy dropdown" that survived two attempts
+   to style it, because there was nothing there to style.
+   So the list is ours. The real <select> stays in the DOM, hidden but
+   authoritative: it holds the value, it fires `change`, and every existing
+   reader (renderOptions, syncSettingsControls, renderBulkAccounts) keeps
+   working untouched. See enhanceSelect in app.js. */
+.sel-wrap{position:relative;display:inline-block}
+.sel-wrap.block{display:block}
+/* Kept for the value and its events, taken out of the layout and out of
+   the tab order -- the button below is what a person sees and focuses. */
+.sel-wrap > select{position:absolute;width:1px;height:1px;opacity:0;pointer-events:none}
+.sel-btn{
+  display:flex;align-items:center;gap:8px;width:100%;
+  padding:10px 13px;padding-right:32px;border-radius:10px;
+  border:1px solid transparent;background:var(--fill);color:var(--ink);
+  font-family:var(--data);font-size:12.5px;text-align:left;cursor:pointer;
+  transition:border-color .15s,background .15s;
+  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12' fill='none'><path d='M2.5 4.5L6 8l3.5-3.5' stroke='%238f948f' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+  background-repeat:no-repeat;background-position:right 11px center;
+}
+.sel-btn:hover{background-color:var(--border)}
+.sel-btn:focus-visible,.sel-wrap.open .sel-btn{border-color:var(--accent);outline:none}
+.sel-menu{
+  position:absolute;z-index:120;top:calc(100% + 5px);left:0;min-width:100%;
+  max-height:264px;overflow:auto;padding:5px;
+  background:var(--card);border-radius:12px;box-shadow:var(--shadow-lg);
+  display:none;
+}
+/* A menu that is not open is not in the page: `display:none` rather than
+   opacity, so it cannot be tabbed into or read out while closed. */
+.sel-wrap.open .sel-menu{display:block}
+.sel-opt{
+  display:flex;align-items:center;gap:8px;width:100%;
+  padding:8px 11px;border-radius:8px;border:0;background:transparent;
+  color:var(--ink);font-family:var(--data);font-size:12.5px;
+  text-align:left;cursor:pointer;white-space:nowrap;
+}
+.sel-opt:hover,.sel-opt.active{background:var(--fill)}
+/* The chosen row is marked with the accent -- the same language the
+   segmented controls and swatches use for "this one" -- and never with
+   the system highlight blue, which belongs to no theme here. */
+.sel-opt[aria-selected="true"]{background:var(--accent);color:var(--accent-on)}
+.sel-opt[aria-selected="true"]:hover{background:var(--accent)}
+
 /* NUMBER FIELDS KEEP THEIR VALUE, NOT THEIR SPINNERS. Chromium's are
    native chrome in the middle of a themed page -- the same mismatch the
    select had -- and every number here (minimum GPUs, a timeout in
@@ -1203,12 +1251,9 @@ input[type=number]::-webkit-inner-spin-button{
    column of nine full-width boxes. */
 .f-grid{display:grid;grid-template-columns:1fr 1fr;gap:0 14px}
 @media(max-width:520px){.f-grid{grid-template-columns:1fr}}
-/* THE RENDER PAGE. One panel, held to a readable width rather than
-   stretched across a 1400px window: these are nine short fields and a
-   button, and a field box a metre wide reads as a mistake. Not centred --
-   left-aligned like every other page's first column, so switching pages
-   does not move the eye. */
-.render-grid{display:grid;grid-template-columns:minmax(0,520px);gap:20px}
+/* The render page's grid is defined once, further down (search
+   .render-grid): a single 520px column was the first attempt and left two
+   thirds of the window empty. */
 .f-err{
   display:none;font-family:var(--data);font-size:10.5px;
   color:var(--offline-ink);margin-top:5px;
@@ -1626,3 +1671,35 @@ button:focus:not(:focus-visible){outline:none}
 .fcell[data-frame]{cursor:pointer}
 .fcell[data-frame]:hover{outline:2px solid var(--accent);outline-offset:1px}
 .fcell[data-frame]:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+
+/* A form row's field fills the row: that was `.f-row select{width:100%}`,
+   and the wrapper is what has to carry it now that the <select> itself is
+   out of the layout. */
+.f-row .sel-wrap{display:block;width:100%}
+
+/* A switch with its own explanation, inside a form panel. The Settings
+   page's .set-row is for a full-width row with the control at the far
+   right; these sit under a field label, so the switch leads and the text
+   follows it. */
+.opt-row{display:flex;gap:11px;align-items:flex-start;margin-bottom:12px}
+.opt-row:last-child{margin-bottom:0}
+.opt-row .toggle{flex:none;margin-top:1px}
+.opt-txt{min-width:0}
+.opt-txt b{display:block;font-size:12.5px;color:var(--ink);margin-bottom:2px}
+.opt-txt span{display:block;font-family:var(--data);font-size:11px;line-height:1.55;color:var(--ink-3)}
+
+/* THE RENDER PAGE USES ITS WIDTH. One 520px strip put nine short fields in
+   a column and left two thirds of a 1400px window empty; the settings and
+   the machines to run them on are now side by side, which also puts the
+   button that spends quota next to the list of accounts it will spend. */
+.render-grid{
+  display:grid;grid-template-columns:minmax(0,1fr) minmax(280px,380px);
+  gap:20px;align-items:start;max-width:1180px;
+}
+@media(max-width:920px){.render-grid{grid-template-columns:minmax(0,1fr)}}
+
+/* A panel clips its content so its rounded corners mean something -- but
+   an OPEN dropdown has to be allowed out of it, or a list opening near the
+   bottom edge is cut in half. Only while one is open, so the corners still
+   clip everything else. */
+.panel:has(.sel-wrap.open),.set-card:has(.sel-wrap.open){overflow:visible}

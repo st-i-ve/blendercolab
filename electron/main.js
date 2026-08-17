@@ -373,6 +373,16 @@ function createWindow() {
           }).scrollIntoView({block: 'center'})`);
         await new Promise(done => setTimeout(done, 400));
       }
+      /* BLENDFLEET_SHOT_CLICK=<css selector> clicks it last of all. Some
+         states only exist while something is open -- a dropdown's list, a
+         panel -- and a screenshot of the closed thing cannot show whether
+         the open one is styled. */
+      if (process.env.BLENDFLEET_SHOT_CLICK) {
+        await win.webContents.executeJavaScript(
+          `document.querySelector(${
+            JSON.stringify(process.env.BLENDFLEET_SHOT_CLICK)}).click()`);
+        await new Promise(done => setTimeout(done, 350));
+      }
       const image = await win.webContents.capturePage();
       fs.writeFileSync(process.env.BLENDFLEET_SHOT, image.toPNG());
       console.log('captured', process.env.BLENDFLEET_SHOT);
