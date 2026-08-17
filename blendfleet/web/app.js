@@ -1137,6 +1137,41 @@ function localSwitch(id) {
 const postOnGpu = localSwitch('tgl-post-gpu');
 const livePreviews = localSwitch('tgl-live-previews');
 
+/* THREE STATES, not two: untouched -> on -> off -> untouched. "Untouched"
+   is what every one of these starts as, and it is the only state that
+   leaves the scene's own value alone -- so it has to be reachable again
+   after a click, or a mis-click could not be undone. */
+function triSwitch(id) {
+  const el = document.getElementById(id);
+  const paint = state => {
+    el.classList.toggle('on', state === true);
+    el.classList.toggle('mixed', state === null);
+    el.setAttribute('aria-checked', state === null ? 'mixed' : String(state));
+    el.dataset.state = state === null ? '' : String(state);
+  };
+  const step = () => {
+    const now = el.dataset.state;
+    paint(now === '' ? true : (now === 'true' ? false : null));
+  };
+  paint(null);
+  el.addEventListener('click', step);
+  el.addEventListener('keydown', e => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); step(); }
+  });
+  /* null when untouched, so renderOptions can send nothing at all. */
+  return () => (el.dataset.state === '' ? null : el.dataset.state === 'true');
+}
+const adaptive = triSwitch('tgl-adaptive');
+const denoise = triSwitch('tgl-denoise');
+const filmTransparent = triSwitch('tgl-transparent');
+
+/* A number the user typed, or null. An empty box is not a zero: zero is a
+   real value for a bounce limit, and "" has to stay "do not touch it". */
+function optionalNumber(id) {
+  const raw = document.getElementById(id).value.trim();
+  return raw === '' ? null : Number(raw);
+}
+
 function renderOptions() {
   const options = {
     startFrame: +document.getElementById('f-start').value,
@@ -1150,6 +1185,18 @@ function renderOptions() {
        nobody could turn either off. Sent explicitly now. */
     postOnGpu: postOnGpu(),
     livePreviews: livePreviews(),
+    /* Blender's own settings. Every one of these is null or "" unless the
+       user filled it in, and the backend reads that as "leave the scene
+       alone" -- see _tri in rpc/session.py and _tune in the notebook. */
+    resPct: optionalNumber('f-pct'),
+    timeLimit: optionalNumber('f-timelimit'),
+    noiseThreshold: optionalNumber('f-noise'),
+    maxBounces: optionalNumber('f-bounces'),
+    denoiser: document.getElementById('f-denoiser').value,
+    colorDepth: document.getElementById('f-depth').value,
+    adaptive: adaptive(),
+    denoise: denoise(),
+    filmTransparent: filmTransparent(),
   };
   if (assignTouched) {
     options.labels = Array.from(
@@ -1510,6 +1557,81 @@ function renderScenePicker() {
 
 document.getElementById('render-scene').addEventListener('change',
                                                          renderScenePicker);
+
+/* ---- FIND A SCENE ------------------------------------------------------
+   The picker handles a handful; this handles an account with a sea of
+   them. It searches what scenes() already returned rather than asking
+   Kaggle again -- so it opens instantly, and it can never show a list that
+   disagrees with the library on Files. */
+const sceneSearch = document.getElementById('scene-search');
+const sceneQuery = document.getElementById('scene-q');
+
+function renderSceneHits() {
+  const query = sceneQuery.value.trim().toLowerCase();
+  const hits = libraryScenes.filter(scene => !query
+    || scene.name.toLowerCase().includes(query)
+    || scene.slug.toLowerCase().includes(query));
+  const local = chosenBlendName.trim();
+  const showLocal = local && (!query || local.toLowerCase().includes(query));
+
+  document.getElementById('scene-q-meta').textContent = query
+    ? `${hits.length + (showLocal ? 1 : 0)} of ${
+        libraryScenes.length + (local ? 1 : 0)} match`
+    : `${libraryScenes.length} on Kaggle${local ? ', 1 on this machine' : ''}`;
+
+  const rows = [];
+  if (showLocal) {
+    rows.push(`<button class="hit" data-pick="local">
+      <b>${esc(local)}</b><span>on this machine · uploads before it renders</span>
+    </button>`);
+  }
+  hits.forEach(scene => {
+    rows.push(`<button class="hit" data-pick="kaggle:${esc(scene.slug)}">
+      <b>${esc(scene.name)}</b><span>${esc(scene.owner)} · ${
+        fmtBytes(scene.sizeBytes)} · ${esc(scene.slug)}</span>
+    </button>`);
+  });
+  const box = document.getElementById('scene-hits');
+  box.innerHTML = rows.join('') || `<div class="empty">${
+    query ? 'Nothing matches that.' : 'No scenes on Kaggle yet.'}</div>`;
+  box.querySelectorAll('[data-pick]').forEach(row => {
+    row.onclick = () => {
+      const select = document.getElementById('render-scene');
+      select.value = row.dataset.pick;
+      /* Through the select, so the custom dropdown and the note under it
+         both follow -- the same path a click in the list takes. */
+      select.dispatchEvent(new Event('change', { bubbles: true }));
+      closeSceneSearch();
+    };
+  });
+}
+
+function openSceneSearch() {
+  sceneSearch.classList.add('show');
+  sceneQuery.value = '';
+  renderSceneHits();
+  sceneQuery.focus();
+}
+
+function closeSceneSearch() {
+  sceneSearch.classList.remove('show');
+}
+
+document.getElementById('btn-scene-search').onclick = openSceneSearch;
+sceneQuery.addEventListener('input', renderSceneHits);
+/* Enter takes the first hit: with one match, typing three letters and
+   pressing Enter is the whole interaction. */
+sceneQuery.addEventListener('keydown', event => {
+  if (event.key === 'Escape') closeSceneSearch();
+  if (event.key === 'Enter') {
+    const first = document.querySelector('#scene-hits [data-pick]');
+    if (first) first.click();
+  }
+});
+/* The backdrop, not the box: a click inside the dialog must not close it. */
+sceneSearch.addEventListener('click', event => {
+  if (event.target === sceneSearch) closeSceneSearch();
+});
 document.getElementById('btn-pick-render').onclick = () => {
   if (backend) backend.pickBlend();
 };

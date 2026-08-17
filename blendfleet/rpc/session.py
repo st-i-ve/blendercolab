@@ -117,6 +117,19 @@ def _orphan(worker: _Worker) -> None:
         critical=True)
 
 
+def _tri(value):
+    """A switch the page may not have sent at all.
+
+    True / False are decisions and reach Blender; None means "not asked
+    for", and the scene keeps whatever the artist saved. JSON's null and a
+    missing key both arrive here as None, which is the point -- an older
+    page cannot accidentally turn somebody's denoiser off by omission.
+    """
+    if value is None:
+        return None
+    return bool(value)
+
+
 _LIVE_SESSIONS: "weakref.WeakSet" = weakref.WeakSet()
 
 
@@ -1720,7 +1733,21 @@ class Session:
             # that predates them still sends -- so an older page (or the Qt
             # build mid-upgrade) keeps the behaviour it had.
             post_on_gpu=bool(options.get("postOnGpu", True)),
-            live_previews=bool(options.get("livePreviews", True)))
+            live_previews=bool(options.get("livePreviews", True)),
+            # The optional Blender settings, passed through as they arrive.
+            # ABSENT MEANS ABSENT: every default below is the sentinel that
+            # RenderSettings and the notebook both read as "leave the
+            # .blend's own value alone", so a page that sends nothing
+            # changes nothing about somebody's scene.
+            resolution_percentage=int(options.get("resPct") or 0),
+            time_limit_seconds=float(options.get("timeLimit") or 0),
+            adaptive_sampling=_tri(options.get("adaptive")),
+            noise_threshold=float(options.get("noiseThreshold") or 0),
+            denoise=_tri(options.get("denoise")),
+            denoiser=str(options.get("denoiser") or ""),
+            max_bounces=int(options.get("maxBounces") or 0),
+            film_transparent=_tri(options.get("filmTransparent")),
+            color_depth=str(options.get("colorDepth") or ""))
         all_accounts = self.store.list()
         blend = self.blend
         # Built once, here, so both the free-accounts check below and
@@ -1862,7 +1889,21 @@ class Session:
             # that predates them still sends -- so an older page (or the Qt
             # build mid-upgrade) keeps the behaviour it had.
             post_on_gpu=bool(options.get("postOnGpu", True)),
-            live_previews=bool(options.get("livePreviews", True)))
+            live_previews=bool(options.get("livePreviews", True)),
+            # The optional Blender settings, passed through as they arrive.
+            # ABSENT MEANS ABSENT: every default below is the sentinel that
+            # RenderSettings and the notebook both read as "leave the
+            # .blend's own value alone", so a page that sends nothing
+            # changes nothing about somebody's scene.
+            resolution_percentage=int(options.get("resPct") or 0),
+            time_limit_seconds=float(options.get("timeLimit") or 0),
+            adaptive_sampling=_tri(options.get("adaptive")),
+            noise_threshold=float(options.get("noiseThreshold") or 0),
+            denoise=_tri(options.get("denoise")),
+            denoiser=str(options.get("denoiser") or ""),
+            max_bounces=int(options.get("maxBounces") or 0),
+            film_transparent=_tri(options.get("filmTransparent")),
+            color_depth=str(options.get("colorDepth") or ""))
         all_accounts = self.store.list()
         fleet = self.fleet_factory(all_accounts)
 

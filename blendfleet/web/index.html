@@ -298,6 +298,11 @@
         <div class="panel" style="padding:14px 17px;margin-bottom:20px">
           <div class="fr-actions" style="margin-top:0;align-items:center">
             <select id="render-scene" data-empty-label="no scene yet" aria-label="Scene to render"></select>
+            <button class="btn ico" id="btn-scene-search" data-tip="Find a scene"
+              aria-label="Find a scene"
+              title="Find a scene — search every scene on Kaggle by name, for when the list is too long to scroll">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+            </button>
             <button class="btn" id="btn-pick-render">Choose a .blend…</button>
             <span class="dz-sub" id="render-scene-note">Scenes already on Kaggle render with no upload at all.</span>
           </div>
@@ -326,6 +331,57 @@
                    disabled -- ticking it would spend that account's quota
                    twice for the same output, which is never offered as a
                    choice. -->
+              <!-- BLENDER'S OWN SETTINGS, and the rule that makes them
+                   safe: every one of these is EMPTY by default and an
+                   empty field changes nothing. The scene keeps what the
+                   artist saved unless a value is actually typed here --
+                   a farm that reset somebody's bounce limit because a form
+                   had a default in it would be editing their render
+                   without saying so.
+                   Names are Blender's own (scene.render.* and
+                   scene.cycles.*), read out of a 5.1 install's UI scripts
+                   rather than remembered. -->
+              <details class="adv">
+                <summary>Blender settings — empty means "leave the scene's own"</summary>
+                <div class="f-grid" style="margin-top:12px">
+                  <div class="f-row"><label>Resolution %</label>
+                    <input id="f-pct" type="number" min="1" max="100" placeholder="100"></div>
+                  <div class="f-row"><label>Seconds per frame cap</label>
+                    <input id="f-timelimit" type="number" min="0" step="10" placeholder="no cap"></div>
+                  <div class="f-row"><label>Noise threshold</label>
+                    <input id="f-noise" type="number" min="0" max="1" step="0.001" placeholder="scene's own"></div>
+                  <div class="f-row"><label>Max bounces</label>
+                    <input id="f-bounces" type="number" min="0" max="64" placeholder="scene's own"></div>
+                  <div class="f-row"><label>Denoiser</label>
+                    <select id="f-denoiser" data-block="1">
+                      <option value="">scene's own</option>
+                      <option value="OPENIMAGEDENOISE">OpenImageDenoise</option>
+                      <option value="OPTIX">OptiX (NVIDIA)</option>
+                    </select></div>
+                  <div class="f-row"><label>Colour depth</label>
+                    <select id="f-depth" data-block="1">
+                      <option value="">scene's own</option>
+                      <option value="8">8-bit</option>
+                      <option value="16">16-bit</option>
+                    </select></div>
+                </div>
+                <div class="opt-row" style="margin-top:6px">
+                  <div class="toggle" id="tgl-adaptive" role="switch" tabindex="0" aria-checked="mixed"></div>
+                  <div class="opt-txt"><b>Adaptive sampling</b>
+                    <span>Stops a pixel early once it is clean enough — the biggest lever on render time that does not change what the image is of. Untouched until you click it.</span></div>
+                </div>
+                <div class="opt-row">
+                  <div class="toggle" id="tgl-denoise" role="switch" tabindex="0" aria-checked="mixed"></div>
+                  <div class="opt-txt"><b>Denoising</b>
+                    <span>Cycles' own denoiser. Off renders the raw samples, which is what you want if you denoise later in the compositor.</span></div>
+                </div>
+                <div class="opt-row">
+                  <div class="toggle" id="tgl-transparent" role="switch" tabindex="0" aria-checked="mixed"></div>
+                  <div class="opt-txt"><b>Transparent film</b>
+                    <span>No world background, and the output switches to RGBA so the alpha survives — the two go together or the transparency is thrown away on save.</span></div>
+                </div>
+              </details>
+
               <!-- Two settings that existed in the backend and never
                    reached the page: both default to on, both were
                    therefore unchangeable. Named for what they do to a
@@ -598,6 +654,25 @@
      that wait a click looked like it had done nothing at all -- so the
      box opens straight away with a placeholder in it and the picture
      arrives into a frame that is already on screen. -->
+<!-- FIND A SCENE. The picker beside it is right for a handful; this is
+     for an account with a sea of them. Searches what scenes() already
+     returned -- no new Kaggle call, so it opens instantly and can never
+     disagree with the list on Files. -->
+<div class="modal" id="scene-search" role="dialog" aria-modal="true"
+     aria-label="Find a scene">
+  <div class="modal-box" style="max-width:580px">
+    <div class="mh">
+      <h3>Find a scene</h3>
+      <div class="mf" style="margin-top:8px">
+        <input id="scene-q" type="text" autocomplete="off" style="width:100%"
+               placeholder="Part of a name — waydown, supra, remember…">
+      </div>
+      <div class="dz-sub" id="scene-q-meta" style="margin-top:6px"></div>
+    </div>
+    <div class="mb" id="scene-hits"></div>
+  </div>
+</div>
+
 <div class="lightbox" id="lightbox" hidden role="dialog" aria-modal="true"
      aria-label="Rendered frame">
   <!-- Focus lands on the dialog itself, not on its Close button: the

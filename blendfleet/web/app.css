@@ -1214,10 +1214,19 @@ select option{background:var(--card);color:var(--ink)}
 }
 .sel-btn:hover{background-color:var(--border)}
 .sel-btn:focus-visible,.sel-wrap.open .sel-btn{border-color:var(--accent);outline:none}
+/* A MENU HAS TO READ AS FLOATING, or it reads as a collision. On the dark
+   theme --card is a hair off --bg, so an open list over a section heading
+   looked like two things overlapping rather than one thing on top: same
+   surface, no edge, a shadow with nothing to catch it. Lifted a step above
+   the panel underneath, given a hairline, and given a shadow big enough to
+   see -- which is the whole difference between "in front of" and "tangled
+   with". */
 .sel-menu{
-  position:absolute;z-index:120;top:calc(100% + 5px);left:0;min-width:100%;
-  max-height:264px;overflow:auto;padding:5px;
-  background:var(--card);border-radius:12px;box-shadow:var(--shadow-lg);
+  position:absolute;z-index:200;top:calc(100% + 6px);left:0;min-width:100%;
+  max-height:264px;overflow:auto;padding:6px;
+  background:color-mix(in srgb,var(--card) 92%,var(--ink) 8%);
+  border:1px solid var(--border);
+  border-radius:12px;box-shadow:0 18px 44px rgba(0,0,0,.5);
   display:none;
 }
 /* A menu that is not open is not in the page: `display:none` rather than
@@ -1703,3 +1712,32 @@ button:focus:not(:focus-visible){outline:none}
    bottom edge is cut in half. Only while one is open, so the corners still
    clip everything else. */
 .panel:has(.sel-wrap.open),.set-card:has(.sel-wrap.open){overflow:visible}
+
+/* One row in the scene search. A whole-row button rather than a row with a
+   button in it: the target is the scene, and anywhere on it should pick. */
+.hit{
+  display:block;width:100%;text-align:left;border:0;background:transparent;
+  padding:9px 11px;border-radius:9px;cursor:pointer;color:var(--ink);
+}
+.hit:hover,.hit:focus-visible{background:var(--fill);outline:none}
+.hit b{display:block;font-size:12.5px;margin-bottom:2px}
+.hit span{display:block;font-family:var(--data);font-size:10.5px;color:var(--ink-3)}
+
+/* Blender's own settings, folded away. They override what is saved in the
+   .blend, so they are deliberately a step further in than the fields that
+   describe the job itself. */
+.adv{margin:4px 0 14px}
+.adv > summary{
+  cursor:pointer;font-family:var(--cond);font-size:10px;font-weight:700;
+  letter-spacing:.18em;text-transform:uppercase;color:var(--ink-3);
+  padding:8px 0;list-style:none;
+}
+.adv > summary::-webkit-details-marker{display:none}
+.adv > summary::before{content:"+ ";color:var(--accent)}
+.adv[open] > summary::before{content:"– "}
+.adv > summary:hover{color:var(--ink-2)}
+/* A switch nobody has touched: neither on nor off, and it has to LOOK like
+   neither -- a plain off switch would claim a decision that was never
+   made. */
+.toggle.mixed{background:var(--border)}
+.toggle.mixed::after{left:13px;background:var(--ink-4)}

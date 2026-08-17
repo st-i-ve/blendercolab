@@ -85,10 +85,88 @@ _t_ready = time.time()
 s = bpy.context.scene
 s.render.resolution_x = int(os.environ["BR_RES_X"])
 s.render.resolution_y = int(os.environ["BR_RES_Y"])
+# FULL SIZE unless the app asks otherwise (BR_RES_PCT below). Forced
+# rather than inherited because a .blend saved at 50% for viewport work
+# would otherwise render at half size on the farm without anybody saying
+# so -- and that has always been this app's behaviour.
 s.render.resolution_percentage = 100
 s.render.image_settings.file_format = os.environ["BR_FORMAT"]
 s.render.engine = "CYCLES"
 s.cycles.samples = int(os.environ["BR_SAMPLES"])
+
+
+def _tune(holder, name, raw, cast=None, label=None):
+    """Apply one setting from the app, or leave the .blend's own alone.
+
+    THE RULE THIS ENFORCES: an EMPTY variable means "not asked for", and
+    the scene keeps whatever the artist saved. Only a value the user
+    actually chose overrides their file -- a farm that silently reset
+    someone's bounce limit or denoiser because a form had a default in it
+    would be changing their render without saying so.
+
+    Guarded because these names move between Blender versions (the app can
+    render on 4.2 through 5.x): a property this build does not have costs a
+    line in the log, never the render.
+    """
+    if raw is None or raw == "":
+        return
+    try:
+        value = cast(raw) if cast else raw
+        setattr(holder, name, value)
+        print(f"[setup] {label or name} = {value}", flush=True)
+    except (AttributeError, TypeError, ValueError) as e:
+        print(f"[setup] could not set {label or name}={raw!r}: {e}", flush=True)
+
+
+def _flag(raw):
+    """"1"/"0" from the app -> bool; anything else -> None (not asked)."""
+    return True if raw == "1" else (False if raw == "0" else None)
+
+
+# EVERYTHING BELOW IS OPTIONAL, and absent by default. Names taken from
+# Blender's own UI scripts (scripts/startup/bl_ui/properties_output.py and
+# scripts/addons_core/cycles/ui.py), not from memory.
+_pct = os.environ.get("BR_RES_PCT", "")
+_tune(s.render, "resolution_percentage", _pct, int, "resolution %")
+
+# Cycles' own time cap, in seconds per frame. 0 is Blender's own "no
+# limit", so an unset value and a zero mean the same thing here.
+_tune(s.cycles, "time_limit", os.environ.get("BR_TIME_LIMIT", ""), float,
+      "time limit per frame (s)")
+
+# Adaptive sampling stops a pixel early once it is clean enough, and the
+# threshold is how clean. The single biggest lever on render time that does
+# not change what the image is of.
+_adaptive = _flag(os.environ.get("BR_ADAPTIVE", ""))
+if _adaptive is not None:
+    _tune(s.cycles, "use_adaptive_sampling", "1" if _adaptive else "0",
+          lambda v: v == "1", "adaptive sampling")
+_tune(s.cycles, "adaptive_threshold", os.environ.get("BR_NOISE", ""), float,
+      "noise threshold")
+
+_denoise = _flag(os.environ.get("BR_DENOISE", ""))
+if _denoise is not None:
+    _tune(s.cycles, "use_denoising", "1" if _denoise else "0",
+          lambda v: v == "1", "denoising")
+# OPENIMAGEDENOISE or OPTIX. OptiX needs an NVIDIA card and the OptiX
+# libraries; Kaggle's T4s have both, but a build without them would raise
+# here -- which _tune turns into a log line and the scene's own choice.
+_tune(s.cycles, "denoiser", os.environ.get("BR_DENOISER", ""), str, "denoiser")
+
+_tune(s.cycles, "max_bounces", os.environ.get("BR_BOUNCES", ""), int,
+      "max bounces")
+
+# A transparent film with an 8-bit RGB output would throw the alpha away,
+# so the two travel together: the app sends RGBA whenever it asks for
+# transparency (see notebook_builder's caller).
+_transparent = _flag(os.environ.get("BR_FILM_TRANSPARENT", ""))
+if _transparent is not None:
+    _tune(s.render, "film_transparent", "1" if _transparent else "0",
+          lambda v: v == "1", "transparent film")
+    _tune(s.render.image_settings, "color_mode",
+          "RGBA" if _transparent else "RGB", str, "colour mode")
+_tune(s.render.image_settings, "color_depth",
+      os.environ.get("BR_COLOR_DEPTH", ""), str, "colour depth")
 
 # Keeps BVH and geometry resident BETWEEN frames -- which only means
 # anything now that consecutive frames share a process. Costs RAM/VRAM
@@ -390,6 +468,22 @@ class RenderSettings:
     # scene used 2.7 GB of each card's 15 GB), and a far larger scene
     # could want it off.
     post_on_gpu: bool = True
+    # ---- optional Blender settings ------------------------------------
+    # EVERY ONE OF THESE DEFAULTS TO "DO NOT TOUCH IT". A farm that reset
+    # somebody's denoiser or bounce limit because a web form had a default
+    # in it would be changing their render without telling them, so an
+    # unset value means the .blend keeps what the artist saved. Names come
+    # from Blender's own UI scripts, not from memory -- see the _tune calls
+    # in the generated notebook.
+    resolution_percentage: int = 0        # 0 = leave the scene's
+    time_limit_seconds: float = 0.0       # Blender's own 0 == no limit
+    adaptive_sampling: bool | None = None
+    noise_threshold: float = 0.0          # 0 = leave the scene's
+    denoise: bool | None = None
+    denoiser: str = ""                    # OPENIMAGEDENOISE | OPTIX | ""
+    max_bounces: int = 0                  # 0 = leave the scene's
+    film_transparent: bool | None = None
+    color_depth: str = ""                 # "8" | "16" | ""
     # A small JPEG of every finished frame, pushed down the log stream so
     # a render can be watched WHILE it runs. Kaggle releases a session's
     # output only once that session ends, so without this there is nothing
@@ -424,6 +518,30 @@ NOTEBOOK_CONTRACT = 1
 NOTEBOOK_MARKER = f"BLENDFLEET-NOTEBOOK contract={NOTEBOOK_CONTRACT}"
 
 _MARKER_RE = re.compile(r"BLENDFLEET-NOTEBOOK contract=(\d+)")
+
+
+def _as_text(value) -> str:
+    """A number the user chose, or "" for "they did not".
+
+    Zero is the sentinel for every numeric setting here (see
+    RenderSettings), so it reduces to the same empty string an untouched
+    field does -- one meaning, one encoding, and the notebook only has to
+    know about "".
+    """
+    if value in (None, 0, 0.0, ""):
+        return ""
+    return str(value)
+
+
+def _as_flag(value) -> str:
+    """True -> "1", False -> "0", None -> "" (not asked for).
+
+    The three-way matters: a switch turned OFF is a decision and has to
+    reach Blender, while a switch nobody touched must not.
+    """
+    if value is None:
+        return ""
+    return "1" if value else "0"
 
 
 def _code(src: str) -> dict:
@@ -677,6 +795,17 @@ BLENDER_VERSION = {settings.blender_version!r}
 MIN_GPUS = {settings.min_gpus!r}
 POST_GPU = {settings.post_on_gpu!r}
 LIVE_PREVIEWS = {settings.live_previews!r}
+# Optional Blender settings, already reduced to what the notebook reads:
+# "" means the user did not ask, and the .blend keeps its own value.
+RES_PCT = {_as_text(settings.resolution_percentage)!r}
+TIME_LIMIT = {_as_text(settings.time_limit_seconds)!r}
+ADAPTIVE = {_as_flag(settings.adaptive_sampling)!r}
+NOISE_THRESHOLD = {_as_text(settings.noise_threshold)!r}
+DENOISE = {_as_flag(settings.denoise)!r}
+DENOISER = {settings.denoiser!r}
+MAX_BOUNCES = {_as_text(settings.max_bounces)!r}
+FILM_TRANSPARENT = {_as_flag(settings.film_transparent)!r}
+COLOR_DEPTH = {settings.color_depth!r}
 
 {HARDWARE_REPORT}
 if len(gpu_names) < MIN_GPUS:
@@ -1001,6 +1130,18 @@ env = os.environ.copy()
 env.update({{"BR_RES_X": str(RES_X), "BR_RES_Y": str(RES_Y),
             "BR_SAMPLES": str(SAMPLES), "BR_FORMAT": FMT,
             "BR_POST_GPU": "1" if POST_GPU else "0",
+            # Optional, and empty unless the user chose one. `_flag` in the
+            # setup cell reads "" as "leave the scene alone", which is why
+            # these are strings rather than numbers with a magic zero.
+            "BR_RES_PCT": RES_PCT,
+            "BR_TIME_LIMIT": TIME_LIMIT,
+            "BR_ADAPTIVE": ADAPTIVE,
+            "BR_NOISE": NOISE_THRESHOLD,
+            "BR_DENOISE": DENOISE,
+            "BR_DENOISER": DENOISER,
+            "BR_BOUNCES": MAX_BOUNCES,
+            "BR_FILM_TRANSPARENT": FILM_TRANSPARENT,
+            "BR_COLOR_DEPTH": COLOR_DEPTH,
             # Live previews, and the byte budget one may spend. Read back
             # out of the kernel's OWN environment first, so a session can
             # be told to stop sending them without rebuilding the
