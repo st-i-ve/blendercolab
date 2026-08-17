@@ -62,6 +62,32 @@ duplication. The two collapse into one adapter as the last step of stage
 2, when Electron is proven and the fallback is obvious rather than
 urgent.
 
+**Paid off (2026-08-17).** Electron is packaged and runs the real fleet,
+so the copies collapsed. `session.py` keeps the behaviour; `bridge.py` is
+now 377 lines of Qt face over it -- 3,150 before, and 2,773 lines of
+duplication gone in total.
+
+What made it safe to do in one step was measuring first rather than
+trusting the port: a normalised diff of the two files (Qt names mapped to
+their Emitter twins, comments stripped) came back identical except for the
+items below, which are the whole of what Qt actually needed.
+
+  - the 14 signals, since QWebChannel can only carry Qt signals
+  - the `@Slot` decorations, since QWebChannel exposes slots and nothing
+    else -- which is also why the relay's delivery method is not one
+  - `pickBlend` and `collect`, which open native dialogs a headless
+    Session has no window to parent
+  - `setPreference` re-applying the Qt theme to the window around the page
+
+Two things fell out of it that are worth naming. The QThread lifetime
+dance -- unparenting, `deleteLater`, the whole defence against
+`qFatal("QThread: Destroyed while thread is still running")` -- is not
+ported but DELETED: Session's workers are plain daemon threads and cannot
+abort a process that way. And the relay hops threads only when it has to:
+a worker's completion was always a queued signal, but a `notification`
+emitted inside a slot arrived immediately, and queueing both broke 28
+tests that were right to break.
+
 ---
 
 ## Stage 1 -- the sidecar and its protocol

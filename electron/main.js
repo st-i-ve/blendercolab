@@ -11,8 +11,9 @@
  * It also dies with its parent, which is what stops an orphaned backend
  * holding a render's state with no window left to show it.
  */
-const { app, BrowserWindow, Menu, Tray, dialog, ipcMain, nativeImage,
-        session, shell } = require('electron');
+const { app, BrowserWindow, Menu, Notification, Tray, dialog, ipcMain,
+        nativeImage, nativeTheme, powerMonitor, powerSaveBlocker, session,
+        shell } = require('electron');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
@@ -89,6 +90,16 @@ function startBackend() {
       return;
     }
     if (message.event) {
+      /* The shell listens to the same events the page does, for the things
+         only a shell can do: keep the machine awake, put progress on the
+         taskbar, raise an OS notification when the window is not there to
+         show one. Before the page, and in a try, because none of it may
+         cost the dashboard an update. */
+      try {
+        observe(message);
+      } catch (e) {
+        console.error('shell could not act on', message.event, e);
+      }
       if (win && !win.isDestroyed()) {
         win.webContents.send('backend:event', message);
       }
@@ -127,6 +138,133 @@ function startBackend() {
       });
     }
   });
+}
+
+/* ---- what a shell can do that a page cannot --------------------------- */
+
+/* THE MACHINE MUST NOT SLEEP WHILE WORK IS IN FLIGHT.
+   A laptop that suspends mid-upload loses the upload -- the resumable
+   uploader has to start that part again -- and mid-collect loses the
+   download. Held only while something is actually running, released the
+   moment it is not: a render farm that permanently prevented sleep would
+   be a worse neighbour than one that occasionally lost a transfer. */
+const busy = new Set();
+let sleepBlocker = null;
+
+function holdSleep() {
+  if (sleepBlocker !== null || busy.size === 0) return;
+  /* 'prevent-app-suspension', not 'prevent-display-sleep': the screen is
+     welcome to turn off. What must not happen is the process being
+     suspended while an HTTPS request is open. */
+  sleepBlocker = powerSaveBlocker.start('prevent-app-suspension');
+}
+
+function releaseSleep() {
+  if (sleepBlocker === null || busy.size > 0) return;
+  powerSaveBlocker.stop(sleepBlocker);
+  sleepBlocker = null;
+}
+
+/* PROGRESS WHERE IT CAN BE SEEN WITH THE WINDOW HIDDEN.
+   The same fraction the card's edge draws, on the taskbar icon, because
+   "keep running in the background" is a feature of this app and a render
+   in the tray otherwise reports nothing at all. Cleared -- not left at
+   100% -- when nothing is rendering: a full bar that never goes away
+   reads as a render that never finished. */
+function showProgress(payload) {
+  if (!win || win.isDestroyed()) return;
+  let done = 0;
+  let total = 0;
+  let running = 0;
+  for (const instance of (payload.instances || [])) {
+    const worker = instance.worker;
+    if (!worker) continue;
+    if (worker.state === 'running' || worker.state === 'queued') running += 1;
+    /* Only frames a render actually claims. framesDone with no frames at
+       all is not 0% of anything, and drawing it as such is the "bar at 0%"
+       this app already refuses elsewhere. */
+    if (Array.isArray(worker.frames) && worker.frames.length) {
+      total += worker.frames.length;
+      done += Math.min(worker.framesDone || 0, worker.frames.length);
+    }
+  }
+  win.setProgressBar(running && total ? done / total : -1);
+  if (process.platform === 'win32') {
+    /* A count, not a percentage: the taskbar badge is 16 pixels and a
+       number of machines is the one thing that fits. */
+    win.setOverlayIcon(running ? badgeFor(running) : null,
+                       running ? `${running} rendering` : '');
+  }
+}
+
+/* Drawn rather than shipped as a file: one asset per possible count is
+   silly, and this is two shapes and a digit. */
+function badgeFor(count) {
+  const label = count > 9 ? '9+' : String(count);
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32">
+    <circle cx="16" cy="16" r="15" fill="#111"/>
+    <circle cx="16" cy="16" r="15" fill="none" stroke="#fff" stroke-width="2"/>
+    <text x="16" y="22" font-family="Segoe UI, sans-serif" font-size="17"
+          font-weight="600" fill="#fff" text-anchor="middle">${label}</text>
+  </svg>`;
+  return nativeImage.createFromDataURL(
+    'data:image/svg+xml;base64,' + Buffer.from(svg).toString('base64'));
+}
+
+/* A NOTIFICATION THE USER CAN ACTUALLY SEE.
+   The app already emits one for every event worth telling somebody about,
+   and until now only the page could hear it -- which is no use at all when
+   the window is hidden in the tray, i.e. exactly when a render finishing
+   is news. Only when hidden: duplicating an on-screen toast as an OS
+   notification is noise. */
+function notifyOutside(message, tone) {
+  if (!Notification.isSupported()) return;
+  if (win && !win.isDestroyed() && win.isVisible() && !win.isMinimized()) return;
+  const note = new Notification({
+    title: tone === 'offline' ? 'BlendFleet — attention needed' : 'BlendFleet',
+    body: message,
+    silent: tone !== 'offline',
+  });
+  note.on('click', showFromTray);
+  note.show();
+}
+
+/* THE THEME THE WINDOW ITSELF USES.
+   The page paints its own surfaces, but the parts Chromium and Windows
+   draw -- scrollbars, the context menu, the Mica backdrop -- take their
+   cue from nativeTheme. Setting themeSource from the app's own preference
+   keeps those in step, and has a second effect worth having: it is also
+   what `prefers-color-scheme` reports to the page, so a preference of
+   "system" resolves to the same answer in both halves rather than the page
+   asking the OS while the window asks the app. */
+function matchShellTheme(preferences) {
+  const wanted = (preferences.theme === 'dark' || preferences.theme === 'light')
+    ? preferences.theme
+    : 'system';
+  if (nativeTheme.themeSource !== wanted) nativeTheme.themeSource = wanted;
+}
+
+function observe(message) {
+  const args = message.args || [];
+  switch (message.event) {
+    case 'settingsChanged':
+      matchShellTheme(JSON.parse(args[0] || '{}'));
+      break;
+    case 'busyChanged': {
+      const [key, inFlight] = args;
+      if (inFlight) busy.add(key); else busy.delete(key);
+      if (busy.size) holdSleep(); else releaseSleep();
+      break;
+    }
+    case 'stateChanged':
+      showProgress(JSON.parse(args[0] || '{}'));
+      break;
+    case 'notification':
+      notifyOutside(args[0] || '', args[1] || '');
+      break;
+    default:
+      break;
+  }
 }
 
 function callBackend(name, args = []) {
@@ -340,6 +478,11 @@ function showFromTray() {
 
 function quitNow() {
   quitting = true;
+  /* Let the machine sleep again. Electron would drop the blocker with the
+     process anyway; releasing it here means the one place that ends the app
+     also ends everything the app was holding. */
+  busy.clear();
+  releaseSleep();
   if (tray) {
     tray.destroy();
     tray = null;
@@ -386,7 +529,12 @@ ipcMain.handle('shell:pickBlend', async () => {
     filters: [{ name: 'Blender', extensions: ['blend'] }],
     properties: ['openFile'],
   });
-  return answer.canceled ? '' : answer.filePaths[0];
+  if (answer.canceled) return '';
+  /* The scene joins the taskbar's Recent list. A .blend is exactly the
+     kind of file somebody comes back to for a week of renders, and this is
+     the OS's own memory of it rather than a second one kept here. */
+  app.addRecentDocument(answer.filePaths[0]);
+  return answer.filePaths[0];
 });
 
 ipcMain.handle('shell:chooseDirectory', async () => {
@@ -440,6 +588,56 @@ if (!app.requestSingleInstanceLock()) {
     });
     startBackend();
     createWindow();
+
+    /* Asked once at startup, because settingsChanged only fires when
+       something CHANGES -- without this, a saved preference of "dark"
+       would leave the native parts light until the user touched a
+       setting. */
+    callBackend('preferences').then(json => {
+      if (json) matchShellTheme(JSON.parse(json));
+    }).catch(e => {
+      /* Caught, because the native theme is cosmetic and an unhandled
+         rejection in the main process is a warning nobody reads. It was one
+         of these that caught `nativeTheme` missing from the require above,
+         so the noise was worth something once. */
+      console.error('could not match the shell theme at startup', e);
+    });
+
+    /* BACK FROM SLEEP, ASK AT ONCE.
+       The status poll is on a 30-second timer, so a lid opened after two
+       hours shows two-hour-old readings until that timer next fires -- and
+       everything on screen looks current. A render can easily have
+       finished, failed, or been evicted in the meantime. */
+    powerMonitor.on('resume', () => {
+      console.error('resumed from sleep — polling now');
+      callBackend('poll');
+    });
+
+    /* The taskbar right-click, for the two things worth reaching without
+       the window: start a render, or go and get finished frames. Both open
+       the app on the page that does it -- a jump list that performed a
+       render invisibly, with no window to report it, would be a way to
+       spend somebody's quota by accident. */
+    if (process.platform === 'win32') {
+      app.setUserTasks([
+        {
+          program: process.execPath,
+          arguments: '--page=dashboard',
+          title: 'Open the dashboard',
+          description: 'Show the fleet and what it is rendering',
+          iconPath: process.execPath,
+          iconIndex: 0,
+        },
+        {
+          program: process.execPath,
+          arguments: '--page=files',
+          title: 'Collect frames',
+          description: 'Open Files, where finished renders are downloaded',
+          iconPath: process.execPath,
+          iconIndex: 0,
+        },
+      ]);
+    }
   });
 
   app.on('window-all-closed', () => {

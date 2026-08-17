@@ -74,6 +74,69 @@ def test_translucency_thins_the_ground_instead_of_removing_it():
     assert "var(--bg)" in glass.group(1)
 
 
+# ---- what only a shell can do -----------------------------------------
+#
+# Asserted as TEXT, and the limits of that are worth stating: these check
+# that the shell still contains the mechanism, not that Windows suspends or
+# that a toast appears. A Node harness driving Electron with a fake sidecar
+# would check the behaviour, and would be a second toolchain in this repo
+# for one file. What text catches is the realistic regression -- somebody
+# refactors main.js and a hook quietly stops being wired.
+
+def _main() -> str:
+    return (ELECTRON / "main.js").read_text(encoding="utf-8")
+
+
+def test_the_machine_is_kept_awake_only_while_work_is_in_flight():
+    """A laptop that suspends mid-upload loses the upload. One that never
+    sleeps because a render farm is installed is a worse neighbour, so the
+    blocker is held against a set of in-flight keys and released when it
+    empties."""
+    source = _main()
+    assert "powerSaveBlocker.start('prevent-app-suspension')" in source, (
+        "sleep is not being blocked, or is blocking the display too")
+    assert "powerSaveBlocker.stop(" in source, "the blocker is never released"
+    assert "busy.size" in source, (
+        "the blocker is not tied to whether anything is actually running")
+
+
+def test_waking_from_sleep_polls_instead_of_waiting_out_the_timer():
+    """The status poll is on a 30-second timer, so a lid opened after two
+    hours shows two-hour-old readings that look current."""
+    source = _main()
+    resumed = re.search(r"powerMonitor\.on\('resume',(.*?)\}\);", source, re.S)
+    assert resumed, "nothing happens when the machine wakes up"
+    assert "callBackend('poll')" in resumed.group(1)
+
+
+def test_taskbar_progress_is_cleared_rather_than_left_full():
+    """setProgressBar(-1) is 'no bar'. A bar left at 100% reads as a render
+    that never finished, which is the opposite of what happened."""
+    source = _main()
+    assert "setProgressBar(" in source
+    assert "-1" in source[source.index("setProgressBar("):
+                          source.index("setProgressBar(") + 120], (
+        "the progress bar is never cleared")
+
+
+def test_an_os_notification_is_only_raised_when_the_window_cannot_show_one():
+    """Duplicating an on-screen toast as an OS notification is noise; the
+    point is the window being hidden in the tray, which is exactly when a
+    render finishing is news."""
+    source = _main()
+    guard = re.search(r"function notifyOutside\((.*?)\n\}", source, re.S)
+    assert guard, "notifications are not routed through one place"
+    assert "isVisible()" in guard.group(1), (
+        "a notification would fire even with the window in front")
+    assert "Notification.isSupported()" in guard.group(1), (
+        "an unsupported platform must not throw on a render finishing")
+
+
+def test_a_chosen_blend_joins_the_operating_system_s_recent_files():
+    source = _main()
+    assert "app.addRecentDocument(" in source
+
+
 # ---- the two copies of one list ---------------------------------------
 
 def test_preload_listens_for_exactly_the_events_the_protocol_sends():

@@ -92,7 +92,15 @@ def test_the_names_settings_validates_are_the_names_that_can_be_painted():
     rejected the moment it is saved."""
     from blendfleet import design
     assert set(ACCENTS) == set(design.ACCENT_NAMES)
-    assert set(THEMES) == set(design.THEME_NAMES)
+    # The palettes are the paintable names, not every selectable one:
+    # "system" is an instruction ("use whichever the OS is using"), which
+    # resolve_theme turns into one of these. The invariant that matters is
+    # therefore in two parts -- these are the same set, AND every
+    # selectable name resolves to one of them (asserted just below).
+    assert set(THEMES) == set(design.PALETTE_THEME_NAMES)
+    for name in design.THEME_NAMES:
+        assert resolve_theme(name) in THEMES.values(), (
+            f"{name!r} can be chosen and saved but resolves to no palette")
     assert FONTS == design.FONT_FAMILIES
     assert DEFAULT_ACCENT == design.DEFAULT_ACCENT
     assert DEFAULT_THEME == design.DEFAULT_THEME

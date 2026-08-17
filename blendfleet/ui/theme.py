@@ -112,10 +112,44 @@ DEFAULT_THEME = design.DEFAULT_THEME
 _active_theme_name: str = DEFAULT_THEME
 
 
+def system_theme_name() -> str:
+    """"dark" or "light", as the operating system currently has it.
+
+    Qt answers this through QStyleHints.colorScheme(), which is also what
+    emits colorSchemeChanged when the user flips their OS theme -- so the
+    window can follow without polling anything.
+
+    Unknown counts as the default rather than as dark: a platform that
+    cannot say must not have its silence read as a preference.
+    """
+    try:
+        from PySide6.QtCore import Qt
+        from PySide6.QtGui import QGuiApplication
+        hints = QGuiApplication.styleHints()
+        if hints is not None:
+            scheme = hints.colorScheme()
+            if scheme == Qt.ColorScheme.Dark:
+                return "dark"
+            if scheme == Qt.ColorScheme.Light:
+                return "light"
+    except Exception:       # noqa: BLE001 -- a theme, not a critical path
+        pass
+    return DEFAULT_THEME
+
+
 def resolve_theme(name: str) -> ThemePalette:
     """The named palette, or the default's. Falls back rather than raising
     for the same reason resolve_accent does: a hand-edited or forward-dated
-    settings.json must not brick the app with no UI left to fix it from."""
+    settings.json must not brick the app with no UI left to fix it from.
+
+    "system" is not a palette but an instruction -- follow the OS -- and
+    this is the one place a theme name becomes colours, so it is the one
+    place that has to know. The page resolves the same instruction its own
+    way, with prefers-color-scheme, which is what keeps the dashboard
+    identical for both shells.
+    """
+    if name == "system":
+        name = system_theme_name()
     return THEMES.get(name, THEMES[DEFAULT_THEME])
 
 

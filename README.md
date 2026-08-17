@@ -139,6 +139,31 @@ real progress and resume-from-committed-offset instead.
 Tesla P100. A 250-frame animation is roughly 4 GPU-hours solo, or ~1.3 h each
 across three accounts.
 
+**The machine a run got costs nothing to ask.** A kernel's metadata carries
+`machine_shape`, so a card can say "this run's machine: Tesla T4" from a
+metadata request instead of a one-minute hardware probe. It names a *type*, not
+a count — `NvidiaTeslaT4` is what Kaggle calls a machine that turns out to hold
+two T4s — so the nvidia-smi banner from inside the run stays the source for how
+many cards there were, and keeps its age.
+
+**Sessions can outlive the app's memory of them.** A job forgotten, or the app
+killed between pushing a kernel and writing its state file, leaves a render
+spending quota with nothing on the dashboard to say so. **Instances → Stray
+sessions** lists the live ones and offers to stop them. It matches only kernels
+BlendFleet named (`blendfleet-worker-<8 hex>`, `<stem>-render-<8 hex>`), because
+the button next to each one cancels it.
+
+**A notebook can be edited underneath a render.** Every generated cell carries a
+`BLENDFLEET-NOTEBOOK contract=N` marker. When a finished render's frame count
+cannot be read, the app checks whether the notebook on Kaggle still prints the
+lines it parses, so "the log was unreadable" and "the notebook was changed" stop
+looking identical.
+
+**The base image is pinned per kernel** (`docker_image_pinning_type: original`),
+so a rerun cannot silently land on a new CUDA driver. It does not pin across
+jobs — each render is a new kernel, and Kaggle offers only "original" or
+"latest".
+
 ---
 
 ## Developing
@@ -159,17 +184,41 @@ No build needed — this is the same app the exe wraps:
 QT_QPA_PLATFORM=offscreen .venv/Scripts/python.exe -m pytest tests/ -q
 ```
 
-1391 tests, entirely offline — including the browser ones, which drive the real
+1500 tests, entirely offline — including the browser ones, which drive the real
 page in a real QtWebEngine. `tests/conftest.py` installs autouse guards that fail
 a test which opens a socket, leaks a thread, or raises an unstubbed modal dialog:
 each is there because that exact failure once made the suite hang or crash
 non-deterministically instead of failing honestly.
+
+> **The exit code is pytest's, deliberately.** QtWebEngine's browser thread dies
+> with an access violation while Python finalises, *after* the summary is
+> printed — measured on Qt 6.11.1, and identically on commits that predate any
+> of this app's threading work, so it is upstream teardown. Left alone it makes
+> every run exit 139, green or not. `pytest_unconfigure` in `conftest.py` runs
+> this app's own shutdown work, flushes, then exits with pytest's verdict. The
+> crash still prints; it just no longer decides whether the suite passed.
 
 ### The Electron shell
 
 `electron/` is a second shell over the same core: the Qt window is
 replaced by an Electron one, and QWebChannel by a headless Python
 sidecar speaking one JSON object per line over stdio.
+
+Being a real desktop shell, it does the things a page cannot:
+
+- **keeps the machine awake while work is in flight** — held against the
+  same `busyChanged` keys the dashboard uses, released the moment nothing
+  is running. A laptop that suspends mid-upload loses the upload.
+- **polls the moment the machine wakes**, instead of showing readings from
+  before the lid closed until the 30-second timer next fires.
+- **puts render progress on the taskbar** (and a count badge), which is the
+  point when the window is hidden in the tray.
+- **raises an OS notification only when the window is hidden** — a toast
+  duplicating one already on screen is noise.
+- **jump list and recent `.blend` files** on the taskbar right-click.
+- **follows the desktop's light/dark setting** when the theme is set to
+  System, resolved by the page through `prefers-color-scheme` and by the
+  window through `nativeTheme`, so the two cannot disagree.
 
 ```bash
 cd electron && npm install     # Electron itself, ~150 MB

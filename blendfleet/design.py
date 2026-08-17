@@ -21,7 +21,15 @@ ACCENT_NAMES = ("orange", "blue", "green", "purple", "red",
                 "dark-orange", "dark-red", "slate")
 DEFAULT_ACCENT = "orange"
 
-THEME_NAMES = ("light", "dark")
+# Two palettes, and one instruction. "system" is not a palette: it means
+# "whichever of the other two the operating system is using right now", and
+# each shell resolves it for its own chrome (ui/theme.resolve_theme via
+# QStyleHints, Electron via nativeTheme) while the page resolves it with
+# prefers-color-scheme. Kept in this list because it is a value Settings
+# must accept and save; PALETTE_THEME_NAMES below is the list of things
+# that can actually be painted.
+THEME_NAMES = ("light", "dark", "system")
+PALETTE_THEME_NAMES = ("light", "dark")
 DEFAULT_THEME = "light"
 
 # key -> the family name as the font itself reports it, which is what

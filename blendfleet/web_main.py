@@ -44,6 +44,22 @@ def main() -> int:
     # is about to render itself in.
     apply(app, settings.accent, settings.theme, settings.font)
 
+    # FOLLOWING THE DESKTOP MEANS FOLLOWING IT WHILE RUNNING, not only at
+    # startup: a desktop that goes dark at sunset should take the window
+    # with it. Only when the preference is "system" -- an explicit choice
+    # is not something the OS gets to override an hour later. `settings` is
+    # re-read rather than captured because the preference can change while
+    # the app is open (Session.setPreference saves it).
+    def follow_system_theme() -> None:
+        from blendfleet.settings import Settings as _Settings
+        if _Settings.load().theme == "system":
+            current = _Settings.load()
+            apply(app, current.accent, current.theme, current.font)
+
+    hints = app.styleHints()
+    if hints is not None and hasattr(hints, "colorSchemeChanged"):
+        hints.colorSchemeChanged.connect(lambda _scheme: follow_system_theme())
+
     from blendfleet.__main__ import _icon_path
     from PySide6.QtGui import QIcon
     icon = _icon_path()
