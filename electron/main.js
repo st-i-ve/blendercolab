@@ -25,14 +25,29 @@ const PACKAGED = app.isPackaged;
    from the repo" and "installed". Named once, here, rather than guessed
    at each use. */
 const paths = {
+  /* resources/BLENDFLEET/WEB, not resources/web. app.css asks for its
+     fonts and the logo as `../../assets/...` -- two levels up from
+     blendfleet/web/, which is the repo root. Flattening the page to
+     resources/web/ made that resolve one level above resources/, so in
+     the first packaged build every @font-face and the sidebar mark
+     silently 404'd: the app looked almost right, in fallback fonts, and
+     the tell was a card label wrapping onto two lines. The page's
+     relative paths are part of its contract with whatever hosts it, so
+     the host mirrors the layout instead of the page changing shape. */
   page: PACKAGED
-    ? path.join(process.resourcesPath, 'web', 'index.html')
+    ? path.join(process.resourcesPath, 'blendfleet', 'web', 'index.html')
     : path.join(ROOT, 'blendfleet', 'web', 'index.html'),
   icon: PACKAGED
     ? path.join(process.resourcesPath, 'assets', 'logo', 'app-icon-256.png')
     : path.join(ROOT, 'assets', 'logo', 'app-icon-256.png'),
+  /* BESIDE THE EXE, not inside resources/ -- `extraFiles` in
+     package.json, not `extraResources`. The built folder is meant to read
+     the way dist/blendfleetweb/ does: the program, then the parts it
+     runs. A sidecar buried two levels down in resources/ is the same
+     bytes and a worse answer to "where is the backend". The page and the
+     icon stay in resources/, which is this shell's `_internal`. */
   backend: PACKAGED
-    ? path.join(process.resourcesPath, 'backend',
+    ? path.join(path.dirname(app.getPath('exe')), 'backend',
                 process.platform === 'win32'
                   ? 'blendfleet-backend.exe' : 'blendfleet-backend')
     : null,

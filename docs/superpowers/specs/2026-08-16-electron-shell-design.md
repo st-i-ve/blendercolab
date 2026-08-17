@@ -37,7 +37,7 @@ story.
    Not one line. The Qt build keeps working, and its 1391 tests keep
    passing, throughout.
 2. **`dist/blendfleetweb/` is never written to.** Electron output goes to
-   `dist/electron/`, the sidecar to `dist/backend/<platform>/`.
+   `dist/fleet-electron/`, the sidecar to `dist/backend/<platform>/`.
 3. **The dashboard is not edited for Electron.** If `blendfleet/web/`
    needs a change to work under Electron, that is a bug in the shell, not
    a job for the page. Held completely: `blendfleet/web/` is byte for
@@ -203,10 +203,12 @@ running.
 ## Stage 3 -- packaging
 
 - `electron-builder` config in `electron/package.json`, output to
-  `dist/electron/`.
+  `dist/fleet-electron/`.
 - The sidecar built by PyInstaller (`packaging/blendfleet-backend.spec`,
   console, no Qt) to `dist/backend/<platform>/`, and bundled as an
-  `extraResource`.
+  `extraFile` -- beside the exe, not inside `resources/`, so the built
+  folder reads the way `dist/blendfleetweb/` does: the program, then the
+  parts it runs.
 - Windows: NSIS installer. Linux: AppImage. macOS: dmg.
 - **PyInstaller cannot cross-compile.** Each platform's sidecar has to be
   built on that platform, so this stage delivers a GitHub Actions matrix
@@ -218,22 +220,54 @@ running.
 `npm run dist` on Windows produces an installer that installs, launches,
 renders, and uninstalls -- and the workflow file builds the other two.
 
-**Where it actually stands (2026-08-17).** The configuration and the
-workflow are written; the local installer build is not done, and the
-reason is the network rather than the config. electron-builder keeps its
-own caches, separate from npm's, and every miss is a download this
-connection cannot finish inside its 600-second timeout. Three of them
-were primed by hand and verified in place -- the Electron zip in
-`%LOCALAPPDATA%\electron\Cache\<sha256-of-url>\`, winCodeSign and NSIS
-under `%LOCALAPPDATA%\electron-builder\Cache\` -- and the build still
-stops immediately after `downloaded label=electron progress=100%` on a
-further request, including with `ELECTRON_MIRROR` and
-`ELECTRON_BUILDER_BINARIES_MIRROR` pointed at a mirror.
+**Where it actually stands (2026-08-17).** There is a packaged app;
+there is no installer.
 
-So the artifact is a CI job away rather than a config change away, which
-is exactly what the matrix exists for. What IS verified locally is
-everything the installer would wrap: the shell runs the real dashboard
-against the real backend, and the frozen sidecar answers the protocol.
+electron-builder still cannot finish here. It gets to `packaging
+platform=win32 electron=43.4.0`, reports the cached Electron zip at 100%,
+then makes one more HTTPS request and sits on it for the full
+600-second timeout -- with the Electron zip primed in
+`%LOCALAPPDATA%\electron\Cache\<sha256-of-url>\`, winCodeSign and NSIS
+primed under `%LOCALAPPDATA%\electron-builder\Cache\`, with mirrors set,
+with `--dir` (which skips NSIS altogether) and with
+`CSC_IDENTITY_AUTO_DISCOVERY=false`. The blocker is the network.
+
+So `electron/pack-offline.js` does the copying electron-builder would
+have done, from files already on disk, and produces
+`dist/fleet-electron/`: `BlendFleet.exe`, `backend/` beside it, the page
+and assets under `resources/`. Windows only, no installer, no asar --
+deliberately not a replacement for electron-builder, which stays the way
+real installers are made. Verified by launching the built exe: the real
+fleet, five accounts, the dark-red accent from saved preferences, the
+sidecar found beside the exe.
+
+**Two bugs the packaged build found, both in the shell.**
+
+*The pipe was not private.* `kaggle`, reached through `poll`, prints a
+page of authentication help to stdout and reads stdin for the answer.
+Both were the protocol's descriptors: the banner arrived as unreadable
+lines, the prompt swallowed a queued call, and the EOF it left behind was
+read by `serve()` as "the shell is gone" -- so the sidecar shut itself
+down cleanly under a live window, exit 0, no traceback. `_take_stdio`
+now dups both descriptors for the protocol and points fd 0 at the null
+device and fd 1 at the diagnostic log, at the fd level so a subprocess
+cannot get around it. Stage 1's "nothing else goes to stdout, ever" was a
+convention, and conventions do not bind libraries.
+
+*The page's relative paths are part of the contract.* `app.css` asks for
+fonts and the logo as `../../assets/...`, two levels up from
+`blendfleet/web/`. Shipping the page as `resources/web/` made those
+resolve above `resources/`: no error, no blank page, just every font
+falling back and an empty circle where the mark goes. The build mirrors
+the repo's layout (`resources/blendfleet/web/`) instead. Rule 3 says a
+change the page needs is a bug in the shell -- this is what that looks
+like in practice.
+
+`electron/` had no tests when it shipped, which is why both of these were
+found by looking rather than by failing.
+`tests/test_electron_shell.py` now checks the ground rule, the asset
+paths (computed from the page's own references), the built layout, and
+the two copies of the events list in `preload.js` and `protocol.py`.
 
 ---
 

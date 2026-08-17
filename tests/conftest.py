@@ -349,7 +349,24 @@ def _diff_snapshot(before: dict, after: dict) -> list[str]:
 # `python -m blendfleet.web_main` will NOT be detected by this and will
 # still be (correctly) treated as "no app running" below -- documented
 # gap, not silently assumed away.
-_APP_PROCESS_NAMES = ("blendfleetweb.exe", "blendfleetweb")
+#
+# The Electron shell is on this list because on 2026-08-17 it walked
+# straight into the gap: `npm start` was running during a full-suite run,
+# its sidecar polled Kaggle on the same 30s loop and rewrote the real
+# fleet.json, and because the only names here were the Qt build's, the
+# guard reported "no app process was observed at ANY point" and escalated
+# to a hard error. The writer was the app, exactly as this fixture's
+# warning path describes -- it just was not wearing a name the fixture
+# knew. `electron.exe` covers a dev run (whose sidecar is a bare
+# python.exe, which stays off this list for the reason above -- pytest
+# itself is one), `BlendFleet.exe` the installed shell, and
+# `blendfleet-backend.exe` the frozen sidecar either may spawn.
+_APP_PROCESS_NAMES = (
+    "blendfleetweb.exe", "blendfleetweb",
+    "electron.exe", "electron",
+    "BlendFleet.exe",
+    "blendfleet-backend.exe", "blendfleet-backend",
+)
 
 
 def _blendfleet_app_is_running() -> bool:

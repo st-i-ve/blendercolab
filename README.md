@@ -199,13 +199,34 @@ output has its own tree. Linux and macOS artifacts come from
 `.github/workflows/electron.yml`, because PyInstaller cannot
 cross-compile: each platform's sidecar has to be frozen on that platform.
 
-> **Installer status.** `npm start` and `npm run backend` work; `npm run
-> dist` has not yet produced an installer on this machine. electron-builder
-> keeps its own caches and every miss is a download that has to finish
-> inside its 600-second timeout, which this connection does not manage —
-> priming the Electron zip, winCodeSign and NSIS by hand got it further
-> but not past. On a CI runner none of that applies, which is what the
-> workflow is for.
+### Building the Electron app
+
+```bash
+cd electron
+npm install
+npm run backend          # freezes the Python sidecar -> dist/backend/
+npm run pack:offline     # assembles dist/fleet-electron/
+```
+
+`dist/fleet-electron/` then holds `BlendFleet.exe` with `backend/` beside
+it, shaped like `dist/blendfleetweb/` — double-click it and the app runs
+against the real fleet, no install step.
+
+> **Installer status.** There is a working packaged app; there is not yet
+> an installer. `npm run dist` (electron-builder, NSIS) gets as far as
+> `packaging platform=win32 electron=43.4.0`, reports the cached Electron
+> zip at 100%, then makes one more HTTPS request and sits on it for its
+> full 600-second timeout. That is with the Electron zip, winCodeSign and
+> NSIS caches primed by hand, with `--dir` (which skips NSIS entirely) and
+> with `CSC_IDENTITY_AUTO_DISCOVERY=false`. The blocker is the network,
+> not the config.
+>
+> `npm run pack:offline` exists because of that: `electron/pack-offline.js`
+> does the copying electron-builder would have done, from files already on
+> disk. No installer, no asar, Windows only — but a real double-clickable
+> folder. Installers for all three platforms come from
+> `.github/workflows/electron.yml`, which is also the only way to build
+> the Linux and macOS sidecars, since PyInstaller cannot cross-compile.
 
 ### Changing the UI without rebuilding
 

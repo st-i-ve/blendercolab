@@ -1,6 +1,35 @@
 /* What the page cannot know about itself, injected by preload.js.
    blendfleet/web/ stays byte for byte the file the Qt build serves. */
 
+/* THE GROUND.
+   app.css:352 says `html,body{background:transparent}` -- the page goes
+   clear because the QT WINDOW paints the ground underneath it. Nothing
+   paints it here, so what showed through was the Mica backdrop, which
+   follows WINDOWS' light/dark setting and not BlendFleet's: switching
+   theme in the app repainted the cards, the ink and the accent wash while
+   the ground behind them sat still.
+
+   Painted on the root rather than on body, so `body::before` (the wash,
+   at z-index -1) still lies above it -- the root's background is the
+   canvas, which is below everything. `html.electron` also outranks the
+   page's bare `html` selector, so this needs no !important.
+
+   var(--bg) rather than a colour of its own: the ground has to be the
+   same one the theme names, or a new accent or theme would need a second
+   edit here to keep up. */
+html.electron {
+  background: var(--bg);
+}
+
+/* Translucency is the page's `body.glass` (app.js:102). When it is on,
+   the ground thins so Mica reads through it again -- which is what that
+   preference means under Qt too, where the Shell widget painted a
+   translucent ground for exactly this. Still derived from --bg, so it
+   keeps following the theme. */
+html.electron:has(body.glass) {
+  background: color-mix(in srgb, var(--bg) 72%, transparent);
+}
+
 /* THE AMBIENT ACCENT WASH.
    The Qt build paints this in the window (ui/web_host.Shell), because its
    title bar sits OUTSIDE the page and a wash that began at the page's top

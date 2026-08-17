@@ -9,6 +9,8 @@
     "start": "electron .",
     "backend": "cd .. && .venv/Scripts/python.exe -m PyInstaller --noconfirm --clean --distpath dist/backend packaging/blendfleet-backend.spec",
     "dist": "electron-builder --publish never",
+    "pack": "electron-builder --dir --publish never",
+    "pack:offline": "node pack-offline.js",
     "backend:posix": "cd .. && .venv/bin/python -m PyInstaller --noconfirm --clean --distpath dist/backend packaging/blendfleet-backend.spec"
   },
   "devDependencies": {
@@ -19,7 +21,7 @@
     "appId": "com.blendfleet.app",
     "productName": "BlendFleet",
     "directories": {
-      "output": "../dist/electron",
+      "output": "../dist/fleet-electron",
       "buildResources": "../assets/logo"
     },
     "files": [
@@ -30,7 +32,7 @@
     "extraResources": [
       {
         "from": "../blendfleet/web",
-        "to": "web"
+        "to": "blendfleet/web"
       },
       {
         "from": "../assets/fonts",
@@ -39,7 +41,9 @@
       {
         "from": "../assets/logo",
         "to": "assets/logo"
-      },
+      }
+    ],
+    "extraFiles": [
       {
         "from": "../dist/backend/blendfleet-backend",
         "to": "backend"

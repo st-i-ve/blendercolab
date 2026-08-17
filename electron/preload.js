@@ -36,7 +36,10 @@ const CALLS = [
 ];
 
 /* Every event it may listen for. Same list as rpc/protocol.EVENTS, and
-   the parity test in tests/test_rpc_session.py is what keeps them equal. */
+   the parity test in tests/test_electron_shell.py is what keeps them
+   equal -- it reads this array out of this file and compares it to the
+   Python tuple, because an event missing from one side is a card that
+   silently never updates. */
 const EVENTS = [
   'stateChanged', 'accountsChanged', 'settingsChanged', 'telemetry',
   'uploadProgress', 'downloadProgress', 'framePreview', 'logLine',
