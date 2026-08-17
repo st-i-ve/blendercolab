@@ -1149,19 +1149,66 @@ h2.sec .btn{align-self:center;flex:none}
 /* A field is a filled well, not an outlined one: the fill is what says
    "type here", and it lets nine of them sit in a panel without adding
    nine rectangles of chrome to the page. */
-.f-row input,.f-row select{
-  width:100%;padding:10px 13px;border-radius:10px;
-  border:1px solid transparent;background:var(--fill);color:var(--ink);
-  font-size:12.5px;outline:none;transition:border-color .15s,background .15s;
+/* EVERY field, not only the ones inside .f-row.
+   That scoping was the whole "legacy look" bug: the bulk-upload account
+   picker and the Settings number boxes were added OUTSIDE .f-row, so they
+   fell back to the operating system's own widget -- a white native
+   <select> with a native arrow, on a black page. A control that opts in by
+   sitting in the right container is a control that will be added wrong
+   again, so the well is now what an input IS here, and .f-row only adds
+   the things that are about being in a form row (full width, spacing). */
+input[type=text],input[type=number],input[type=password],input[type=search],
+select,textarea,.f-row input,.f-row select{
+  padding:10px 13px;border-radius:10px;
+  border:1px solid transparent;background-color:var(--fill);color:var(--ink);
+  font-size:12.5px;outline:none;transition:border-color .15s,background-color .15s;
 }
-.f-row input:hover,.f-row select:hover{background:var(--border)}
-.f-row input:focus,.f-row select:focus{border-color:var(--accent);background:var(--fill)}
-.f-row input.invalid{border-color:var(--offline)}
+.f-row input,.f-row select{width:100%}
+input:hover,select:hover,textarea:hover{background-color:var(--border)}
+input:focus,select:focus,textarea:focus{
+  border-color:var(--accent);background-color:var(--fill);
+}
+.f-row input.invalid,input.invalid{border-color:var(--offline)}
+
+/* A SELECT DRAWS ITSELF UNLESS TOLD NOT TO. appearance:none removes the
+   native control; the chevron then has to be ours, and it is a background
+   image because a <select> cannot carry a ::after.
+   The arrow's grey is fixed rather than themed on purpose: a data URI
+   cannot read currentColor, and this one (#8f948f) is legible on both the
+   light fill and the dark one -- two theme-specific copies of the same
+   arrow would be two things to keep in step for no gain. */
+select{
+  appearance:none;-webkit-appearance:none;
+  padding-right:32px;cursor:pointer;
+  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12' fill='none'><path d='M2.5 4.5L6 8l3.5-3.5' stroke='%238f948f' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+  background-repeat:no-repeat;background-position:right 11px center;
+}
+/* The drop-down list itself is drawn by the OS and cannot be styled, so
+   the OPTIONS at least get colours that do not flash white on a dark
+   page while it is open. */
+select option{background:var(--card);color:var(--ink)}
+
+/* NUMBER FIELDS KEEP THEIR VALUE, NOT THEIR SPINNERS. Chromium's are
+   native chrome in the middle of a themed page -- the same mismatch the
+   select had -- and every number here (minimum GPUs, a timeout in
+   minutes, a frame) is typed or nudged with the arrow keys, which both
+   still work. */
+input[type=number]{appearance:textfield;-moz-appearance:textfield}
+input[type=number]::-webkit-outer-spin-button,
+input[type=number]::-webkit-inner-spin-button{
+  -webkit-appearance:none;margin:0;
+}
 /* Frame range, size and sampling are read as PAIRS -- start with end,
    width with height -- so they are set as pairs rather than as a
    column of nine full-width boxes. */
 .f-grid{display:grid;grid-template-columns:1fr 1fr;gap:0 14px}
 @media(max-width:520px){.f-grid{grid-template-columns:1fr}}
+/* THE RENDER PAGE. One panel, held to a readable width rather than
+   stretched across a 1400px window: these are nine short fields and a
+   button, and a field box a metre wide reads as a mistake. Not centred --
+   left-aligned like every other page's first column, so switching pages
+   does not move the eye. */
+.render-grid{display:grid;grid-template-columns:minmax(0,520px);gap:20px}
 .f-err{
   display:none;font-family:var(--data);font-size:10.5px;
   color:var(--offline-ink);margin-top:5px;

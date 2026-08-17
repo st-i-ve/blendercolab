@@ -23,7 +23,8 @@ from PySide6.QtWidgets import QApplication
 pytest.importorskip("PySide6.QtWebEngineWidgets",
                     reason="QtWebEngine is not available in this environment")
 
-from PySide6.QtWebEngineCore import QWebEnginePage      # noqa: E402
+from PySide6.QtWebEngineCore import (QWebEnginePage,      # noqa: E402
+                                     QWebEngineProfile)
 from PySide6.QtWebEngineWidgets import QWebEngineView   # noqa: E402
 
 from blendfleet.ui.web_host import WEB_DIR              # noqa: E402
@@ -35,10 +36,20 @@ LOAD_MS = 3500
 
 
 class _RecordingPage(QWebEnginePage):
-    """A page that remembers every console message, errors included."""
+    """A page that remembers every console message, errors included.
+
+    Built on an OFF-THE-RECORD profile (a QWebEngineProfile with no
+    storage name), which keeps Chromium's profile in memory. A default
+    profile writes %APPDATA%/BlendFleet/Preferences -- the browser's own
+    file, inside the app's real directory -- and conftest's
+    guard_real_app_dir_untouched then fails the session as soon as those
+    contents change during a run. Nothing here needs persistence: the page
+    reads its preferences from the backend, not from localStorage.
+    """
 
     def __init__(self, parent=None):
-        super().__init__(parent)
+        self._profile = QWebEngineProfile()      # no name == off the record
+        super().__init__(self._profile, parent)
         self.messages: list[tuple[str, str, int]] = []
 
     def javaScriptConsoleMessage(self, level, message, line, source):  # noqa: N802
@@ -133,7 +144,7 @@ def test_the_markup_has_its_pages_and_controls(loaded_page):
     """Guards the other half: a page that parses but has lost its markup
     is just as broken."""
     _, result = loaded_page
-    assert result.get("pages") == 5, result
+    assert result.get("pages") == 6, result
     assert result.get("buttons", 0) >= 20, result
 
 
@@ -2656,3 +2667,194 @@ def test_no_shapes_means_no_buttons_rather_than_an_invented_one(loaded_page):
     """)
 
     assert empty == "0"
+
+
+# --------------------------------------------------------------------------
+# The storage view and the bulk upload queue, painted in the real page from
+# the payloads the backend actually sends. Both are innerHTML built from
+# untrusted-ish strings (dataset names, error text, file names), so "does it
+# render at all" is a real question and not a formality.
+# --------------------------------------------------------------------------
+
+def test_the_storage_view_paints_what_each_account_holds(loaded_page):
+    page, _ = loaded_page
+    html = _evaluate(page, """
+      (() => {
+        renderStorage({
+          usedBytes: 1024 * 1024 * 829,
+          accounts: [{
+            label: 'acct0', username: 'user_0',
+            usedBytes: 1024 * 1024 * 829,
+            datasets: [
+              {slug: 'user_0/waydown-blend', bytes: 1024*1024*402,
+               ageSeconds: 3600, kind: 'scene'},
+              {slug: 'user_0/blender-5-2-0-linux', bytes: 1024*1024*367,
+               ageSeconds: 86400 * 6, kind: 'runtime'},
+              {slug: 'user_0/bf-diag-big', bytes: 1024*1024*60,
+               ageSeconds: 86400 * 15, kind: 'other'},
+            ],
+          }],
+          errors: {acct1: 'token revoked'},
+        });
+        return document.getElementById('storage-list').innerHTML
+          + '||' + document.getElementById('storage-meta').textContent;
+      })()
+    """)
+
+    assert "user_0/waydown-blend" in html
+    assert "scene" in html and "Blender runtime" in html and "not a scene" in html
+    # The runtime's own warning, because deleting it costs a re-upload.
+    assert "re-uploads it" in html
+    # An account that could not be read is stated separately from one that
+    # holds nothing -- never merged into the total.
+    assert "acct1" in html and "token revoked" in html
+    assert "1 could not be read" in html.split("||")[1]
+
+
+def test_the_upload_queue_shows_a_state_and_a_reason_per_file(loaded_page):
+    page, _ = loaded_page
+    html = _evaluate(page, """
+      (() => {
+        renderUploadQueue({
+          files: [
+            {name: 'first.blend', bytes: 1024*1024*40, state: 'done',
+             slug: 'user_0/first-blend', error: ''},
+            {name: 'broken.blend', bytes: 1024*1024*12, state: 'failed',
+             slug: '', error: 'Kaggle refused the upload'},
+            {name: 'third.blend', bytes: 1024*1024*8, state: 'queued',
+             slug: '', error: ''},
+          ],
+          refused: [{name: 'waydown.blend1', why: 'not a .blend file'}],
+          current: 'broken.blend', done: 1, failed: 1, total: 3,
+        });
+        return document.getElementById('bulk-list').innerHTML
+          + '||' + document.getElementById('bulk-meta').textContent
+          + '||' + document.getElementById('btn-bulk-upload').disabled;
+      })()
+    """)
+    body, meta, disabled = html.split("||")
+
+    assert "on Kaggle" in body and "did not upload" in body
+    assert "Kaggle refused the upload" in body, "the reason has to be visible"
+    # What the chooser refused stays on screen: otherwise "I selected four"
+    # silently disagrees with "three staged".
+    assert "waydown.blend1" in body and "not a .blend file" in body
+    assert "1 of 3 uploaded, 1 failed" in meta, meta
+    assert disabled == "false", (
+        "a queue holding a failed and a queued file must still be uploadable")
+
+
+def test_an_empty_queue_disables_the_upload_button(loaded_page):
+    page, _ = loaded_page
+    state = _evaluate(page, """
+      (() => {
+        renderUploadQueue({files: [], refused: [], done: 0, failed: 0, total: 0});
+        return document.getElementById('btn-bulk-upload').disabled
+          + '||' + document.getElementById('bulk-meta').textContent;
+      })()
+    """)
+
+    assert state.split("||")[0] == "true"
+    assert "nothing staged" in state.split("||")[1]
+
+
+# --------------------------------------------------------------------------
+# Navigation. Added when a screenshot of the new Render page showed the
+# sidebar still highlighting Dashboard: the page, its title and its nav
+# button are three things that must always agree, and until now nothing
+# checked that they did.
+# --------------------------------------------------------------------------
+
+NAV_PAGES = ["dashboard", "files", "render", "instances", "logs", "settings"]
+
+
+@pytest.mark.parametrize("page", NAV_PAGES)
+def test_clicking_a_nav_button_shows_exactly_that_page(loaded_page, page):
+    view, _ = loaded_page
+    answer = _evaluate(view, f"""
+      (() => {{
+        document.querySelector('[data-page="{page}"]').click();
+        return JSON.stringify({{
+          marked: [...document.querySelectorAll('.nav-btn.on')]
+            .map(b => b.dataset.page),
+          shown: [...document.querySelectorAll('.page.on')].map(p => p.id),
+          title: document.getElementById('page-title').textContent,
+        }});
+      }})()
+    """)
+    state = json_loads(answer)
+
+    assert state["marked"] == [page], (
+        f"the sidebar marks {state['marked']} while showing {page}")
+    assert state["shown"] == [f"page-{page}"], (
+        f"{state['shown']} is visible instead of page-{page}")
+    assert state["title"].strip().lower() == page
+
+
+def test_every_nav_button_has_a_page_and_every_page_has_a_button(loaded_page):
+    """A button with no page is a dead click; a page with no button is
+    unreachable. Both have happened in this app's history."""
+    view, _ = loaded_page
+    answer = _evaluate(view, """
+      (() => JSON.stringify({
+        buttons: [...document.querySelectorAll('.nav-btn')].map(b => b.dataset.page),
+        pages: [...document.querySelectorAll('.page')].map(p => p.id.replace('page-','')),
+      }))()
+    """)
+    state = json_loads(answer)
+
+    assert sorted(state["buttons"]) == sorted(state["pages"])
+    assert sorted(state["buttons"]) == sorted(NAV_PAGES)
+
+
+# --------------------------------------------------------------------------
+# Fields must be this app's, not the operating system's. The bulk-upload
+# account picker shipped as a raw <select>: a white native widget with a
+# native arrow, on a black page. It looked "legacy" because it literally
+# was -- the well styling was scoped to `.f-row`, and that control lives
+# outside it. These check the fix at the level the bug existed: computed
+# style, in both themes, on a control that is NOT in a form row.
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("theme", ["light", "dark"])
+def test_a_select_outside_a_form_row_is_still_ours(loaded_page, theme):
+    view, _ = loaded_page
+    answer = _evaluate(view, f"""
+      (() => {{
+        document.documentElement.dataset.theme = '{theme}';
+        const picker = document.getElementById('bulk-account');
+        const style = getComputedStyle(picker);
+        const fill = getComputedStyle(document.documentElement)
+          .getPropertyValue('--fill').trim();
+        return JSON.stringify({{
+          appearance: style.appearance,
+          background: style.backgroundColor,
+          image: style.backgroundImage.slice(0, 30),
+          radius: style.borderRadius,
+          fill: fill,
+        }});
+      }})()
+    """)
+    style = json_loads(answer)
+
+    assert style["appearance"] == "none", (
+        "the OS is still drawing this control")
+    # Its own chevron, since appearance:none removes the native one and a
+    # <select> cannot carry a ::after to draw it.
+    assert style["image"].startswith("url("), "no chevron was drawn"
+    assert style["radius"] != "0px", "a field here is a rounded well"
+    assert style["background"] not in ("rgb(255, 255, 255)", "rgba(0, 0, 0, 0)"), (
+        f"the picker is painting {style['background']} rather than the "
+        f"theme's own field fill ({style['fill']})")
+
+
+def test_number_fields_do_not_show_native_spinners(loaded_page):
+    """Chromium's spinners are native chrome in the middle of a themed
+    page -- the same mismatch the select had. Typing and the arrow keys
+    both still work without them."""
+    view, _ = loaded_page
+    appearance = _evaluate(view, """
+      getComputedStyle(document.getElementById('min-gpus')).appearance
+    """)
+
+    assert appearance in ("textfield", "auto"), appearance

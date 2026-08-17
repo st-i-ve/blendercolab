@@ -2337,7 +2337,9 @@ function renderUploadQueue(payload) {
       </div>
     </div>`).join('');
 
-  list.innerHTML = rows + skipped;
+  list.innerHTML = (rows + skipped) || `<div class="empty">Nothing staged. ${
+    ''}Choose several .blend files and they upload one after another, each ${
+    ''}reporting its own outcome.</div>`;
 }
 
 function renderBulkAccounts(instances) {
@@ -2403,6 +2405,12 @@ function renderStorage(payload) {
       <div class="unreadable-body"><b>${esc(label)}</b>
         <div class="dz-sub">could not be read — ${esc(errors[label])}</div></div>
     </div>`).join('');
+  if (!list.innerHTML) {
+    /* Every account reachable and none of them holding anything is a real
+       answer, and a different one from "not checked yet". */
+    list.innerHTML = '<div class="empty">Nothing on Kaggle yet — no account '
+      + 'owns a dataset.</div>';
+  }
 
   /* Deletion goes through deleteScene, which resolves the owner from the
      slug and refuses without that account's own token -- and refuses while

@@ -337,6 +337,42 @@ function createWindow() {
   if (process.env.BLENDFLEET_SHOT) {
     const after = Number(process.env.BLENDFLEET_SHOT_DELAY || 4000);
     setTimeout(async () => {
+      /* BLENDFLEET_SHOT_PAGE=files|render|settings clicks that nav button
+         before capturing. Same development-only status as the shot itself:
+         checking a page's LAYOUT means seeing that page, and a screenshot
+         of the dashboard cannot answer a question about the settings
+         form. */
+      if (process.env.BLENDFLEET_SHOT_PAGE) {
+        /* Reports what the DOM actually thinks afterwards, because reading
+           a highlight off a screenshot is guesswork: a hover or focus ring
+           looks much like a selected nav item, and mistaking one for the
+           other sends you fixing navigation that was never broken. */
+        const state = await win.webContents.executeJavaScript(
+          `(() => {
+             document.querySelector('[data-page="${
+               process.env.BLENDFLEET_SHOT_PAGE}"]').click();
+             return JSON.stringify({
+               marked: [...document.querySelectorAll('.nav-btn.on')]
+                 .map(b => b.dataset.page),
+               shown: [...document.querySelectorAll('.page.on')].map(p => p.id),
+               hovered: [...document.querySelectorAll('.nav-btn:hover')]
+                 .map(b => b.dataset.page),
+             });
+           })()`);
+        console.error('nav state at capture:', state);
+        await new Promise(done => setTimeout(done, 500));
+      }
+      /* BLENDFLEET_SHOT_INTO=<css selector> scrolls that element into view
+         first. A capture is one viewport, and the controls worth checking
+         are often below the fold -- a screenshot of the top of Settings
+         cannot answer a question about a field near the bottom of it. */
+      if (process.env.BLENDFLEET_SHOT_INTO) {
+        await win.webContents.executeJavaScript(
+          `document.querySelector(${
+            JSON.stringify(process.env.BLENDFLEET_SHOT_INTO)
+          }).scrollIntoView({block: 'center'})`);
+        await new Promise(done => setTimeout(done, 400));
+      }
       const image = await win.webContents.capturePage();
       fs.writeFileSync(process.env.BLENDFLEET_SHOT, image.toPNG());
       console.log('captured', process.env.BLENDFLEET_SHOT);
