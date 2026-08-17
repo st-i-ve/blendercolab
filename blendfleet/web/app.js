@@ -478,6 +478,10 @@ function renderState(json) {
   renderUnshared(state);
   renderFailures(state);
   renderDataset(state);
+  /* The bulk upload's account picker comes off the same payload as
+     everything else: an account added or removed changes who can own a
+     batch, and a stale list would offer one that is gone. */
+  renderBulkAccounts(state.instances);
 }
 
 /* Rebuild the cards from the payload already on screen.
@@ -2279,6 +2283,148 @@ document.getElementById('btn-stop-all').onclick = () =>
 document.getElementById('btn-send-job').onclick = () =>
   backend && backend.sendJob(JSON.stringify(renderOptions()));
 
+/* ---- SEVERAL SCENES AT ONCE ------------------------------------------
+   The queue is the backend's, always: this paints what uploadQueueChanged
+   reports and keeps no copy. A local copy would be a second version of the
+   truth, and the one that goes stale is the one on screen. */
+const BULK_STATE = {
+  queued: ['queued', ''],
+  uploading: ['uploading now', 'accent'],
+  done: ['on Kaggle', 'ok'],
+  failed: ['did not upload', 'bad'],
+};
+
+function renderUploadQueue(payload) {
+  const files = payload.files || [];
+  const refused = payload.refused || [];
+  const meta = document.getElementById('bulk-meta');
+  const list = document.getElementById('bulk-list');
+  const button = document.getElementById('btn-bulk-upload');
+
+  /* Counted, not summarised: "6 of 8, 2 failed" is what a person needs to
+     decide whether to retry, and a single percentage hides which. */
+  meta.textContent = files.length
+    ? `${payload.done || 0} of ${files.length} uploaded${
+        payload.failed ? `, ${payload.failed} failed` : ''}`
+    : 'nothing staged';
+  button.disabled = !files.some(f => f.state === 'queued' || f.state === 'failed');
+
+  const rows = files.map(f => {
+    const [label, tone] = BULK_STATE[f.state] || ['', ''];
+    return `
+    <div class="file-row-card">
+      <div class="unreadable-body">
+        <b>${esc(f.name)}</b>
+        <div class="dz-sub">${fmtBytes(f.bytes)} · <span class="${
+          tone ? 'badge ' + tone : ''}">${esc(label)}</span>${
+          f.slug ? ' · ' + esc(f.slug) : ''}${
+          /* The reason, verbatim from the backend. A failed file stays in
+             the queue, so this is also the text somebody reads before
+             deciding whether pressing Upload again is worth it. */
+          f.error ? ' · ' + esc(f.error) : ''}</div>
+      </div>
+    </div>`;
+  }).join('');
+
+  /* What the chooser refused, kept visible rather than dropped: a .blend1
+     backup swept up by a multi-select would otherwise silently not be
+     there, and "I selected nine" would disagree with "eight staged". */
+  const skipped = refused.map(r => `
+    <div class="file-row-card">
+      <div class="unreadable-body">
+        <b>${esc(r.name)}</b>
+        <div class="dz-sub">not staged — ${esc(r.why)}</div>
+      </div>
+    </div>`).join('');
+
+  list.innerHTML = rows + skipped;
+}
+
+function renderBulkAccounts(instances) {
+  const select = document.getElementById('bulk-account');
+  const chosen = select.value;
+  select.innerHTML = (instances || []).map(i =>
+    `<option value="${esc(i.label)}">${esc(i.label)}</option>`).join('');
+  if (chosen) select.value = chosen;
+}
+
+document.getElementById('btn-pick-many').onclick = () => {
+  if (backend) backend.pickBlends();
+};
+document.getElementById('btn-bulk-upload').onclick = () => {
+  if (backend) backend.uploadScenes(document.getElementById('bulk-account').value);
+};
+
+/* ---- WHAT EACH ACCOUNT IS HOLDING ------------------------------------
+   No quota figure appears here on purpose: the Kaggle API exposes none, so
+   any "x of y GB" would be a number this app invented. Sizes and ages are
+   measured; a limit would not be. */
+const STORAGE_KIND = {
+  scene: ['scene', ''],
+  runtime: ['Blender runtime', 'warn'],
+  other: ['not a scene', ''],
+};
+
+function renderStorage(payload) {
+  const accounts = payload.accounts || [];
+  const errors = payload.errors || {};
+  const meta = document.getElementById('storage-meta');
+  const list = document.getElementById('storage-list');
+  const unchecked = Object.keys(errors);
+
+  meta.textContent = accounts.length
+    ? `${fmtBytes(payload.usedBytes || 0)} across ${accounts.length} account(s)${
+        unchecked.length ? ` · ${unchecked.length} could not be read` : ''}`
+    : 'nothing to report';
+
+  list.innerHTML = accounts.map(account => `
+    <div class="file-row-card" style="display:block">
+      <div class="l1" style="margin-bottom:6px">
+        <b>${esc(account.label)}</b>
+        <span class="dz-sub">${esc(account.username || 'no username')} · ${
+          fmtBytes(account.usedBytes)} in ${account.datasets.length} dataset(s)</span>
+      </div>
+      ${account.datasets.map(d => {
+        const [kind, tone] = STORAGE_KIND[d.kind] || ['', ''];
+        return `<div class="l1" style="padding:3px 0">
+          <span class="dz-sub" style="flex:1;min-width:0">
+            ${esc(d.slug)} <span class="${tone ? 'badge ' + tone : ''}">${esc(kind)}</span>
+            · ${fmtBytes(d.bytes)} · <span class="age">${fmtAge(d.ageSeconds)}</span>
+          </span>
+          <button class="btn ico sm danger" data-drop="${esc(d.slug)}"
+                  aria-label="Delete this dataset" data-tip="Delete this dataset"
+                  title="${d.kind === 'runtime'
+                    ? 'This is the Blender runtime BlendFleet uploads. Deleting it means the next render on this account re-uploads it.'
+                    : 'Delete this dataset from Kaggle. Accounts it was shared with lose access; a scene deleted here has to be re-uploaded to render again.'}">${ACT.trash}</button>
+        </div>`;
+      }).join('')}
+    </div>`).join('') + unchecked.map(label => `
+    <div class="file-row-card">
+      <div class="unreadable-body"><b>${esc(label)}</b>
+        <div class="dz-sub">could not be read — ${esc(errors[label])}</div></div>
+    </div>`).join('');
+
+  /* Deletion goes through deleteScene, which resolves the owner from the
+     slug and refuses without that account's own token -- and refuses while
+     a job is rendering from it. Same guarded path as the scene library's
+     own delete, not a second one. */
+  list.querySelectorAll('[data-drop]').forEach(btn => {
+    btn.onclick = () => {
+      const slug = btn.dataset.drop;
+      if (!window.confirm(
+        `Delete ${slug} from Kaggle?\n\nThis cannot be undone. Any account it `
+        + 'was shared with loses access, and a scene deleted here has to be '
+        + 'uploaded again before it can render.')) return;
+      if (backend) backend.deleteScene(slug);
+    };
+  });
+}
+
+document.getElementById('btn-storage').onclick = () => {
+  document.getElementById('storage-meta').textContent = 'reading every account…';
+  if (backend) backend.storage();
+};
+
 /* STRAY SESSIONS: renders on Kaggle that no tracked job accounts for.
    Painted only from what the backend reports -- never a remembered list,
    because a stray that has since been cancelled must not keep appearing as
@@ -3121,6 +3267,13 @@ new QWebChannel(qt.webChannelTransport, channel => {
      unasked on every launch would spend somebody's rate limit to answer a
      question they did not ask. The button on the Instances page asks it. */
   backend.straySessionsChanged.connect(json => renderStrays(JSON.parse(json)));
+
+  /* Both painted from the backend's own report, never from a copy kept
+     here. Neither is asked for on startup: storage() is a dataset listing
+     per account, and a bulk queue only exists once somebody has chosen
+     files. */
+  backend.uploadQueueChanged.connect(json => renderUploadQueue(JSON.parse(json)));
+  backend.storageChanged.connect(json => renderStorage(JSON.parse(json)));
 
   backend.refreshQuota();
   backend.poll();

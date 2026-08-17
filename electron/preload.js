@@ -29,7 +29,8 @@ const CALLS = [
   'accounts', 'addAccount', 'blenderVersions', 'cancelAll', 'cancelInstance',
   'cancelJob', 'checkHardware', 'checkOutputs', 'collect', 'deleteScene',
   'diagnostics', 'estimateRender', 'forgetJob', 'forgetUnreadableJob',
-  'cancelStraySession', 'findStraySessions',
+  'cancelStraySession', 'findStraySessions', 'storage',
+  'setBlends', 'uploadScenes',
   'health', 'launch', 'outputs', 'poll', 'preferences', 'previewFrame',
   'ready', 'refreshQuota', 'removeAccount', 'renderScene', 'scenes',
   'sendJob', 'setBlend', 'setPreference', 'setUsername', 'startInstances',
@@ -46,6 +47,7 @@ const EVENTS = [
   'uploadProgress', 'downloadProgress', 'framePreview', 'logLine',
   'notification', 'healthChanged', 'busyChanged', 'scenesChanged',
   'outputsChanged', 'collectFinished', 'straySessionsChanged',
+  'storageChanged', 'uploadQueueChanged',
 ];
 
 const handlers = {};
@@ -102,6 +104,21 @@ backend.pickBlend = async (...args) => {
   if (typeof args[args.length - 1] === 'function') callback = args.pop();
   const chosen = await ipcRenderer.invoke('shell:pickBlend');
   const answer = await call('setBlend', [chosen || '']);
+  if (callback) callback(answer);
+  return answer;
+};
+
+/* The bulk chooser, same division of labour as pickBlend: the shell shows
+   the dialog, the sidecar decides what is acceptable and stages it. A
+   dismissed chooser stages nothing rather than clearing what was already
+   staged. */
+backend.pickBlends = async (...args) => {
+  let callback = null;
+  if (typeof args[args.length - 1] === 'function') callback = args.pop();
+  const chosen = await ipcRenderer.invoke('shell:pickBlends');
+  const answer = (chosen && chosen.length)
+    ? await call('setBlends', [JSON.stringify(chosen)])
+    : JSON.stringify({ queued: 0, refused: [] });
   if (callback) callback(answer);
   return answer;
 };

@@ -87,6 +87,30 @@ class Scene:
     blend_name: str
 
 
+def dataset_kind(ref: str) -> str:
+    """"scene", "runtime" or "other", from the name alone.
+
+    The storage view needs to tell three things apart: a scene worth
+    keeping, the Blender runtime this app uploads (deleting that costs the
+    next render a re-upload, so it must be labelled and not merely listed),
+    and everything else -- diagnostic leftovers, an old smoke test, a
+    dataset from a version of this app that no longer exists.
+
+    Name-based, and no more trustworthy than the filter below for the same
+    reason: nothing here opens a dataset. "scene" means "named like one",
+    which is exactly what Scene's own docstring says about itself.
+    """
+    name = str(ref).split("/", 1)[-1]
+    if RUNTIME_DATASET_RE.match(name):
+        return "runtime"
+    # The same suffix scenes_from_datasets filters on, and the same
+    # "a bare '-blend' has no name to render" exclusion: a dataset this
+    # would call a scene must be one that dataset actually yields.
+    if name.endswith(_SCENE_SUFFIX) and name[: -len(_SCENE_SUFFIX)]:
+        return "scene"
+    return "other"
+
+
 def scenes_from_datasets(datasets: list[DatasetInfo]) -> list[Scene]:
     """Filter `datasets` down to the ones that look like scenes.
 

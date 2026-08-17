@@ -537,6 +537,19 @@ ipcMain.handle('shell:pickBlend', async () => {
   return answer.filePaths[0];
 });
 
+ipcMain.handle('shell:pickBlends', async () => {
+  const answer = await dialog.showOpenDialog(win, {
+    title: 'Select .blend files',
+    filters: [{ name: 'Blender', extensions: ['blend'] }],
+    /* multiSelections is the whole point; the sidecar still checks each
+       path, because a multi-select is how a .blend1 backup gets swept up. */
+    properties: ['openFile', 'multiSelections'],
+  });
+  if (answer.canceled) return [];
+  answer.filePaths.forEach(path => app.addRecentDocument(path));
+  return answer.filePaths;
+});
+
 ipcMain.handle('shell:chooseDirectory', async () => {
   const answer = await dialog.showOpenDialog(win, {
     title: 'Save frames to',

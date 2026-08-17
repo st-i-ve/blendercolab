@@ -42,6 +42,7 @@ EVENTS = (
     "uploadProgress", "downloadProgress", "framePreview", "logLine",
     "notification", "healthChanged", "busyChanged", "scenesChanged",
     "outputsChanged", "collectFinished", "straySessionsChanged",
+    "storageChanged", "uploadQueueChanged",
 )
 
 

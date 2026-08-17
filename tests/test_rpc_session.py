@@ -190,15 +190,29 @@ def _contract(adapter_class):
             and callable(getattr(adapter_class, n))} - qobject - signals
 
 
+# The only methods the Qt adapter may have and the sidecar may not: the
+# ones that OPEN A DIALOG. A headless Session has no window to parent one
+# to, so each is split in two -- the shell shows the chooser, the Session
+# takes the answer. Mapped to that counterpart rather than listed as bare
+# exemptions, so adding a dialog cannot quietly widen the gap: the way
+# through this test is to provide the headless half.
+_DIALOG_METHODS = {"pickBlend": "setBlend", "pickBlends": "setBlends"}
+
+
 def test_both_adapters_offer_the_same_methods_to_the_page():
     """A method the page calls and the sidecar cannot answer is a dead
     button."""
-    missing = _contract(Backend) - _contract(Session) - {"pickBlend"}
+    missing = _contract(Backend) - _contract(Session) - set(_DIALOG_METHODS)
     assert not missing, f"the sidecar cannot answer: {sorted(missing)}"
-    assert "setBlend" in _contract(Session)
-    assert "pickBlend" not in _contract(Session), (
-        "a headless sidecar has no window to parent a file dialog to -- "
-        "the shell shows it and calls setBlend")
+
+    for opener, headless in _DIALOG_METHODS.items():
+        assert opener not in _contract(Session), (
+            f"{opener} opens a file dialog; a headless sidecar has no window "
+            "to parent one to")
+        assert headless in _contract(Session), (
+            f"{opener} is exempt only because {headless} is what the shell "
+            f"calls instead -- without it, {opener} is unreachable under "
+            "Electron")
 
 
 def test_both_adapters_emit_the_same_events(qapp, tmp_path):

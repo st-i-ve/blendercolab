@@ -65,6 +65,7 @@ grid is approximate and says so.
 """
 from __future__ import annotations
 
+import json
 import threading
 
 from PySide6.QtCore import QObject, Qt, Signal, Slot
@@ -119,6 +120,8 @@ class Backend(QObject):
     outputsChanged = Signal(str)
     collectFinished = Signal(str)
     straySessionsChanged = Signal(str)
+    storageChanged = Signal(str)
+    uploadQueueChanged = Signal(str)
 
     # Private, and deliberately not a Slot: QWebChannel exposes every slot
     # it finds, and the page has no business being able to inject events.
@@ -353,6 +356,14 @@ class Backend(QObject):
     def findStraySessions(self) -> None:
         self._session.findStraySessions()
 
+    @Slot()
+    def storage(self) -> None:
+        self._session.storage()
+
+    @Slot(str)
+    def uploadScenes(self, label: str = "") -> None:
+        self._session.uploadScenes(label)
+
     @Slot(str, str)
     def cancelStraySession(self, label: str, slug: str) -> None:
         self._session.cancelStraySession(label, slug)
@@ -372,6 +383,23 @@ class Backend(QObject):
         path, _ = QFileDialog.getOpenFileName(
             None, "Select .blend", "", "Blender (*.blend)")
         return self._session.setBlend(path)
+
+    @Slot(result=str)
+    def pickBlends(self) -> str:
+        """Open the OS file chooser for SEVERAL .blend files at once.
+
+        The bulk counterpart to pickBlend, and the same division of labour:
+        this opens the dialog, `setBlends` decides what is acceptable and
+        stages it. A dismissed chooser stages nothing rather than clearing
+        what was already staged -- cancelling has never meant "throw away
+        my last selection" anywhere else in this app.
+        """
+        from PySide6.QtWidgets import QFileDialog
+        paths, _ = QFileDialog.getOpenFileNames(
+            None, "Select .blend files", "", "Blender (*.blend)")
+        if not paths:
+            return json.dumps({"queued": 0, "refused": []})
+        return self._session.setBlends(json.dumps(list(paths)))
 
     @Slot(str)
     @Slot(str, str)

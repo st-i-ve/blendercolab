@@ -48,7 +48,8 @@ from blendfleet.kaggle_client import (PENDING_STATES, TERMINAL_STATES,
 from blendfleet.log_stream import stream_progress
 from blendfleet.notebook_builder import RenderSettings
 from blendfleet.platform_paths import log_dir, state_dir
-from blendfleet.scenes import Scene, scenes_from_datasets
+from blendfleet.scenes import (Scene, dataset_kind as _dataset_kind,
+                               scenes_from_datasets)
 from blendfleet.settings import Settings
 from blendfleet.ui.messages import explain
 
@@ -200,6 +201,11 @@ class Session:
         self.collectFinished = Emitter("collectFinished")
         # Sessions running on Kaggle that no tracked job accounts for.
         self.straySessionsChanged = Emitter("straySessionsChanged")
+        # What each account is holding on Kaggle, and of what kind.
+        self.storageChanged = Emitter("storageChanged")
+        # Which staged .blend files are queued, uploading, done or
+        # failed -- a bulk upload reports per file, never one verdict.
+        self.uploadQueueChanged = Emitter("uploadQueueChanged")
         self.store = store
         self.fleet_factory = fleet_factory
         self.verifier = verifier
@@ -317,6 +323,9 @@ class Session:
         # as a live one. See _resume_streams and ready().
         self._resumed_labels: set[str] = set()
         self._resumed = False
+        # Staged for a bulk upload, and what the chooser refused.
+        self._upload_queue: list[dict] = []
+        self._upload_refused: list[dict] = []
 
         # A status poll is infrequent and costs a network call per account;
         # the live drain is cheap and purely in-memory. Two timers, two
@@ -1508,6 +1517,164 @@ class Session:
 
         self._start("dataset", work, "Uploading the scene", ok)
 
+    def setBlends(self, paths_json: str = "") -> str:
+        """Stage several .blend files for upload, and say what was refused.
+
+        The counterpart to setBlend for a multi-select. Files are checked
+        HERE, before anything is queued, because "you chose eight and six
+        will be uploaded" is worth knowing before the first byte goes out
+        rather than as a surprise six minutes in.
+
+        Two refusals, both silent-failure risks otherwise: a file that is
+        not a .blend (a multi-select makes it easy to sweep up a .blend1
+        backup, which Blender writes beside every save) and a file that is
+        no longer there.
+        """
+        try:
+            raw = json.loads(paths_json or "[]")
+        except ValueError:
+            raw = []
+        queued: list[dict] = []
+        refused: list[dict] = []
+        for entry in raw if isinstance(raw, list) else []:
+            if not isinstance(entry, str) or not entry.strip():
+                continue
+            path = Path(entry)
+            if path.suffix.lower() != ".blend":
+                refused.append({"name": path.name,
+                                "why": "not a .blend file"})
+                continue
+            if not path.is_file():
+                refused.append({"name": path.name, "why": "no longer there"})
+                continue
+            queued.append({"path": str(path), "name": path.name,
+                           "bytes": path.stat().st_size, "state": "queued",
+                           "slug": "", "error": ""})
+        # Replaces rather than appends: the file chooser's answer IS the
+        # queue, and a second pick that silently kept the first pick's
+        # files would upload things the user did not just choose.
+        self._upload_queue = queued
+        self._upload_refused = refused
+        self._emit_upload_queue()
+        return json.dumps({"queued": len(queued), "refused": refused})
+
+    def _emit_upload_queue(self, current: str = "") -> None:
+        """The whole queue, every time. Small enough to send whole, and a
+        payload of deltas would need the page to keep its own copy of the
+        truth -- which is exactly what this app does not do anywhere."""
+        files = getattr(self, "_upload_queue", [])
+        self.uploadQueueChanged.emit(json.dumps({
+            "files": [{k: v for k, v in f.items() if k != "path"}
+                      for f in files],
+            "refused": getattr(self, "_upload_refused", []),
+            "current": current,
+            "done": sum(1 for f in files if f["state"] == "done"),
+            "failed": sum(1 for f in files if f["state"] == "failed"),
+            "total": len(files),
+        }))
+
+    def uploadScenes(self, label: str = "") -> None:
+        """Upload every staged .blend, one after another, to ONE account.
+
+        SEQUENTIAL ON PURPOSE. Each upload is a single resumable GCS
+        session with real progress (see uploader.py, which measured
+        chunking as slower); several at once on one account would split the
+        same bandwidth, and a failure mid-way would leave several
+        half-finished sessions to reason about instead of one.
+
+        PER-FILE OUTCOMES, never one verdict. Eight files where the fifth
+        failed has to say which -- the same rule refreshQuota and
+        find_stray_sessions keep -- and the four after it still upload,
+        because a bad file is not a reason to abandon the good ones.
+
+        `label` chooses which account OWNS the scenes; the fleet's first
+        account when empty, which is what the single-scene Upload has
+        always used. It matters more than it looks: an account holding
+        nothing has all its storage free, and Kaggle is per-account.
+        """
+        queue = [f for f in getattr(self, "_upload_queue", [])
+                 if f["state"] in ("queued", "failed")]
+        if not queue:
+            self.notification.emit(
+                "Choose some .blend files first.", "offline")
+            return
+        accounts = self.store.list()
+        if not accounts:
+            self.notification.emit(
+                "Add at least one Kaggle account first.", "offline")
+            return
+        owner = next((a for a in accounts if a.label == label), accounts[0])
+        # The owner is whichever account a Fleet holds FIRST
+        # (Fleet.prepare_dataset: `owner = self.accounts[0]`), so choosing
+        # one is choosing the order -- not a new parameter Fleet has to
+        # learn.
+        ordered = [owner] + [a for a in accounts if a.label != owner.label]
+        fleet = self.fleet_factory(ordered)
+
+        def work():
+            results = []
+            for entry in queue:
+                blend = Path(entry["path"])
+                entry["state"] = "uploading"
+                entry["error"] = ""
+                self._emit_upload_queue(current=entry["name"])
+                try:
+                    slug = fleet.prepare_dataset(
+                        blend,
+                        required=[owner],
+                        on_progress=lambda p, name=entry["name"]:
+                            self.uploadProgress.emit(json.dumps({
+                                "label": owner.label,
+                                "stage": "uploading",
+                                # The file's name travels with its bytes:
+                                # one bar for eight files is unreadable
+                                # unless it says which one is moving.
+                                "detail": name,
+                                "uploaded": p.uploaded,
+                                "total": p.total,
+                            })),
+                        on_stage=lambda key, detail, name=entry["name"]:
+                            self.uploadProgress.emit(json.dumps({
+                                "label": owner.label, "stage": key,
+                                "detail": f"{name}: {detail}" if detail
+                                          else name})))
+                except Exception as e:      # noqa: BLE001 -- per file
+                    from blendfleet.ui.messages import explain
+                    entry["state"] = "failed"
+                    entry["error"] = self._scrub(
+                        explain("Uploading the scene", e))
+                    crash_log.record(self._scrub(
+                        f"bulk upload failed for {blend.name}: "
+                        f"{type(e).__name__}: {e}"), critical=True)
+                else:
+                    entry["state"] = "done"
+                    entry["slug"] = slug
+                    self.logLine.emit(f"dataset ready: {slug}", "active")
+                results.append(entry)
+                self._emit_upload_queue()
+            return results
+
+        def ok(results) -> None:
+            done = [r for r in results if r["state"] == "done"]
+            failed = [r for r in results if r["state"] == "failed"]
+            if failed:
+                names = ", ".join(f"{r['name']} ({r['error']})"
+                                  for r in failed)
+                self.notification.emit(
+                    f"Uploaded {len(done)} of {len(results)} scene(s) to "
+                    f"{owner.label}. These did not upload and are still "
+                    f"queued to retry: {names}", "offline")
+            else:
+                self.notification.emit(
+                    f"Uploaded {len(done)} scene(s) to {owner.label}.",
+                    "active")
+            self._emit_upload_queue()
+            # The library and the storage view are both now out of date by
+            # exactly this many datasets.
+            self.scenes()
+
+        self._start("bulk-upload", work, "Uploading the scenes", ok)
+
     def launch(self, options_json: str) -> None:
         """Start a render on chosen accounts (every FREE account when none
         are named).
@@ -2020,6 +2187,79 @@ class Session:
             self.poll()
 
         self._start("cancel", work, "Cancelling the render", ok)
+
+    def storage(self) -> None:
+        """What each account is holding on Kaggle, and what kind of thing.
+
+        Kaggle is a good cache and a bad backup, and this is the view that
+        makes that concrete: which account has room, which datasets are
+        scenes, which are the Blender runtime this app uploads, and which
+        are neither -- diagnostic leftovers, a smoke test from a month ago,
+        anything a previous version left behind.
+
+        NO QUOTA FIGURE IS SHOWN, because the API does not expose one.
+        `total_bytes` per dataset is real and measured; a storage limit
+        would be a number this app invented, and the whole point of the
+        honesty rules is not doing that. What it can say truthfully is how
+        much each account is using and how old each dataset is.
+
+        Deleting from here goes through deleteScene, which already refuses
+        without the owner's own token and refuses while a job is rendering
+        from that dataset -- one deletion path, already guarded, rather
+        than a second one that would have to re-learn both rules.
+        """
+        accounts = self.store.list()
+        if not accounts:
+            self.notification.emit("Add an account first.", "offline")
+            return
+
+        def work():
+            found: list[dict] = []
+            errors: dict[str, str] = {}
+            for account in accounts:
+                try:
+                    datasets = self.fleet_factory(accounts).client_factory(
+                        account.token).list_datasets()
+                except Exception as e:      # noqa: BLE001 -- per account
+                    errors[account.label] = self._scrub(str(e))
+                    continue
+                found.append({
+                    "label": account.label,
+                    "username": account.username or "",
+                    "usedBytes": sum(d.total_bytes for d in datasets),
+                    "datasets": [{
+                        "slug": d.ref,
+                        "title": d.title,
+                        "bytes": d.total_bytes,
+                        "updated": d.last_updated.isoformat(),
+                        "ageSeconds": max(
+                            time.time() - d.last_updated.timestamp(), 0.0),
+                        # What kind of thing this is, so the page can tell a
+                        # scene from the Blender runtime from a leftover --
+                        # and so "delete" is never offered for the runtime
+                        # without saying what it is.
+                        "kind": _dataset_kind(d.ref),
+                    } for d in sorted(datasets,
+                                      key=lambda d: -d.total_bytes)],
+                })
+            return found, errors
+
+        def ok(result) -> None:
+            found, errors = result
+            self.storageChanged.emit(json.dumps({
+                "accounts": found,
+                "errors": errors,
+                # Summed here rather than in the page: one place decides
+                # what "used" means, and it is the place that also decides
+                # what a dataset's size is.
+                "usedBytes": sum(a["usedBytes"] for a in found),
+            }))
+            if errors:
+                self.notification.emit(
+                    f"Could not read storage for {len(errors)} account(s).",
+                    "offline")
+
+        self._start("storage", work, "Reading Kaggle storage", ok)
 
     def findStraySessions(self) -> None:
         """Look for sessions this app started and lost track of.

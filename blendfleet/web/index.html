@@ -203,6 +203,38 @@
               </div>
             </div>
 
+            <!-- BULK UPLOAD. Scenes live on Kaggle and render later, so
+                 sending a batch now and choosing what to render afterwards
+                 is the useful shape. One dataset per file (never one
+                 dataset holding several: nothing downstream can tell which
+                 .blend inside it to render), uploaded one after another,
+                 with an outcome per file rather than one verdict. -->
+            <h2 class="sec" style="margin-top:26px">Send several scenes
+              <span class="meta" id="bulk-meta">nothing staged</span></h2>
+            <div class="panel">
+              <div class="fr-actions">
+                <button class="btn" id="btn-pick-many">Choose .blend files…</button>
+                <select id="bulk-account" style="min-width:150px"></select>
+                <button class="btn primary" id="btn-bulk-upload" disabled>Upload them</button>
+              </div>
+              <div class="dz-sub" style="margin-top:8px">Uploaded one at a time to the account you pick — each becomes its own dataset, ready to render whenever. An account holding nothing has all its Kaggle storage free.</div>
+              <div id="bulk-list"></div>
+            </div>
+
+            <!-- STORAGE. Kaggle is a good cache and a bad backup: nothing
+                 here is a quota figure, because the API exposes none. What
+                 it can say truthfully is what each account holds, how old
+                 it is, and which datasets are scenes rather than the
+                 Blender runtime or leftovers. -->
+            <h2 class="sec" style="margin-top:26px">Kaggle storage
+              <span class="meta" id="storage-meta">not checked yet</span></h2>
+            <div class="panel">
+              <div class="fr-actions">
+                <button class="btn" id="btn-storage">Check what each account holds</button>
+              </div>
+              <div id="storage-list"></div>
+            </div>
+
             <!-- Frame-by-frame progress moved to Dashboard: each running
                  scene now gets its own grid there, next to its own accounts
                  and its own collect/cancel controls (see #instances /
