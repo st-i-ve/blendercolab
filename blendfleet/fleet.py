@@ -37,7 +37,8 @@ from blendfleet.kaggle_client import (
 # live one, and a second copy of the pattern is a second thing to get out
 # of step with what notebook_builder actually prints.
 from blendfleet.log_stream import PROGRESS_RE
-from blendfleet.notebook_builder import RenderSettings, build, build_probe
+from blendfleet.notebook_builder import (RenderSettings, build, build_probe,
+                                         notebook_drift)
 from blendfleet.platform_paths import state_dir
 
 STATE_FILE = "fleet.json"
@@ -56,6 +57,51 @@ _SLUG_STRIP_RE = re.compile(r"[^a-z0-9]+")
 # capped well under Kaggle's ~50 character slug limit rather than letting a
 # long filename fail at the same late, post-upload moment.
 MIN_STEM_LENGTH = 3
+
+# WHICH NOTEBOOKS ON AN ACCOUNT ARE THIS APP'S. Every kernel it creates is
+# named by one of three rules, all of them in this file:
+#
+#     <username>/blendfleet-worker-<8 hex>     start_workers
+#     <username>/blendfleet-hwcheck-<8 hex>    check_hardware
+#     <username>/<stem>-render-<8 hex>        render (job_id = uuid4 hex[:8])
+#
+# Matched narrowly on purpose. This is used to find sessions the app lost
+# track of, and the action offered for one is CANCEL -- so a pattern loose
+# enough to match a notebook the user wrote themselves would offer to kill
+# their work. The 8-hex suffix is what makes each rule specific; a bare
+# "-render-" would match anything.
+_OUR_KERNEL_RE = re.compile(
+    r"^(?:blendfleet-(?:worker|hwcheck)-[0-9a-f]{8}"
+    r"|.+-render-[0-9a-f]{8})$")
+
+
+def _diagnostic(what: str, client, method: str, *args):
+    """A read that only EXPLAINS a poll, or nothing at all.
+
+    Everything gathered this way is commentary rather than the answer: what
+    machine a session was given, why a frame count could not be read. A
+    render's status must never go unreported because one of those raised --
+    including when it raises AttributeError because the client is older
+    than the call, which is exactly how the first version of this broke
+    eleven Fleet tests with fakes that predated it.
+
+    Returns None on any failure, which every caller treats as "not known".
+    """
+    try:
+        return getattr(client, method)(*args)
+    except Exception as e:      # noqa: BLE001 -- commentary, never fatal
+        crash_log.record(f"{what}: {type(e).__name__}: {e}", critical=False)
+        return None
+
+
+def is_blendfleet_kernel(slug: str) -> bool:
+    """True if `slug` names a notebook this app created.
+
+    Takes the full "owner/name" and looks only at the name: ownership is
+    already established by the account whose token listed it.
+    """
+    _, _, name = str(slug).partition("/")
+    return bool(name) and _OUR_KERNEL_RE.match(name) is not None
 MAX_STEM_LENGTH = 30
 
 # How many accounts poll_all() asks Kaggle about at once.
@@ -506,6 +552,22 @@ class WorkerState:
     # network call, and a finished job stays tracked -- and polled every 30
     # seconds -- until the user forgets it.
     final_count_checked: bool = False
+    # Kaggle's own name for the machine this worker's session got --
+    # "nvidiaTeslaT4x2" -- read from the kernel's metadata rather than out
+    # of the run (KaggleClient.machine_shape). Kept on the WORKER because a
+    # kernel slug is unique per job, so this describes one session and
+    # never has to be aged: the job it belongs to carries its own timing.
+    # None means it was not read, or Kaggle did not say.
+    # Why the notebook on Kaggle cannot be relied on to report, when the
+    # frame count could not be read and asking found a reason. Empty
+    # otherwise, including when nothing was asked.
+    notebook_drift: str = ""
+    machine_shape: str | None = None
+    # Asked once per worker, exactly like final_count_checked and for the
+    # same reason: it is a real network call, and a job keeps being polled
+    # every 30 seconds until the user forgets it. Set whether or not an
+    # answer came back.
+    machine_checked: bool = False
     # True only when that read actually produced a count. frames_done is
     # then the render's own last word, not the last thing a live stream
     # happened to save before the window closed. False after a checked read
@@ -601,6 +663,16 @@ class _WorkerRefresh:
     # The frame count read out of it, or None for "not known" -- never a
     # guess and never a zero. See _final_frame_count.
     final_done: int | None = None
+    # True when the kernel's metadata was asked for its machine shape. Set
+    # whether or not it answered, which is what makes that one-shot.
+    machine_checked: bool = False
+    # What it said, or None. See KaggleClient.machine_shape.
+    machine_shape: str | None = None
+    # One sentence about why the notebook on Kaggle cannot be trusted to
+    # report, or "" for "nothing wrong with it" AND for "not asked" -- see
+    # notebook_builder.notebook_drift, which returns "" for an unreadable
+    # source precisely so an unanswered request never becomes a verdict.
+    notebook_drift: str = ""
 
 
 @dataclass
@@ -611,6 +683,21 @@ class CancelResult:
     kernel_slug: str
     ok: bool
     error: str = ""
+
+
+@dataclass
+class StraySession:
+    """A session this app started and no longer has a record of.
+
+    The reason this is worth finding: it is still spending the account's
+    quota. Nothing on the dashboard mentions it, because the job it
+    belonged to was forgotten, or the app was killed between pushing a
+    kernel and writing the state file, or the state file was lost. The user
+    finds out when a render refuses to start for want of hours.
+    """
+    label: str
+    slug: str
+    state: str
 
 
 class FleetBusyError(RuntimeError):
@@ -2412,6 +2499,22 @@ class Fleet:
                         w.frames_done = result.final_done
                         w.frames_done_at = time.time()
                         w.final_count_known = True
+                # Written the same way, for the same reason: the call
+                # already happened on the pool thread, and the flag is set
+                # whether or not Kaggle named a machine. Not cleared when a
+                # worker goes back to ACTIVE_STATES the way the log read is
+                # -- one kernel slug is one session, so the machine it was
+                # given cannot change under us.
+                if result.machine_checked:
+                    w.machine_checked = True
+                    if result.machine_shape:
+                        w.machine_shape = result.machine_shape
+                # Only ever set, never cleared by a later poll: the read
+                # that produced it happens once (with the final-count read),
+                # so a subsequent empty result means "not asked again", not
+                # "the notebook is fine now".
+                if result.notebook_drift:
+                    w.notebook_drift = result.notebook_drift
         current = self.load_jobs()
         updated_by_id = {st.job_id: st for st in jobs}
         merged = []
@@ -2491,13 +2594,35 @@ class Fleet:
         except Exception as e:      # noqa: BLE001 -- re-raised by the caller
             result.error = e
             return result
-        if (getattr(result.status, "state", "") in TERMINAL_STATES
-                and not worker.final_count_checked):
+        state = getattr(result.status, "state", "")
+        if state in TERMINAL_STATES and not worker.final_count_checked:
             # Set BEFORE the fetch and regardless of its outcome: this is
             # what makes the read one-shot per worker (see
             # _final_frame_count).
             result.log_checked = True
             result.final_done = self._final_frame_count(client, worker)
+            if result.final_done is None:
+                # ONLY when the count could not be read. A render that
+                # reported its frames needs no explanation, and asking
+                # Kaggle for the notebook source of every finished worker
+                # would be a request per worker to answer a question nobody
+                # asked. Here the user is already owed an explanation, and
+                # "the notebook was edited" is a different one from "the
+                # log could not be fetched".
+                result.notebook_drift = notebook_drift(
+                    _diagnostic(f"notebook source for {worker.kernel_slug}",
+                                client, "kernel_source",
+                                worker.kernel_slug) or "")
+        # "queued" is excluded deliberately: a queued kernel has no session
+        # yet, so its metadata either says nothing or still describes some
+        # earlier run -- and either would be reported here as the machine
+        # THIS render got. Same one-shot discipline as above.
+        if ((state == "running" or state in TERMINAL_STATES)
+                and not worker.machine_checked):
+            result.machine_checked = True
+            result.machine_shape = _diagnostic(
+                f"machine shape for {worker.kernel_slug}",
+                client, "machine_shape", worker.kernel_slug)
         return result
 
     def _final_frame_count(self, client, worker) -> int | None:
@@ -2655,6 +2780,99 @@ class Fleet:
         return [result for st in self.load_jobs()
                 for result in self._cancel_workers(
                     [w for w in st.workers if w.state in ACTIVE_STATES])]
+
+    def tracked_kernel_slugs(self) -> set[str]:
+        """Every kernel slug this app still has a record of.
+
+        Includes the ones inside `unreadable_jobs`, which is the whole
+        reason those raw entries are preserved rather than dropped: a job
+        whose JSON could not be parsed still names real sessions, and
+        treating them as untracked would offer to cancel a render that is
+        deliberately going.
+        """
+        slugs = {w.kernel_slug for st in self.load_jobs() for w in st.workers}
+
+        def walk(value) -> None:
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    if key == "kernel_slug" and isinstance(item, str):
+                        slugs.add(item)
+                    else:
+                        walk(item)
+            elif isinstance(value, list):
+                for item in value:
+                    walk(item)
+
+        for entry in self.unreadable_jobs:
+            walk(entry)
+        return {s for s in slugs if s}
+
+    def find_stray_sessions(
+            self, limit_per_account: int = 12
+    ) -> tuple[list[StraySession], dict[str, str]]:
+        """Sessions on these accounts that this app started and then lost.
+
+        Returns what was found and, separately, which accounts could not be
+        asked -- per account, never as one failure. A revoked token on one
+        account must not hide a session burning quota on another; that is
+        the same rule refreshQuota and cancel_all already keep.
+
+        ONLY LIVE SESSIONS ARE REPORTED. A finished stray costs nothing and
+        listing it would turn a quota warning into a list of every notebook
+        the app ever made. `limit_per_account` caps the status calls,
+        because each candidate costs one: the listing is cheap, confirming
+        twelve of them is not.
+        """
+        tracked = self.tracked_kernel_slugs()
+        strays: list[StraySession] = []
+        errors: dict[str, str] = {}
+        for account in self.accounts:
+            try:
+                client = self.client_factory(account.token)
+                candidates = [
+                    ref for ref in client.my_kernel_refs()
+                    if is_blendfleet_kernel(ref) and ref not in tracked
+                ][:limit_per_account]
+                for slug in candidates:
+                    # The observed state, not the word "running": queued and
+                    # running are both ACTIVE and both worth reporting, and
+                    # only one of them is on a GPU right now.
+                    state = client.status(slug).state
+                    if state in ACTIVE_STATES:
+                        strays.append(StraySession(label=account.label,
+                                                   slug=slug, state=state))
+            except Exception as e:      # noqa: BLE001 -- reported per account
+                errors[account.label] = _tokenless(str(e), self.accounts)
+                crash_log.record(
+                    _tokenless(f"could not look for stray sessions on "
+                               f"{account.label}: {type(e).__name__}: {e}",
+                               self.accounts), critical=False)
+        return strays, errors
+
+    def cancel_stray_session(self, label: str, slug: str) -> CancelResult:
+        """Cancel one stray, named explicitly.
+
+        Takes both the account and the slug rather than searching for it
+        again: the page is acting on a list it was already shown, and a
+        second search could return a different set. Refuses a slug that is
+        not one of this app's -- the caller passes back what it was given,
+        and "cancel this notebook" is not an instruction to take on trust.
+        """
+        account = next((a for a in self.accounts if a.label == label), None)
+        if account is None:
+            return CancelResult(label=label, kernel_slug=slug, ok=False,
+                                error=f"there is no account called {label}")
+        if not is_blendfleet_kernel(slug):
+            return CancelResult(
+                label=label, kernel_slug=slug, ok=False,
+                error=f"{slug} is not a notebook BlendFleet created")
+        try:
+            ok = self.client_factory(account.token).cancel(slug)
+        except Exception as e:      # noqa: BLE001 -- answered, not raised
+            return CancelResult(label=label, kernel_slug=slug, ok=False,
+                                error=_tokenless(str(e), self.accounts))
+        return CancelResult(label=label, kernel_slug=slug, ok=ok,
+                            error="" if ok else "Kaggle refused the cancel")
 
     def cancel_worker(self, label: str) -> CancelResult | None:
         """Cancel exactly the worker labelled `label`, leaving every other

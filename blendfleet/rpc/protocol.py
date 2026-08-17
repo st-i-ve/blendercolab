@@ -41,7 +41,7 @@ EVENTS = (
     "stateChanged", "accountsChanged", "settingsChanged", "telemetry",
     "uploadProgress", "downloadProgress", "framePreview", "logLine",
     "notification", "healthChanged", "busyChanged", "scenesChanged",
-    "outputsChanged", "collectFinished",
+    "outputsChanged", "collectFinished", "straySessionsChanged",
 )
 
 

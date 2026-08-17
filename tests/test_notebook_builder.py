@@ -205,6 +205,36 @@ def test_kernel_metadata_pins_the_exact_valid_machine_shape(tmp_path, settings):
     assert meta["machine_shape"] == "NvidiaTeslaT4"
 
 
+def test_kernel_metadata_pins_the_base_image_to_the_one_it_was_built_with(
+        tmp_path, settings):
+    """Kaggle rolls its Docker images without asking, and the CUDA driver
+    inside one is what Blender's GPU rendering runs against. "original"
+    holds the image this kernel was created with, so a rerun of the same
+    notebook on the same scene cannot quietly render against a different
+    driver -- the kind of difference that gets debugged in Blender for a day
+    before anybody suspects the platform.
+
+    Exactly "original", not merely present: "latest" is the other legal
+    value and is the behaviour this exists to turn off.
+    """
+    build([1], settings, "me/remember-blend", tmp_path, "me/render-0")
+    meta = json.loads((tmp_path / "kernel-metadata.json").read_text())
+    assert meta["docker_image_pinning_type"] == "original"
+
+
+def test_the_hardware_probe_pins_its_image_too(tmp_path):
+    """The probe exists to answer "what would a render get here". A probe
+    on a different base image than the render answers a question nobody
+    asked."""
+    from blendfleet.notebook_builder import build_probe
+
+    build_probe(tmp_path, "me/blendfleet-hwcheck-1a2b3c4d")
+    meta = json.loads((tmp_path / "kernel-metadata.json").read_text())
+    assert meta["docker_image_pinning_type"] == "original"
+    assert meta["machine_shape"] == "NvidiaTeslaT4", (
+        "the probe must ask for exactly what a render asks for")
+
+
 def test_kernel_metadata_keeps_enable_gpu_alongside_machine_shape(tmp_path, settings):
     # enable_gpu is deprecated but dropping it would risk a CPU session on
     # a backend that has not adopted machine_shape yet -- keep both.
@@ -297,7 +327,14 @@ def test_preflight_cell_is_still_valid_python_with_a_gate_configured(tmp_path):
 def test_writes_a_zip_archive_using_stdlib_zipfile(tmp_path, settings):
     cells = cells_src(build([1], settings, "me/x", tmp_path, "me/r"))
     runner = next(c for c in cells if "def _archive_new" in c)
-    assert "zipfile" in runner.splitlines()[0], \
+    # The import LINE, wherever it sits in the cell -- this used to assert
+    # `splitlines()[0]`, which stopped being the import the moment every
+    # generated cell started carrying the BLENDFLEET-NOTEBOOK marker on its
+    # first line (see notebook_builder._code). What the test is about is
+    # that zipfile is imported at all, not which row it lands on.
+    imports = [line for line in runner.splitlines()
+               if line.startswith("import ") or line.startswith("from ")]
+    assert any("zipfile" in line for line in imports), \
         "zipfile must be imported (stdlib -- no dependency on either side)"
     assert "zipfile.ZipFile" in runner
 

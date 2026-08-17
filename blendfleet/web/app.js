@@ -94,13 +94,40 @@ const sfx = {
 };
 
 /* ---------------- chrome ------------------------------------------------ */
+/* "system" is a preference, not a palette: the CSS only knows light and
+   dark, so it is resolved here, at paint time, and never written into
+   prefs. The shells resolve the same instruction for their own chrome --
+   Qt through QStyleHints, Electron through nativeTheme -- which is what
+   lets this page stay identical for both. */
+const darkOutside = window.matchMedia('(prefers-color-scheme: dark)');
+
+function resolvedTheme() {
+  if (prefs.theme !== 'system') return prefs.theme;
+  return darkOutside.matches ? 'dark' : 'light';
+}
+
 function applyPrefs(p) {
   prefs = Object.assign(prefs, p);
-  document.documentElement.dataset.theme = prefs.theme;
+  document.documentElement.dataset.theme = resolvedTheme();
   document.documentElement.dataset.accent = prefs.accent;
   document.documentElement.dataset.font = prefs.font || 'heebo';
   document.body.classList.toggle('glass', !!prefs.translucent);
 }
+
+/* Following means following: someone whose desktop goes dark at sunset
+   expects this to go with it, without reopening the app. Only while the
+   preference is "system" -- an explicit choice is not a starting point for
+   the OS to override later. Snapped through the same suppression the
+   manual switch uses, or the ground would fade while the cards had
+   already changed. */
+darkOutside.addEventListener('change', () => {
+  if (prefs.theme !== 'system') return;
+  const root = document.documentElement;
+  root.classList.add('theme-snap');
+  applyPrefs({});
+  void root.offsetWidth;
+  requestAnimationFrame(() => root.classList.remove('theme-snap'));
+});
 
 document.querySelectorAll('.nav-btn').forEach(button => {
   button.addEventListener('click', () => {
@@ -146,7 +173,12 @@ function setTheme(next) {
 const themeBtn = document.getElementById('btn-theme');
 themeBtn.addEventListener('click', () => {
   themeBtn.classList.add('spin');
-  setTheme(prefs.theme === 'dark' ? 'light' : 'dark');
+  /* The opposite of what is ON SCREEN, not of what is stored: with the
+     preference on "system" and the desktop dark, "stored" is neither, and
+     a button that turned a dark window dark would look broken. Clicking
+     always makes the choice explicit -- the way back to following the OS
+     is in Settings, where it was chosen. */
+  setTheme(resolvedTheme() === 'dark' ? 'light' : 'dark');
 });
 themeBtn.addEventListener('animationend', () => themeBtn.classList.remove('spin'));
 
@@ -667,6 +699,35 @@ function instanceCard(inst) {
       + ` <span class="age">${fmtAge(inst.hardware.ageSeconds)}</span>`
     : 'never run — launch to see specs';
 
+  /* WHAT MACHINE THIS RUN GOT, when Kaggle has said so (worker.machine,
+     from the kernel's own metadata). Shown as the value because it is the
+     only line here that is a fact about the render on screen -- the cached
+     banner is from some earlier session, which is why that one carries an
+     age and this one does not. The heading changes with it, or the card
+     would label a fresh fact "last known".
+
+     THE BANNER IS NOT DISCARDED FOR IT. A shape names a TYPE and not a
+     count: "NvidiaTeslaT4" is what Kaggle calls a machine that turns out
+     to have two T4s in it, and only nvidia-smi inside the run ever says
+     two. So the banner's own reading, with its age, moves into the title
+     rather than being dropped -- replacing "Tesla T4, Tesla T4 1d ago"
+     with "Tesla T4" would be this card reporting less than it knows. */
+  const machine = worker && worker.machine ? worker.machine : '';
+  const hwKey = machine ? 'This run’s machine' : 'Last known hardware';
+  const hwPlain = inst.hardware
+    ? inst.hardware.gpus.map(g => g.model || 'GPU').join(', ')
+      + (inst.hardware.cpuCount ? ` · ${inst.hardware.cpuCount} vCPU` : '')
+      + ` (seen ${fmtAge(inst.hardware.ageSeconds)})`
+    : '';
+  const hwTitle = machine
+    ? `Kaggle assigned this machine shape for this run.${
+        hwPlain ? ' Hardware last seen inside a run: ' + hwPlain + '.' : ''
+      } A shape names the type, not how many cards — only the run itself reports that.`
+    : '';
+  const hwValue = machine
+    ? `<span title="${esc(hwTitle)}">${GPU_MARK}${esc(machine)}</span>`
+    : hw;
+
   /* Live beats polled. The 30s status poll can only say queued/running --
      it cannot say "installing Blender" or "frame 7 of 15", because Kaggle
      returns no logs until a kernel COMPLETES. The SSE stream can, so when
@@ -694,13 +755,20 @@ function instanceCard(inst) {
      meantime, so it is a floor, not a reading. Presenting it bare, next
      to a bar, would claim a measurement nobody took. It carries its age,
      the same way the cached hardware line does. */
+  /* WHY the count is missing, when the backend found a reason. It asks
+     Kaggle for the notebook's source only in this situation -- a stopped
+     render whose count could not be read -- so this is either empty or one
+     sentence worth reading. Printed verbatim: the page does not get to
+     decide what "the notebook was edited" means. */
+  const drift = worker && worker.notebookDrift ? worker.notebookDrift : '';
   const savedFrames = unknown
     ? `<span class="frange dim" title="This render has stopped, but its own${
          ''} log on Kaggle could not be read, so how many frames it${
          ''} finished is not known. The last number a live connection${
          ''} saved is from before it ended and would be wrong to show as a${
          ''} count. “Collect frames…” is the authoritative list of what${
-         ''} exists.">count not known</span>`
+         ''} exists.${drift ? ' ' + drift : ''}">count not known${
+         drift ? ' <b>· notebook changed</b>' : ''}</span>`
     /* A count read from the finished kernel's own log needs no label:
        it is the render's last word, and the state icon in the head
        already says the render ended. Only a number that is NOT a
@@ -879,8 +947,8 @@ function instanceCard(inst) {
       <div class="meta">
         <div class="m"><span class="k">Quota (API)</span>
           <span class="v">${esc(inst.quota || '—')}</span></div>
-        <div class="m"><span class="k">Last known hardware</span>
-          <span class="v">${hw}</span></div>
+        <div class="m"><span class="k">${hwKey}</span>
+          <span class="v">${hwValue}</span></div>
         ${liveHw}
       </div>
       ${worker ? `
@@ -2210,6 +2278,61 @@ document.getElementById('btn-stop-all').onclick = () =>
   backend && backend.cancelAll();
 document.getElementById('btn-send-job').onclick = () =>
   backend && backend.sendJob(JSON.stringify(renderOptions()));
+
+/* STRAY SESSIONS: renders on Kaggle that no tracked job accounts for.
+   Painted only from what the backend reports -- never a remembered list,
+   because a stray that has since been cancelled must not keep appearing as
+   if quota were still draining. */
+function renderStrays(payload) {
+  const list = document.getElementById('stray-list');
+  const meta = document.getElementById('stray-meta');
+  const strays = payload.strays || [];
+  const errors = payload.errors || {};
+  const unchecked = Object.keys(errors);
+
+  /* Two separate statements, never merged: "nothing is running" is
+     evidence, "we could not ask" is the absence of it. A summary that
+     said "0 found" after failing to reach an account would be a lie by
+     arithmetic. */
+  meta.textContent = strays.length
+    ? `${strays.length} running`
+    : (unchecked.length ? 'none found on the accounts we could reach'
+                        : 'none — everything running is on the dashboard');
+
+  const rows = strays.map(s => `
+    <div class="file-row-card">
+      <div class="unreadable-body">
+        <b>${esc(s.slug)}</b>
+        <div class="dz-sub">${esc(s.label)} · ${esc(s.state || 'active')}${
+          s.state === 'running' ? ' on a GPU now' : ' — waiting for a machine'
+        } · spending quota</div>
+      </div>
+      <button class="btn ico sm danger" data-stray="${esc(s.slug)}"
+              data-stray-label="${esc(s.label)}"
+              aria-label="Stop this session" data-tip="Stop this session"
+              title="Cancel this session on Kaggle. It is not part of any tracked job, so nothing on the dashboard changes.">${ACT.stop || '×'}</button>
+    </div>`).join('');
+
+  const failed = unchecked.map(label => `
+    <div class="file-row-card">
+      <div class="unreadable-body">
+        <b>${esc(label)}</b>
+        <div class="dz-sub">could not be checked — ${esc(errors[label])}</div>
+      </div>
+    </div>`).join('');
+
+  list.innerHTML = rows + failed;
+  list.querySelectorAll('[data-stray]').forEach(btn => {
+    btn.onclick = () => backend && backend.cancelStraySession(
+      btn.dataset.strayLabel, btn.dataset.stray);
+  });
+}
+
+document.getElementById('btn-strays').onclick = () => {
+  const meta = document.getElementById('stray-meta');
+  meta.textContent = 'checking every account…';
+  if (backend) backend.findStraySessions();
+};
 document.getElementById('btn-forget').onclick = () => {
   /* Confirmed, and worded as what it actually is. Abandoning a running
      session while sounding like a cancel would be the worst lie this app
@@ -2941,6 +3064,12 @@ new QWebChannel(qt.webChannelTransport, channel => {
   backend.outputsChanged.connect(renderOutputs);
   backend.outputs();
   backend.checkOutputs();
+
+  /* Connected, but never called on startup: this costs a notebook listing
+     plus a status call per candidate on EVERY account, and doing that
+     unasked on every launch would spend somebody's rate limit to answer a
+     question they did not ask. The button on the Instances page asks it. */
+  backend.straySessionsChanged.connect(json => renderStrays(JSON.parse(json)));
 
   backend.refreshQuota();
   backend.poll();

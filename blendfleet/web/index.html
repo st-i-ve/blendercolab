@@ -327,6 +327,22 @@
               </table>
             </div>
             <div class="dz-sub" style="margin-top:10px">Quota is what the Kaggle API reports right now, not a guarantee — it has been observed to disagree with the settings page. Hardware is the last seen, with its age: Kaggle reallocates between runs.</div>
+
+            <!-- STRAY SESSIONS. A render this app lost track of — a job
+                 forgotten, or the app killed between pushing a kernel and
+                 writing its state file — keeps spending the account's
+                 quota with nothing on the dashboard to say so. A button
+                 rather than a timer: it is a notebook listing plus a
+                 status call per candidate, per account. -->
+            <h2 class="sec" style="margin-top:20px">Stray sessions
+              <span class="meta" id="stray-meta">not checked yet</span></h2>
+            <div class="panel">
+              <div class="fr-actions" style="margin-bottom:0">
+                <button class="btn" id="btn-strays">Look for stray sessions</button>
+                <span class="dz-sub">Only running ones are listed — a finished session costs nothing.</span>
+              </div>
+              <div id="stray-list"></div>
+            </div>
           </div>
         </div>
       </div>
@@ -354,7 +370,11 @@
         <div class="panel set-card">
           <div class="set-row">
             <div class="st"><h4>Theme</h4><p>Light for daylight suites, dark for night shifts.</p></div>
-            <div class="seg" id="seg-theme"><button data-v="light">Light</button><button data-v="dark">Dark</button></div>
+            <!-- Three states, and the third is not a colour: "System"
+                 means follow the desktop, resolved by the page with
+                 prefers-color-scheme and by the window with its own
+                 platform call, so the two cannot disagree. -->
+            <div class="seg" id="seg-theme"><button data-v="light">Light</button><button data-v="dark">Dark</button><button data-v="system">System</button></div>
           </div>
           <div class="set-row">
             <div class="st"><h4>Accent colour</h4><p>Rendering activity, progress and highlights.</p></div>

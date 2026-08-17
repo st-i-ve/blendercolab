@@ -29,6 +29,7 @@ const CALLS = [
   'accounts', 'addAccount', 'blenderVersions', 'cancelAll', 'cancelInstance',
   'cancelJob', 'checkHardware', 'checkOutputs', 'collect', 'deleteScene',
   'diagnostics', 'estimateRender', 'forgetJob', 'forgetUnreadableJob',
+  'cancelStraySession', 'findStraySessions',
   'health', 'launch', 'outputs', 'poll', 'preferences', 'previewFrame',
   'ready', 'refreshQuota', 'removeAccount', 'renderScene', 'scenes',
   'sendJob', 'setBlend', 'setPreference', 'setUsername', 'startInstances',
@@ -44,7 +45,7 @@ const EVENTS = [
   'stateChanged', 'accountsChanged', 'settingsChanged', 'telemetry',
   'uploadProgress', 'downloadProgress', 'framePreview', 'logLine',
   'notification', 'healthChanged', 'busyChanged', 'scenesChanged',
-  'outputsChanged', 'collectFinished',
+  'outputsChanged', 'collectFinished', 'straySessionsChanged',
 ];
 
 const handlers = {};

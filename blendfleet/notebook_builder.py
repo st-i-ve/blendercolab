@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -395,9 +396,64 @@ class RenderSettings:
     live_previews: bool = True
 
 
+# WHAT MAKES A NOTEBOOK ON KAGGLE THIS APP'S, AND WHOSE VERSION.
+#
+# The app reads a render's progress by parsing the notebook's own stdout --
+# `PROGRESS frame=... ok=... secs=...`, the hardware banner, TELEMETRY. That
+# is a contract between two programs, and the one on Kaggle can change
+# without this one knowing: somebody opens the notebook in the browser and
+# edits it, or an older BlendFleet pushed it and a newer one is reading it.
+# Either way the render appears to run and report nothing, and the app
+# currently has no way to say which.
+#
+# So every cell it generates carries this line, and `notebook_drift` below
+# is what compares it. Bump CONTRACT whenever the log format the app parses
+# changes -- that is what makes "built by a different version" detectable
+# rather than merely suspected.
+NOTEBOOK_CONTRACT = 1
+NOTEBOOK_MARKER = f"BLENDFLEET-NOTEBOOK contract={NOTEBOOK_CONTRACT}"
+
+_MARKER_RE = re.compile(r"BLENDFLEET-NOTEBOOK contract=(\d+)")
+
+
 def _code(src: str) -> dict:
+    # Marked here rather than in each template: this is the one place every
+    # generated cell passes through, so a template added later cannot
+    # forget it.
+    src = f"# {NOTEBOOK_MARKER}\n" + src.strip("\n")
     return {"cell_type": "code", "execution_count": None, "metadata": {},
-            "outputs": [], "source": src.strip("\n").splitlines(keepends=True)}
+            "outputs": [], "source": src.splitlines(keepends=True)}
+
+
+def notebook_drift(source: str) -> str:
+    """Why the notebook on Kaggle cannot be trusted to report, or "".
+
+    Given the source Kaggle holds for a kernel, answers in one sentence
+    fit to show a user. Every answer is about what this app can no longer
+    rely on -- never a guess about who changed it or why.
+
+    Deliberately narrow: an edit that leaves the marker and the PROGRESS
+    line intact is NOT reported, because the app can still read such a
+    notebook, and warning about edits that do not matter would teach the
+    user to ignore the warning that does.
+    """
+    if not source:
+        # Absence of evidence. Kaggle did not hand over a source, which is
+        # not the same as a notebook that has been changed.
+        return ""
+    found = _MARKER_RE.search(source)
+    if found is None:
+        return ("The notebook on Kaggle is not one BlendFleet built — it "
+                "looks edited, so its progress lines cannot be relied on.")
+    if int(found.group(1)) != NOTEBOOK_CONTRACT:
+        return (f"The notebook on Kaggle was built by a different version "
+                f"of BlendFleet (contract {found.group(1)}, this app reads "
+                f"{NOTEBOOK_CONTRACT}) — what it reports may not match what "
+                "this app expects.")
+    if "PROGRESS frame=" not in source:
+        return ("The notebook on Kaggle no longer prints the progress lines "
+                "this app reads — frame counts from it cannot be trusted.")
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -530,6 +586,20 @@ print("PROBE_DONE", flush=True)
         # requested something different would answer a question nobody
         # asked.
         "machine_shape": MACHINE_SHAPE,
+        # Hold the base image this kernel was created with, instead of
+        # taking whatever is newest each time it runs. Kaggle rolls its
+        # images without asking, and the CUDA driver in one is what
+        # Blender's GPU rendering actually runs against -- a kernel that
+        # rendered fine and then behaves differently on a rerun, with the
+        # same notebook and the same scene, is a day lost to looking in the
+        # wrong place.
+        #
+        # WHAT IT DOES NOT BUY, so nobody expects it to: this pins a kernel
+        # to ITS OWN original image, and a render creates a new kernel per
+        # job, so two jobs started a month apart can still get different
+        # images. There is no API for "give me the image I used last
+        # month" -- only "original" (this) and "latest".
+        "docker_image_pinning_type": "original",
         "dataset_sources": [],
         "competition_sources": [],
         "kernel_sources": [],
@@ -1065,6 +1135,20 @@ print("WORKER stopped", flush=True)
         # would otherwise silently fall back to a CPU-only session if this
         # were dropped (docs/machine-shape-findings.md, section 2).
         "machine_shape": MACHINE_SHAPE,
+        # Hold the base image this kernel was created with, instead of
+        # taking whatever is newest each time it runs. Kaggle rolls its
+        # images without asking, and the CUDA driver in one is what
+        # Blender's GPU rendering actually runs against -- a kernel that
+        # rendered fine and then behaves differently on a rerun, with the
+        # same notebook and the same scene, is a day lost to looking in the
+        # wrong place.
+        #
+        # WHAT IT DOES NOT BUY, so nobody expects it to: this pins a kernel
+        # to ITS OWN original image, and a render creates a new kernel per
+        # job, so two jobs started a month apart can still get different
+        # images. There is no API for "give me the image I used last
+        # month" -- only "original" (this) and "latest".
+        "docker_image_pinning_type": "original",
         "enable_internet": True,
         # The scene, plus Blender itself when it is being shipped as a
         # dataset rather than downloaded. The CONTROL dataset is

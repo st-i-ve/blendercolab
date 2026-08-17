@@ -8,6 +8,7 @@ goes through KaggleApi / kagglesdk instead.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import threading
 from dataclasses import dataclass
@@ -620,6 +621,43 @@ def _install_api_timeout(api, timeout) -> bool:
         return False
 
 
+def describe_machine(shape: str | None) -> str | None:
+    """Kaggle's machine name, in words a person reads.
+
+        NvidiaTeslaT4    ->  Tesla T4
+        NvidiaTeslaP100  ->  Tesla P100
+        nvidiaTeslaT4x2  ->  2x Tesla T4
+
+    CASE-INSENSITIVE, because the live vocabulary is capitalised and the
+    first version of this was not. Confirmed against a real fleet on
+    2026-08-17: Kaggle returned `NvidiaTeslaT4` -- the same spelling
+    notebook_builder.MACHINE_SHAPE sends and docs/machine-shape-findings.md
+    records -- which the lowercase pattern did not match, so every card
+    would have shown the raw string instead of a name.
+
+    WHAT IT DOES NOT SAY IS HOW MANY. `NvidiaTeslaT4` yields TWO T4s (see
+    that same findings doc); the shape names a type, not a count. The count
+    comes from the hardware banner nvidia-smi prints inside the run, which
+    is why this never replaces that reading, only labels the run.
+
+    ANYTHING UNRECOGNISED IS RETURNED UNCHANGED, on purpose. Kaggle adds
+    accelerators without asking, and the choice for an unknown name is
+    between showing what Kaggle said and showing nothing. A raw
+    `nvidiaL4x8` is ugly and true; a blank is neither.
+    """
+    if not shape:
+        return None
+    match = re.fullmatch(r"nvidia([A-Za-z0-9]+?)(?:x(\d+))?", shape.strip(),
+                         re.IGNORECASE)
+    if match is None:
+        return shape.strip()
+    # TeslaT4 -> Tesla T4: a space at each lower-to-upper hump, which keeps
+    # "T4" and "P100" whole because neither has one inside it.
+    model = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", match.group(1))
+    count = match.group(2)
+    return f"{count}x {model}" if count else model
+
+
 def _default_sdk_factory(token: str):
     """Env-free: kagglesdk.KaggleClient accepts api_token= and only falls
     back to os.environ when it is None (kaggle_http_client.py:268)."""
@@ -814,6 +852,108 @@ class KaggleClient:
             total_seconds=int(r.gpu_quota.total_time_allowed.total_seconds()),
             refresh_time=str(r.quota_refresh_time),
             source="api")
+
+    def kernel_source(self, slug: str) -> str:
+        """The notebook source Kaggle currently holds for `slug`.
+
+        Same request as `machine_shape` -- get_kernel returns the metadata
+        and the blob together -- read for a different reason: to find out
+        whether the notebook still prints what this app parses. See
+        notebook_builder.notebook_drift.
+
+        Returns "" rather than raising, and "" means "could not read it",
+        never "it is fine": the caller must not turn an unanswered request
+        into a verdict about somebody's notebook.
+        """
+        from kagglesdk.kernels.types.kernels_api_service import (
+            ApiGetKernelRequest)
+        owner, _, name = slug.partition("/")
+        if not owner or not name:
+            return ""
+        request = ApiGetKernelRequest()
+        request.user_name = owner
+        request.kernel_slug = name
+        try:
+            sdk = self._sdk_factory(self.token)
+            r = sdk.kernels.kernels_api_client.get_kernel(request)
+        except Exception as e:      # noqa: BLE001 -- diagnosis, never fatal
+            crash_log.record(
+                f"could not read the notebook source for {slug}: "
+                f"{type(e).__name__}: {e}", critical=False)
+            return ""
+        source = getattr(getattr(r, "blob", None), "source", "")
+        return str(source or "")
+
+    def my_kernel_refs(self, pages: int = 2, page_size: int = 100) -> list[str]:
+        """Every notebook ref this account owns, newest first.
+
+        The same listing `whoami` reads one row of, asked for in full. It
+        exists so the app can find sessions IT started and then lost track
+        of -- a render the app was killed in the middle of, or a job the
+        user forgot, both of which keep spending the account's thirty hours
+        a week with nothing on screen to say so.
+
+        Bounded on purpose. Two pages of a hundred is far more notebooks
+        than this app will ever have made on one account, and an unbounded
+        walk of somebody's whole Kaggle history is not a thing to do on
+        their behalf without asking.
+        """
+        refs: list[str] = []
+        for page in range(1, max(pages, 1) + 1):
+            listing = self.api.kernels_list(mine=True, page=page,
+                                            page_size=page_size) or []
+            for item in listing:
+                ref = str(getattr(item, "ref", ""))
+                if "/" in ref:
+                    refs.append(ref)
+            # A short page is the last page. Asking for one more would be a
+            # wasted round trip on every account, every time.
+            if len(listing) < page_size:
+                break
+        return refs
+
+    def machine_shape(self, slug: str) -> str | None:
+        """Kaggle's own name for the machine this kernel's session got.
+
+        The SDK calls it "the machine shape that was used in the last
+        session. Largely, this indicates the type of accelerator" -- so for
+        a render kernel, whose slug is unique per job, it is the machine
+        THAT run was given: `nvidiaTeslaT4x2`, `nvidiaTeslaP100`.
+
+        WHY THIS IS WORTH A CALL. The only other way this app learns what
+        hardware an account got is to start a session and read nvidia-smi
+        out of the log (checkHardware), which costs about a minute of the
+        30 hours a week an account has. This costs a metadata request and
+        no quota at all.
+
+        WHAT IT IS NOT. It names the machine of the LAST session, so it is
+        never evidence about what a future run will get -- Kaggle's
+        allocation is a lottery, and the same account has had 2x T4 one
+        minute and no GPU the next. It also carries no per-GPU detail: no
+        index, no memory, no driver. The hardware banner remains the
+        source for those, and this does not overwrite it.
+
+        Returns None rather than raising: this is decoration on a poll that
+        must not fail because a metadata endpoint was unhappy.
+        """
+        from kagglesdk.kernels.types.kernels_api_service import (
+            ApiGetKernelRequest)
+        owner, _, name = slug.partition("/")
+        if not owner or not name:
+            return None
+        request = ApiGetKernelRequest()
+        request.user_name = owner
+        request.kernel_slug = name
+        try:
+            sdk = self._sdk_factory(self.token)
+            r = sdk.kernels.kernels_api_client.get_kernel(request)
+        except Exception as e:      # noqa: BLE001 -- decoration, never fatal
+            crash_log.record(
+                f"could not read the machine shape for {slug}: "
+                f"{type(e).__name__}: {e}", critical=False)
+            return None
+        shape = getattr(getattr(r, "metadata", None), "machine_shape", "")
+        return (str(shape).strip() or None) if shape else None
 
     # ---------------- datasets ----------------
     def dataset_exists(self, slug: str) -> bool:
