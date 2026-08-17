@@ -7,6 +7,13 @@ stdout (see protocol.py). Nothing else goes to stdout, ever -- a stray
 print would land in the middle of the stream and read as a corrupt
 message. Logging goes to the diagnostic file the rest of the app uses.
 
+That rule used to be a convention this module kept, and conventions do
+not bind libraries. `kaggle`, reached through `poll`, prints eighteen
+lines of authentication help to stdout and reads stdin for the answer --
+so the pipe carrying the protocol was being written into by a banner and
+read out of by a prompt, which cost a reply and then the process. See
+`_take_stdio`: the rule is now enforced rather than requested.
+
 EOF ON STDIN IS THE SHUTDOWN SIGNAL. It is what the sidecar gets when
 the shell that spawned it dies -- including when it dies badly -- and
 acting on it is what stops an orphaned Python process holding a render's
@@ -15,6 +22,7 @@ state with no window left to show it. There is no other exit path: no
 """
 from __future__ import annotations
 
+import os
 import sys
 
 from blendfleet import crash_log
@@ -44,6 +52,48 @@ def build_session() -> Session:
                      cache_dir() / "work")
 
     return Session(store, fleet_factory, verify_token, settings)
+
+
+def _take_stdio(log_path=None):
+    """Hand the protocol private copies of the pipe, then take the pipe
+    away from everything else in this process.
+
+    Done at the file-descriptor level, not by rebinding `sys.stdout`:
+    what has to be contained is a library, and a library may print
+    through C, or hand fd 1 to a subprocess it spawns. `dup2` follows the
+    pipe wherever it is passed; rebinding a Python attribute does not.
+
+    After this returns:
+
+      - fd 1 is the diagnostic log, so a stray print is still readable
+        afterwards rather than merely gone. Losing the Kaggle banner
+        entirely is how a shipped build would hide a real auth problem.
+      - fd 0 is the null device, so anything that prompts is answered
+        with EOF immediately -- which surfaces as an honest `ok: false`
+        on the call that prompted, instead of that call quietly eating
+        the next message off the wire.
+
+    Must run before anything reads stdin. Python's own `sys.stdin` has
+    read nothing at this point; a chunk buffered into it ahead of the dup
+    would be a message the protocol never sees.
+    """
+    protocol_in = os.fdopen(os.dup(0), "r", encoding="utf-8")
+    protocol_out = os.fdopen(os.dup(1), "w", encoding="utf-8", newline="\n")
+
+    empty = os.open(os.devnull, os.O_RDONLY)
+    os.dup2(empty, 0)
+    os.close(empty)
+
+    try:
+        sink = (os.open(str(log_path), os.O_WRONLY | os.O_APPEND | os.O_CREAT)
+                if log_path else os.open(os.devnull, os.O_WRONLY))
+    except OSError:
+        # An unwritable log is not a reason to leave the pipe exposed.
+        sink = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(sink, 1)
+    os.close(sink)
+
+    return protocol_in, protocol_out
 
 
 def serve(session: Session, stdin=None, stdout=None) -> int:
@@ -87,6 +137,9 @@ def main() -> int:
     path = crash_log.install()
     crash_log.record(
         f"sidecar starting (python -m blendfleet.rpc), log at {path}")
+    # Before build_session, which is the first thing here that imports a
+    # library with opinions about the console.
+    protocol_in, protocol_out = _take_stdio(path)
     try:
         session = build_session()
     except Exception as e:      # noqa: BLE001 -- the shell has to hear this
@@ -94,12 +147,12 @@ def main() -> int:
                          critical=True)
         # Said on the protocol as well as in the log: a shell waiting for
         # a reply that never comes shows a blank window with no reason.
-        sys.stdout.write('{"event":"notification","args":['
-                         f'"BlendFleet could not start its backend: {e}",'
-                         '"offline"]}\n')
-        sys.stdout.flush()
+        protocol_out.write('{"event":"notification","args":['
+                           f'"BlendFleet could not start its backend: {e}",'
+                           '"offline"]}\n')
+        protocol_out.flush()
         return 1
-    return serve(session)
+    return serve(session, protocol_in, protocol_out)
 
 
 if __name__ == "__main__":
