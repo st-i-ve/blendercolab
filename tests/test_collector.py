@@ -1,3 +1,4 @@
+import time
 import zipfile
 from pathlib import Path
 import pytest
@@ -694,3 +695,160 @@ def test_case_only_collision_does_not_overwrite_on_a_case_insensitive_disk(tmp_p
     assert entries(a.archive_path) == ["Kitchen_0001.png"]
     assert entries(b.archive_path) == ["kitchen_0001.png"]
     assert b.wanted_name == "kitchen.zip"
+
+
+# --------------------------------------------------------------------
+# Concurrent fetch (2026-09-05). The measurement that justifies it is in
+# the comment inside collect(); these tests pin the BEHAVIOUR that
+# measurement bought, and the guarantees it must not have cost.
+# --------------------------------------------------------------------
+
+def _many(n):
+    """A fleet of `n` workers, one frame each, with matching accounts."""
+    st = FleetState(job_id="jN", blend_name="r.blend", start_frame=1,
+                    end_frame=n,
+                    workers=[WorkerState(f"a{i}", f"u{i}", f"u{i}/k{i}", [i + 1])
+                             for i in range(n)])
+    return st, [Account(f"a{i}", "KGAT_" + str(i) * 32) for i in range(n)]
+
+
+def test_workers_download_at_the_same_time_not_one_after_another(tmp_path):
+    """The point of the change: accounts must be in flight together.
+
+    Written as a barrier rather than a stopwatch -- a timing assertion
+    would pass on a serial collect on a fast enough machine and flake on
+    a slow one. Every client blocks until all of them have arrived, so a
+    collect that still fetched one at a time cannot get past the first
+    one and fails here instead of silently being slow.
+
+    Sized to COLLECT_FANOUT, not to a literal 5: asking more accounts to
+    meet than the pool will ever run at once is a deadlock in the TEST,
+    which is exactly what the first draft of this did.
+    """
+    import threading
+    from blendfleet.collector import COLLECT_FANOUT
+
+    n = COLLECT_FANOUT
+    st, accounts = _many(n)
+    barrier = threading.Barrier(n, timeout=10)
+
+    class Concurrent(FakeClient):
+        def fetch_output(self, slug, dest):
+            barrier.wait()
+            return FakeClient.fetch_output(self, slug, dest)
+
+    frame = {f"KGAT_{str(i) * 32}": [f"f_{i + 1:04d}.png"] for i in range(n)}
+    r = collect(st, accounts, lambda tok: Concurrent(tok, frame[tok]),
+                tmp_path / "out")
+
+    assert r.worker_errors == {}, (
+        "the fetches never met -- a broken barrier here means collect "
+        "downloaded one account at a time")
+    assert r.copied == n
+    assert r.missing_frames == []
+
+
+def test_fanout_bounds_how_many_download_at_once(tmp_path):
+    """`fanout` is a ceiling on live connections, not a suggestion.
+
+    Kaggle is on the other end of these sockets; opening one per account
+    for a large fleet is how a download turns into a rate-limit. The
+    default is 4 (COLLECT_FANOUT) because that is where the measured
+    throughput stopped improving.
+    """
+    import threading
+
+    st, accounts = _many(8)
+    live = 0
+    peak = 0
+    lock = threading.Lock()
+    started = threading.Semaphore(0)
+
+    class Counting(FakeClient):
+        def fetch_output(self, slug, dest):
+            nonlocal live, peak
+            with lock:
+                live += 1
+                peak = max(peak, live)
+            started.release()
+            time.sleep(0.05)        # hold the slot so overlap is observable
+            with lock:
+                live -= 1
+            return FakeClient.fetch_output(self, slug, dest)
+
+    frame = {f"KGAT_{str(i) * 32}": [f"f_{i + 1:04d}.png"] for i in range(8)}
+    r = collect(st, accounts, lambda tok: Counting(tok, frame[tok]),
+                tmp_path / "out", fanout=3)
+
+    assert r.copied == 8
+    assert peak <= 3, f"{peak} downloads ran at once against a fanout of 3"
+    assert peak > 1, "nothing overlapped at all -- the fetch went serial"
+
+
+def test_frame_order_is_the_worker_order_however_the_downloads_finish(tmp_path):
+    """Whichever download lands first, the FIRST worker still wins a
+    duplicated frame -- the merge walks `workers`, not completion order.
+
+    Here worker a1 (deliberately fast) and worker a0 (deliberately slow)
+    both return frame 1 with different bytes. a0 comes first in the fleet,
+    so a0's bytes are the ones in the zip, exactly as when the fetch was
+    serial. Without the serial in-order merge this is a coin toss that
+    changes which render a user is handed.
+    """
+    def factory(tok):
+        if tok.endswith("0" * 32):
+            class Slow(FakeClient):
+                def fetch_output(self, slug, dest):
+                    time.sleep(0.15)
+                    dest.mkdir(parents=True, exist_ok=True)
+                    p = dest / "f_0001.png"
+                    p.write_bytes(b"FIRST-WORKER")
+                    return [p]
+            return Slow(tok)
+
+        class Fast(FakeClient):
+            def fetch_output(self, slug, dest):
+                dest.mkdir(parents=True, exist_ok=True)
+                p = dest / "f_0001.png"
+                p.write_bytes(b"SECOND-WORKER")
+                return [p]
+        return Fast(tok)
+
+    st = FleetState(job_id="j1", blend_name="r.blend", start_frame=1,
+                    end_frame=1,
+                    workers=[WorkerState("a0", "u0", "u0/k0", [1]),
+                             WorkerState("a1", "u1", "u1/k1", [1])])
+
+    r = collect(st, accts(), factory, tmp_path / "out")
+
+    assert r.copied == 1, "one frame collected twice is still one frame"
+    assert entry_bytes(r.archive_path, "r_0001.png") == b"FIRST-WORKER"
+    assert r.per_worker == {"a0": 1, "a1": 0}
+
+
+def test_a_slow_workers_failure_still_leaves_no_staging_behind(tmp_path):
+    """Cleanup used to hang off each worker's own `finally` inside the
+    single loop. With the fetch fanned out that per-worker `finally` is
+    gone, so the outer one has to wipe EVERY staging folder -- including
+    those of workers whose download failed after writing partial files
+    into the user's own chosen directory.
+    """
+    class Boom(FakeClient):
+        def fetch_output(self, slug, dest):
+            dest.mkdir(parents=True, exist_ok=True)
+            (dest / "f_0009.png").write_bytes(b"half a frame")
+            raise RuntimeError("connection reset")
+
+    st, accounts = _many(4)
+    frame = {f"KGAT_{str(i) * 32}": [f"f_{i + 1:04d}.png"] for i in range(4)}
+
+    def factory(tok):
+        return Boom(tok) if tok.endswith("0" * 32) else FakeClient(tok, frame[tok])
+
+    out = tmp_path / "out"
+    r = collect(st, accounts, factory, out)
+
+    assert not list(out.glob(".raw_*")), (
+        "a failed worker's staging folder was left in the user's folder")
+    assert "connection reset" in r.worker_errors["a0"]
+    assert r.copied == 3

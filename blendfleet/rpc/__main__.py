@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 
 from blendfleet import crash_log
 from blendfleet.accounts import AccountStore
@@ -108,10 +109,21 @@ def serve(session: Session, stdin=None, stdout=None) -> int:
     stdin = stdin or sys.stdin
     stdout = stdout or sys.stdout
 
+    # One line at a time onto the pipe, whoever is emitting. Dispatch is
+    # single-threaded but EVENTS are not: they come from whichever worker
+    # thread produced them, and since 2026-09-05 collect fans its
+    # downloads out across four threads that all tick downloadProgress at
+    # once. write+flush is two calls, so without this two events can
+    # interleave into one another and hand the shell half a JSON object
+    # -- and this protocol is newline-delimited, so a torn line is not a
+    # dropped event, it is a parse error that ends the stream.
+    write_lock = threading.Lock()
+
     def write(line: str) -> None:
         try:
-            stdout.write(line)
-            stdout.flush()
+            with write_lock:
+                stdout.write(line)
+                stdout.flush()
         except (BrokenPipeError, ValueError):
             # The shell went away mid-write. Nothing to report it to; the
             # read loop below is about to end for the same reason.

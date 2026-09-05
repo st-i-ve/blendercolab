@@ -6,12 +6,18 @@ import time
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable
 
 from blendfleet.fleet import slugify_stem
 from blendfleet.notebook_builder import ARCHIVE_SUFFIX
 
 FRAME_RE = re.compile(r"_(\d+)\.(png|jpg|jpeg)$", re.I)
+
+# How many accounts download at once. Four because that is where the
+# measurement flattened, not because it is a round number -- the figures
+# are in the long comment inside collect().
+COLLECT_FANOUT = 4
 
 
 @dataclass
@@ -253,6 +259,7 @@ def collect(fleet_state, accounts, client_factory: Callable,
             dest: Path, *, worker_label: str | None = None,
             on_progress: Callable[[str, object], None] | None = None,
             sleep: Callable[[float], None] = time.sleep,
+            fanout: int = COLLECT_FANOUT,
             ) -> CollectReport:
     """Merge every worker's rendered frames into ONE zip in `dest`.
 
@@ -366,46 +373,102 @@ def collect(fleet_state, accounts, client_factory: Callable,
     # mistake as counting a truncated download as a collected frame.
     part = dest / f".{fleet_state.job_id}-collecting.zip.part"
     part.unlink(missing_ok=True)   # a previous interrupted collect's leftovers
+
     try:
+        # ---- WHO CAN BE ASKED, settled before a byte moves ------------
+        # Serial and in worker order on purpose: this is where the "no
+        # configured account" verdict is recorded, and a report written from
+        # one thread needs no lock around it.
+        askable = []
+        for w in workers:
+            acct = by_label.get(w.label) or by_username.get(w.username)
+            if acct is None:
+                # This used to skip in silence. The worker's frames then
+                # landed in missing_frames with nothing to explain them, which
+                # on screen is indistinguishable from an account that rendered
+                # nothing at all -- and that is exactly how a real 25-frame
+                # render (2026-08-12) was read as "two accounts did not
+                # render", when both had in fact finished every frame.
+                report.per_worker[w.label] = 0
+                report.worker_errors[w.label] = (
+                    f"{w.username or w.label} rendered "
+                    f"{len(w.frames)} frame(s), but no configured account "
+                    f"matches it any more, so BlendFleet has no token to "
+                    f"download them with. Nothing is lost -- the frames are "
+                    f"still on Kaggle. Re-add that account under Manage "
+                    f"accounts… (the Kaggle username is {w.username or 'unknown'}) "
+                    f"and download again.")
+                continue
+            askable.append((w, acct))
+
+        # ---- FETCH, ALL ACCOUNTS AT ONCE ------------------------------
+        # MEASURED, not assumed. Against a real five-account job (2026-09-05,
+        # waydown, 35 MB of output): 60.9s one account after another, 22.1s
+        # with all five downloading together; repeated, 61.0s against 26.2s.
+        # A single connection sits at ~0.58 MB/s however long it is given, so
+        # the limit is per connection and not this machine's link.
+        #
+        # The aggregate flattens near 1.5 MB/s though -- five streams gave
+        # 2.3-2.75x, nowhere near 5x -- so something above one connection (the
+        # link, or a Kaggle-side cap) becomes the ceiling. Hence a default of
+        # four: past that, more streams buy noise rather than throughput. On
+        # the 536-frame render sitting on these accounts (~1.8 GB) this is the
+        # difference between about 54 minutes and about 21.
+        #
+        # DOWNLOADS ONLY. The merge below stays serial for two reasons that
+        # are not about speed: a ZipFile open for writing is one cursor, and
+        # "the first worker to contribute a frame keeps it" has to stay
+        # deterministic, which means walking the workers in their own order.
+        fetched: dict[str, list[Path]] = {}
+
+        def _fetch(pair):
+            w, acct = pair
+            # The client is built HERE, on the thread that will use it, not
+            # in the loop above: each account gets its own kaggle client and
+            # therefore its own connection, which is the whole point -- one
+            # shared client would serialise these back into one stream.
+            client = client_factory(acct.token)
+            # Retried as a whole, on top of the per-file retry inside
+            # downloader.fetch_files. Measured 2026-08-11: a finished
+            # 15-minute render reported ZERO frames because one download was
+            # truncated, and simply calling collect again recovered all 15.
+            # The frames are already rendered and paid for by the time this
+            # runs -- a transient socket error must not be what loses them.
+            return w.label, _fetch_with_retry(client, w, stagings[w.label],
+                                              on_progress, sleep)
+
+        if askable:
+            with ThreadPoolExecutor(
+                    max_workers=max(1, min(fanout, len(askable))),
+                    thread_name_prefix="blendfleet-collect") as pool:
+                futures = {pool.submit(_fetch, pair): pair[0] for pair in askable}
+                for future in as_completed(futures):
+                    w = futures[future]
+                    try:
+                        label, files = future.result()
+                    except Exception as e:      # noqa: BLE001 -- per worker
+                        # Unchanged contract: one worker failing (dead kernel,
+                        # revoked token, network blip) is recorded and every
+                        # other worker still collects. Its frames simply stay
+                        # out of the found set, which is exactly correct --
+                        # they were not collected.
+                        report.worker_errors[w.label] = str(e)
+                        report.per_worker[w.label] = 0
+                    else:
+                        fetched[label] = files
+
+        # ---- MERGE, ONE AT A TIME, IN WORKER ORDER --------------------
         # ZIP_STORED for exactly the reason notebook_builder.py uses it on
         # the worker side: PNG and JPEG are already compressed, so
         # deflating them burns CPU over the whole render for a percent or
         # two. This is a container, not a compressor.
         with zipfile.ZipFile(part, "w", zipfile.ZIP_STORED) as merged:
             for w in workers:
-                acct = by_label.get(w.label) or by_username.get(w.username)
-                if acct is None:
-                    # This used to `continue` in silence. The worker's
-                    # frames then landed in missing_frames with nothing to
-                    # explain them, which on screen is indistinguishable
-                    # from an account that rendered nothing at all -- and
-                    # that is exactly how a real 25-frame render
-                    # (2026-08-12) was read as "two accounts did not
-                    # render", when both had in fact finished every frame.
-                    report.per_worker[w.label] = 0
-                    report.worker_errors[w.label] = (
-                        f"{w.username or w.label} rendered "
-                        f"{len(w.frames)} frame(s), but no configured account "
-                        f"matches it any more, so BlendFleet has no token to "
-                        f"download them with. Nothing is lost -- the frames are "
-                        f"still on Kaggle. Re-add that account under Manage "
-                        f"accounts… (the Kaggle username is {w.username or 'unknown'}) "
-                        f"and download again.")
-                    continue
-                client = client_factory(acct.token)
+                files = fetched.get(w.label)
+                if files is None:
+                    continue        # never asked, or its fetch failed
                 staging = stagings[w.label]
                 try:
-                    # Retried as a whole, on top of the per-file retry
-                    # inside downloader.fetch_files. Measured 2026-08-11: a
-                    # finished 15-minute render reported ZERO frames
-                    # because one download was truncated, and simply
-                    # calling collect again recovered all 15. The frames
-                    # are already rendered and paid for by the time this
-                    # runs -- a transient socket error must not be what
-                    # loses them.
-                    files = _fetch_with_retry(client, w, staging, on_progress,
-                                              sleep)
-
                     frame_paths = _resolve_frame_sources(files, staging,
                                                          w.label, report)
 
@@ -413,35 +476,25 @@ def collect(fleet_state, accounts, client_factory: Callable,
                     for frame in sorted(frame_paths):
                         if frame in found:
                             # An earlier worker already contributed this
-                            # frame. Writing it again would put two
-                            # entries under one name in the zip, and
-                            # extractors disagree about which of them wins
-                            # -- so the first writer keeps it, which also
-                            # keeps `copied` counting frames rather than
-                            # copies (two workers handed the same frame is
-                            # 1 frame collected, not 2).
+                            # frame. Writing it again would put two entries
+                            # under one name in the zip, and extractors
+                            # disagree about which of them wins -- so the
+                            # first writer keeps it, which also keeps
+                            # copied counting frames rather than copies.
                             continue
                         src = frame_paths[frame]
-                        # Keep the source extension: the render format is
-                        # a user choice (PNG or JPEG) and a .jpg renamed
-                        # to .png is a corrupt file, not a converted one.
+                        # Keep the source extension: the render format is a
+                        # user choice (PNG or JPEG) and a .jpg renamed to
+                        # .png is a corrupt file, not a converted one.
                         suffix = src.suffix.lower()
                         merged.write(src, arcname=f"{stem}_{frame:04d}{suffix}")
                         found.add(frame)
                         n += 1
                         report.copied += 1
                     report.per_worker[w.label] = n
-                except Exception as e:
-                    # Task 6: one worker's fetch failing (dead kernel,
-                    # revoked token, network blip) must not abort
-                    # collecting everyone else -- reported here instead,
-                    # and this worker's frames simply stay out of `found`,
-                    # which is exactly correct: they were not actually
-                    # collected.
+                except Exception as e:      # noqa: BLE001 -- per worker
                     report.worker_errors[w.label] = str(e)
                     report.per_worker[w.label] = 0
-                finally:
-                    _wipe(staging)
 
         if report.copied:
             base = _archive_base_name(fleet_state, worker_label)
@@ -451,6 +504,11 @@ def collect(fleet_state, accounts, client_factory: Callable,
             if final.name != f"{base}.zip":
                 report.wanted_name = f"{base}.zip"
     finally:
+        # Every staging folder, including those of workers whose fetch
+        # failed: the per-worker cleanup that used to do this went with
+        # the single loop.
+        for staging in stagings.values():
+            _wipe(staging)
         # Nothing was collected (or something escaped): no zip. An empty
         # <scene>.zip would read as a delivered render right up until it
         # is opened -- absent is the honest answer, and CollectReport
